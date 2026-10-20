@@ -1,0 +1,52 @@
+# OmniVoice Studio routing (Traefik file provider). Copy to traefik\dynamic\omnivoice.yml in the
+# deployed project and replace voice.example.com with the public hostname.
+#
+# Mirrors the Vite proxy in Omnivoice-wrapper-site\vite.config.ts, but the API calls go straight
+# to the containers over the shared `proxy` network by container name:
+#   /api/*          -> omnivoice-triton-api:18081   (prefix stripped; host port 18080 unchanged)
+#   /perform-api/*  -> omnivoice-perform-api:18090  (prefix stripped; host port 18090 unchanged)
+#   everything else -> Vite UI on the Windows host, port 8010 (npm run dev / npm run preview)
+#
+# Both API containers must be attached to `proxy` (see README "OmniVoice integration").
+# Longer rules win, so the two PathPrefix routers take precedence over the UI router.
+# This app has no login of its own: put a Cloudflare Access application in front of the
+# hostname BEFORE adding the public hostname to the tunnel.
+http:
+  routers:
+    omnivoice-api:
+      rule: Host(`voice.example.com`) && PathPrefix(`/api`)
+      entryPoints: [web]
+      middlewares: [omnivoice-strip-api, default-headers]
+      service: omnivoice-triton-api
+    omnivoice-perform-api:
+      rule: Host(`voice.example.com`) && PathPrefix(`/perform-api`)
+      entryPoints: [web]
+      middlewares: [omnivoice-strip-perform-api, default-headers]
+      service: omnivoice-perform-api
+    omnivoice-ui:
+      rule: Host(`voice.example.com`)
+      entryPoints: [web]
+      middlewares: [default-headers]
+      service: omnivoice-ui
+
+  middlewares:
+    omnivoice-strip-api:
+      stripPrefix:
+        prefixes: [/api]
+    omnivoice-strip-perform-api:
+      stripPrefix:
+        prefixes: [/perform-api]
+
+  services:
+    omnivoice-triton-api:
+      loadBalancer:
+        servers:
+          - url: http://omnivoice-triton-api:18081
+    omnivoice-perform-api:
+      loadBalancer:
+        servers:
+          - url: http://omnivoice-perform-api:18090
+    omnivoice-ui:
+      loadBalancer:
+        servers:
+          - url: http://host.docker.internal:8010

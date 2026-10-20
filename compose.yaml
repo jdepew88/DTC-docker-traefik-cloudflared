@@ -1,0 +1,140 @@
+# Traefik v3.7.15 + Cloudflare Tunnel for Docker Desktop (Windows, Linux containers).
+#
+#   docker compose up -d                      # socket-proxy + traefik
+#   docker compose --profile tunnel up -d     # + cloudflared (needs secrets/cloudflare_tunnel_token)
+#   docker compose --profile test up -d whoami  # disposable echo backend (tests only)
+#
+# Images are pinned by tag AND multi-arch index digest. See README "Upgrades" before changing them.
+name: traefik-cloudflared
+
+services:
+  socket-proxy:
+    # Read-only Docker API filter. Never publish its port 2375.
+    image: tecnativa/docker-socket-proxy:v0.5.0@sha256:1f5038b54f06c3e18422902cf00ba21803d1c97805aae032e5e6673d532d3459
+    container_name: socket-proxy
+    restart: unless-stopped
+    environment:
+      # Only what the Traefik Docker provider needs (verified against Docker Engine API 1.56).
+      CONTAINERS: '1'
+      EVENTS: '1'
+      VERSION: '1'
+      PING: '1'
+      POST: '0'
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - socket-internal
+    read_only: true
+    tmpfs:
+      - /run
+      - /tmp
+      - /var/lib/haproxy
+    security_opt:
+      - no-new-privileges:true
+    logging: &logging
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: '3'
+
+  traefik:
+    image: traefik:v3.7.15@sha256:0f6150202bc1fed72a7bd2107460eaa510e5b8a905f3fdb5b84f2c8619c33368
+    container_name: traefik
+    restart: unless-stopped
+    depends_on:
+      - socket-proxy
+    command:
+      - --configFile=/etc/traefik/traefik.yml
+    volumes:
+      - ./traefik/traefik.yml:/etc/traefik/traefik.yml:ro
+      - ./traefik/dynamic:/etc/traefik/dynamic:ro
+    ports:
+      # Loopback only: local validation and the read-only dashboard. Not reachable from the LAN.
+      - '127.0.0.1:${TRAEFIK_HTTP_PORT:-8180}:80'
+      - '127.0.0.1:${TRAEFIK_DASHBOARD_PORT:-8181}:8080'
+    networks:
+      proxy: {}
+      socket-internal: {}
+      tunnel: {}
+    healthcheck:
+      test: ['CMD', 'traefik', 'healthcheck', '--configFile=/etc/traefik/traefik.yml']
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    logging: *logging
+
+  cloudflared:
+    # Remotely managed tunnel: public hostnames are configured in the Cloudflare dashboard
+    # and point at http://traefik:80. The token is read from a file, never from the command line.
+    image: cloudflare/cloudflared:2026.10.1@sha256:a15a3b50b8dabd57ac2090e9484c0247dba9dfa1f0df4d298d4317f9d69eb2d5
+    container_name: cloudflared
+    restart: unless-stopped
+    profiles: [tunnel]
+    command: tunnel --no-autoupdate --metrics 0.0.0.0:20241 run
+    environment:
+      TUNNEL_TOKEN_FILE: /run/secrets/cloudflare_tunnel_token
+    secrets:
+      - cloudflare_tunnel_token
+    depends_on:
+      traefik:
+        condition: service_healthy
+    networks:
+      tunnel:
+        # Fixed address: the only source Traefik trusts for X-Forwarded-* headers (traefik.yml).
+        ipv4_address: 172.31.250.10
+    healthcheck:
+      test: ['CMD', 'cloudflared', 'tunnel', '--metrics', '127.0.0.1:20241', 'ready']
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    logging: *logging
+
+  whoami:
+    # Disposable echo backend used by tests\Test-Stack.ps1. Only started with --profile test and
+    # removed again by the test script; never route a public hostname to it permanently.
+    image: traefik/whoami:v1.12.0@sha256:c4717a8d1f0134a7444e24f881160e033991f23027c6c5a9a3f8fd22e70d1d44
+    container_name: whoami-test
+    profiles: [test]
+    networks:
+      - proxy
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.whoami-test.rule=Host(`${WHOAMI_TEST_HOST:-whoami.localhost}`)
+      - traefik.http.routers.whoami-test.entrypoints=web
+      - traefik.http.routers.whoami-test.middlewares=default-headers@file
+      - traefik.http.services.whoami-test.loadbalancer.server.port=80
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+
+secrets:
+  cloudflare_tunnel_token:
+    file: ./secrets/cloudflare_tunnel_token
+
+networks:
+  # Shared application network. Created once by install.ps1 (docker network create proxy) and
+  # owned by no Compose project, so `docker compose down` here never touches app containers.
+  proxy:
+    name: proxy
+    external: true
+  # Traefik <-> socket-proxy only; no Internet access.
+  socket-internal:
+    internal: true
+  # cloudflared <-> Traefik only. Apps on `proxy` cannot reach cloudflared or spoof its address.
+  tunnel:
+    ipam:
+      config:
+        - subnet: 172.31.250.0/28
+          ip_range: 172.31.250.0/29
