@@ -1,0 +1,35 @@
+# EXAMPLE: a hand-written Traefik file-provider route, for cases the service registry does not cover
+# (several backends behind one router, custom middlewares, weighted services, ...).
+#
+# Copy to traefik\dynamic\<name>.yml (any name except svc-*.yml, which is generated and overwritten), then
+# run .\install.ps1 -Reload. For the common one-hostname-one-backend case, use services.ps1 instead.
+http:
+  routers:
+    my-app:
+      rule: Host(`app.example.com`)
+      entryPoints: [web]
+      middlewares: [default-headers@file]
+      service: my-app
+    my-app-api:
+      rule: Host(`app.example.com`) && PathPrefix(`/api`)
+      entryPoints: [web]
+      middlewares: [my-app-strip-api, default-headers@file]
+      service: my-app-api
+
+  middlewares:
+    my-app-strip-api:
+      stripPrefix:
+        prefixes: [/api]
+
+  services:
+    # A container on the shared proxy network (by container name, container port).
+    my-app-api:
+      loadBalancer:
+        servers:
+          - url: http://my-app-api:8000
+    # An app running directly on Windows (listening on 0.0.0.0, allowed by Windows Firewall).
+    my-app:
+      loadBalancer:
+        servers:
+          - url: http://host.docker.internal:3000
+    # Another device on the LAN would be: - url: http://10.10.0.11:32800

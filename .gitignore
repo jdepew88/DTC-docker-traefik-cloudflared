@@ -2,11 +2,14 @@
 .env
 secrets/
 *token*
-# Site-specific routes rendered on the deployed host
-traefik/dynamic/omnivoice.yml
+# Site-specific state rendered on the deployed host
+config/services.json
+traefik/dynamic/svc-*.yml
+traefik/dynamic/zz-test-*.yml
 traefik/dynamic/*.local.yml
 traefik/dynamic/app-*.yml
 traefik/dynamic/.reload
+*.tmp-*
 # Wizard state (no secrets, but deployment-specific)
 tunnel.json
 # Installer state

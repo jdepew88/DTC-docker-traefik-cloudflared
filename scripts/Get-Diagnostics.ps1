@@ -1,7 +1,7 @@
 #requires -version 5.1
 <#
 .SYNOPSIS
-  Read-only diagnostics for the Traefik + cloudflared stack. Safe to paste into an issue:
+  Read-only diagnostics for one Traefik + cloudflared instance. Safe to paste into an issue:
   anything that looks like a tunnel token (eyJ...) is redacted.
 
 .EXAMPLE
@@ -18,11 +18,9 @@ param(
 $ErrorActionPreference = 'Continue'
 # Resolved here: $PSScriptRoot/$MyInvocation are not populated in param() defaults on PowerShell 5.1.
 if (-not $ProjectPath) { $ProjectPath = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path) }
-$dashPort = 8181
-$envFile = Join-Path $ProjectPath '.env'
-if (Test-Path -LiteralPath $envFile) {
-  foreach ($line in Get-Content -LiteralPath $envFile) { if ($line -match '^\s*TRAEFIK_DASHBOARD_PORT\s*=\s*(\d+)') { $dashPort = [int]$Matches[1] } }
-}
+Import-Module (Join-Path $ProjectPath 'lib\TraefikProxy.psm1') -Force
+$s = Get-StackSettings -InstallPath $ProjectPath
+$dashPort = $s.DashboardPort
 
 function Section([string]$Title, [scriptblock]$Body) {
   "`n===== $Title"
@@ -30,6 +28,10 @@ function Section([string]$Title, [scriptblock]$Body) {
 }
 
 $report = & {
+  Section 'Instance' {
+    "stack=$($s.StackName) path=$ProjectPath http=127.0.0.1:$($s.HttpPort) dashboard=127.0.0.1:$($s.DashboardPort)"
+    "proxyNetwork=$($s.ProxyNetwork) tunnelSubnet=$($s.TunnelSubnet) cloudflaredIp=$($s.CloudflaredIp)"
+  }
   Section 'Docker' {
     docker version --format 'client {{.Client.Version}} (API {{.Client.APIVersion}}) / server {{.Server.Version}} (API {{.Server.APIVersion}}, min {{.Server.MinAPIVersion}})'
     docker info --format 'os={{.OSType}} name={{.Name}} root={{.DockerRootDir}} kernel={{.KernelVersion}}'
@@ -37,10 +39,16 @@ $report = & {
     docker context show
   }
   Section 'Stack containers' { docker compose --project-directory $ProjectPath --profile tunnel --profile test ps -a }
-  Section 'Images' { docker inspect traefik socket-proxy cloudflared --format '{{.Name}} {{.Config.Image}}' }
-  Section 'proxy network members' { docker network inspect proxy --format '{{range .Containers}}{{.Name}} {{.IPv4Address}}{{println}}{{end}}' }
+  Section 'Images' { docker inspect $s.TraefikContainer $s.SocketProxyContainer $s.CloudflaredContainer --format '{{.Name}} {{.Config.Image}}' }
+  Section "$($s.ProxyNetwork) network members" { docker network inspect $s.ProxyNetwork --format '{{range .Containers}}{{.Name}} {{.IPv4Address}}{{println}}{{end}}' }
   Section 'Networks' { docker network ls }
-  Section 'Loopback listeners 8180/8181' { Get-NetTCPConnection -State Listen -LocalPort 8180, 8181 -ErrorAction SilentlyContinue | Select-Object LocalAddress, LocalPort, OwningProcess | Format-Table -AutoSize | Out-String }
+  Section "Loopback listeners $($s.HttpPort)/$($s.DashboardPort)" { Get-NetTCPConnection -State Listen -LocalPort $s.HttpPort, $s.DashboardPort -ErrorAction SilentlyContinue | Select-Object LocalAddress, LocalPort, OwningProcess | Format-Table -AutoSize | Out-String }
+  Section 'Service registry (config\services.json)' {
+    $registry = Read-ServiceRegistry -Settings $s
+    foreach ($svc in $registry.services) { '{0,-24} {1,-8} {2,-40} -> {3}' -f $svc.name, $(if ($svc.enabled) { 'enabled' } else { 'disabled' }), ($svc.hostnames -join ','), (Get-ServiceUrl $svc) }
+    $plan = Get-ServicePlan -Settings $s -Services $registry.services
+    Format-ServicePlan $plan
+  }
   Section 'Traefik routers' {
     try {
       (Invoke-RestMethod "http://127.0.0.1:$dashPort/api/http/routers") | ForEach-Object { '{0,-40} {1,-8} {2}' -f $_.name, $_.status, $_.rule }
@@ -55,9 +63,9 @@ $report = & {
       }
     } catch { "dashboard API unreachable: $_" }
   }
-  Section "traefik logs (last $LogLines)" { docker logs --tail $LogLines traefik }
-  Section "cloudflared logs (last $LogLines)" { docker logs --tail $LogLines cloudflared }
-  Section 'socket-proxy denials (last 500 lines)' { docker logs --tail 500 socket-proxy | Select-String ' 403 ' }
+  Section "traefik logs (last $LogLines)" { docker logs --tail $LogLines $s.TraefikContainer }
+  Section "cloudflared logs (last $LogLines)" { docker logs --tail $LogLines $s.CloudflaredContainer }
+  Section 'socket-proxy denials (last 500 lines)' { docker logs --tail 500 $s.SocketProxyContainer | Select-String ' 403 ' }
 }
 
 $redacted = $report | ForEach-Object { $_ -replace 'eyJ[A-Za-z0-9_\-=+/.]{20,}', 'eyJ...REDACTED' }
