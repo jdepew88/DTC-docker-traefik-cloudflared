@@ -14,6 +14,8 @@
     2. tests\Test-Stack.ps1 against the instance
     3. services.ps1: preview-only add, apply, docker / lan / Windows-host targets, edit, disable, enable,
        rollback, remove, invalid input rejected, validate -Deep
+    3b. webui.ps1 against the live instance with a Cloudflare API mock: add a service through preview/confirm,
+       check live traffic, remove it with Cloudflare cleanup
     4. Teardown: compose down, remove the instance's proxy network and folder
 
 .EXAMPLE
@@ -31,6 +33,7 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 2.0
 $repo = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
 Import-Module (Join-Path $repo 'lib\TraefikProxy.psm1') -Force
+Import-Module (Join-Path $repo 'tests\WebUiTestHelpers.psm1') -Force
 $script:Results = New-Object System.Collections.ArrayList
 
 function Add-Result([string]$Status, [string]$Name, [string]$Detail) {
@@ -168,6 +171,39 @@ try {
   foreach ($n in @('demo', 'lan-demo')) { $null = Invoke-Ps $svc (@('remove', '-Name', $n, '-Apply') + $common) }
   $r = Wait-Http 'demo.test.example' '/' { param($x) $x.Code -eq '404' }
   Test-Condition 'remove deletes routes and definitions' ($r.Code -eq '404' -and @(Get-ChildItem (Join-Path $installPath 'traefik\dynamic') -Filter 'svc-*.yml').Count -eq 0) "HTTP $($r.Code)"
+
+  # --- 3b. Web UI end to end (live Traefik, Cloudflare API mock) ---------------------------------------------------
+  $uiWork = Join-Path ([IO.Path]::GetTempPath()) "$stack-ui"
+  New-Item -ItemType Directory -Force -Path $uiWork | Out-Null
+  $mockToken = 'mockTok_' + [Guid]::NewGuid().ToString('N') + 'abcdef'
+  $mock = $null; $ui = $null
+  try {
+    $mock = Start-CloudflareMock -Repo $repo -WorkDir $uiWork -Token $mockToken
+    $ui = Start-WebUiServer -Script (Join-Path $installPath 'webui.ps1') -InstallPath $installPath -WorkDir $uiWork -ApiBase $mock.Base
+    $null = Connect-WebUi $ui
+    $st = Invoke-WebUi $ui GET '/api/status'
+    Test-Condition 'web UI: status sees the running instance' ($st.Status -eq 200 -and $st.Data.stack.TraefikApi -and @($st.Data.stack.Containers | Where-Object { $_.Role -eq 'traefik' -and $_.State -eq 'running' }).Count -eq 1) "HTTP $($st.Status)"
+    $null = Invoke-WebUi $ui POST '/api/cloudflare/token' @{ token = $mockToken }
+    $sel = Invoke-WebUi $ui POST '/api/cloudflare/select' @{ accountId = 'acc0000000000000000000000000001'; tunnelId = '11111111-2222-3333-4444-555555555555' }
+    $body = @{ op = 'add'; name = 'ui-demo'
+      service = @{ name = 'ui-demo'; hostnames = @('ui-demo.example.test'); target = @{ type = 'auto'; host = "$stack-whoami"; port = 80; protocol = 'http' }; cloudflare = @{ publish = $true; access = $true } }
+      cloudflare = @{ automate = $true; accessEmails = @('owner@example.com') } }
+    $change = Invoke-WebUiChange $ui $body
+    $r = Wait-Http 'ui-demo.example.test' '/' { param($x) $x.Code -eq '200' }
+    $dnsMade = @((Get-MockState $mock).dns | Where-Object { $_.name -eq 'ui-demo.example.test' }).Count
+    Test-Condition 'web UI: add (preview -> confirm) routes live traffic and configures Cloudflare' ($sel.Status -eq 200 -and $change.Apply.Status -eq 200 -and $change.Apply.Data.ok -and
+      $r.Code -eq '200' -and $r.Body -match 'Hostname:' -and $dnsMade -eq 1 -and @($change.Apply.Data.steps | Where-Object { $_.name -eq 'Traefik reload' -and $_.status -eq 'Done' }).Count -eq 1) "HTTP $($r.Code) $($change.Apply.Body)"
+    $change = Invoke-WebUiChange $ui @{ op = 'remove'; name = 'ui-demo'; cloudflare = @{ automate = $true; cleanup = $true } }
+    $r = Wait-Http 'ui-demo.example.test' '/' { param($x) $x.Code -eq '404' }
+    $dnsLeft = @((Get-MockState $mock).dns | Where-Object { $_.name -eq 'ui-demo.example.test' }).Count
+    Test-Condition 'web UI: remove with cleanup (route 404, Cloudflare records gone)' ($change.Apply.Status -eq 200 -and $r.Code -eq '404' -and $dnsLeft -eq 0) "HTTP $($r.Code)"
+    $logs = Invoke-WebUi $ui GET '/api/logs?role=traefik&tail=20'
+    Test-Condition 'web UI: container logs of the instance' ($logs.Status -eq 200 -and $logs.Data.Ok -and @($logs.Data.Lines).Count -gt 0) "HTTP $($logs.Status)"
+  } finally {
+    Stop-TestServer $ui
+    Stop-TestServer $mock
+    Remove-Item -LiteralPath $uiWork -Recurse -Force -ErrorAction SilentlyContinue
+  }
 
   $diag = Invoke-Ps (Join-Path $installPath 'scripts\Get-Diagnostics.ps1') @('-ProjectPath', $installPath)
   Test-Condition 'diagnostics run against the instance' ($diag.ExitCode -eq 0 -and $diag.Text -match "stack=$stack" -and $diag.Text -match 'Service registry') ''

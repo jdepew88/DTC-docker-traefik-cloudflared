@@ -7,7 +7,7 @@
 
 $HostnamePattern = '^(?=.{1,253}$)([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}$'
 $LabelPattern = '^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$'
-$TokenPattern = 'eyJ[A-Za-z0-9_\-=+/]{40,}'
+$TokenPattern = Get-TunnelTokenPattern
 $ZeroTrustUrl = 'https://one.dash.cloudflare.com/'
 $StackContainers = @($Settings.TraefikContainer, $Settings.SocketProxyContainer, $Settings.CloudflaredContainer, $Settings.WhoamiContainer)
 
@@ -65,34 +65,7 @@ function Save-WizardState($State) {
 }
 
 # --- Token --------------------------------------------------------------------------------------------
-# A tunnel token is base64(JSON {"a": account tag, "t": tunnel id, "s": secret}). Only a and t are returned.
-function ConvertFrom-TunnelToken([string]$Token) {
-  try {
-    $b64 = $Token.Replace('-', '+').Replace('_', '/')
-    switch ($b64.Length % 4) { 2 { $b64 += '==' } 3 { $b64 += '=' } }
-    $json = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($b64)) | ConvertFrom-Json
-    if ($json.PSObject.Properties['t'] -and $json.PSObject.Properties['s']) {
-      return [pscustomobject]@{ AccountTag = [string]$json.a; TunnelId = [string]$json.t }
-    }
-  } catch { }
-  return $null
-}
-
-# Returns the name of another container already running a connector for this tunnel, if any.
-# Tokens of other containers are compared in memory only and never printed.
-function Find-ConnectorForTunnel([string]$TunnelId) {
-  foreach ($line in (Invoke-Docker ps -a --format '{{.Names}}|{{.Image}}').Output) {
-    $parts = $line.Split('|')
-    if ($parts.Count -lt 2 -or $parts[1] -notmatch 'cloudflared' -or $parts[0] -eq $Settings.CloudflaredContainer) { continue }
-    $config = (Invoke-Docker inspect $parts[0] --format '{{json .Config.Cmd}} {{json .Config.Env}}').Output -join ' '
-    foreach ($match in [regex]::Matches($config, $TokenPattern)) {
-      $decoded = ConvertFrom-TunnelToken $match.Value
-      if ($decoded -and $decoded.TunnelId -eq $TunnelId) { return $parts[0] }
-    }
-  }
-  return $null
-}
-
+# Token parsing, connector lookup, the token file and starting cloudflared live in lib\TraefikProxy.psm1.
 function Read-TunnelToken {
   for ($attempt = 1; $attempt -le 3; $attempt++) {
     $secure = Read-Host -AsSecureString -Prompt '    Paste the token or the whole docker command (input hidden)'
@@ -110,41 +83,15 @@ function Read-TunnelToken {
 }
 
 function Save-TunnelToken([string]$Token) {
-  $tokenPath = Join-Path $InstallPath 'secrets\cloudflare_tunnel_token'
-  New-Item -ItemType Directory -Force -Path (Split-Path -Parent $tokenPath) | Out-Null
-  if (Test-Path -LiteralPath $tokenPath) {
-    $saveTo = Join-Path $InstallPath ('backups\' + $Timestamp + '\secrets\cloudflare_tunnel_token')
-    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $saveTo) | Out-Null
-    Copy-Item -LiteralPath $tokenPath -Destination $saveTo
-  }
-  [IO.File]::WriteAllText($tokenPath, $Token)
-  $null = & icacls $tokenPath /inheritance:r /grant:r "${env:USERNAME}:(R,W)" '*S-1-5-18:(R)' '*S-1-5-32-544:(R)'
+  $null = Save-TunnelTokenFile -Settings $Settings -Token $Token
   Write-Note 'Saved to secrets\cloudflare_tunnel_token (readable by you, SYSTEM and Administrators only).'
 }
 
 # --- Stack ----------------------------------------------------------------------------------------------
 function Start-TunnelStack([switch]$Recreate) {
-  $upArgs = (Get-ComposeArgs -Settings $Settings -Profiles @('tunnel')) + @('up', '-d', '--wait', '--wait-timeout', '120')
-  if ($Recreate) { $upArgs += @('--force-recreate', 'cloudflared') }
-  $cf = $Settings.CloudflaredContainer
-  $since = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
-  $up = Invoke-Docker @upArgs
-  if ($up.ExitCode -ne 0) {
-    $up.Output | Select-Object -Last 10 | ForEach-Object { Write-Note $_ }
-    $logs = (Invoke-Docker logs --tail 30 $cf).Output -join "`n"
-    if ($logs -match 'Unauthorized|invalid token|tunnel credentials') { throw 'cloudflared rejected the token. Copy it again from the Cloudflare dashboard and re-run the wizard.' }
-    throw "Starting cloudflared failed. See: docker logs --tail 100 $cf"
-  }
-  $deadline = (Get-Date).AddSeconds(60)
-  do {
-    $logs = (Invoke-Docker logs --since $since $cf).Output -join "`n"
-    $connections = [regex]::Matches($logs, 'Registered tunnel connection').Count
-    if ($connections -ge 1) { break }
-    Start-Sleep -Seconds 2
-  } while ((Get-Date) -lt $deadline)
-  if ($connections -lt 1) { throw "cloudflared started but registered no tunnel connections within 60 s. Check: docker logs $cf" }
-  $locations = ([regex]::Matches($logs, 'location=(\S+)') | ForEach-Object { $_.Groups[1].Value } | Select-Object -Unique) -join ', '
-  Write-Note "cloudflared connected: $connections connection(s) to Cloudflare ($locations)."
+  $r = Start-TunnelConnector -Settings $Settings -Recreate:$Recreate
+  if (-not $r.Ok) { $r.Output | Select-Object -Last 10 | ForEach-Object { Write-Note $_ }; throw $r.Message }
+  Write-Note $r.Message
 }
 
 # --- Routes ---------------------------------------------------------------------------------------------
@@ -388,7 +335,7 @@ function Invoke-TunnelWizard([switch]$AddAppOnly, [string]$Domain, [string]$Tunn
     Write-Note 'Anyone with this token can run your tunnel: never share it or commit it.'
     $entered = Read-TunnelToken
     Write-Note "Token is valid for tunnel ID $($entered.TunnelId)."
-    $other = Find-ConnectorForTunnel $entered.TunnelId
+    $other = Find-ConnectorForTunnel -Settings $Settings -TunnelId $entered.TunnelId
     if ($other) {
       throw "Container '$other' already runs a connector for this same tunnel. Create a NEW tunnel for this stack so the two are not load-balanced together; '$other' was left untouched."
     }

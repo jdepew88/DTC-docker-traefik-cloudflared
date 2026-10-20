@@ -68,5 +68,5 @@ $report = & {
   Section 'socket-proxy denials (last 500 lines)' { docker logs --tail 500 $s.SocketProxyContainer | Select-String ' 403 ' }
 }
 
-$redacted = $report | ForEach-Object { $_ -replace 'eyJ[A-Za-z0-9_\-=+/.]{20,}', 'eyJ...REDACTED' }
+$redacted = ConvertTo-RedactedText $report
 if ($OutFile) { $redacted | Set-Content -LiteralPath $OutFile -Encoding UTF8; "Written to $OutFile" } else { $redacted }

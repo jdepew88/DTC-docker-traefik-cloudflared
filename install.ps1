@@ -72,9 +72,19 @@ $ManagedFiles = @(
   'examples\compose-labels.example.yaml',
   'examples\manual-route.yml.example',
   'lib\TraefikProxy.psm1',
+  'lib\CloudflareApi.psm1',
+  'lib\LocalHttp.psm1',
   'services.ps1',
+  'webui.ps1',
+  'webui\index.html',
+  'webui\app.js',
+  'webui\app.css',
+  'webui\icon.svg',
   'tests\Test-Stack.ps1',
   'tests\Test-ServiceConfig.ps1',
+  'tests\Test-WebUi.ps1',
+  'tests\WebUiTestHelpers.psm1',
+  'tests\CloudflareMock.ps1',
   'scripts\Get-Diagnostics.ps1',
   'scripts\TunnelWizard.ps1',
   'install.ps1',
@@ -337,7 +347,7 @@ if ($SetTunnelToken) {
     Write-Note '[dry-run] would prompt for the token and write secrets\cloudflare_tunnel_token'
   } else {
     $entered = Read-TunnelToken
-    $other = Find-ConnectorForTunnel $entered.TunnelId
+    $other = Find-ConnectorForTunnel -Settings $Settings -TunnelId $entered.TunnelId
     if ($other) { throw "Container '$other' already runs a connector for tunnel $($entered.TunnelId). Use a token for a separate tunnel." }
     Save-TunnelToken $entered.Token
     $state = Get-WizardState

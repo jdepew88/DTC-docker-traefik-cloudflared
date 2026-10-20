@@ -36,7 +36,8 @@ traefik --socket-internal (internal)--> socket-proxy --> docker.sock (read-only,
 | Installer (`-DryRun`, `-Start`, `-Reload`, `-Rollback`, `-Stop`) | **Implemented and exercised** against an isolated instance. |
 | Interactive wizard (`-Wizard`, `-AddApp`) | **Implemented**; uses the shared service backend. The Cloudflare steps have **not** been run end to end against a real tunnel from this repository. |
 | Cloudflare Tunnel connector (`cloudflared`) | Compose service and token handling implemented; **not live-validated** in this repository. |
-| Browser-based setup and management UI | Planned (separate branch). |
+| Browser-based setup and management UI (`webui.ps1`) | **Implemented and tested** against a Cloudflare API mock and a live isolated instance. Not yet run against the real Cloudflare API. |
+| Cloudflare API automation (tunnel create, connector token, DNS, tunnel routes, Access apps) | **Implemented and mock-tested**; DPAPI-encrypted API token. |
 
 ## Requirements
 
@@ -69,8 +70,54 @@ cd $env:USERPROFILE\.docker\projects\traefik-proxy
 ```
 
 The last command only **previews** the change. Add `-Apply` to write it. Then publish it through Cloudflare
-with the guided wizard (`.\install.ps1 -Wizard` the first time, `.\install.ps1 -AddApp` later), or by hand
-(see [Cloudflare](#cloudflare-tunnel-remotely-managed)).
+with the [web UI](#web-ui), the guided console wizard (`.\install.ps1 -Wizard` the first time,
+`.\install.ps1 -AddApp` later), or by hand (see [Cloudflare](#cloudflare-tunnel-remotely-managed)).
+
+## Web UI
+
+A local browser interface for the whole lifecycle: Docker Desktop checks, installing and starting the stack,
+connecting Cloudflare, choosing or creating a tunnel, adding / editing / disabling / removing services,
+backups and rollback, logs, validation and diagnostics.
+
+```powershell
+# from the repository (targets %USERPROFILE%\.docker\projects\traefik-proxy) or from the install folder
+powershell -ExecutionPolicy Bypass -File .\webui.ps1                 # opens the browser
+powershell -ExecutionPolicy Bypass -File .\webui.ps1 -Port 8190 -NoBrowser -InstallPath D:\proxy
+```
+
+The console prints a one-time sign-in link (`http://127.0.0.1:8190/?k=...`). Stop the server with Ctrl+C.
+
+**Adding a service** (Services > Add a service): enter a name, pick a domain (loaded from Cloudflare) and a
+subdomain, the backend IP address or hostname and port. The target type is detected (container name,
+`localhost` = this PC, IP / DNS name = network device) and can be overridden. Choose who can reach it (Cloudflare
+Access with a list of emails, public, or local only), then **Preview changes**. The preview shows the Traefik
+file diff, validation warnings (for example the media-streaming notice for Plex) and every Cloudflare action:
+create the Access application, add the tunnel route `hostname -> http://traefik:80`, create the proxied CNAME to
+`<tunnel-id>.cfargotunnel.com`. Nothing happens until you tick *I reviewed these changes* and **Apply**. Then
+the configuration is validated in a throwaway Traefik container, backed up, written and reloaded, and the
+Cloudflare changes run in a safe order (Access first, DNS last).
+
+Cloudflare safety rules:
+
+- The API token is verified before it is stored, encrypted with Windows DPAPI for the current Windows user
+  (`secrets\cloudflare_api.dpapi`, ACL restricted) and never sent back to the browser.
+- An existing DNS record or tunnel route that points somewhere else is only replaced after a separate
+  per-resource confirmation. A/AAAA and multi-record names are never changed automatically (the change is
+  blocked with an explanation). Existing Access applications are reused, never modified.
+- Removing a service (or changing its hostname) can clean up only what points at this instance's tunnel and
+  Access applications this tool created (tracked in `config\cloudflare.json`). Disabling keeps Cloudflare as is.
+- A preview is single-use and expires after 15 minutes; if Traefik files or the relevant Cloudflare state
+  changed in between, the apply is refused and you preview again.
+- Without a token, every preview lists the exact manual steps for the Cloudflare dashboard instead.
+
+Scoped token permissions: *Account > Cloudflare Tunnel > Edit*, *Account > Access: Apps and Policies > Edit*
+(only for automatic Access), *Zone > DNS > Edit* and *Zone > Zone > Read* for the zones you use.
+
+Security of the interface itself: it listens on a `127.0.0.1` socket only (not reachable from the LAN), needs
+the sign-in link (HttpOnly, SameSite=Strict session cookie), rejects foreign `Host` headers (DNS rebinding),
+requires a matching `Origin`, a per-session CSRF token and JSON bodies for every change, limits request sizes,
+serves a fixed whitelist of static files with a strict Content-Security-Policy, and writes every change to
+`logs\webui-audit.log` (redacted).
 
 ## Managing services
 
@@ -254,8 +301,10 @@ container on this PC already uses.
 
 ```powershell
 .\tests\Test-ServiceConfig.ps1          # 63 checks: generator, validation, plan/apply, rollback, deep validation
+.\tests\Test-WebUi.ps1                  # web UI + Cloudflare automation against a loopback Cloudflare API mock
 .\tests\Invoke-IsolatedTest.ps1         # (repository only) disposable second instance: install, live tests,
-                                        # services.ps1 walkthrough with docker/LAN/host targets, teardown
+                                        # services.ps1 walkthrough with docker/LAN/host targets, a web UI
+                                        # end-to-end change (mock Cloudflare), teardown
 .\tests\Test-Stack.ps1                  # live checks against a running instance, exit code 1 on failure
 .\tests\Test-Stack.ps1 -PublicTestHost whoami-test.example.com
 .\scripts\Get-Diagnostics.ps1 -OutFile diag.txt
@@ -308,9 +357,12 @@ routes from the old `traefik\dynamic\` folder can be copied over as-is, or re-cr
 
 ## Known limitations
 
-- The Cloudflare side is guided, not automated: tunnels, published routes, DNS records and Access applications
-  are created in the Cloudflare dashboard (API automation is planned for the web UI, with explicit confirmation).
+- Cloudflare automation (web UI) has been tested against a mock of the API, not yet against the real Cloudflare
+  API; in particular, Access applications are created with an inline email policy, which should be checked on
+  first real use. The console wizard and `services.ps1` remain guided (manual Cloudflare steps).
 - The tunnel path (cloudflared, public test) has not been validated end to end from this repository.
+- The web UI handles one request at a time; long operations (installer, deep validation) block it briefly.
+  Cloudflare changes are not part of backups/rollback.
 - HTTP only between Cloudflare and Traefik inside Docker; TLS terminates at the Cloudflare edge. LAN clients
   cannot use the proxy (ports are loopback-only by design).
 - Cloudflare edge limits apply: 100 MB request body (Free/Pro), 100 s response timeout (HTTP 524), and

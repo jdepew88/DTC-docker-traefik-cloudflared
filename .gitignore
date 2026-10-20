@@ -4,6 +4,8 @@ secrets/
 *token*
 # Site-specific state rendered on the deployed host
 config/services.json
+config/cloudflare.json
+logs/
 traefik/dynamic/svc-*.yml
 traefik/dynamic/zz-test-*.yml
 traefik/dynamic/*.local.yml

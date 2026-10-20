@@ -1,5 +1,6 @@
 #requires -version 5.1
-# Shared backend for install.ps1, services.ps1, the tunnel wizard, the tests and the web UI.
+# Shared backend for install.ps1, services.ps1, the tunnel wizard, the tests and the web UI (webui.ps1).
+# Cloudflare API access lives in lib\CloudflareApi.psm1.
 #
 # Proxied applications are described in a service registry (config\services.json). Each enabled service is
 # rendered into one Traefik file-provider route, traefik\dynamic\svc-<name>.yml. Changes are always computed
@@ -729,8 +730,202 @@ function Wait-ServiceRouters {
   return [pscustomobject]@{ Ok = $false; Missing = $missing; Routers = $routers }
 }
 
+# --- Tunnel connector ----------------------------------------------------------------------------------------
+
+# A tunnel token is base64(JSON {"a": account tag, "t": tunnel id, "s": secret}).
+$script:TunnelTokenPattern = 'eyJ[A-Za-z0-9_\-=+/]{40,}'
+
+function Get-TunnelTokenPattern { return $script:TunnelTokenPattern }
+
+# Returns only the account tag and tunnel id of a token (never the secret), or $null if it is not a token.
+function ConvertFrom-TunnelToken([string]$Token) {
+  try {
+    $b64 = $Token.Replace('-', '+').Replace('_', '/')
+    switch ($b64.Length % 4) { 2 { $b64 += '==' } 3 { $b64 += '=' } }
+    $json = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($b64)) | ConvertFrom-Json
+    if ($json.PSObject.Properties['t'] -and $json.PSObject.Properties['s']) {
+      return [pscustomobject]@{ AccountTag = [string]$json.a; TunnelId = [string]$json.t }
+    }
+  } catch { }
+  return $null
+}
+
+# Returns the name of another container already running a connector for this tunnel, if any.
+# Tokens of other containers are compared in memory only and never returned or printed.
+function Find-ConnectorForTunnel {
+  param([Parameter(Mandatory = $true)]$Settings, [Parameter(Mandatory = $true)][string]$TunnelId)
+  foreach ($line in (Invoke-Docker ps -a --format '{{.Names}}|{{.Image}}').Output) {
+    $parts = $line.Split('|')
+    if ($parts.Count -lt 2 -or $parts[1] -notmatch 'cloudflared' -or $parts[0] -eq $Settings.CloudflaredContainer) { continue }
+    $config = (Invoke-Docker inspect $parts[0] --format '{{json .Config.Cmd}} {{json .Config.Env}}').Output -join ' '
+    foreach ($match in [regex]::Matches($config, $script:TunnelTokenPattern)) {
+      $decoded = ConvertFrom-TunnelToken $match.Value
+      if ($decoded -and $decoded.TunnelId -eq $TunnelId) { return $parts[0] }
+    }
+  }
+  return $null
+}
+
+# Readable by the current user, SYSTEM and Administrators only.
+function Set-SecretFileAcl([string]$Path) {
+  $null = & icacls $Path /inheritance:r /grant:r "${env:USERNAME}:(R,W)" '*S-1-5-18:(R)' '*S-1-5-32-544:(R)'
+}
+
+# Writes secrets\cloudflare_tunnel_token (the previous token, if any, is copied to backups\<timestamp>\secrets\).
+# Returns the backup path or $null.
+function Save-TunnelTokenFile {
+  param([Parameter(Mandatory = $true)]$Settings, [Parameter(Mandatory = $true)][string]$Token)
+  if (-not (ConvertFrom-TunnelToken $Token)) { throw 'That is not a valid tunnel token.' }
+  $path = Join-Path $Settings.InstallPath 'secrets\cloudflare_tunnel_token'
+  New-Item -ItemType Directory -Force -Path (Split-Path -Parent $path) | Out-Null
+  $saved = $null
+  if (Test-Path -LiteralPath $path) {
+    $saved = Join-Path $Settings.BackupRoot ((Get-Date -Format 'yyyyMMdd-HHmmss') + '\secrets\cloudflare_tunnel_token')
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $saved) | Out-Null
+    Copy-Item -LiteralPath $path -Destination $saved -Force
+  }
+  [IO.File]::WriteAllText($path, $Token)
+  Set-SecretFileAcl $path
+  return $saved
+}
+
+function Test-TunnelTokenFile($Settings) {
+  return (Test-Path -LiteralPath (Join-Path $Settings.InstallPath 'secrets\cloudflare_tunnel_token'))
+}
+
+# docker compose up for this instance only (Traefik + socket proxy, plus cloudflared with -WithTunnel).
+function Start-ProxyStack {
+  param([Parameter(Mandatory = $true)]$Settings, [switch]$WithTunnel)
+  $profiles = @()
+  if ($WithTunnel) {
+    if (-not (Test-TunnelTokenFile $Settings)) { throw 'secrets\cloudflare_tunnel_token is missing; install the tunnel connector token first.' }
+    $profiles = @('tunnel')
+  }
+  $up = Invoke-Docker @((Get-ComposeArgs -Settings $Settings -Profiles $profiles) + @('up', '-d', '--wait', '--wait-timeout', '120'))
+  return [pscustomobject]@{ Ok = ($up.ExitCode -eq 0); Output = @(ConvertTo-RedactedText $up.Output) }
+}
+
+# Starts (or recreates, after a token change) this instance's cloudflared and waits for registered connections.
+function Start-TunnelConnector {
+  param([Parameter(Mandatory = $true)]$Settings, [switch]$Recreate, [int]$TimeoutSeconds = 60)
+  if (-not (Test-TunnelTokenFile $Settings)) { throw 'secrets\cloudflare_tunnel_token is missing.' }
+  $upArgs = (Get-ComposeArgs -Settings $Settings -Profiles @('tunnel')) + @('up', '-d', '--wait', '--wait-timeout', '120')
+  if ($Recreate) { $upArgs += @('--force-recreate', 'cloudflared') }
+  $cf = $Settings.CloudflaredContainer
+  $since = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+  $up = Invoke-Docker @upArgs
+  $result = [pscustomobject]@{ Ok = $false; Connections = 0; Locations = ''; Message = ''; Output = @(ConvertTo-RedactedText $up.Output) }
+  if ($up.ExitCode -ne 0) {
+    $logs = (Invoke-Docker logs --tail 30 $cf).Output -join "`n"
+    if ($logs -match 'Unauthorized|invalid token|tunnel credentials') { $result.Message = 'cloudflared rejected the tunnel token. Fetch or paste it again.' }
+    else { $result.Message = "Starting cloudflared failed. See: docker logs --tail 100 $cf" }
+    return $result
+  }
+  $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+  $logs = ''
+  do {
+    $logs = (Invoke-Docker logs --since $since $cf).Output -join "`n"
+    $result.Connections = [regex]::Matches($logs, 'Registered tunnel connection').Count
+    if ($result.Connections -ge 1) { break }
+    Start-Sleep -Seconds 2
+  } while ((Get-Date) -lt $deadline)
+  if ($result.Connections -lt 1) { $result.Message = "cloudflared started but registered no tunnel connections within $TimeoutSeconds s. Check: docker logs $cf"; return $result }
+  $result.Locations = ([regex]::Matches($logs, 'location=(\S+)') | ForEach-Object { $_.Groups[1].Value } | Select-Object -Unique) -join ', '
+  $result.Ok = $true
+  $result.Message = "cloudflared connected: $($result.Connections) connection(s) to Cloudflare ($($result.Locations))."
+  return $result
+}
+
+# --- Status, logs ---------------------------------------------------------------------------------------------
+
+# Masks tunnel tokens, bearer tokens and anything labelled token/secret/password.
+function ConvertTo-RedactedText([string[]]$Lines) {
+  foreach ($line in $Lines) {
+    $l = [string]$line -replace 'eyJ[A-Za-z0-9_\-=+/.]{20,}', 'eyJ...REDACTED'
+    $l = $l -replace '(?i)(bearer\s+)[A-Za-z0-9._~+/=-]{8,}', '$1REDACTED'
+    $l -replace '(?i)((token|secret|password|api[_-]?key)["'']?\s*[:=]\s*["'']?)[^\s"'',;]{8,}', '$1REDACTED'
+  }
+}
+
+# Docker Desktop prerequisites: CLI, engine, Linux containers, Compose v2.
+function Get-DockerStatus {
+  $status = [ordered]@{ CliFound = $false; EngineRunning = $false; ServerVersion = ''; OsType = ''; ComposeVersion = ''; ComposeOk = $false; Context = ''; Problems = @() }
+  if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
+    $status.Problems = @('The docker command was not found. Install Docker Desktop (https://www.docker.com/products/docker-desktop/) and reopen this window.')
+    return [pscustomobject]$status
+  }
+  $status.CliFound = $true
+  $info = Invoke-Docker info --format '{{.ServerVersion}}|{{.OSType}}'
+  $line = (@($info.Output) | Where-Object { $_ -match '\|' } | Select-Object -First 1)
+  if ($info.ExitCode -eq 0 -and $line) {
+    $parts = ([string]$line).Split('|')
+    $status.EngineRunning = $true
+    $status.ServerVersion = $parts[0]
+    $status.OsType = $parts[1]
+    if ($parts[1] -ne 'linux') { $status.Problems += 'Docker Desktop is in Windows-containers mode. Right-click the Docker tray icon and choose "Switch to Linux containers".' }
+  } else {
+    $status.Problems += 'The Docker engine is not reachable. Start Docker Desktop and wait until it reports "Engine running".'
+  }
+  $compose = Invoke-Docker compose version --short
+  if ($compose.ExitCode -eq 0) {
+    $status.ComposeVersion = ((@($compose.Output) -join '').Trim())
+    $status.ComposeOk = $status.ComposeVersion -match '^v?2|^v?[3-9]'
+    if (-not $status.ComposeOk) { $status.Problems += "Docker Compose v2 or later is required (found $($status.ComposeVersion)). Update Docker Desktop." }
+  } else { $status.Problems += 'docker compose is not available. Update Docker Desktop.' }
+  $status.Context = ((Invoke-Docker context show).Output -join '').Trim()
+  return [pscustomobject]$status
+}
+
+function Get-StackContainerNames($Settings) {
+  return [ordered]@{ traefik = $Settings.TraefikContainer; 'socket-proxy' = $Settings.SocketProxyContainer; cloudflared = $Settings.CloudflaredContainer }
+}
+
+# Read-only snapshot of this instance: containers, Traefik ping, tunnel token presence, loaded routers.
+function Get-StackStatus {
+  param([Parameter(Mandatory = $true)]$Settings, [switch]$SkipDocker)
+  $containers = @()
+  $names = Get-StackContainerNames $Settings
+  foreach ($role in $names.Keys) {
+    $c = [ordered]@{ Role = $role; Name = $names[$role]; Exists = $false; State = 'missing'; Health = ''; Image = ''; StartedAt = '' }
+    if (-not $SkipDocker) {
+      $r = Invoke-Docker inspect $names[$role] --format '{{.State.Status}}|{{if .State.Health}}{{.State.Health.Status}}{{end}}|{{.Config.Image}}|{{.State.StartedAt}}'
+      if ($r.ExitCode -eq 0) {
+        $p = ((@($r.Output) -join '').Trim()).Split('|')
+        $c.Exists = $true; $c.State = $p[0]; $c.Health = $p[1]; $c.Image = $p[2]; $c.StartedAt = $p[3]
+      }
+    }
+    $containers += [pscustomobject]$c
+  }
+  $version = $null
+  $routers = $null
+  if (-not $SkipDocker) {
+    $version = Get-TraefikApi $Settings '/api/version'
+    if ($null -ne $version) { $routers = Get-TraefikApi $Settings '/api/http/routers' }
+  }
+  return [pscustomobject]@{
+    Installed          = (Test-Path -LiteralPath (Join-Path $Settings.InstallPath 'compose.yaml'))
+    Containers         = $containers
+    TraefikApi         = ($null -ne $version)
+    TraefikVersion     = $(if ($version) { [string]@($version)[0].Version } else { '' })
+    Routers            = $(if ($null -ne $routers) { @($routers | ForEach-Object { [pscustomobject]@{ Name = $_.name; Status = $_.status; Rule = $_.rule } }) } else { @() })
+    TunnelTokenPresent = (Test-TunnelTokenFile $Settings)
+  }
+}
+
+# Last lines of one of this instance's containers (redacted). $Role: traefik | socket-proxy | cloudflared.
+function Get-StackLogs {
+  param([Parameter(Mandatory = $true)]$Settings, [Parameter(Mandatory = $true)][string]$Role, [int]$Tail = 200)
+  $names = Get-StackContainerNames $Settings
+  if (-not $names.Contains($Role)) { throw "Unknown container role '$Role'." }
+  $Tail = [Math]::Max(1, [Math]::Min(2000, $Tail))
+  $r = Invoke-Docker logs --tail $Tail --timestamps $names[$Role]
+  return [pscustomobject]@{ Container = $names[$Role]; Ok = ($r.ExitCode -eq 0); Lines = @(ConvertTo-RedactedText $r.Output) }
+}
+
 Export-ModuleMember -Function Invoke-Docker, Read-DotEnv, Get-FileSha256, Write-TextFileAtomic, ConvertTo-IPv4Range, Test-CidrOverlap,
-  Test-IPv4Address, Get-StackSettings, Test-StackSettings, Get-ComposeArgs, Test-ContainerRunning, Sync-TraefikDynamic, ConvertTo-ServiceDefinition,
+  Get-TunnelTokenPattern, ConvertFrom-TunnelToken, Find-ConnectorForTunnel, Set-SecretFileAcl, Save-TunnelTokenFile, Test-TunnelTokenFile,
+  Start-ProxyStack, Start-TunnelConnector, ConvertTo-RedactedText, Get-DockerStatus, Get-StackContainerNames, Get-StackStatus, Get-StackLogs,
+  Test-PrivateIPv4, Test-IPv4Address, Get-StackSettings, Test-StackSettings, Get-ComposeArgs, Test-ContainerRunning, Sync-TraefikDynamic, ConvertTo-ServiceDefinition,
   New-ServiceDefinition, Read-ServiceRegistry, ConvertTo-RegistryJson, Get-AvailableMiddlewares, Test-ServiceDefinition,
   Test-ServiceRegistry, Get-ServiceFileName, Get-ServiceUrl, Get-ServiceRule, ConvertTo-TraefikRouteYaml, Get-ServicePlan,
   Get-LineDiff, Format-ServicePlan, New-ServiceBackup, Get-ServiceBackups, Invoke-ServicePlan, Restore-ServiceBackup,
