@@ -1,0 +1,31 @@
+# EXAMPLE FRAGMENT for Omnivoice-wrapper-site\docker-compose.perform.yml.
+# Appends the shared external `proxy` network to the existing service; keeps `default` and the
+# published host port so current behaviour (Vite proxy -> localhost:18090) is unchanged.
+# Routing lives in traefik\dynamic\omnivoice.yml (examples\omnivoice.dynamic.yml.example), so no
+# Traefik labels are needed here. Applying this recreates the container on the next `up`.
+services:
+  omnivoice-perform-api:
+    networks:
+      - default
+      - proxy
+
+networks:
+  proxy:
+    name: proxy
+    external: true
+
+# The omnivoice-triton-api container is started with `docker run`, not Compose. Attach it once
+# (no restart; the attachment persists across container restarts):
+#   docker network connect proxy omnivoice-triton-api
+# If you later recreate it with `docker run`, add:  --network proxy   (or connect again).
+
+# --- Alternative for future Compose apps: labels instead of a file-provider route -------------
+# services:
+#   myapp:
+#     networks: [proxy]
+#     labels:
+#       - traefik.enable=true
+#       - traefik.http.routers.myapp.rule=Host(`myapp.example.com`)
+#       - traefik.http.routers.myapp.entrypoints=web
+#       - traefik.http.routers.myapp.middlewares=default-headers@file
+#       - traefik.http.services.myapp.loadbalancer.server.port=8000   # container port, not host port

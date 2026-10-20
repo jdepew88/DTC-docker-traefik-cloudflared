@@ -1,0 +1,8 @@
+# Dashboard/API only on the `traefik` entry point, which compose.yaml publishes on 127.0.0.1 only.
+# cloudflared only ever talks to the `web` entry point, so this is not reachable through the tunnel.
+http:
+  routers:
+    dashboard:
+      rule: PathPrefix(`/api`) || PathPrefix(`/dashboard`)
+      entryPoints: [traefik]
+      service: api@internal

@@ -1,0 +1,10 @@
+http:
+  middlewares:
+    default-headers:
+      headers:
+        contentTypeNosniff: true
+        referrerPolicy: strict-origin-when-cross-origin
+        frameDeny: true
+        # Public TLS terminates at Cloudflare; HSTS is safe because every public hostname is HTTPS-only.
+        stsSeconds: 31536000
+        stsIncludeSubdomains: false

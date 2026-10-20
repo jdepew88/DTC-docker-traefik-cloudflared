@@ -1,0 +1,22 @@
+# Secrets and local configuration
+.env
+secrets/
+*token*
+# Site-specific routes rendered on the deployed host
+traefik/dynamic/omnivoice.yml
+traefik/dynamic/*.local.yml
+traefik/dynamic/app-*.yml
+traefik/dynamic/.reload
+# Wizard state (no secrets, but deployment-specific)
+tunnel.json
+# Installer state
+backups/
+.install-manifest.json
+*.dist
+*.bak*
+# Original package archive
+zipped project start/
+*.zip
+*.log
+.DS_Store
+__pycache__/

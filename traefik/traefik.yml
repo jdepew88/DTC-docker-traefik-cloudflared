@@ -1,0 +1,60 @@
+# Traefik v3.7 static configuration. Static config comes from this file only:
+# Traefik ignores CLI flags / TRAEFIK_* env vars when a config file is used.
+global:
+  checkNewVersion: false
+  sendAnonymousUsage: false
+
+log:
+  level: INFO
+
+accessLog: {}
+
+api:
+  # Read-only dashboard, served only on the loopback-published `traefik` entry point
+  # (see dynamic/dashboard.yml). Never enable api.insecure.
+  dashboard: true
+  insecure: false
+
+ping:
+  entryPoint: traefik
+
+entryPoints:
+  web:
+    address: ':80'
+    forwardedHeaders:
+      # Only cloudflared (fixed IP on the `tunnel` network, compose.yaml) may set
+      # X-Forwarded-Proto/For/Host. Everything else gets them overwritten by Traefik.
+      trustedIPs:
+        - 172.31.250.10/32
+    http: &strict-http
+      # Explicit v3.6+ request hardening (Traefik warns when these are left at their defaults).
+      # Relax a single flag here only if an app legitimately needs it (e.g. %2F in URL paths).
+      aliasHeadersStrategy: delete
+      encodedCharacters:
+        allowEncodedSlash: false
+        allowEncodedBackSlash: false
+        allowEncodedNullCharacter: false
+        allowEncodedSemicolon: false
+        allowEncodedPercent: false
+        allowEncodedQuestionMark: false
+        allowEncodedHash: false
+    transport:
+      respondingTimeouts:
+        # Large audio uploads over the tunnel can take longer than the 60s v3 default.
+        readTimeout: 300s
+        writeTimeout: 0s
+        idleTimeout: 180s
+  traefik:
+    address: ':8080'
+    http: *strict-http
+
+providers:
+  docker:
+    # Docker API through the read-only socket proxy; the client negotiates the API version.
+    endpoint: tcp://socket-proxy:2375
+    exposedByDefault: false
+    network: proxy
+    watch: true
+  file:
+    directory: /etc/traefik/dynamic
+    watch: true
