@@ -185,6 +185,7 @@ try {
     Test-Condition 'web UI: status sees the running instance' ($st.Status -eq 200 -and $st.Data.stack.TraefikApi -and @($st.Data.stack.Containers | Where-Object { $_.Role -eq 'traefik' -and $_.State -eq 'running' }).Count -eq 1) "HTTP $($st.Status)"
     $null = Invoke-WebUi $ui POST '/api/cloudflare/token' @{ token = $mockToken }
     $sel = Invoke-WebUi $ui POST '/api/cloudflare/select' @{ accountId = 'acc0000000000000000000000000001'; tunnelId = '11111111-2222-3333-4444-555555555555' }
+    $null = Invoke-WebUi $ui POST '/api/cloudflare/domains' @{ zoneIds = @('zone00000000000000000000000000001') }
     $body = @{ op = 'add'; name = 'ui-demo'
       service = @{ name = 'ui-demo'; hostnames = @('ui-demo.example.test'); target = @{ type = 'auto'; host = "$stack-whoami"; port = 80; protocol = 'http' }; cloudflare = @{ publish = $true; access = $true } }
       cloudflare = @{ automate = $true; accessEmails = @('owner@example.com') } }

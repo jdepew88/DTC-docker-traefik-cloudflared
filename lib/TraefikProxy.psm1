@@ -100,6 +100,13 @@ function Get-StackSettings {
   if (-not $EnvPath) { $EnvPath = Join-Path $InstallPath '.env' }
   $values = Read-DotEnv $EnvPath
   if ($values.Count -eq 0) { $values = Read-DotEnv (Join-Path $InstallPath '.env.example') }
+  return ConvertTo-StackSettings -InstallPath $InstallPath -Values $values
+}
+
+# Instance settings from .env-style values (KEY = value); missing keys get the built-in defaults.
+function ConvertTo-StackSettings {
+  param([Parameter(Mandatory = $true)][string]$InstallPath, [hashtable]$Values = @{})
+  $values = $Values
   $get = {
     param($Key, $Default)
     if ($values.ContainsKey($Key) -and $values[$Key]) { return $values[$Key] }
@@ -146,6 +153,123 @@ function Test-StackSettings($Settings) {
   if ($ip[0] -le $subnet[0] -or $ip[0] -ge $subnet[1]) { $errors += 'CLOUDFLARED_IP must be a host address inside TUNNEL_SUBNET.' }
   if ($ip[0] -ge $range[0] -and $ip[0] -le $range[1]) { $errors += 'CLOUDFLARED_IP must be outside TUNNEL_IP_RANGE (that range is handed out to other containers).' }
   return $errors
+}
+
+# The .env keys that make an instance unique, with the settings property each one maps to.
+$script:InstanceKeys = [ordered]@{
+  STACK_NAME = 'StackName'; TRAEFIK_HTTP_PORT = 'HttpPort'; TRAEFIK_DASHBOARD_PORT = 'DashboardPort'; PROXY_NETWORK = 'ProxyNetwork'
+  TUNNEL_SUBNET = 'TunnelSubnet'; TUNNEL_IP_RANGE = 'TunnelIpRange'; CLOUDFLARED_IP = 'CloudflaredIp'
+}
+
+function ConvertTo-InstanceValues($Settings) {
+  $values = [ordered]@{}
+  foreach ($k in $script:InstanceKeys.Keys) { $values[$k] = [string]$Settings.($script:InstanceKeys[$k]) }
+  return $values
+}
+
+# .env text: the template (normally .env.example) with the instance keys replaced; comments are kept.
+function New-DotEnvContent([string]$Template, $Values) {
+  $done = @{}
+  $lines = @(foreach ($line in ($Template -split "`r?`n")) {
+      if ($line -match '^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=' -and $Values.Contains($Matches[1])) { $done[$Matches[1]] = $true; "$($Matches[1])=$($Values[$Matches[1]])" }
+      else { $line }
+    })
+  foreach ($k in $Values.Keys) { if (-not $done.ContainsKey($k)) { $lines += "$k=$($Values[$k])" } }
+  return (($lines -join "`n").TrimEnd() + "`n")
+}
+
+function Test-DockerEngine {
+  return [bool]((Get-Command docker -ErrorAction SilentlyContinue) -and (Invoke-Docker info --format '{{.OSType}}').ExitCode -eq 0)
+}
+
+# Read-only checks of instance settings against what already exists on this PC: container names, loopback ports,
+# the tunnel subnet and the shared network. Returns @{ Key; Level = error|warning|info; Message }.
+function Get-StackConflicts {
+  param([Parameter(Mandatory = $true)]$Settings)
+  $out = New-Object System.Collections.ArrayList
+  $add = { param($Key, $Level, $Message) $null = $out.Add([pscustomobject][ordered]@{ Key = $Key; Level = $Level; Message = $Message }) }
+  foreach ($e in @(Test-StackSettings $Settings)) { & $add 'settings' 'error' $e }
+  if (-not (Test-DockerEngine)) {
+    & $add 'docker' 'warning' 'Docker is not running, so names, ports and networks could not be checked yet.'
+    return $out.ToArray()
+  }
+  $ownTraefik = $false
+  foreach ($name in @($Settings.TraefikContainer, $Settings.SocketProxyContainer, $Settings.CloudflaredContainer)) {
+    $r = Invoke-Docker inspect $name --format '{{json .Config.Labels}}'
+    if ($r.ExitCode -ne 0) { continue }
+    $labels = $null
+    try { $labels = (@($r.Output)[-1]) | ConvertFrom-Json } catch { }
+    $project = ''; $dir = ''
+    if ($labels -and $labels.PSObject.Properties['com.docker.compose.project']) { $project = [string]$labels.'com.docker.compose.project' }
+    if ($labels -and $labels.PSObject.Properties['com.docker.compose.project.working_dir']) { $dir = [string]$labels.'com.docker.compose.project.working_dir' }
+    $sameDir = $dir -and ([IO.Path]::GetFullPath($dir).TrimEnd('\') -eq [IO.Path]::GetFullPath($Settings.InstallPath).TrimEnd('\'))
+    if ($project -eq $Settings.StackName -and $sameDir) {
+      & $add 'STACK_NAME' 'info' "Container '$name' belongs to this instance."
+      if ($name -eq $Settings.TraefikContainer) { $ownTraefik = $true }
+    } else {
+      $owner = if ($project) { "project '$project'" } else { 'another program' }
+      & $add 'STACK_NAME' 'error' "A container named '$name' already exists ($owner). Choose another instance name."
+    }
+  }
+  foreach ($p in @(@('TRAEFIK_HTTP_PORT', $Settings.HttpPort), @('TRAEFIK_DASHBOARD_PORT', $Settings.DashboardPort))) {
+    $user = Get-PortUser $p[1]
+    if (-not $user) { continue }
+    if ($ownTraefik -and $user -eq "container '$($Settings.TraefikContainer)'") { continue }
+    & $add $p[0] 'error' "Port $($p[1]) is already in use on this PC (by $user)."
+  }
+  if ($Settings.TunnelSubnet -match '^\d{1,3}(\.\d{1,3}){3}/\d{1,2}$') {
+    foreach ($id in @((Invoke-Docker network ls -q).Output | Where-Object { $_ })) {
+      $parts = ([string](@((Invoke-Docker network inspect $id --format '{{.Name}}|{{range .IPAM.Config}}{{.Subnet}} {{end}}').Output)[-1])).Split('|')
+      if ($parts.Count -lt 2 -or $parts[0] -eq $Settings.TunnelNetwork) { continue }
+      foreach ($subnet in ($parts[1].Trim() -split '\s+')) {
+        if ($subnet -match '^\d+\.\d+\.\d+\.\d+/\d+$' -and (Test-CidrOverlap $subnet $Settings.TunnelSubnet)) {
+          & $add 'TUNNEL_SUBNET' 'error' "Docker network '$($parts[0])' already uses $subnet, which overlaps $($Settings.TunnelSubnet)."
+        }
+      }
+    }
+  }
+  $net = Invoke-Docker network inspect $Settings.ProxyNetwork --format '{{len .Containers}}'
+  if ($net.ExitCode -eq 0) {
+    & $add 'PROXY_NETWORK' 'warning' "The Docker network '$($Settings.ProxyNetwork)' already exists ($((@($net.Output))[-1]) containers attached) and would be shared: every container on it can reach every other one. Choose a new name for an isolated instance."
+  }
+  return $out.ToArray()
+}
+
+# Instance settings that collide with nothing on this PC (container names, ports, networks, subnets). Read-only.
+function Get-SuggestedStackSettings {
+  param([Parameter(Mandatory = $true)][string]$InstallPath)
+  $containers = @(); $networks = @(); $subnets = @()
+  if (Test-DockerEngine) {
+    $containers = @((Invoke-Docker ps -a --format '{{.Names}}').Output | Where-Object { $_ })
+    foreach ($id in @((Invoke-Docker network ls -q).Output | Where-Object { $_ })) {
+      $parts = ([string](@((Invoke-Docker network inspect $id --format '{{.Name}}|{{range .IPAM.Config}}{{.Subnet}} {{end}}').Output)[-1])).Split('|')
+      $networks += $parts[0]
+      if ($parts.Count -gt 1) { $subnets += @($parts[1].Trim() -split '\s+' | Where-Object { $_ -match '^\d+\.\d+\.\d+\.\d+/\d+$' }) }
+    }
+  }
+  $stack = 'traefik-proxy'
+  for ($i = 2; $i -le 20; $i++) {
+    if (@(@("$stack-traefik", "$stack-socket-proxy", "$stack-cloudflared") | Where-Object { $containers -contains $_ }).Count -eq 0) { break }
+    $stack = "traefik-proxy-$i"
+  }
+  $http = 8180
+  foreach ($base in @(8180, 8280, 8380, 8480, 8580, 8680, 8780, 8880, 8980, 9180, 9280)) {
+    $http = $base
+    if (-not (Get-PortUser $base) -and -not (Get-PortUser ($base + 1))) { break }
+  }
+  $network = 'proxy'
+  if ($networks -contains $network) { $network = "$stack-proxy" }
+  $third = 0; $second = 31
+  :find foreach ($s in @(31, 30, 29, 28)) {
+    for ($t = 250; $t -ge 200; $t--) {
+      if (@($subnets | Where-Object { Test-CidrOverlap $_ "172.$s.$t.0/28" }).Count -eq 0) { $second = $s; $third = $t; break find }
+    }
+  }
+  if ($third -eq 0) { $third = 250 }
+  return ConvertTo-StackSettings -InstallPath $InstallPath -Values @{
+    STACK_NAME = $stack; TRAEFIK_HTTP_PORT = "$http"; TRAEFIK_DASHBOARD_PORT = "$($http + 1)"; PROXY_NETWORK = $network
+    TUNNEL_SUBNET = "172.$second.$third.0/28"; TUNNEL_IP_RANGE = "172.$second.$third.0/29"; CLOUDFLARED_IP = "172.$second.$third.10"
+  }
 }
 
 function Get-ComposeArgs {
@@ -948,7 +1072,8 @@ function Get-StackLogs {
 Export-ModuleMember -Function Invoke-Docker, Read-DotEnv, Get-FileSha256, Write-TextFileAtomic, ConvertTo-IPv4Range, Test-CidrOverlap,
   Get-TunnelTokenPattern, ConvertFrom-TunnelToken, Find-ConnectorForTunnel, Set-SecretFileAcl, Save-TunnelTokenFile, Test-TunnelTokenFile,
   Start-ProxyStack, Start-TunnelConnector, Get-PortUser, ConvertTo-RedactedText, Get-DockerStatus, Get-StackContainerNames, Get-StackStatus, Get-StackLogs,
-  Test-PrivateIPv4, Test-IPv4Address, Get-StackSettings, Test-StackSettings, Get-ComposeArgs, Test-ContainerRunning, Sync-TraefikDynamic, ConvertTo-ServiceDefinition,
+  Test-PrivateIPv4, Test-IPv4Address, Get-StackSettings, ConvertTo-StackSettings, ConvertTo-InstanceValues, New-DotEnvContent,
+  Test-DockerEngine, Get-StackConflicts, Get-SuggestedStackSettings, Test-StackSettings, Get-ComposeArgs, Test-ContainerRunning, Sync-TraefikDynamic, ConvertTo-ServiceDefinition,
   New-ServiceDefinition, Read-ServiceRegistry, ConvertTo-RegistryJson, Get-AvailableMiddlewares, Test-ServiceDefinition,
   Test-ServiceRegistry, Get-ServiceFileName, Get-ServiceUrl, Get-ServiceRule, ConvertTo-TraefikRouteYaml, Get-ServicePlan,
   Get-LineDiff, Format-ServicePlan, New-ServiceBackup, Get-ServiceBackups, Invoke-ServicePlan, Restore-ServiceBackup,

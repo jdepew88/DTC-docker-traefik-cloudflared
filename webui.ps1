@@ -30,7 +30,9 @@ param(
   [string]$CloudflareApiBase,
   # Tests only: write the launch link here instead of printing/opening it, and stop when StopFile appears.
   [string]$LaunchUrlFile,
-  [string]$StopFile
+  [string]$StopFile,
+  # Where the last used install folder is remembered (default: %LOCALAPPDATA%\TraefikProxy\webui.json).
+  [string]$StateFile
 )
 
 $ErrorActionPreference = 'Stop'
@@ -41,9 +43,20 @@ Import-Module (Join-Path $here 'lib\CloudflareApi.psm1') -Force
 Import-Module (Join-Path $here 'lib\LocalHttp.psm1') -Force
 Set-CloudflareApiBase $CloudflareApiBase
 
+if (-not $StateFile) { $StateFile = Join-Path $env:LOCALAPPDATA 'TraefikProxy\webui.json' }
+# Install folder: -InstallPath, else this folder when it is an installation, else the folder chosen last time in the
+# setup wizard, else the default.
 if (-not $InstallPath) {
   if ((Test-Path -LiteralPath (Join-Path $here '.env')) -or (Test-Path -LiteralPath (Join-Path $here '.install-manifest.json'))) { $InstallPath = $here }
-  else { $InstallPath = Join-Path $env:USERPROFILE '.docker\projects\traefik-proxy' }
+  else {
+    $InstallPath = Join-Path $env:USERPROFILE '.docker\projects\traefik-proxy'
+    try {
+      if (Test-Path -LiteralPath $StateFile) {
+        $remembered = [string](([IO.File]::ReadAllText($StateFile) | ConvertFrom-Json).installPath)
+        if ($remembered -match '^[A-Za-z]:\\' -and (Test-Path -LiteralPath $remembered)) { $InstallPath = $remembered }
+      }
+    } catch { }
+  }
 }
 $InstallPath = [IO.Path]::GetFullPath($InstallPath)
 $StaticRoot = Join-Path $here 'webui'
@@ -103,7 +116,46 @@ function New-JsonResponse($Data, [int]$Status = 200, [hashtable]$Headers = @{}) 
   return @{ Status = $Status; ContentType = 'application/json; charset=utf-8'; Body = (ConvertTo-Json -InputObject $Data -Depth 14 -Compress); Headers = $h }
 }
 
-function Get-Settings { return Get-StackSettings -InstallPath $InstallPath }
+# Instance settings: the installed .env, else the setup wizard's draft, else the packaged defaults.
+function Get-Settings {
+  if (Test-Path -LiteralPath (Join-Path $InstallPath '.env')) { return Get-StackSettings -InstallPath $InstallPath }
+  $draft = Read-SetupDraft
+  $values = Read-DotEnv (Join-Path $here '.env.example')
+  if ($draft.settings) { foreach ($p in $draft.settings.PSObject.Properties) { $values[$p.Name] = [string]$p.Value } }
+  return ConvertTo-StackSettings -InstallPath $InstallPath -Values $values
+}
+
+function Get-SettingsSource {
+  if (Test-Path -LiteralPath (Join-Path $InstallPath '.env')) { return 'env' }
+  if ((Read-SetupDraft).settings) { return 'draft' }
+  return 'defaults'
+}
+
+# Setup wizard choices that are not secret and not yet installed: config\setup.json in the install folder.
+function Read-SetupDraft {
+  $draft = [pscustomobject][ordered]@{ version = 1; settings = $null; deployment = [pscustomobject][ordered]@{ mode = ''; tunnelChoice = ''; tunnelId = ''; tunnelName = ''; newTunnelName = '' }; installedAt = '' }
+  $path = Join-Path $InstallPath 'config\setup.json'
+  if (-not (Test-Path -LiteralPath $path)) { return $draft }
+  try {
+    $json = [IO.File]::ReadAllText($path) | ConvertFrom-Json
+    if ($json.PSObject.Properties['settings'] -and $json.settings) { $draft.settings = $json.settings }
+    if ($json.PSObject.Properties['deployment'] -and $json.deployment) {
+      foreach ($p in $draft.deployment.PSObject.Properties.Name) { if ($json.deployment.PSObject.Properties[$p]) { $draft.deployment.$p = [string]$json.deployment.$p } }
+    }
+    if ($json.PSObject.Properties['installedAt']) { $draft.installedAt = [string]$json.installedAt }
+  } catch { }
+  return $draft
+}
+
+function Save-SetupDraft($Draft) {
+  Write-TextFileAtomic (Join-Path $InstallPath 'config\setup.json') ((ConvertTo-Json -InputObject $Draft -Depth 5) + "`n")
+  Save-RememberedPath
+}
+
+# Remembers the install folder for the next start of webui.ps1 (only the path; nothing secret).
+function Save-RememberedPath {
+  try { Write-TextFileAtomic $StateFile ((ConvertTo-Json -InputObject ([ordered]@{ installPath = $InstallPath }) -Compress) + "`n") } catch { }
+}
 
 function Test-Installed { return (Test-Path -LiteralPath (Join-Path $InstallPath 'compose.yaml')) }
 
@@ -468,31 +520,348 @@ function Get-CloudflareData {
   foreach ($p in $config.managed.PSObject.Properties) { $managed += [ordered]@{ hostname = $p.Name; service = $p.Value.service; dns = [bool]$p.Value.dnsRecordId; access = [bool]$p.Value.accessAppId } }
   return [ordered]@{
     token     = Get-CloudflareApiTokenInfo -Settings $settings
-    config    = [ordered]@{ accountId = $config.accountId; accountName = $config.accountName; tunnelId = $config.tunnelId; tunnelName = $config.tunnelName }
+    config    = [ordered]@{ accountId = $config.accountId; accountName = $config.accountName; tunnelId = $config.tunnelId; tunnelName = $config.tunnelName; domains = @($config.domains) }
     managed   = $managed
     connector = [ordered]@{ tokenFile = (Test-TunnelTokenFile $settings); container = $settings.CloudflaredContainer; running = $(if (Test-Installed) { Test-ContainerRunning $settings.CloudflaredContainer } else { $false }) }
     apiBase   = Get-CloudflareApiBase
   }
 }
 
+# What the browser sees of a discovery run (never the token).
+function ConvertTo-DiscoveryView($Discovery, $Config) {
+  $allowed = @($Config.domains | ForEach-Object { $_.id })
+  return [ordered]@{
+    valid       = [bool]$Discovery.Valid
+    status      = $Discovery.Status
+    message     = $Discovery.Message
+    accounts    = @($Discovery.Accounts)
+    accountId   = $Discovery.AccountId
+    accountName = $Discovery.AccountName
+    zones       = @($Discovery.Zones | ForEach-Object { [ordered]@{ id = $_.id; name = $_.name; status = $_.status; accountId = $_.accountId; dns = $_.dns; allowed = ($allowed -contains $_.id) } })
+    tunnels     = @($Discovery.Tunnels)
+    permissions = @($Discovery.Permissions)
+    domains     = @($Config.domains)
+  }
+}
+
+# Verifies a pasted token, then stores it (DPAPI) and records what it can reach. Allowed before installation: the
+# token goes to secrets\ in the install folder, which is created if needed. Nothing in Cloudflare is changed.
 function Save-TokenRequest($Body) {
   $settings = Get-Settings
-  if (-not (Test-Installed)) { Stop-Request 409 ((Get-NotInstalledMessage) + ' The API token is stored in its secrets folder.') }
   $token = ([string](Get-Field $Body 'token' '')).Trim()
   if (-not (Test-CloudflareApiToken $token)) { Stop-Request 400 'That does not look like a Cloudflare API token (it should be a long string of letters, digits, - and _).' }
   $info = Get-CloudflareApiTokenInfo -Settings $settings
   if ($info.Stored -and -not [bool](Get-Field $Body 'confirmReplace' $false)) { Stop-Request 409 'A token is already stored. Confirm that you want to replace it.' @{ needsConfirm = 'replace' } }
-  $check = Test-CloudflareToken -Settings $settings -Token $token
-  if (-not $check.Valid) { Stop-Request 400 ('Cloudflare did not accept this token; it was not saved. ' + $check.Message) }
+  $config = Read-CloudflareConfig -Settings $settings
+  $discovery = Get-CloudflareDiscovery -Settings $settings -Token $token -AccountId $config.accountId
+  if (-not $discovery.Valid) { $token = $null; Stop-Request 400 ('The token was not saved. ' + $discovery.Message) }
   Save-CloudflareApiToken -Settings $settings -Token $token
   $token = $null
-  $config = Read-CloudflareConfig -Settings $settings
-  if (-not $config.accountId -and @($check.Accounts).Count -eq 1) {
-    $config.accountId = $check.Accounts[0].id; $config.accountName = $check.Accounts[0].name
-    Save-CloudflareConfig -Settings $settings -Config $config
+  Save-RememberedPath
+  if ($discovery.AccountId) { $config.accountId = $discovery.AccountId; $config.accountName = $discovery.AccountName }
+  # Keep allowed domains the new token can still see; with exactly one visible domain, allow it automatically.
+  $visible = @($discovery.Zones | ForEach-Object { $_.id })
+  $config.domains = @($config.domains | Where-Object { $visible -contains $_.id })
+  if (@($config.domains).Count -eq 0 -and @($discovery.Zones).Count -eq 1) {
+    $z = $discovery.Zones[0]
+    $config.domains = @([pscustomobject][ordered]@{ id = $z.id; name = $z.name; accountId = $z.accountId })
   }
-  Write-Audit 'cloudflare-token-saved' "accounts=$(@($check.Accounts).Count) zones=$(@($check.Zones).Count)"
-  return [ordered]@{ saved = $true; accounts = @($check.Accounts); zones = @($check.Zones); message = $check.Message }
+  Save-CloudflareConfig -Settings $settings -Config $config
+  Write-Audit 'cloudflare-token-saved' "accounts=$(@($discovery.Accounts).Count) zones=$(@($discovery.Zones).Count) allowed=$(@($config.domains).Count)"
+  $view = ConvertTo-DiscoveryView $discovery $config
+  $view['saved'] = $true
+  return $view
+}
+
+function Get-DiscoveryRequest {
+  $settings = Get-Settings
+  if (-not (Get-CloudflareApiTokenInfo -Settings $settings).Stored) { Stop-Request 409 'Save a Cloudflare API token first.' }
+  $config = Read-CloudflareConfig -Settings $settings
+  $discovery = Get-CloudflareDiscovery -Settings $settings -AccountId $config.accountId -ZoneIds @($config.domains | ForEach-Object { $_.id })
+  return ConvertTo-DiscoveryView $discovery $config
+}
+
+# The application-level allowlist: services can only be published under these domains.
+function Set-DomainsRequest($Body) {
+  $settings = Get-Settings
+  if (-not (Get-CloudflareApiTokenInfo -Settings $settings).Stored) { Stop-Request 409 'Save a Cloudflare API token first.' }
+  $ids = @(@(Get-Field $Body 'zoneIds' @()) | ForEach-Object { [string]$_ } | Where-Object { $_ } | Select-Object -Unique)
+  foreach ($id in $ids) { if (-not (Test-CloudflareId $id)) { Stop-Request 400 "Invalid zone id '$id'." } }
+  $zones = @(Invoke-CloudflareApi -Settings $settings -Path '/zones' -All)
+  $selected = @()
+  foreach ($id in $ids) {
+    $z = @($zones | Where-Object { $_.id -eq $id })
+    if ($z.Count -eq 0) { Stop-Request 400 "The API token cannot see zone '$id'." }
+    $acct = ''; if ($z[0].PSObject.Properties['account'] -and $z[0].account) { $acct = [string]$z[0].account.id }
+    $selected += [pscustomobject][ordered]@{ id = [string]$z[0].id; name = [string]$z[0].name; accountId = $acct }
+  }
+  $config = Read-CloudflareConfig -Settings $settings
+  $config.domains = $selected
+  Save-CloudflareConfig -Settings $settings -Config $config
+  Write-Audit 'cloudflare-domains' (($selected | ForEach-Object { $_.name }) -join ',')
+  return [ordered]@{ domains = @($selected) }
+}
+
+# --- Setup wizard ----------------------------------------------------------------------------------------------
+
+$DeploymentModes = @(
+  [ordered]@{ id = 'tunnel'; supported = $true; title = 'Cloudflare Tunnel'; detail = 'Publishes apps through an outbound tunnel from this PC. No router ports, no public IP needed. Cloudflare provides HTTPS.' }
+  [ordered]@{ id = 'local'; supported = $true; title = 'Local only'; detail = 'Traefik on this PC only (127.0.0.1). Nothing is published and Cloudflare is not needed. You can add a tunnel later.' }
+  [ordered]@{ id = 'public-ip'; supported = $false; title = 'Public IP with port forwarding'; detail = 'Not supported by this version: Traefik only listens on 127.0.0.1 and has no HTTPS entry point or certificate resolver. Use Cloudflare Tunnel instead.' }
+)
+$TlsInfo = [ordered]@{
+  letsEncryptSupported = $false
+  detail = "Let's Encrypt is not available in this version and no ACME email is needed. With Cloudflare Tunnel, Cloudflare issues and renews the HTTPS certificates for your hostnames at its edge; the tunnel itself is encrypted. In local-only mode Traefik serves plain HTTP on 127.0.0.1."
+}
+
+function Get-SetupData {
+  $settings = Get-Settings
+  $draft = Read-SetupDraft
+  $token = Get-CloudflareApiTokenInfo -Settings $settings
+  $cfConfig = Read-CloudflareConfig -Settings $settings
+  $installed = Test-Installed
+  $mode = $draft.deployment.mode
+  if ($installed -and -not $mode) { $mode = $(if (Test-TunnelTokenFile $settings) { 'tunnel' } else { 'local' }) }
+  return [ordered]@{
+    installPath    = $InstallPath
+    installed      = $installed
+    sourcePath     = $here
+    canInstall     = (Test-Path -LiteralPath (Join-Path $here 'install.ps1'))
+    canChangePath  = -not $installed
+    settingsSource = Get-SettingsSource
+    settings       = ConvertTo-InstanceValues $settings
+    deployment     = [ordered]@{ mode = $mode; tunnelChoice = $draft.deployment.tunnelChoice; tunnelId = $draft.deployment.tunnelId; tunnelName = $draft.deployment.tunnelName; newTunnelName = $draft.deployment.newTunnelName }
+    installedAt    = $draft.installedAt
+    modes          = $DeploymentModes
+    tls            = $TlsInfo
+    cloudflare     = [ordered]@{
+      tokenStored = $token.Stored; tokenReadable = $token.Readable; tokenSavedAt = $token.SavedAt
+      accountId = $cfConfig.accountId; accountName = $cfConfig.accountName; tunnelId = $cfConfig.tunnelId; tunnelName = $cfConfig.tunnelName
+      domains = @($cfConfig.domains)
+      tokenLink = Get-CloudflareTokenTemplateUrl; tokenLinkWithAccess = Get-CloudflareTokenTemplateUrl -IncludeAccess
+      permissions = @(Get-CloudflareTokenPermissions | ForEach-Object { [ordered]@{ id = $_.Id; label = $_.Label; optional = $_.Optional; purpose = $_.Purpose } })
+    }
+  }
+}
+
+function Assert-NotInstalled([string]$What) {
+  if (Test-Installed) { Stop-Request 409 "$What cannot be changed here after installation. Edit $InstallPath\.env by hand (and re-run the installer), or install a second instance into another folder." }
+}
+
+# Settings from a request body: only the instance keys, as plain strings.
+function Get-SettingsFromBody($Body) {
+  $raw = Get-Field $Body 'settings' $null
+  if ($null -eq $raw) { Stop-Request 400 'Missing settings.' }
+  $values = Read-DotEnv (Join-Path $here '.env.example')
+  foreach ($k in @('STACK_NAME', 'TRAEFIK_HTTP_PORT', 'TRAEFIK_DASHBOARD_PORT', 'PROXY_NETWORK', 'TUNNEL_SUBNET', 'TUNNEL_IP_RANGE', 'CLOUDFLARED_IP')) {
+    $v = ([string](Get-Field $raw $k '')).Trim()
+    if (-not $v) { Stop-Request 400 "$k is required." }
+    if ($v.Length -gt 64 -or $v -notmatch '^[A-Za-z0-9_./-]+$') { Stop-Request 400 "$k contains characters that are not allowed." }
+    $values[$k] = $v
+  }
+  foreach ($k in @('TRAEFIK_HTTP_PORT', 'TRAEFIK_DASHBOARD_PORT')) { if ($values[$k] -notmatch '^\d{2,5}$') { Stop-Request 400 "$k must be a number." } }
+  try { $settings = ConvertTo-StackSettings -InstallPath $InstallPath -Values $values } catch { Stop-Request 400 $_.Exception.Message }
+  $errors = @(Test-StackSettings $settings)
+  if ($errors.Count -gt 0) { Stop-Request 400 ($errors -join ' ') }
+  return $settings
+}
+
+function Save-SettingsRequest($Body) {
+  Assert-NotInstalled 'The instance settings'
+  $settings = Get-SettingsFromBody $Body
+  $draft = Read-SetupDraft
+  $draft.settings = [pscustomobject](ConvertTo-InstanceValues $settings)
+  Save-SetupDraft $draft
+  Write-Audit 'setup-settings' (($draft.settings.PSObject.Properties | ForEach-Object { "$($_.Name)=$($_.Value)" }) -join ' ')
+  return [ordered]@{ settings = ConvertTo-InstanceValues $settings; conflicts = @(Get-StackConflicts -Settings $settings) }
+}
+
+# Moves the install folder before anything is installed. Files the wizard already wrote (API token, Cloudflare
+# selections, setup draft) move along; an existing installation at the new path is managed as it is.
+function Set-InstallPathRequest($Body) {
+  Assert-NotInstalled 'The install folder'
+  $path = ([string](Get-Field $Body 'path' '')).Trim()
+  if ($path -notmatch '^[A-Za-z]:\\[^<>:"|?*]+$') { Stop-Request 400 'Enter a full local path such as C:\Users\you\traefik-proxy or D:\proxy.' }
+  try { $full = [IO.Path]::GetFullPath($path).TrimEnd('\') } catch { Stop-Request 400 'That is not a valid folder path.' }
+  if ($full -match '^[A-Za-z]:$') { Stop-Request 400 'Choose a folder, not the root of a drive.' }
+  if ($env:windir -and $full.StartsWith($env:windir, [StringComparison]::OrdinalIgnoreCase)) { Stop-Request 400 'Choose a folder outside the Windows directory.' }
+  if ($full -eq $InstallPath) { return Get-SetupData }
+  $moves = @('secrets\cloudflare_api.dpapi', 'config\cloudflare.json', 'config\setup.json') | Where-Object { Test-Path -LiteralPath (Join-Path $InstallPath $_) }
+  $targetInstalled = Test-Path -LiteralPath (Join-Path $full 'compose.yaml')
+  if (-not $targetInstalled) {
+    foreach ($rel in $moves) { if (Test-Path -LiteralPath (Join-Path $full $rel)) { Stop-Request 409 "$full already contains $rel. Choose another folder." } }
+  }
+  if (-not $targetInstalled) {
+    foreach ($rel in $moves) {
+      $to = Join-Path $full $rel
+      New-Item -ItemType Directory -Force -Path (Split-Path -Parent $to) | Out-Null
+      Move-Item -LiteralPath (Join-Path $InstallPath $rel) -Destination $to
+      if ($rel -like 'secrets\*') { Set-SecretFileAcl $to }
+    }
+    foreach ($dir in @('secrets', 'config', 'logs', '')) {
+      $d = Join-Path $InstallPath $dir
+      if ((Test-Path -LiteralPath $d) -and @(Get-ChildItem -LiteralPath $d -Force).Count -eq 0) { Remove-Item -LiteralPath $d -Force }
+    }
+  }
+  $old = $InstallPath
+  $script:InstallPath = $full
+  Save-RememberedPath
+  Write-Audit 'setup-path' "from=$old to=$full moved=$(@($moves).Count) existingInstallation=$targetInstalled"
+  return Get-SetupData
+}
+
+function Set-DeploymentRequest($Body) {
+  Assert-NotInstalled 'The deployment method'
+  $mode = [string](Get-Field $Body 'mode' '')
+  $def = @($DeploymentModes | Where-Object { $_.id -eq $mode })
+  if ($def.Count -eq 0) { Stop-Request 400 "Unknown deployment method '$mode'." }
+  if (-not $def[0].supported) { Stop-Request 400 $def[0].detail }
+  $draft = Read-SetupDraft
+  $d = $draft.deployment
+  $d.mode = $mode
+  $d.tunnelChoice = ''; $d.tunnelId = ''; $d.tunnelName = ''; $d.newTunnelName = ''
+  if ($mode -eq 'tunnel') {
+    $config = Assert-CloudflareReady
+    $settings = Get-Settings
+    $choice = [string](Get-Field $Body 'tunnelChoice' '')
+    if ($choice -eq 'existing') {
+      $id = [string](Get-Field $Body 'tunnelId' '')
+      if (-not (Test-CloudflareId $id)) { Stop-Request 400 'Choose a tunnel.' }
+      $t = @(Get-CloudflareTunnels -Settings $settings -AccountId $config.accountId | Where-Object { $_.id -eq $id })
+      if ($t.Count -eq 0) { Stop-Request 400 'That tunnel does not exist in the selected account.' }
+      if (-not $t[0].remotelyManaged) { Stop-Request 400 "Tunnel '$($t[0].name)' is locally managed (config file). Only dashboard/API-managed tunnels can be automated; create a new tunnel instead." }
+      $d.tunnelChoice = 'existing'; $d.tunnelId = $id; $d.tunnelName = [string]$t[0].name
+    } elseif ($choice -eq 'new') {
+      $name = ([string](Get-Field $Body 'newTunnelName' '')).Trim()
+      if ($name -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$') { Stop-Request 400 'Tunnel name: use letters, digits, dot, dash or underscore (max 63).' }
+      if (@(Get-CloudflareTunnels -Settings $settings -AccountId $config.accountId | Where-Object { $_.name -eq $name }).Count -gt 0) { Stop-Request 400 "A tunnel named '$name' already exists; choose it as an existing tunnel instead." }
+      $d.tunnelChoice = 'new'; $d.newTunnelName = $name
+    } else { Stop-Request 400 'Choose an existing tunnel or name a new one.' }
+  }
+  Save-SetupDraft $draft
+  Write-Audit 'setup-deployment' "mode=$mode tunnel=$($d.tunnelChoice) $($d.tunnelName)$($d.newTunnelName)"
+  return Get-SetupData
+}
+
+# Everything the installation would do, and what blocks it. Read-only (the installer runs with -DryRun).
+function Get-InstallPlan([switch]$NoDryRun) {
+  $settings = Get-Settings
+  $draft = Read-SetupDraft
+  $mode = $draft.deployment.mode
+  $installed = Test-Installed
+  $blockers = @(); $warnings = @(); $steps = @()
+  $docker = Get-DockerStatus
+  if (-not ($docker.CliFound -and $docker.EngineRunning -and $docker.OsType -eq 'linux' -and $docker.ComposeOk)) { $blockers += 'Docker Desktop is not ready (see the Docker Desktop step).' }
+  if (-not (Test-Path -LiteralPath (Join-Path $here 'install.ps1'))) { $blockers += 'install.ps1 is missing next to webui.ps1.' }
+  if (-not $mode) { $blockers += 'Choose a deployment method.' }
+  $conflicts = @()
+  if (-not $installed) {
+    $conflicts = @(Get-StackConflicts -Settings $settings)
+    foreach ($c in $conflicts) { if ($c.Level -eq 'error') { $blockers += $c.Message } elseif ($c.Level -eq 'warning') { $warnings += $c.Message } }
+  }
+  $config = Read-CloudflareConfig -Settings $settings
+  $tunnelLabel = ''
+  if ($mode -eq 'tunnel') {
+    $token = Get-CloudflareApiTokenInfo -Settings $settings
+    if (-not ($token.Stored -and $token.Readable)) { $blockers += 'Tunnel mode needs the Cloudflare API token (Connect Cloudflare).' }
+    if (-not $config.accountId) { $blockers += 'Choose the Cloudflare account.' }
+    if (@($config.domains).Count -eq 0) { $warnings += 'No allowed domain is selected yet; services cannot be published until you choose one.' }
+    $choice = $draft.deployment.tunnelChoice
+    if ($choice -eq 'existing') {
+      $tunnelLabel = $draft.deployment.tunnelName
+      $other = Find-ConnectorForTunnel -Settings $settings -TunnelId $draft.deployment.tunnelId
+      if ($other) { $blockers += "Container '$other' already runs a connector for tunnel '$tunnelLabel'. Use a separate tunnel for this instance." }
+    } elseif ($choice -eq 'new') { $tunnelLabel = $draft.deployment.newTunnelName }
+    else { $blockers += 'Choose the tunnel (existing or new).' }
+  }
+
+  $envPath = Join-Path $InstallPath '.env'
+  if (Test-Path -LiteralPath $envPath) { $steps += [ordered]@{ kind = 'local'; text = "Keep the existing $envPath." } }
+  else {
+    $v = ConvertTo-InstanceValues $settings
+    $steps += [ordered]@{ kind = 'local'; text = "Write $envPath (instance '$($v.STACK_NAME)', ports 127.0.0.1:$($v.TRAEFIK_HTTP_PORT)/$($v.TRAEFIK_DASHBOARD_PORT), network '$($v.PROXY_NETWORK)', tunnel subnet $($v.TUNNEL_SUBNET))." }
+  }
+  if ($mode -eq 'tunnel' -and $draft.deployment.tunnelChoice -eq 'new') {
+    $steps += [ordered]@{ kind = 'cloudflare'; text = "Create the Cloudflare tunnel '$tunnelLabel' in account '$($config.accountName)' (remotely managed). No DNS record or route is created yet." }
+  }
+  if ($mode -eq 'tunnel') {
+    $steps += [ordered]@{ kind = 'local'; text = "Download the connector token of tunnel '$tunnelLabel' into secrets\cloudflare_tunnel_token (read-only API call)." }
+  }
+  $containers = "$($settings.TraefikContainer), $($settings.SocketProxyContainer)"
+  if ($mode -eq 'tunnel') { $containers += ", $($settings.CloudflaredContainer)" }
+  $steps += [ordered]@{ kind = 'docker'; text = "Run install.ps1 -Start$(if ($mode -eq 'tunnel') { ' -EnableTunnel' }): copy the stack files, create the Docker network '$($settings.ProxyNetwork)' if it does not exist, and start this instance's containers only ($containers)." }
+
+  $lines = @()
+  if (-not $NoDryRun -and (Test-Path -LiteralPath (Join-Path $here 'install.ps1')) -and $docker.EngineRunning) {
+    $installArgs = @('-InstallPath', $InstallPath, '-DryRun')
+    $tmp = $null
+    if (-not (Test-Path -LiteralPath $envPath)) {
+      $tmp = Join-Path ([IO.Path]::GetTempPath()) ("tpx-draft-{0}.env" -f [Guid]::NewGuid().ToString('N').Substring(0, 8))
+      [IO.File]::WriteAllText($tmp, (New-DotEnvContent ([IO.File]::ReadAllText((Join-Path $here '.env.example'))) (ConvertTo-InstanceValues $settings)))
+      $installArgs += @('-EnvFile', $tmp)
+    }
+    try { $r = Invoke-PowerShellFile (Join-Path $here 'install.ps1') $installArgs; $lines = $r.Lines }
+    finally { if ($tmp) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue } }
+  }
+  $keyText = (ConvertTo-Json -Compress -Depth 5 -InputObject @((ConvertTo-InstanceValues $settings), $draft.deployment, $InstallPath, @($config.domains | ForEach-Object { $_.id }), $config.accountId))
+  $sha = [Security.Cryptography.SHA256]::Create()
+  $planKey = [BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($keyText))).Replace('-', '').Substring(0, 32)
+  return [ordered]@{
+    installed = $installed; mode = $mode; steps = $steps; blockers = $blockers; warnings = $warnings
+    conflicts = $conflicts; dryRun = $lines; canInstall = ($blockers.Count -eq 0); planKey = $planKey
+  }
+}
+
+# Runs the previewed installation. The only place where the setup wizard changes Docker or Cloudflare.
+function Invoke-InstallRequest($Body) {
+  Assert-Confirmed $Body
+  $plan = Get-InstallPlan -NoDryRun
+  if (-not $plan.canInstall) { Stop-Request 409 ('Installation is blocked: ' + ($plan.blockers -join ' ')) }
+  if ([string](Get-Field $Body 'planKey' '') -ne $plan.planKey) { Stop-Request 409 'The settings changed since the preview. Preview the installation again.' }
+  $settings = Get-Settings
+  $draft = Read-SetupDraft
+  $mode = $draft.deployment.mode
+  $results = New-Object System.Collections.ArrayList
+  $step = { param($Name, $Status, $Message) $null = $results.Add([ordered]@{ name = $Name; status = $Status; message = $Message }) }
+  $lines = @()
+  $ok = $true
+  try {
+    $envPath = Join-Path $InstallPath '.env'
+    if (-not (Test-Path -LiteralPath $envPath)) {
+      Write-TextFileAtomic $envPath (New-DotEnvContent ([IO.File]::ReadAllText((Join-Path $here '.env.example'))) (ConvertTo-InstanceValues $settings))
+      & $step 'Write .env' 'Done' $envPath
+    }
+    Save-RememberedPath
+    if ($mode -eq 'tunnel') {
+      $config = Read-CloudflareConfig -Settings $settings
+      if ($draft.deployment.tunnelChoice -eq 'new') {
+        $t = New-CloudflareTunnel -Settings $settings -AccountId $config.accountId -Name $draft.deployment.newTunnelName
+        $config.tunnelId = $t.id; $config.tunnelName = $t.name
+        $draft.deployment.tunnelChoice = 'existing'; $draft.deployment.tunnelId = $t.id; $draft.deployment.tunnelName = $t.name; $draft.deployment.newTunnelName = ''
+        Save-SetupDraft $draft
+        Write-Audit 'cloudflare-tunnel-created' "name=$($t.name) id=$($t.id)"
+        & $step 'Create Cloudflare tunnel' 'Done' "$($t.name) ($($t.id))"
+      } else {
+        $config.tunnelId = $draft.deployment.tunnelId; $config.tunnelName = $draft.deployment.tunnelName
+      }
+      Save-CloudflareConfig -Settings $settings -Config $config
+      $null = Install-CloudflareTunnelToken -Settings $settings -AccountId $config.accountId -TunnelId $config.tunnelId
+      Write-Audit 'tunnel-token-installed' "tunnel=$($config.tunnelId)"
+      & $step 'Install connector token' 'Done' 'secrets\cloudflare_tunnel_token'
+    }
+    $installArgs = @('-InstallPath', $InstallPath, '-Start')
+    if ($mode -eq 'tunnel') { $installArgs += '-EnableTunnel' }
+    $r = Invoke-PowerShellFile (Join-Path $here 'install.ps1') $installArgs
+    $lines = $r.Lines
+    if ($r.ExitCode -ne 0) { $ok = $false; & $step 'Run the installer' 'Failed' 'See the installer output.' }
+    else { & $step 'Run the installer' 'Done' "install.ps1 $($installArgs -join ' ')" }
+  } catch {
+    $ok = $false
+    & $step 'Installation' 'Failed' $_.Exception.Message
+  }
+  if ($ok) { $draft = Read-SetupDraft; $draft.installedAt = (Get-Date -Format 's'); Save-SetupDraft $draft }
+  Write-Audit 'setup-install' "ok=$ok mode=$mode"
+  return [ordered]@{ ok = $ok; steps = $results.ToArray(); lines = $lines }
 }
 
 function Select-CloudflareRequest($Body) {
@@ -634,9 +1003,24 @@ function Invoke-ApiRoute($Request, $Body) {
       return [ordered]@{ accounts = @(Invoke-CloudflareApi -Settings $settings -Path '/accounts' -All | ForEach-Object { [ordered]@{ id = [string]$_.id; name = [string]$_.name } }) }
     }
     'GET /api/cloudflare/zones' {
+      # Only the allowed domains: services can be published under these and nothing else.
       $config = Assert-CloudflareReady
-      return [ordered]@{ zones = @(Get-CloudflareZones -Settings $settings -AccountId $config.accountId) }
+      return [ordered]@{ zones = @(Select-AllowedZones $config (Get-CloudflareZones -Settings $settings -AccountId $config.accountId)) }
     }
+    'GET /api/cloudflare/discovery' { return Get-DiscoveryRequest }
+    'POST /api/cloudflare/domains' { return Set-DomainsRequest $Body }
+    'GET /api/setup' { return Get-SetupData }
+    'POST /api/setup/path' { return Set-InstallPathRequest $Body }
+    'POST /api/setup/settings' { return Save-SettingsRequest $Body }
+    'POST /api/setup/suggest' {
+      Assert-NotInstalled 'The instance settings'
+      $s = Get-SuggestedStackSettings -InstallPath $InstallPath
+      return [ordered]@{ settings = ConvertTo-InstanceValues $s; conflicts = @(Get-StackConflicts -Settings $s) }
+    }
+    'POST /api/setup/check' { return [ordered]@{ settings = ConvertTo-InstanceValues $settings; conflicts = @(Get-StackConflicts -Settings $settings) } }
+    'POST /api/setup/deployment' { return Set-DeploymentRequest $Body }
+    'POST /api/setup/preview' { return Get-InstallPlan }
+    'POST /api/setup/install' { return Invoke-InstallRequest $Body }
     'GET /api/cloudflare/tunnels' {
       $config = Assert-CloudflareReady
       return [ordered]@{ tunnels = @(Get-CloudflareTunnels -Settings $settings -AccountId $config.accountId) }

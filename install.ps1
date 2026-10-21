@@ -84,6 +84,7 @@ $ManagedFiles = @(
   'tests\Test-ServiceConfig.ps1',
   'tests\Test-WebUi.ps1',
   'tests\Test-FirstRun.ps1',
+  'tests\Test-Onboarding.ps1',
   'tests\WebUiTestHelpers.psm1',
   'tests\CloudflareMock.ps1',
   'scripts\Get-Diagnostics.ps1',

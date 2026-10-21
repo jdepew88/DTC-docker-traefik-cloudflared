@@ -97,13 +97,25 @@ function Read-CloudflareApiToken($Settings) {
 function Read-CloudflareConfig {
   param([Parameter(Mandatory = $true)]$Settings)
   $path = Join-Path $Settings.InstallPath $script:ConfigFile
-  $config = [pscustomobject][ordered]@{ version = 1; accountId = ''; accountName = ''; tunnelId = ''; tunnelName = ''; managed = [pscustomobject]@{} }
+  # domains: the application-level allowlist. Services can only be published under these zones, even when the
+  # API token can see more.
+  $config = [pscustomobject][ordered]@{ version = 1; accountId = ''; accountName = ''; tunnelId = ''; tunnelName = ''; domains = @(); managed = [pscustomobject]@{} }
   if (Test-Path -LiteralPath $path) {
     $json = [IO.File]::ReadAllText($path) | ConvertFrom-Json
     foreach ($p in @('accountId', 'accountName', 'tunnelId', 'tunnelName')) { if ($json.PSObject.Properties[$p] -and $json.$p) { $config.$p = [string]$json.$p } }
+    if ($json.PSObject.Properties['domains'] -and $json.domains) {
+      $config.domains = @($json.domains | Where-Object { $_ -and $_.PSObject.Properties['id'] -and $_.PSObject.Properties['name'] } | ForEach-Object {
+          [pscustomobject][ordered]@{ id = [string]$_.id; name = [string]$_.name; accountId = $(if ($_.PSObject.Properties['accountId']) { [string]$_.accountId } else { '' }) } })
+    }
     if ($json.PSObject.Properties['managed'] -and $json.managed) { $config.managed = $json.managed }
   }
   return $config
+}
+
+# The zones (from a zone list) that are on the allowlist in config\cloudflare.json.
+function Select-AllowedZones($Config, $Zones) {
+  $ids = @($Config.domains | ForEach-Object { $_.id })
+  return @($Zones | Where-Object { $ids -contains $_.id })
 }
 
 function Save-CloudflareConfig {
@@ -185,7 +197,10 @@ function Invoke-CloudflareApi {
       if ($messages.Count -eq 0) { $messages = @("HTTP $status") }
       $err = "Cloudflare API: $Method ${Path}: " + ($messages -join '; ')
       if ($status -eq 403 -or $status -eq 401) { $err += ' - check that the API token has the required permissions (see the Cloudflare page).' }
-      throw $err
+      # The HTTP status travels with the error so callers can tell "missing permission" from other failures.
+      $ex = New-Object System.Exception $err
+      $ex.Data['cfStatus'] = $status
+      throw $ex
     }
     if (-not $All) { return $envelope.result }
     foreach ($item in @($envelope.result)) { if ($null -ne $item) { $null = $results.Add($item) } }
@@ -223,6 +238,110 @@ function Test-CloudflareToken {
   return [pscustomobject]$result
 }
 
+# --- Token creation link and permission discovery -------------------------------------------------------------------
+
+# Cloudflare's pre-filled "Create API token" page (a user-owned token), per
+# https://developers.cloudflare.com/fundamentals/api/how-to/account-owned-token-template/ :
+# permissionGroupKeys is a URL-encoded JSON array of {key, type}; accountId=* and zoneId=all are the documented
+# scope values, and the user narrows accounts and zones on Cloudflare's page before creating the token.
+# 'zone', 'dns' and 'access' are keys from Cloudflare's published key table. 'argotunnel' (Cloudflare Tunnel) is
+# not in that table; it is the permission's internal name used by other tools' template links. If Cloudflare's page
+# does not show it, the user adds "Account > Cloudflare Tunnel > Edit" by hand, and discovery below reports it.
+$script:TokenPermissions = @(
+  [pscustomobject]@{ Id = 'zone'; Key = 'zone'; Type = 'read'; Label = 'Zone > Zone > Read'; Optional = $false; Purpose = 'list the domains you allow' }
+  [pscustomobject]@{ Id = 'dns'; Key = 'dns'; Type = 'edit'; Label = 'Zone > DNS > Edit'; Optional = $false; Purpose = 'create the CNAME record of each published hostname' }
+  [pscustomobject]@{ Id = 'tunnel'; Key = 'argotunnel'; Type = 'edit'; Label = 'Account > Cloudflare Tunnel > Edit'; Optional = $false; Purpose = 'create or select the tunnel and add published routes' }
+  [pscustomobject]@{ Id = 'access'; Key = 'access'; Type = 'edit'; Label = 'Account > Access: Apps and Policies > Edit'; Optional = $true; Purpose = 'protect hostnames with a Cloudflare Access login (optional)' }
+)
+
+function Get-CloudflareTokenPermissions { return $script:TokenPermissions }
+
+function Get-CloudflareTokenTemplateUrl {
+  param([switch]$IncludeAccess, [string]$Name = 'Traefik proxy for Windows')
+  $perms = @($script:TokenPermissions | Where-Object { $IncludeAccess -or -not $_.Optional } | ForEach-Object { '{"key":"' + $_.Key + '","type":"' + $_.Type + '"}' })
+  $json = '[' + ($perms -join ',') + ']'
+  return 'https://dash.cloudflare.com/profile/api-tokens?permissionGroupKeys=' + [Uri]::EscapeDataString($json) +
+    '&accountId=*&zoneId=all&name=' + [Uri]::EscapeDataString($Name)
+}
+
+function Get-CfErrorStatus($ErrorRecord) {
+  $ex = $ErrorRecord.Exception
+  if ($ex.Data.Contains('cfStatus')) { return [int]$ex.Data['cfStatus'] }
+  return 0
+}
+
+# Verifies a token (a candidate, or the stored one) and finds out what it can do, using read-only calls only:
+# accounts, zones, DNS records per zone, tunnels and Access apps per account. Never throws: every failure becomes
+# a message. Editing rights cannot be proven without making a change, so DNS shows "readable".
+function Get-CloudflareDiscovery {
+  param([Parameter(Mandatory = $true)]$Settings, [string]$Token, [string]$AccountId, [string[]]$ZoneIds = @())
+  $d = [ordered]@{ Valid = $false; Status = ''; Message = ''; Accounts = @(); Zones = @(); AccountId = ''; AccountName = ''; Tunnels = @(); Permissions = @() }
+  $call = { param($Path, $Query, [switch]$All)
+    $p = @{ Settings = $Settings; Path = $Path; Query = $(if ($Query) { $Query } else { @{} }); All = [bool]$All }
+    if ($Token) { $p['Token'] = $Token }
+    Invoke-CloudflareApi @p
+  }
+  $errors = @()
+  # Account-owned tokens cannot use /user/tokens/verify; for those, listing accounts or zones proves the token works.
+  try { $v = & $call '/user/tokens/verify'; $d.Status = [string]$v.status } catch { $errors += $_.Exception.Message }
+  if ($d.Status -and $d.Status -ne 'active') { $d.Message = "Cloudflare reports this token as '$($d.Status)'. Create a new token."; return [pscustomobject]$d }
+  try { $d.Accounts = @(& $call '/accounts' -All | ForEach-Object { [pscustomobject][ordered]@{ id = [string]$_.id; name = [string]$_.name } }) } catch { $errors += $_.Exception.Message }
+  try {
+    $d.Zones = @(& $call '/zones' -All | ForEach-Object {
+        $acct = ''; $acctName = ''
+        if ($_.PSObject.Properties['account'] -and $_.account) { $acct = [string]$_.account.id; if ($_.account.PSObject.Properties['name']) { $acctName = [string]$_.account.name } }
+        [pscustomobject][ordered]@{ id = [string]$_.id; name = [string]$_.name; status = [string]$_.status; accountId = $acct; accountName = $acctName; dns = 'unknown' } })
+  } catch { $errors += $_.Exception.Message }
+  $d.Valid = ($d.Status -eq 'active') -or $d.Accounts.Count -gt 0 -or $d.Zones.Count -gt 0
+  if (-not $d.Valid) { $d.Message = 'Cloudflare rejected this token (invalid, expired or revoked), or it has no permissions at all. ' + ($errors -join ' '); return [pscustomobject]$d }
+
+  # Account: the requested one, else the only one visible (from /accounts or from the zones' owners).
+  $candidates = @($d.Accounts)
+  foreach ($z in $d.Zones) { if ($z.accountId -and -not (@($candidates | Where-Object { $_.id -eq $z.accountId }))) { $candidates += [pscustomobject][ordered]@{ id = $z.accountId; name = $z.accountName } } }
+  if ($d.Accounts.Count -eq 0 -and $candidates.Count -gt 0) { $d.Accounts = $candidates }
+  if ($AccountId -and @($candidates | Where-Object { $_.id -eq $AccountId })) { $d.AccountId = $AccountId }
+  elseif ($candidates.Count -eq 1) { $d.AccountId = $candidates[0].id }
+  if ($d.AccountId) { $d.AccountName = [string](@($candidates | Where-Object { $_.id -eq $d.AccountId })[0].name) }
+
+  $perm = { param($Id, $State, $Message)
+    $def = @($script:TokenPermissions | Where-Object { $_.Id -eq $Id })[0]
+    [pscustomobject][ordered]@{ id = $Id; label = $def.Label; optional = $def.Optional; purpose = $def.Purpose; state = $State; message = $Message }
+  }
+  $perms = @()
+  if ($d.Zones.Count -gt 0) { $perms += & $perm 'zone' 'ok' "$($d.Zones.Count) domain(s) visible." }
+  else { $perms += & $perm 'zone' 'missing' 'Cloudflare returned no domains. Add "Zone > Zone > Read" and include your domain under "Zone Resources" when creating the token.' }
+
+  $checkZones = @($d.Zones)
+  if (@($ZoneIds).Count -gt 0) { $checkZones = @($d.Zones | Where-Object { $ZoneIds -contains $_.id }) }
+  $ok = 0; $missing = @()
+  foreach ($z in @($checkZones | Select-Object -First 25)) {
+    try { $null = & $call "/zones/$($z.id)/dns_records" @{ per_page = 1 }; $z.dns = 'ok'; $ok++ }
+    catch { $z.dns = 'missing'; $missing += $z.name }
+  }
+  if ($checkZones.Count -eq 0) { $perms += & $perm 'dns' 'unknown' 'No domain to check yet.' }
+  elseif ($missing.Count -eq 0) { $perms += & $perm 'dns' 'ok' 'DNS records are readable. Edit rights are confirmed the first time a record is created.' }
+  elseif ($ok -gt 0) { $perms += & $perm 'dns' 'partial' ("No DNS access for: " + ($missing -join ', ') + '. Add "Zone > DNS > Edit" for those zones.') }
+  else { $perms += & $perm 'dns' 'missing' 'The token cannot read DNS records. Add "Zone > DNS > Edit".' }
+
+  if (-not $d.AccountId) {
+    $why = if ($candidates.Count -gt 1) { 'Choose an account to check tunnel and Access permissions.' } else { 'No Cloudflare account is visible to this token. Add "Account > Cloudflare Tunnel > Edit" and include the account under "Account Resources".' }
+    $perms += & $perm 'tunnel' 'unknown' $why
+    $perms += & $perm 'access' 'unknown' $why
+  } else {
+    try {
+      $d.Tunnels = @(Get-CloudflareTunnels -Settings $Settings -AccountId $d.AccountId -Token $Token)
+      $perms += & $perm 'tunnel' 'ok' "$($d.Tunnels.Count) tunnel(s) in $($d.AccountName)."
+    } catch {
+      $msg = if ((Get-CfErrorStatus $_) -eq 403) { 'The token cannot read tunnels. Add "Account > Cloudflare Tunnel > Edit". Without it, use local-only mode or set the tunnel up by hand.' } else { 'Tunnels could not be listed: ' + $_.Exception.Message }
+      $perms += & $perm 'tunnel' 'missing' $msg
+    }
+    try { $null = & $call "/accounts/$($d.AccountId)/access/apps" @{ per_page = 1 }; $perms += & $perm 'access' 'ok' 'Access applications are readable.' }
+    catch { $perms += & $perm 'access' 'missing' 'Optional: without "Account > Access: Apps and Policies > Edit" this tool cannot create Access logins; you would add them in the Cloudflare dashboard.' }
+  }
+  $d.Permissions = $perms
+  return [pscustomobject]$d
+}
+
 function Get-CloudflareZones {
   param([Parameter(Mandatory = $true)]$Settings, [string]$AccountId)
   $query = @{}
@@ -231,8 +350,10 @@ function Get-CloudflareZones {
 }
 
 function Get-CloudflareTunnels {
-  param([Parameter(Mandatory = $true)]$Settings, [Parameter(Mandatory = $true)][string]$AccountId)
-  return @(Invoke-CloudflareApi -Settings $Settings -Path "/accounts/$AccountId/cfd_tunnel" -Query @{ is_deleted = 'false' } -All | ForEach-Object {
+  param([Parameter(Mandatory = $true)]$Settings, [Parameter(Mandatory = $true)][string]$AccountId, [string]$Token)
+  $p = @{ Settings = $Settings; Path = "/accounts/$AccountId/cfd_tunnel"; Query = @{ is_deleted = 'false' }; All = $true }
+  if ($Token) { $p['Token'] = $Token }
+  return @(Invoke-CloudflareApi @p | ForEach-Object {
       [pscustomobject]@{
         id = [string]$_.id; name = [string]$_.name; status = [string]$_.status
         remotelyManaged = ($_.PSObject.Properties['remote_config'] -and [bool]$_.remote_config) -or ($_.PSObject.Properties['config_src'] -and $_.config_src -eq 'cloudflare')
@@ -343,7 +464,8 @@ function Get-CloudflareServicePlan {
   }
 
   $observed = [ordered]@{}
-  $zones = @(Get-CloudflareZones -Settings $Settings)
+  $visibleZones = @(Get-CloudflareZones -Settings $Settings)
+  $zones = @(Select-AllowedZones $config $visibleZones)
   $tunnelConfig = Invoke-CloudflareApi -Settings $Settings -Path "/accounts/$acct/cfd_tunnel/$($config.tunnelId)/configurations"
   $cfg = $null
   if ($tunnelConfig -and $tunnelConfig.PSObject.Properties['config'] -and $tunnelConfig.config) { $cfg = $tunnelConfig.config }
@@ -364,7 +486,12 @@ function Get-CloudflareServicePlan {
   foreach ($h in $publish) {
     $zone = Find-CloudflareZone $zones $h
     if (-not $zone) {
-      $actions += New-CfAction 'dns' 'blocked' $h "No Cloudflare zone for $h" "The API token cannot see a zone that $h belongs to. Add the domain to Cloudflare or give the token DNS:Edit on it." $false $null
+      $visible = Find-CloudflareZone $visibleZones $h
+      if ($visible) {
+        $actions += New-CfAction 'dns' 'blocked' $h "$($visible.name) is not an allowed domain for this instance" "Add $($visible.name) to the allowed domains (Setup > Connect Cloudflare) to publish $h." $false $null
+      } else {
+        $actions += New-CfAction 'dns' 'blocked' $h "No Cloudflare zone for $h" "The API token cannot see a zone that $h belongs to. Add the domain to Cloudflare or give the token DNS:Edit on it." $false $null
+      }
       continue
     }
     # 1. Access
@@ -534,5 +661,5 @@ function Invoke-CloudflareServicePlan {
 
 Export-ModuleMember -Function Set-CloudflareApiBase, Get-CloudflareApiBase, Test-CloudflareApiToken, Save-CloudflareApiToken, Remove-CloudflareApiToken,
   Get-CloudflareApiTokenInfo, Read-CloudflareConfig, Save-CloudflareConfig, Invoke-CloudflareApi, Test-CloudflareToken, Get-CloudflareZones,
-  Get-CloudflareTunnels, Test-CloudflareId, Find-CloudflareZone, New-CloudflareTunnel, Install-CloudflareTunnelToken, Get-CloudflareManualSteps,
+  Get-CloudflareTunnels, Test-CloudflareId, Select-AllowedZones, Get-CloudflareTokenPermissions, Get-CloudflareTokenTemplateUrl, Get-CloudflareDiscovery, Find-CloudflareZone, New-CloudflareTunnel, Install-CloudflareTunnelToken, Get-CloudflareManualSteps,
   Get-CloudflareServicePlan, Invoke-CloudflareServicePlan

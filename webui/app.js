@@ -13,6 +13,11 @@
     middlewares: [],
     zones: [],
     cf: null,
+    setup: null,
+    discovery: null,
+    installPlan: null,
+    installResult: null,
+    conflicts: null,
     editing: null,
     planBody: null,
     plan: null,
@@ -170,10 +175,17 @@
   }
 
   async function refreshStatus() {
-    const s = await api('GET', '/api/status');
+    const [s, setup] = await Promise.all([api('GET', '/api/status'), api('GET', '/api/setup')]);
     state.status = s;
+    state.setup = setup;
+    if (!setup.cloudflare.tokenStored) state.discovery = null;
     renderInstance(s);
     renderSetup(s);
+    // What the stored token can do is checked once per page load (read-only Cloudflare calls).
+    if (setup.cloudflare.tokenStored && setup.cloudflare.tokenReadable && !state.discovery && !state.discoveryLoading) {
+      state.discoveryLoading = true;
+      loadDiscovery().catch((e) => toast(e.message, true)).finally(() => { state.discoveryLoading = false; });
+    }
     return s;
   }
 
@@ -196,16 +208,31 @@
       h('div', null, h('h2', null, `${n}. ${title}`, ' ', badgeEl), ...body));
   }
 
-  function renderSetup(s) {
-    const d = s.docker;
-    const st = s.stack;
-    const i = s.instance;
-    const cf = s.cloudflare;
-    const steps = [];
+  // The first-run wizard. Order: Cloudflare first (or skip for local-only), then Docker, install folder and
+  // instance settings, deployment method, domains, HTTPS, and finally a preview and the confirmed installation.
+  // Nothing changes Docker or Cloudflare before "Install" is confirmed (the API token is only verified and stored).
+  const HANDOFF_TEXT = "Cloudflare will display your API token when you create it. Copy it before closing that page. For security, Cloudflare won't display the same secret again. If you lose it, revoke or delete the old token and create a replacement.";
 
+  function renderSetup(s) {
+    const setup = state.setup;
+    if (!setup) return;
+    const d = s.docker;
+    const cf = setup.cloudflare;
+    const dep = setup.deployment;
+    const localOnly = dep.mode === 'local';
+    const steps = [];
+    const tokenOk = cf.tokenStored && cf.tokenReadable;
     const dockerOk = d.CliFound && d.EngineRunning && d.OsType === 'linux' && d.ComposeOk;
-    steps.push(step(1, 'Docker Desktop', dockerOk ? 'done' : 'blocked', badge(dockerOk ? 'Ready' : 'Needs attention', dockerOk ? 'ok' : 'err'),
-      h('p', null, 'Traefik and cloudflared run as Linux containers in Docker Desktop (WSL 2 backend).'),
+
+    // 1. Connect Cloudflare
+    const cfDone = tokenOk && arr(cf.domains).length > 0;
+    steps.push(step(1, 'Connect Cloudflare', cfDone ? 'done' : (localOnly && !tokenOk) ? 'done' : 'attention',
+      badge(cfDone ? `${arr(cf.domains).length} allowed domain(s)` : tokenOk ? 'Choose domains' : localOnly ? 'Skipped (local only)' : 'Start here', cfDone || (localOnly && !tokenOk) ? 'ok' : 'warn'),
+      renderConnectCloudflare(setup)));
+
+    // 2. Docker Desktop
+    steps.push(step(2, 'Docker Desktop', dockerOk ? 'done' : 'blocked', badge(dockerOk ? 'Ready' : 'Needs attention', dockerOk ? 'ok' : 'err'),
+      h('p', null, 'Traefik and cloudflared run as Linux containers in Docker Desktop (WSL 2 backend). This check only reads.'),
       h('ul', { class: 'checks' },
         check(d.CliFound, 'docker command available'),
         check(d.EngineRunning, d.EngineRunning ? `Docker engine running (version ${d.ServerVersion})` : 'Docker engine running'),
@@ -214,83 +241,353 @@
       arr(d.Problems).map((p) => h('p', { class: 'hint warn' }, p)),
       h('div', { class: 'actions' }, h('button', { type: 'button', class: 'btn', onclick: (e) => withBusy(e.currentTarget, refreshStatus) }, 'Check again'))));
 
-    const containers = arr(st.Containers);
-    const core = containers.filter((c) => c.Role !== 'cloudflared');
-    const coreRunning = core.length > 0 && core.every((c) => c.State === 'running');
-    const stackOk = i.installed && coreRunning && st.TraefikApi;
-    const stackOut = h('pre', { class: 'output', hidden: true, tabindex: '0' });
-    steps.push(step(2, 'Traefik stack', stackOk ? 'done' : dockerOk ? 'attention' : 'todo', badge(stackOk ? 'Running' : i.installed ? 'Not running' : 'Not installed', stackOk ? 'ok' : 'warn'),
-      h('p', null, 'Installs the proxy into ', h('code', null, i.installPath),
-        ` and starts Traefik and a read-only Docker socket proxy. Traefik listens on 127.0.0.1 only (ports ${i.httpPort} and ${i.dashboardPort}); the installer refuses to start if a name, port or network is already used by another stack.`),
-      h('ul', { class: 'checks' },
-        check(i.installed, i.installed ? 'Installed' : 'Installed'),
-        core.map((c) => check(c.State === 'running', `${c.Name}: ${c.State}${c.Health ? ` (${c.Health})` : ''}`)),
-        check(st.TraefikApi, st.TraefikApi ? `Traefik API answering (v${st.TraefikVersion})` : 'Traefik API answering')),
-      i.canInstall ? h('div', { class: 'actions' },
-        h('button', {
-          type: 'button', class: 'btn', onclick: (e) => withBusy(e.currentTarget, async () => {
-            const r = await api('POST', '/api/install/preview', {});
-            showOutput(stackOut, r.lines);
-          }),
-        }, 'Preview installation'),
-        h('button', {
-          type: 'button', class: 'btn primary', disabled: !dockerOk, onclick: (e) => installStack(e.currentTarget, stackOut),
-        }, i.installed ? 'Update and start…' : 'Install and start…')) : null,
-      stackOut));
+    // 3. Install folder and instance settings
+    steps.push(step(3, 'Install folder and instance settings', setup.installed ? 'done' : setup.settingsSource === 'draft' ? 'done' : 'todo',
+      badge(setup.installed ? 'Installed' : setup.settingsSource === 'draft' ? 'Saved' : 'Defaults', setup.installed || setup.settingsSource === 'draft' ? 'ok' : 'neutral'),
+      renderInstanceSettings(setup)));
 
-    const tokenOk = cf.tokenStored && cf.tokenReadable;
-    steps.push(step(3, 'Cloudflare connection', tokenOk && cf.accountId ? 'done' : 'todo', badge(tokenOk ? (cf.accountName || 'Token stored') : 'Optional', tokenOk ? 'ok' : 'neutral'),
-      h('p', null, 'A scoped Cloudflare API token lets this tool create DNS records, tunnel routes and Access applications for you. Without it, you get exact manual instructions instead.'),
-      h('div', { class: 'actions' }, h('button', { type: 'button', class: 'btn', onclick: () => selectTab('cloudflare', true) }, 'Open Cloudflare settings'))));
+    // 4. Deployment method
+    steps.push(step(4, 'Deployment method', dep.mode ? 'done' : 'todo', badge(dep.mode === 'tunnel' ? 'Cloudflare Tunnel' : localOnly ? 'Local only' : 'Not chosen', dep.mode ? 'ok' : 'neutral'),
+      renderDeployment(setup)));
 
-    const cfRunning = (containers.find((c) => c.Role === 'cloudflared') || {}).State === 'running';
-    const tunnelOk = !!cf.tunnelId && st.TunnelTokenPresent && cfRunning;
-    steps.push(step(4, 'Tunnel', tunnelOk ? 'done' : 'todo', badge(tunnelOk ? `Connected: ${cf.tunnelName}` : cf.tunnelId ? 'Connector not running' : 'Not configured', tunnelOk ? 'ok' : 'neutral'),
-      h('p', null, 'The tunnel connects Cloudflare to this PC without opening router ports. This instance runs its own cloudflared container.'),
-      h('ul', { class: 'checks' },
-        check(!!cf.tunnelId, cf.tunnelId ? `Tunnel selected: ${cf.tunnelName}` : 'Tunnel selected', true),
-        check(st.TunnelTokenPresent, 'Connector token installed', true),
-        check(cfRunning, 'cloudflared running', true)),
-      h('div', { class: 'actions' }, h('button', { type: 'button', class: 'btn', onclick: () => selectTab('cloudflare', true) }, 'Set up the tunnel'))));
+    // 5. Domains and DNS
+    steps.push(step(5, 'Domains and DNS', localOnly || arr(cf.domains).length ? 'done' : 'todo',
+      badge(localOnly ? 'Not needed' : arr(cf.domains).length ? arr(cf.domains).map((x) => x.name).join(', ') : 'No domain', localOnly || arr(cf.domains).length ? 'ok' : 'neutral'),
+      localOnly
+        ? h('p', null, 'Local only: no DNS records are created. Apps are reached through Traefik on this PC (127.0.0.1) with their hostname, for example with a hosts-file entry or ',
+          h('code', null, `curl -H "Host: app.example.com" http://127.0.0.1:${setup.settings.TRAEFIK_HTTP_PORT}/`), '.')
+        : [h('p', null, 'Services can only be published under the allowed domains chosen in step 1, even if the API token can see more. ',
+          'Each published hostname gets a proxied CNAME record pointing at the tunnel; it is created when you add the service, after its own preview and confirmation. Existing records are never replaced without a separate confirmation.'),
+        arr(cf.domains).length ? h('ul', { class: 'checks' }, arr(cf.domains).map((x) => check(true, x.name))) : h('p', { class: 'hint warn' }, 'No allowed domain yet. Choose one in step 1.')]));
 
+    // 6. HTTPS certificates
+    steps.push(step(6, 'HTTPS certificates', 'done', badge(localOnly ? 'HTTP on 127.0.0.1' : 'Provided by Cloudflare', 'neutral'),
+      h('p', null, setup.tls.detail)));
+
+    // 7. Review and install
+    steps.push(step(7, setup.installed ? 'Installation' : 'Review and install', setup.installed ? 'done' : 'todo',
+      badge(setup.installed ? 'Installed' : 'Not installed', setup.installed ? 'ok' : 'neutral'),
+      renderInstall(setup, dockerOk)));
+
+    // 8. Services
     const svc = s.services;
-    steps.push(step(5, 'Services', svc.total > 0 ? 'done' : 'todo', badge(`${svc.enabled} enabled / ${svc.total} total`, svc.total > 0 ? 'ok' : 'neutral'),
+    steps.push(step(8, 'Services', svc.total > 0 ? 'done' : 'todo', badge(`${svc.enabled} enabled / ${svc.total} total`, svc.total > 0 ? 'ok' : 'neutral'),
       h('p', null, 'Add each app you want to publish: a name, its public hostname and where it runs. You can manage many apps through this one Traefik.'),
       svc.drift > 0 ? h('p', { class: 'hint warn' }, `${svc.drift} route file(s) differ from the service registry. Open Services to review.`) : null,
       h('div', { class: 'actions' }, h('button', {
-        type: 'button', class: 'btn primary', disabled: !i.installed,
+        type: 'button', class: 'btn primary', disabled: !setup.installed,
         onclick: () => { selectTab('services'); openServiceForm(null); },
       }, 'Add a service'))));
 
     fill($('#setup-steps'), steps);
   }
 
-  function showOutput(pre, lines) {
-    pre.hidden = false;
-    pre.textContent = arr(lines).join('\n') || '(no output)';
+  function renderConnectCloudflare(setup) {
+    const cf = setup.cloudflare;
+    const tokenOk = cf.tokenStored && cf.tokenReadable;
+    const withAccess = state.tokenLinkAccess !== false;
+    const link = h('a', {
+      class: 'btn primary', href: withAccess ? cf.tokenLinkWithAccess : cf.tokenLink, target: '_blank', rel: 'noopener noreferrer', id: 'cf-create-token',
+      onclick: () => { state.handoff = true; $('#cf-handoff').hidden = false; },
+    }, 'Create Cloudflare API Token');
+    const accessBox = h('input', { type: 'checkbox', id: 'cf-incl-access', checked: withAccess });
+    accessBox.addEventListener('change', () => { state.tokenLinkAccess = accessBox.checked; link.href = accessBox.checked ? cf.tokenLinkWithAccess : cf.tokenLink; });
+
+    const tokenInput = h('input', { id: 'wiz-token', type: 'password', autocomplete: 'off', spellcheck: 'false', placeholder: 'Paste the API token', 'aria-describedby': 'wiz-token-hint' });
+    const form = h('form', { class: 'inline-form', autocomplete: 'off', id: 'wiz-token-form' },
+      h('label', { for: 'wiz-token' }, tokenOk ? 'Replace the API token' : 'API token'), tokenInput,
+      h('button', { type: 'submit', class: 'btn primary' }, 'Verify and save'));
+    form.addEventListener('submit', (e) => { e.preventDefault(); saveToken(tokenInput, e.submitter || form.querySelector('button')); });
+
+    return [
+      h('p', null, 'This tool uses a Cloudflare API token, limited to the permissions below, to set up the tunnel and DNS for you. Every change is previewed and needs your confirmation.'),
+      h('ul', { class: 'perm-list' }, arr(cf.permissions).map((p) => h('li', null, h('strong', null, p.label), p.optional ? ' (optional)' : '', h('span', { class: 'muted' }, ` - to ${p.purpose}`)))),
+      h('label', { class: 'check' }, accessBox, h('span', null, 'Include the optional Access permission (lets this tool put a Cloudflare login in front of your apps)')),
+      h('div', { class: 'actions' }, link,
+        !tokenOk && setup.deployment.mode !== 'local' && !setup.installed ? h('button', { type: 'button', class: 'btn', onclick: (e) => skipCloudflare(e.currentTarget) }, 'Skip: install local only, without Cloudflare') : null),
+      h('p', { class: 'hint' }, 'The link opens Cloudflare\'s token page with these permissions filled in. Review them there. Under ',
+        h('strong', null, 'Account Resources'), ' and ', h('strong', null, 'Zone Resources'),
+        ', choose only the account and the domains this PC should manage, then select Continue to summary and Create Token. If Cloudflare\'s page does not list "Cloudflare Tunnel", add Account > Cloudflare Tunnel > Edit yourself.'),
+      h('div', { class: 'card callout info', id: 'cf-handoff', hidden: tokenOk && !state.handoff },
+        h('p', null, h('strong', null, HANDOFF_TEXT)),
+        h('p', null, 'Paste the token below. Once it is copied, you can close the Cloudflare tab. The token is encrypted for your Windows account (DPAPI) on this PC and never shown again, put in a link, or stored in the browser.')),
+      tokenOk ? h('div', { class: 'status-line' }, badge('Token stored (encrypted)', 'ok'), h('span', { class: 'muted' }, `Saved ${cf.tokenSavedAt}`)) : null,
+      cf.tokenStored && !cf.tokenReadable ? h('p', { class: 'hint warn' }, 'The stored token cannot be decrypted by this Windows account. Paste it again or create a new one.') : null,
+      form,
+      h('p', { class: 'hint', id: 'wiz-token-hint' }, 'The token is checked with Cloudflare before it is saved. Nothing in your Cloudflare account is changed.'),
+      tokenOk ? h('div', { class: 'actions' },
+        h('button', { type: 'button', class: 'btn', onclick: (e) => withBusy(e.currentTarget, loadDiscovery) }, 'Check permissions again'),
+        h('button', { type: 'button', class: 'btn danger-outline', onclick: (e) => removeToken(e.currentTarget) }, 'Remove stored token')) : null,
+      tokenOk ? renderDiscovery(state.discovery, cf) : null,
+    ];
   }
 
-  async function installStack(button, out) {
-    const i = state.status.instance;
+  function permBadge(p) {
+    const map = { ok: ['OK', 'ok'], partial: ['Partly', 'warn'], missing: [p.optional ? 'Not granted' : 'Missing', p.optional ? 'neutral' : 'err'], unknown: ['Unknown', 'neutral'] };
+    const [text, kind] = map[p.state] || ['?', 'neutral'];
+    return badge(text, kind);
+  }
+
+  function renderDiscovery(disc, cf) {
+    if (!disc) return h('p', { class: 'muted' }, 'Checking what the token can do…');
+    const zones = arr(disc.zones);
+    const accounts = arr(disc.accounts);
+    const boxes = zones.map((z) => h('input', { type: 'checkbox', value: z.id, checked: z.allowed || (zones.length === 1) }));
+    return h('div', { class: 'plan-section' },
+      h('h3', null, 'What this token can do'),
+      h('ul', { class: 'issue-list' }, arr(disc.permissions).map((p) => h('li', null, permBadge(p), ' ', h('strong', null, p.label), h('p', { class: 'hint' }, p.message)))),
+      accounts.length > 1 ? h('div', { class: 'inline-form' },
+        h('label', { for: 'wiz-account' }, 'Account'),
+        h('select', { id: 'wiz-account', onchange: (e) => withBusy(null, async () => { await api('POST', '/api/cloudflare/select', { accountId: e.target.value }); await loadDiscovery(); await refreshStatus(); }) },
+          h('option', { value: '' }, 'Choose an account…'), accounts.map((a) => h('option', { value: a.id, selected: a.id === disc.accountId }, a.name)))) :
+        accounts.length === 1 ? h('p', null, 'Account: ', h('strong', null, accounts[0].name)) : null,
+      h('h3', null, 'Allowed domains'),
+      zones.length === 0 ? h('p', { class: 'hint warn' }, 'The token cannot see any domain. Edit the token in Cloudflare (Zone > Zone > Read and Zone > DNS > Edit for your domain) or create a new one.') :
+        [h('p', { class: 'muted' }, zones.length === 1 ? 'The token can manage one domain; it was selected automatically.' : 'Choose the domains this instance may publish services under.'),
+          h('fieldset', { class: 'chips' }, h('legend', { class: 'sr-only' }, 'Allowed domains'),
+            zones.map((z, i) => h('label', { class: 'check' }, boxes[i], h('span', null, z.name, ' ', z.dns === 'missing' ? badge('no DNS access', 'warn') : null)))),
+          h('div', { class: 'actions' }, h('button', {
+            type: 'button', class: 'btn', onclick: (e) => withBusy(e.currentTarget, async () => {
+              const ids = boxes.filter((b) => b.checked).map((b) => b.value);
+              await api('POST', '/api/cloudflare/domains', { zoneIds: ids });
+              toast(ids.length ? `Allowed domains saved (${ids.length}).` : 'No domain is allowed now.');
+              await loadDiscovery();
+              await refreshStatus();
+            }),
+          }, 'Save allowed domains'))],
+      arr(cf.domains).length === 0 && zones.length > 1 ? h('p', { class: 'hint warn' }, 'No domain is allowed yet.') : null);
+  }
+
+  async function saveToken(input, button) {
+    const token = input.value.trim();
+    if (!token) { toast('Paste the API token first.', true); return; }
+    const send = async (confirmReplace) => {
+      try {
+        return await api('POST', '/api/cloudflare/token', { token, confirmReplace });
+      } catch (err) {
+        if (err.status === 409 && err.data.needsConfirm === 'replace') {
+          const ok = await confirmDialog({ title: 'Replace the stored token?', body: 'A Cloudflare API token is already stored. The new token replaces it after Cloudflare verifies it. Revoke the old token in Cloudflare if you no longer need it.', okText: 'Replace' });
+          return ok ? send(true) : null;
+        }
+        throw err;
+      }
+    };
+    await withBusy(button, async () => {
+      const r = await send(false);
+      input.value = '';
+      if (!r) return;
+      state.discovery = r;
+      state.handoff = false;
+      toast(`Token verified and saved: ${arr(r.zones).length} domain(s) visible.`);
+      await refreshStatus();
+    });
+  }
+
+  async function removeToken(button) {
+    const ok = await confirmDialog({ title: 'Remove the stored API token?', body: 'Automation stops working until you save a token again. Nothing in Cloudflare is changed. Revoke or delete the token in the Cloudflare dashboard if you no longer need it.', okText: 'Remove', danger: true });
+    if (!ok) return;
+    await withBusy(button, async () => {
+      await api('POST', '/api/cloudflare/token/delete', { confirm: true });
+      state.discovery = null;
+      toast('Stored token removed.');
+      await refreshStatus();
+    });
+  }
+
+  async function loadDiscovery() {
+    state.discovery = await api('GET', '/api/cloudflare/discovery');
+    renderSetup(state.status);
+  }
+
+  async function skipCloudflare(button) {
+    await withBusy(button, async () => {
+      state.setup = await api('POST', '/api/setup/deployment', { mode: 'local' });
+      state.installPlan = null;
+      toast('Local-only installation chosen. You can connect Cloudflare later.');
+      renderSetup(state.status);
+    });
+  }
+
+  const SETTING_FIELDS = [
+    ['STACK_NAME', 'Instance name', 'Prefix of the container names and the Compose project.'],
+    ['TRAEFIK_HTTP_PORT', 'Traefik HTTP port (127.0.0.1)', ''],
+    ['TRAEFIK_DASHBOARD_PORT', 'Dashboard port (127.0.0.1)', ''],
+    ['PROXY_NETWORK', 'Shared Docker network', 'App containers join it so Traefik can reach them by name.'],
+    ['TUNNEL_SUBNET', 'Tunnel subnet', 'Private network between cloudflared and Traefik.'],
+    ['TUNNEL_IP_RANGE', 'Tunnel IP range', ''],
+    ['CLOUDFLARED_IP', 'cloudflared address', ''],
+  ];
+
+  function renderConflicts(list) {
+    const items = arr(list).filter((c) => c.Level !== 'info');
+    if (!items.length) return h('p', { class: 'hint' }, 'No conflicts with containers, ports or networks on this PC.');
+    return h('ul', { class: 'issue-list' }, items.map((c) => h('li', { class: c.Level === 'error' ? 'err' : 'warn' }, badge(c.Level === 'error' ? 'Conflict' : 'Note', c.Level === 'error' ? 'err' : 'warn'), ' ', c.Message)));
+  }
+
+  function renderInstanceSettings(setup) {
+    const editable = !setup.installed;
+    const pathInput = h('input', { id: 'wiz-path', value: setup.installPath, spellcheck: 'false', autocomplete: 'off', disabled: !setup.canChangePath });
+    const inputs = {};
+    const fields = SETTING_FIELDS.map(([key, label, hint]) => {
+      inputs[key] = h('input', { id: `wiz-${key}`, value: setup.settings[key], spellcheck: 'false', autocomplete: 'off', disabled: !editable });
+      return h('div', { class: 'field' }, h('label', { for: `wiz-${key}` }, label), inputs[key], hint ? h('p', { class: 'hint' }, hint) : null);
+    });
+    const read = () => { const o = {}; for (const [k] of SETTING_FIELDS) o[k] = inputs[k].value.trim(); return o; };
+    const conflictsBox = h('div', { id: 'wiz-conflicts' }, state.conflicts ? renderConflicts(state.conflicts) : null);
+    return [
+      h('p', null, 'The install folder holds this instance\'s settings (.env), configuration, secrets, backups and logs. The program itself runs from ',
+        h('code', null, setup.sourcePath), '.'),
+      h('div', { class: 'inline-form' },
+        h('label', { for: 'wiz-path' }, 'Install folder'), pathInput,
+        editable ? h('button', {
+          type: 'button', class: 'btn', onclick: (e) => withBusy(e.currentTarget, async () => {
+            state.setup = await api('POST', '/api/setup/path', { path: pathInput.value.trim() });
+            state.installPlan = null; state.conflicts = null;
+            toast(`Install folder: ${state.setup.installPath}`);
+            await refreshStatus();
+          }),
+        }, 'Use this folder') : null),
+      editable ? null : h('p', { class: 'hint' }, 'This instance is installed; its settings are shown read-only. Edit .env in the install folder by hand to change them.'),
+      h('p', { class: 'muted' }, 'Each instance needs its own name, ports, network and tunnel subnet so it cannot interfere with other stacks on this PC (including other Traefik or cloudflared containers).'),
+      h('div', { class: 'grid' }, fields),
+      editable ? h('div', { class: 'actions' },
+        h('button', {
+          type: 'button', class: 'btn', onclick: (e) => withBusy(e.currentTarget, async () => {
+            const r = await api('POST', '/api/setup/suggest', {});
+            for (const [k] of SETTING_FIELDS) inputs[k].value = r.settings[k];
+            state.conflicts = r.conflicts;
+            fill(conflictsBox, renderConflicts(r.conflicts));
+            toast('Suggested free values filled in. Save them to use them.');
+          }),
+        }, 'Suggest free values'),
+        h('button', {
+          type: 'button', class: 'btn primary', onclick: (e) => withBusy(e.currentTarget, async () => {
+            const r = await api('POST', '/api/setup/settings', { settings: read() });
+            state.conflicts = r.conflicts; state.installPlan = null;
+            toast('Instance settings saved.');
+            await refreshStatus();
+          }),
+        }, 'Save settings'),
+        h('button', {
+          type: 'button', class: 'btn', onclick: (e) => withBusy(e.currentTarget, async () => {
+            const r = await api('POST', '/api/setup/check', {});
+            state.conflicts = r.conflicts;
+            fill(conflictsBox, renderConflicts(r.conflicts));
+          }),
+        }, 'Check saved settings')) : null,
+      conflictsBox,
+    ];
+  }
+
+  function renderDeployment(setup) {
+    const dep = setup.deployment;
+    const cf = setup.cloudflare;
+    const tokenOk = cf.tokenStored && cf.tokenReadable;
+    if (setup.installed) return h('p', null, dep.mode === 'tunnel' ? `Cloudflare Tunnel${cf.tunnelName ? ` (${cf.tunnelName})` : ''}. Manage the tunnel on the Cloudflare page.` : 'Local only. To publish apps later, set up a tunnel on the Cloudflare page.');
+    const current = state.depMode || dep.mode || (tokenOk ? 'tunnel' : 'local');
+    const radios = arr(setup.modes).map((m) => h('label', { class: 'radio' },
+      h('input', { type: 'radio', name: 'wiz-mode', value: m.id, checked: m.id === current, disabled: !m.supported || (m.id === 'tunnel' && !tokenOk), onchange: () => { state.depMode = m.id; renderSetup(state.status); } }),
+      h('span', null, h('strong', null, m.title), m.supported ? '' : ' (not supported in this version)', ': ', m.detail,
+        m.id === 'tunnel' && !tokenOk ? h('span', { class: 'hint warn' }, ' Connect Cloudflare first (step 1).') : null)));
+    const tunnels = arr(state.discovery && state.discovery.tunnels).filter((t) => t.remotelyManaged);
+    const choice = state.tunnelChoice || dep.tunnelChoice || (tunnels.length ? 'existing' : 'new');
+    const sel = h('select', { id: 'wiz-tunnel' }, h('option', { value: '' }, tunnels.length ? 'Choose a tunnel…' : 'No dashboard-managed tunnels found'),
+      tunnels.map((t) => h('option', { value: t.id, selected: t.id === dep.tunnelId }, `${t.name} (${t.status || 'inactive'}, ${t.connections} connection${t.connections === 1 ? '' : 's'})`)));
+    const nameInput = h('input', { id: 'wiz-tunnel-name', value: dep.newTunnelName || `${setup.settings.STACK_NAME}`, spellcheck: 'false', autocomplete: 'off' });
+    const tunnelBlock = current === 'tunnel' && tokenOk ? h('fieldset', { class: 'exposure' }, h('legend', null, 'Tunnel for this instance'),
+      h('label', { class: 'radio' }, h('input', { type: 'radio', name: 'wiz-tchoice', value: 'new', checked: choice === 'new', onchange: () => { state.tunnelChoice = 'new'; } }),
+        h('span', null, h('strong', null, 'Create a new tunnel'), ' (recommended: one tunnel per instance). It is created only when you confirm the installation.')),
+      h('div', { class: 'inline-form' }, h('label', { for: 'wiz-tunnel-name' }, 'New tunnel name'), nameInput),
+      h('label', { class: 'radio' }, h('input', { type: 'radio', name: 'wiz-tchoice', value: 'existing', checked: choice === 'existing', onchange: () => { state.tunnelChoice = 'existing'; } }),
+        h('span', null, h('strong', null, 'Use an existing tunnel'), ' that no other connector on this PC serves.')),
+      h('div', { class: 'inline-form' }, h('label', { for: 'wiz-tunnel' }, 'Tunnel'), sel)) : null;
+    return [
+      h('fieldset', { class: 'exposure' }, h('legend', null, 'How will apps be reached?'), radios),
+      tunnelBlock,
+      h('div', { class: 'actions' }, h('button', {
+        type: 'button', class: 'btn primary', onclick: (e) => withBusy(e.currentTarget, async () => {
+          const body = { mode: current };
+          if (current === 'tunnel') {
+            const c = $('input[name="wiz-tchoice"]:checked');
+            body.tunnelChoice = c ? c.value : '';
+            body.tunnelId = sel.value;
+            body.newTunnelName = nameInput.value.trim();
+          }
+          state.setup = await api('POST', '/api/setup/deployment', body);
+          state.installPlan = null;
+          toast('Deployment method saved.');
+          renderSetup(state.status);
+        }),
+      }, 'Save deployment method')),
+    ];
+  }
+
+  function renderInstall(setup, dockerOk) {
+    if (setup.installed) {
+      const st = state.status.stack;
+      const containers = arr(st.Containers);
+      return [
+        h('p', null, 'Installed in ', h('code', null, setup.installPath), setup.installedAt ? ` on ${setup.installedAt}` : '', '.'),
+        h('ul', { class: 'checks' },
+          containers.filter((c) => c.Role !== 'cloudflared' || setup.deployment.mode === 'tunnel').map((c) => check(c.State === 'running', `${c.Name}: ${c.State}${c.Health ? ` (${c.Health})` : ''}`)),
+          check(st.TraefikApi, st.TraefikApi ? `Traefik API answering (v${st.TraefikVersion})` : 'Traefik API answering')),
+      ];
+    }
+    const plan = state.installPlan;
+    const out = h('pre', { class: 'output', hidden: !plan || !arr(plan.dryRun).length, tabindex: '0' }, plan ? arr(plan.dryRun).join('\n') : '');
+    const box = h('input', { type: 'checkbox', id: 'wiz-install-ok' });
+    const go = h('button', { type: 'button', class: 'btn primary', disabled: true }, 'Install…');
+    box.addEventListener('change', () => { go.disabled = !(box.checked && plan && plan.canInstall); });
+    go.addEventListener('click', () => runInstall(go));
+    const kind = { local: ['This PC', 'neutral'], docker: ['Docker', 'info'], cloudflare: ['Cloudflare', 'warn'] };
+    return [
+      h('p', null, 'The preview lists every step and runs the installer in dry-run mode. Docker and Cloudflare are only changed after you confirm.'),
+      h('div', { class: 'actions' }, h('button', {
+        type: 'button', class: 'btn', disabled: !setup.canInstall, onclick: (e) => withBusy(e.currentTarget, async () => {
+          state.installPlan = await api('POST', '/api/setup/preview', {});
+          renderSetup(state.status);
+        }),
+      }, plan ? 'Preview again' : 'Preview installation')),
+      plan ? h('div', { class: 'plan-section' },
+        h('h3', null, 'Steps'),
+        h('ol', { class: 'action-list' }, arr(plan.steps).map((s) => h('li', null, badge((kind[s.kind] || ['', 'neutral'])[0], (kind[s.kind] || ['', 'neutral'])[1]), ' ', s.text))),
+        arr(plan.blockers).length ? [h('h3', null, 'Blocking problems'), h('ul', { class: 'issue-list' }, arr(plan.blockers).map((b) => h('li', { class: 'err' }, b)))] : null,
+        arr(plan.warnings).length ? [h('h3', null, 'Notes'), h('ul', { class: 'issue-list' }, arr(plan.warnings).map((w) => h('li', { class: 'warn' }, w)))] : null,
+        h('h3', null, 'Installer dry run'), out,
+        plan.canInstall ? h('div', { class: 'actions' }, h('label', { class: 'check' }, box, h('span', null, 'I reviewed these steps')), go) : null) : null,
+      !dockerOk ? h('p', { class: 'hint warn' }, 'Docker Desktop must be running to install.') : null,
+      state.installResult ? h('div', { class: 'plan-section' }, h('h3', null, state.installResult.ok ? 'Installation finished' : 'Installation failed'),
+        h('ul', { class: 'result-list' }, arr(state.installResult.steps).map((s) => h('li', null, badge(s.status, s.status === 'Done' ? 'ok' : 'err'), ' ', s.name, s.message ? h('p', { class: 'hint' }, s.message) : null))),
+        h('pre', { class: 'output', tabindex: '0' }, arr(state.installResult.lines).join('\n'))) : null,
+    ];
+  }
+
+  async function runInstall(button) {
+    const plan = state.installPlan;
     const ok = await confirmDialog({
-      title: i.installed ? 'Update and start the stack' : 'Install and start the stack',
-      body: [
-        h('p', null, 'This runs ', h('code', null, 'install.ps1 -Start'), ' for ', h('code', null, i.installPath), '.'),
-        h('ul', null,
-          h('li', null, 'Copies or updates the stack files (files you edited are kept; the new version is saved as .dist).'),
-          h('li', null, `Creates the shared Docker network "${i.proxyNetwork}" if it does not exist.`),
-          h('li', null, `Starts this instance's containers only (${i.stackName}-traefik, ${i.stackName}-socket-proxy).`)),
-        'Use "Preview installation" first to see every step.',
-      ],
-      okText: 'Install and start',
+      title: 'Install this instance',
+      body: [h('p', null, 'This performs the previewed steps:'), h('ol', null, arr(plan.steps).map((s) => h('li', null, s.text))),
+        'Only this instance\'s containers are started. Existing containers, networks and Cloudflare resources are not modified.'],
+      okText: 'Install',
+      checkbox: plan.steps.some((s) => s.kind === 'cloudflare') ? 'Create the listed resource in my Cloudflare account' : null,
     });
     if (!ok) return;
     await withBusy(button, async () => {
-      const r = await api('POST', '/api/install/run', { confirm: true, enableTunnel: !!state.status.stack.TunnelTokenPresent });
-      showOutput(out, r.lines);
-      toast(r.ok ? 'Stack installed and started.' : 'The installer reported an error; see the output.', !r.ok);
+      try {
+        state.installResult = await api('POST', '/api/setup/install', { confirm: true, planKey: plan.planKey });
+      } catch (err) {
+        if (err.status === 409) state.installPlan = null;
+        throw err;
+      }
+      state.installPlan = null;
+      toast(state.installResult.ok ? 'Installed and started.' : 'The installation reported an error; see the output.', !state.installResult.ok);
       await refreshStatus();
     });
+  }
+
+  function showOutput(pre, lines) {
+    pre.hidden = false;
+    pre.textContent = arr(lines).join('\n') || '(no output)';
   }
 
   // --- Services ---------------------------------------------------------------------------------------
@@ -667,6 +964,7 @@
       t.Stored ? h('span', { class: 'muted' }, `Saved ${t.SavedAt} by ${t.User}`) : null,
       cf.apiBase !== 'https://api.cloudflare.com/client/v4' ? badge(`API: ${cf.apiBase} (test mock)`, 'warn') : null);
     $('#btn-cf-token-remove').hidden = !t.Stored;
+    if (state.setup) $('#cf-tab-create-token').href = state.setup.cloudflare.tokenLinkWithAccess;
     const disabled = !t.Stored;
     ['#cf-account', '#cf-tunnel', '#btn-cf-load', '#btn-cf-select', '#cf-tunnel-name'].forEach((s) => { $(s).disabled = disabled; });
     $('#cf-tunnel-form button').disabled = disabled || !cf.config.accountId;

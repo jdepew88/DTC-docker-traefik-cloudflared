@@ -160,6 +160,16 @@ try {
   $r = Invoke-WebUi $ui GET '/api/cloudflare'
   Test-Condition 'Cloudflare status shows metadata only' ($r.Status -eq 200 -and $r.Data.token.Stored -and $r.Data.token.Readable -and $r.Body -notmatch [regex]::Escape($apiToken)) (Short $r)
 
+  # --- Allowed domains ----------------------------------------------------------------------------------------------
+  $r = Invoke-WebUi $ui GET '/api/cloudflare/zones'
+  Test-Condition 'two visible domains: none is allowed automatically' ($r.Status -eq 200 -and @($r.Data.zones).Count -eq 0) (Short $r)
+  $r = Invoke-WebUi $ui POST '/api/cloudflare/domains' @{ zoneIds = @('zone00000000000000000000000000009') }
+  Test-Condition 'a domain the token cannot see is refused' ($r.Status -eq 400) (Short $r)
+  $r = Invoke-WebUi $ui POST '/api/cloudflare/domains' @{ zoneIds = @('zone00000000000000000000000000001') }
+  Test-Condition 'allowed domains saved (example.test only)' ($r.Status -eq 200 -and @($r.Data.domains).Count -eq 1 -and (Read-CloudflareConfig -Settings $settings).domains[0].name -eq 'example.test') (Short $r)
+  $r = Invoke-WebUi $ui GET '/api/cloudflare/zones'
+  Test-Condition 'service form lists only the allowed domain' ($r.Status -eq 200 -and (@($r.Data.zones | ForEach-Object { $_.name }) -join ',') -eq 'example.test') (Short $r)
+
   # --- Account / tunnel -------------------------------------------------------------------------------------------------
   $r = Invoke-WebUi $ui GET '/api/cloudflare/tunnels'
   Test-Condition 'tunnels listed (remote vs. locally managed)' ($r.Status -eq 200 -and @($r.Data.tunnels | Where-Object { $_.name -eq 'existing-tunnel' -and $_.remotelyManaged }).Count -eq 1 -and
@@ -249,6 +259,9 @@ try {
   Test-Condition 'Access without allowed emails -> blocked' ((Find-Action $plan 'access:noemail.example.test')[0].kind -eq 'blocked' -and -not $plan.Data.canApply) (Short $plan)
   $plan = Invoke-WebUi $ui POST '/api/services/plan' (New-Body 'add' 'nozone' @('app.not-in-account.test') '10.10.0.16' 80 'public')
   Test-Condition 'hostname outside the token''s zones -> blocked' ((Find-Action $plan 'dns:app.not-in-account.test')[0].kind -eq 'blocked' -and -not $plan.Data.canApply) (Short $plan)
+  $plan = Invoke-WebUi $ui POST '/api/services/plan' (New-Body 'add' 'otherzone' @('app.other.test') '10.10.0.16' 80 'public')
+  $oz = Find-Action $plan 'dns:app.other.test'
+  Test-Condition 'visible but not allowed domain -> blocked, nothing written' ($oz.Count -eq 1 -and $oz[0].kind -eq 'blocked' -and $oz[0].summary -match 'not an allowed domain' -and -not $plan.Data.canApply -and (Get-Dns 'app.other.test').Count -eq 0) ($plan.Data.cloudflare | ConvertTo-Json -Depth 6 -Compress)
   $plan = Invoke-WebUi $ui POST '/api/services/plan' (New-Body 'add' 'Bad Name' @('bad.example.test') '127.0.0.1' 0 'public')
   Test-Condition 'invalid input -> validation errors, cannot apply' ($plan.Status -eq 200 -and -not $plan.Data.canApply -and @($plan.Data.traefik.issues | Where-Object { $_.Level -eq 'Error' }).Count -ge 2) (Short $plan)
   $plan = Invoke-WebUi $ui POST '/api/services/plan' (New-Body 'add' 'manual' @('manual.example.test') '10.10.0.17' 80 'access' @() $false)
@@ -313,7 +326,7 @@ try {
   $plainFiles = @(Get-ChildItem -LiteralPath $install -Recurse -File | Where-Object { $_.FullName -notlike '*\secrets\*' -and $_.Length -lt 5MB } |
       Where-Object { ([IO.File]::ReadAllText($_.FullName)).Contains($apiToken) })
   Test-Condition 'API token not written to any file in plaintext' ($plainFiles.Count -eq 0) (($plainFiles | ForEach-Object { $_.FullName }) -join ', ')
-  $authOk = @(Get-MockRequests $mock | Where-Object { -not $_.authOk -and $_.path -ne '/client/v4/user/tokens/verify' -and $_.path -ne '/client/v4/accounts' })
+  $authOk = @(Get-MockRequests $mock | Where-Object { -not $_.authOk -and $_.path -ne '/client/v4/user/tokens/verify' -and $_.path -ne '/client/v4/accounts' -and $_.path -ne '/client/v4/zones' })
   Test-Condition 'every Cloudflare call carried the stored token' ($authOk.Count -eq 0) (($authOk | ForEach-Object { $_.path }) -join ', ')
 
   $r = Invoke-WebUi $ui POST '/api/cloudflare/token/delete' @{}

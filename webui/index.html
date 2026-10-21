@@ -46,6 +46,8 @@
           container, a program on this PC, or a device on your network.</p>
         <p class="muted">Every change is shown as a preview first and only applied after you confirm it. Nothing outside this
           instance's own containers is started, stopped or modified.</p>
+        <p>Start with <strong>step 1, Connect Cloudflare</strong>, or skip it to install for local use only. Docker and Cloudflare
+          are not changed until you confirm the installation in step 7.</p>
       </div>
       <ol class="steps" id="setup-steps"></ol>
     </section>
@@ -184,13 +186,15 @@
 
       <div class="card">
         <h2>1. API token</h2>
-        <p>Create a token at <a href="https://dash.cloudflare.com/profile/api-tokens" target="_blank" rel="noopener noreferrer">dash.cloudflare.com &rarr; My Profile &rarr; API Tokens</a>
-          &rarr; <em>Create Custom Token</em>, with only these permissions:</p>
+        <p>The token needs only these permissions. Limit it to the account and domains this PC should manage.</p>
         <ul class="perm-list">
+          <li><strong>Zone</strong> &middot; Zone &middot; Read, and <strong>Zone</strong> &middot; DNS &middot; Edit</li>
           <li><strong>Account</strong> &middot; Cloudflare Tunnel &middot; Edit</li>
-          <li><strong>Account</strong> &middot; Access: Apps and Policies &middot; Edit <span class="muted">(only for automatic Access)</span></li>
-          <li><strong>Zone</strong> &middot; DNS &middot; Edit, and <strong>Zone</strong> &middot; Zone &middot; Read <span class="muted">(limit to the zones you will use)</span></li>
+          <li><strong>Account</strong> &middot; Access: Apps and Policies &middot; Edit <span class="muted">(optional, for automatic Access)</span></li>
         </ul>
+        <div class="actions"><a class="btn" id="cf-tab-create-token" href="https://dash.cloudflare.com/profile/api-tokens" target="_blank" rel="noopener noreferrer">Create Cloudflare API Token</a></div>
+        <p class="hint">Cloudflare will display your API token when you create it. Copy it before closing that page. For security,
+          Cloudflare won't display the same secret again. If you lose it, revoke or delete the old token and create a replacement.</p>
         <p class="muted">The token is encrypted with Windows DPAPI for your Windows account and stored in
           <code>secrets\cloudflare_api.dpapi</code>. It is never shown again or sent back to the browser.</p>
         <div id="cf-token-status" class="status-line"></div>

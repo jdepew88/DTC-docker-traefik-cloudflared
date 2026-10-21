@@ -53,18 +53,32 @@ function Fail([int]$Status, [int]$Code, [string]$Message) {
 $handler = {
   param($req)
   $auth = if ($req.Headers.ContainsKey('authorization')) { $req.Headers['authorization'] } else { '' }
-  $authOk = ($auth -eq "Bearer $Token")
-  $entry = [ordered]@{ method = $req.Method; path = $req.Path; query = $req.Query; body = $req.Body; authOk = $authOk }
+  # -Token has every permission. Tokens named mock<Profile>_<random> simulate restricted tokens:
+  #   One       only the zone example.test        NoZone    no Zone Read (no zones, no DNS)
+  #   NoTunnel  no Cloudflare Tunnel permission    NoAccess  no Access permission
+  #   Disabled  verify reports status 'disabled'
+  $tokenProfile = ''
+  if ($auth -eq "Bearer $Token") { $tokenProfile = 'Full' }
+  elseif ($auth -match '^Bearer mock(One|NoZone|NoTunnel|NoAccess|Disabled)_[A-Za-z0-9]{24,}$') { $tokenProfile = $Matches[1] }
+  $authOk = ($tokenProfile -eq 'Full')
+  $entry = [ordered]@{ method = $req.Method; path = $req.Path; query = $req.Query; body = $req.Body; authOk = $authOk; profile = $tokenProfile }
   [IO.File]::AppendAllText($LogFile, (ConvertTo-Json -InputObject $entry -Compress -Depth 5) + "`n")
-  if (-not $authOk) { return Fail 401 10000 'Authentication error' }
+  if (-not $tokenProfile) { return Fail 401 10000 'Authentication error' }
   $p = $req.Path -replace '^/client/v4', ''
   $body = $null
   if ($req.Body) { $body = $req.Body | ConvertFrom-Json }
   $m = $req.Method
-  if ($m -eq 'GET' -and $p -eq '/user/tokens/verify') { return Ok ([pscustomobject]@{ id = 'tok'; status = 'active' }) }
+  if ($m -eq 'GET' -and $p -eq '/user/tokens/verify') { return Ok ([pscustomobject]@{ id = 'tok'; status = $(if ($tokenProfile -eq 'Disabled') { 'disabled' } else { 'active' }) }) }
+  if ($tokenProfile -eq 'Disabled') { return Fail 401 1000 'Invalid API Token' }
+  if ($tokenProfile -ne 'Full' -and $m -ne 'GET') { return Fail 403 10000 'Authentication error' }
+  if ($tokenProfile -eq 'NoTunnel' -and $p -match '/cfd_tunnel') { return Fail 403 10000 'Authentication error' }
+  if ($tokenProfile -eq 'NoAccess' -and $p -match '/access/') { return Fail 403 10000 'Authentication error' }
+  if ($tokenProfile -eq 'NoZone' -and $p -match '^/zones/') { return Fail 403 10000 'Authentication error' }
   if ($m -eq 'GET' -and $p -eq '/accounts') { return Ok $db.accounts }
   if ($m -eq 'GET' -and $p -eq '/zones') {
     $z = @($db.zones)
+    if ($tokenProfile -eq 'NoZone') { $z = @() }
+    if ($tokenProfile -eq 'One') { $z = @($z | Where-Object { $_.name -eq 'example.test' }) }
     if ($req.Query.ContainsKey('account.id')) { $z = @($z | Where-Object { $_.account.id -eq $req.Query['account.id'] }) }
     return Ok $z
   }
@@ -123,6 +137,7 @@ $handler = {
     $db.apps.Remove($app[0])
     return Ok ([pscustomobject]@{ id = $id })
   }
+  if ($tokenProfile -ne 'Full' -and $p -eq '/_state') { return Fail 403 10000 'Authentication error' }
   if ($m -eq 'GET' -and $p -eq '/_state') { return Ok ([pscustomobject]@{ tunnels = @($db.tunnels); configs = $db.configs; dns = @($db.dns); apps = @($db.apps) }) }
   return Fail 404 7003 "No route for $m $p"
 }

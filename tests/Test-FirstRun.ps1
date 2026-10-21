@@ -143,8 +143,12 @@ try {
   Test-Condition 'service preview: 409 "install first"' ($r.Status -eq 409 -and $r.Data.error -match 'install') (Short $r)
   $r = Invoke-Ui POST '/api/backups/restore' @{ id = 'x'; confirm = $true }
   Test-Condition 'rollback: 409 "install first"' ($r.Status -eq 409) (Short $r)
-  $r = Invoke-Ui POST '/api/cloudflare/token' @{ token = ('x' * 40) }
-  Test-Condition 'API token save: 409 "install first" (no Cloudflare call)' ($r.Status -eq 409) (Short $r)
+  # The API token may be saved before installation (Test-Onboarding.ps1 covers that against the mock); a malformed
+  # one is refused locally, without any Cloudflare call.
+  $r = Invoke-Ui POST '/api/cloudflare/token' @{ token = 'not a token' }
+  Test-Condition 'malformed API token refused locally' ($r.Status -eq 400) (Short $r)
+  $r = Invoke-Ui GET '/api/setup'
+  Test-Condition 'setup wizard data: not installed, default settings, no deployment chosen' ($r.Status -eq 200 -and $r.Data.installed -eq $false -and $r.Data.settingsSource -eq 'defaults' -and -not $r.Data.deployment.mode -and $r.Data.cloudflare.tokenStored -eq $false) (Short $r)
   $r = Invoke-Ui POST '/api/cloudflare/connector' @{ confirm = $true }
   Test-Condition 'connector: 409' ($r.Status -eq 409) (Short $r)
 

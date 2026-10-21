@@ -38,7 +38,7 @@ function Start-WebUiServer {
   $out = Join-Path $WorkDir 'webui.out'
   Remove-Item -LiteralPath $urlFile, $stop -ErrorAction SilentlyContinue
   $args2 = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$Script`"", '-Port', $port, '-InstallPath', "`"$InstallPath`"", '-NoBrowser',
-    '-LaunchUrlFile', "`"$urlFile`"", '-StopFile', "`"$stop`"")
+    '-LaunchUrlFile', "`"$urlFile`"", '-StopFile', "`"$stop`"", '-StateFile', "`"$(Join-Path $WorkDir 'webui-state.json')`"")
   if ($ApiBase) { $args2 += @('-CloudflareApiBase', $ApiBase) }
   $p = Start-Process powershell.exe -PassThru -WindowStyle Hidden -RedirectStandardOutput $out -RedirectStandardError ($out + '.err') -ArgumentList $args2
   if (-not (Wait-TcpPort $port 40)) { throw ('Web UI did not start: ' + (Get-Content -Raw -LiteralPath ($out + '.err') -ErrorAction SilentlyContinue)) }

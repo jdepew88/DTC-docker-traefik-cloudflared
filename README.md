@@ -37,6 +37,7 @@ traefik --socket-internal (internal)--> socket-proxy --> docker.sock (read-only,
 | Interactive wizard (`-Wizard`, `-AddApp`) | **Implemented**; uses the shared service backend. The Cloudflare steps have **not** been run end to end against a real tunnel from this repository. |
 | Cloudflare Tunnel connector (`cloudflared`) | Compose service and token handling implemented; **not live-validated** in this repository. |
 | Browser-based setup and management UI (`webui.ps1`) | **Implemented and tested** against a Cloudflare API mock and a live isolated instance. Not yet run against the real Cloudflare API. |
+| Cloudflare-first onboarding (token template link, permission discovery, domain allowlist, local-only path) | **Implemented and mock-tested**, including a confirmed local-only install of a disposable instance. The template link has not been opened against a real Cloudflare account. |
 | Cloudflare API automation (tunnel create, connector token, DNS, tunnel routes, Access apps) | **Implemented and mock-tested**; DPAPI-encrypted API token. |
 
 ## Requirements
@@ -92,6 +93,31 @@ On a new machine, start it from the repository: modules, scripts and the install
 and logs, so it does not need to exist yet. Until the stack is installed, status, logs, validation and
 diagnostics report *Not installed*; the Setup page installs it.
 
+**First run (Setup page).** The wizard starts with Cloudflare and changes nothing in Docker or Cloudflare until
+you confirm the installation in its last step:
+
+1. **Connect Cloudflare.** *Create Cloudflare API Token* opens Cloudflare's pre-filled token page
+   (`dash.cloudflare.com/profile/api-tokens?permissionGroupKeys=...&accountId=*&zoneId=all`) asking for
+   *Zone > Zone > Read*, *Zone > DNS > Edit*, *Account > Cloudflare Tunnel > Edit* and, optionally,
+   *Account > Access: Apps and Policies > Edit*. Restrict the accounts and zones there before creating the token.
+   Cloudflare shows the token only once: copy it, paste it into the masked field, then close the Cloudflare tab.
+   The token is verified, stored with DPAPI (never in a URL, the browser, logs or Git), and read-only calls show
+   which accounts, domains, tunnels and permissions it has; missing permissions are explained. One visible
+   domain is allowed automatically; with several, you choose. Services can only be published under these
+   allowed domains. You can replace or remove the token at any time, or **skip** this step for a local-only
+   installation.
+2. **Docker Desktop** checks (read-only).
+3. **Install folder and instance settings**: the folder (changeable until installed and remembered for the
+   next start) and the name, ports, network and tunnel subnet, with *Suggest free values* and a conflict check
+   against existing containers, ports and networks.
+4. **Deployment method**: *Cloudflare Tunnel* (new or existing dashboard-managed tunnel) or *Local only*.
+   *Public IP with port forwarding* is shown as not supported by this version.
+5. **Domains and DNS**: the allowed domains; DNS records are created per service, after their own preview.
+6. **HTTPS certificates**: provided by Cloudflare at its edge in tunnel mode. Let's Encrypt is not available in
+   this version, so no ACME email is asked for.
+7. **Review and install**: a preview of every step (with an installer dry run), then the confirmed installation
+   (write `.env`, create the tunnel if requested, install the connector token, `install.ps1 -Start`).
+
 **Adding a service** (Services > Add a service): enter a name, pick a domain (loaded from Cloudflare) and a
 subdomain, the backend IP address or hostname and port. The target type is detected (container name,
 `localhost` = this PC, IP / DNS name = network device) and can be overridden. Choose who can reach it (Cloudflare
@@ -116,7 +142,10 @@ Cloudflare safety rules:
 - Without a token, every preview lists the exact manual steps for the Cloudflare dashboard instead.
 
 Scoped token permissions: *Account > Cloudflare Tunnel > Edit*, *Account > Access: Apps and Policies > Edit*
-(only for automatic Access), *Zone > DNS > Edit* and *Zone > Zone > Read* for the zones you use.
+(only for automatic Access), *Zone > DNS > Edit* and *Zone > Zone > Read* for the zones you use. The template
+link uses Cloudflare's documented keys `zone`, `dns` and `access`; for Cloudflare Tunnel it uses `argotunnel`,
+which works in other tools' links but is not in Cloudflare's published key table. If Cloudflare's page does not
+list Cloudflare Tunnel, add it by hand; the permission check after pasting the token reports it either way.
 
 Security of the interface itself: it listens on a `127.0.0.1` socket only (not reachable from the LAN), needs
 the sign-in link (HttpOnly, SameSite=Strict session cookie), rejects foreign `Host` headers (DNS rebinding),
@@ -308,6 +337,8 @@ container on this PC already uses.
 .\tests\Test-ServiceConfig.ps1          # 63 checks: generator, validation, plan/apply, rollback, deep validation
 .\tests\Test-WebUi.ps1                  # web UI + Cloudflare automation against a loopback Cloudflare API mock
 .\tests\Test-FirstRun.ps1               # first run: web UI and diagnostics from the source folder, nothing installed yet
+.\tests\Test-Onboarding.ps1             # Cloudflare-first wizard against the mock: token link, discovery, permissions,
+                                        # allowlist, local-only, preview, confirmed install of a disposable instance
 .\tests\Invoke-IsolatedTest.ps1         # (repository only) disposable second instance: install, live tests,
                                         # services.ps1 walkthrough with docker/LAN/host targets, a web UI
                                         # end-to-end change (mock Cloudflare), teardown
