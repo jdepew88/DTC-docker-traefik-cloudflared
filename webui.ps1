@@ -31,8 +31,14 @@ param(
   # Tests only: write the launch link here instead of printing/opening it, and stop when StopFile appears.
   [string]$LaunchUrlFile,
   [string]$StopFile,
-  # Where the last used install folder is remembered (default: %LOCALAPPDATA%\TraefikProxy\webui.json).
-  [string]$StateFile
+  # Where the last used install folder and the recent projects are remembered (default: %LOCALAPPDATA%\TraefikProxy\webui.json).
+  [string]$StateFile,
+  # Folder whose subfolders are offered as existing deployments (default: %USERPROFILE%\.docker\projects).
+  [string]$ProjectsRoot,
+  # Launcher mode (Start-DeploymentManager.ps1): the sign-in link is written to -LaunchUrlFile only (never printed),
+  # works once and is replaced by a new one after use; -OpenBrowser opens it.
+  [switch]$SingleUseLaunch,
+  [switch]$OpenBrowser
 )
 
 $ErrorActionPreference = 'Stop'
@@ -42,10 +48,14 @@ Import-Module (Join-Path $here 'lib\TraefikProxy.psm1') -Force
 Import-Module (Join-Path $here 'lib\CloudflareApi.psm1') -Force
 Import-Module (Join-Path $here 'lib\Dashboard.psm1') -Force
 Import-Module (Join-Path $here 'lib\ConfigBackup.psm1') -Force
+Import-Module (Join-Path $here 'lib\ProjectDiscovery.psm1') -Force
 Import-Module (Join-Path $here 'lib\LocalHttp.psm1') -Force
 Set-CloudflareApiBase $CloudflareApiBase
 
 if (-not $StateFile) { $StateFile = Join-Path $env:LOCALAPPDATA 'TraefikProxy\webui.json' }
+if (-not $ProjectsRoot) { $ProjectsRoot = Join-Path $env:USERPROFILE '.docker\projects' }
+# With an explicit -InstallPath the deployment is chosen; otherwise the website starts on the project chooser.
+$ProjectChosen = $PSBoundParameters.ContainsKey('InstallPath')
 # Install folder: -InstallPath, else this folder when it is an installation, else the folder chosen last time in the
 # setup wizard, else the default.
 if (-not $InstallPath) {
@@ -75,6 +85,8 @@ $State = @{
   Sessions  = @{}
   Plans     = @{}
   Imports   = @{}
+  Chosen    = $ProjectChosen
+  Upgrades  = @{}
   Cookie    = "tpx_session_$Port"
   Origins   = @("http://127.0.0.1:$Port", "http://localhost:$Port")
   Hosts     = @("127.0.0.1:$Port", "localhost:$Port")
@@ -98,6 +110,7 @@ $StaticFiles = @{
   '/logic.js'   = @('logic.js', 'text/javascript; charset=utf-8')
   '/setup.js'   = @('setup.js', 'text/javascript; charset=utf-8')
   '/pages.js'   = @('pages.js', 'text/javascript; charset=utf-8')
+  '/projects.js' = @('projects.js', 'text/javascript; charset=utf-8')
   '/learn.json' = @('learn.json', 'application/json; charset=utf-8')
   '/app.css'    = @('app.css', 'text/css; charset=utf-8')
   '/icon.svg'   = @('icon.svg', 'image/svg+xml')
@@ -170,9 +183,35 @@ function New-Download([string]$FileName, [string]$ContentType, $Body) {
   return [pscustomobject]@{ IsDownload = $true; FileName = $FileName; ContentType = $ContentType; Body = $Body }
 }
 
-# Remembers the install folder for the next start of webui.ps1 (only the path; nothing secret).
+# Manager state outside every deployment: the last used folder and the recent projects (paths and names only).
+function Read-ManagerState {
+  $st = [ordered]@{ installPath = ''; recent = @() }
+  try {
+    if (Test-Path -LiteralPath $StateFile) {
+      $j = [IO.File]::ReadAllText($StateFile) | ConvertFrom-Json
+      if ($j.PSObject.Properties['installPath']) { $st.installPath = [string]$j.installPath }
+      if ($j.PSObject.Properties['recent'] -and $j.recent) {
+        $st.recent = @($j.recent | Where-Object { $_ -and $_.PSObject.Properties['path'] -and [string]$_.path -match '^[A-Za-z]:\\' } | ForEach-Object {
+            [ordered]@{ path = [string]$_.path; stackName = [string](Get-Field $_ 'stackName' ''); lastOpened = [string](Get-Field $_ 'lastOpened' '') } })
+      }
+    }
+  } catch { }
+  if ($st.installPath -and @($st.recent | Where-Object { Test-SamePath $_.path $st.installPath }).Count -eq 0) { $st.recent = @([ordered]@{ path = $st.installPath; stackName = ''; lastOpened = '' }) + @($st.recent) }
+  return $st
+}
+
+function Save-ManagerState($St) {
+  try { Write-TextFileAtomic $StateFile ((ConvertTo-Json -InputObject $St -Depth 4) + "`n") } catch { }
+}
+
+# Remembers the install folder for the next start and puts it on top of the recent projects (nothing secret).
 function Save-RememberedPath {
-  try { Write-TextFileAtomic $StateFile ((ConvertTo-Json -InputObject ([ordered]@{ installPath = $InstallPath }) -Compress) + "`n") } catch { }
+  $st = Read-ManagerState
+  $name = ''
+  try { $name = (Get-Settings).StackName } catch { }
+  $st.installPath = $InstallPath
+  $st.recent = @(@([ordered]@{ path = $InstallPath; stackName = $name; lastOpened = (Get-Date -Format 's') }) + @($st.recent | Where-Object { -not (Test-SamePath $_.path $InstallPath) }) | Select-Object -First 20)
+  Save-ManagerState $st
 }
 
 function Test-Installed { return (Test-Path -LiteralPath (Join-Path $InstallPath 'compose.yaml')) }
@@ -1376,8 +1415,10 @@ function Get-OverviewData {
     $recent = @($text -split "`r?`n" | Where-Object { $_ -match '^\d{4}-' } | Select-Object -Last 8)
     [array]::Reverse($recent)
   }
+  $upgrade = $null
+  if ($installed) { try { $upgrade = Get-UpgradeStatus -Path $InstallPath -SourceRoot $here } catch { } }
   return [ordered]@{
-    installed = $installed; mode = $mode; status = $status; dashboard = $dash; tunnel = $tunnel
+    installed = $installed; mode = $mode; status = $status; dashboard = $dash; tunnel = $tunnel; upgrade = $upgrade; path = $InstallPath
     domains = @($cf.domains); services = [ordered]@{ total = $services.Count; enabled = @($services | Where-Object { $_.enabled }).Count; published = @($services | Where-Object { $_.enabled -and $_.cloudflare.publish }).Count }
     warnings = $warnings; recent = $recent
   }
@@ -1419,11 +1460,147 @@ function Get-ExpertConfigData {
   }
 }
 
+# --- Projects: discover, attach, start new, upgrade --------------------------------------------------------------
+# Attach opens an existing deployment as it is: nothing in its folder, in Docker or in Cloudflare changes. Upgrade
+# updates its application files (a separate, confirmed step). Restore (Backups page) recovers configuration from a file.
+
+function Get-ProjectPathFromBody($Body) {
+  try { return ConvertTo-ProjectPath ([string](Get-Field $Body 'path' '')) } catch { Stop-Request 400 $_.Exception.Message }
+}
+
+function Get-ProjectsData {
+  $st = Read-ManagerState
+  $remembered = @($st.recent | ForEach-Object { $_.path })
+  $candidates = @(Find-ProjectCandidates -Remembered $remembered -SourceRoot $here -ProjectsRoot $ProjectsRoot)
+  $list = @(foreach ($c in $candidates) {
+      $sum = Get-ProjectSummary -Path $c.path -SourceRoot $here
+      if ($sum.kind -in @('other', 'package') -and @($c.sources) -notcontains 'recent') { continue }
+      $rec = @($st.recent | Where-Object { Test-SamePath $_.path $c.path })
+      [ordered]@{ summary = $sum; sources = @($c.sources); recent = ($rec.Count -gt 0); lastOpened = $(if ($rec.Count) { $rec[0].lastOpened } else { '' }); active = ((Test-SamePath $c.path $InstallPath) -and $State.Chosen) }
+    })
+  $list = @($list | Sort-Object @{ e = { -not $_.active } }, @{ e = { -not $_.recent } }, @{ e = { $_.lastOpened }; Descending = $true })
+  return [ordered]@{
+    chosen = [bool]$State.Chosen; activePath = $InstallPath; activeInstalled = (Test-Installed)
+    projects = $list; projectsRoot = $ProjectsRoot; sourcePath = $here
+    suggestedNewPath = (Get-NewProjectSuggestion)
+  }
+}
+
+# A free folder name under the Docker projects folder for a new deployment.
+function Get-NewProjectSuggestion {
+  $base = Join-Path $ProjectsRoot 'traefik-proxy'
+  if (-not (Test-Path -LiteralPath $base)) { return $base }
+  for ($i = 2; $i -le 50; $i++) { $p = "$base-$i"; if (-not (Test-Path -LiteralPath $p)) { return $p } }
+  return "$base-new"
+}
+
+function Invoke-ProjectInspect($Body) {
+  $path = Get-ProjectPathFromBody $Body
+  $r = Get-ProjectInspection -Path $path -SourceRoot $here -Cloudflare:([bool](Get-Field $Body 'cloudflare' $true))
+  return $r
+}
+
+# Makes the folder the active project. Reads only; resets previews that belonged to the previous project.
+function Set-ActiveProject([string]$Path) {
+  $script:InstallPath = $Path
+  $State.Chosen = $true
+  $State.Plans.Clear(); $State.Imports.Clear(); $State.Upgrades.Clear()
+  Save-RememberedPath
+}
+
+function Invoke-ProjectAttach($Body) {
+  $path = Get-ProjectPathFromBody $Body
+  $kind = Get-ProjectKind $path
+  if ($kind -eq 'missing') { Stop-Request 404 "The folder $path does not exist (moved or deleted). Remove it from the list or choose its new location." }
+  if ($kind -eq 'legacy') { Stop-Request 409 'This folder uses the earlier single-app layout, which this manager does not manage. It was left unchanged. See "Migrating from the earlier single-app layout" in the README.' }
+  if ($kind -in @('other', 'package')) { Stop-Request 409 "$path is not a deployment of this tool. Choose the folder that contains its .env and compose.yaml, or start a new deployment." }
+  $i = Get-ProjectInspection -Path $path -SourceRoot $here -NoDocker
+  if (-not $i.usable) { Stop-Request 409 ('This deployment cannot be opened: ' + (@($i.blockers) -join ' ')) }
+  Set-ActiveProject $path
+  return [ordered]@{ attached = $true; path = $path; installed = (Test-Installed); stackName = (Get-Settings).StackName }
+}
+
+# A new deployment in a folder without one. Nothing is written until the setup journey saves its first choice.
+function Invoke-ProjectNew($Body) {
+  $path = Get-ProjectPathFromBody $Body
+  $kind = Get-ProjectKind $path
+  if ($kind -in @('manager', 'legacy')) { Stop-Request 409 "$path already contains a deployment. Open it instead (Continue where you left off); starting a new deployment there is refused." @{ needsAttach = $true } }
+  if ($kind -eq 'package') { Stop-Request 409 'That is a copy of the manager itself. Choose an empty folder for the new deployment.' }
+  if ($kind -eq 'other' -and @(Get-ChildItem -LiteralPath $path -Force -ErrorAction SilentlyContinue).Count -gt 0) { Stop-Request 409 "$path is not empty. Choose an empty or new folder for the deployment." }
+  Set-ActiveProject $path
+  return [ordered]@{ path = $path; draft = ($kind -eq 'draft') }
+}
+
+function Invoke-ProjectForget($Body) {
+  $path = Get-ProjectPathFromBody $Body
+  $st = Read-ManagerState
+  $st.recent = @($st.recent | Where-Object { -not (Test-SamePath $_.path $path) })
+  if (Test-SamePath $st.installPath $path) { $st.installPath = '' }
+  Save-ManagerState $st
+  return [ordered]@{ removed = $path }
+}
+
+function Get-FolderBrowseData([string]$Path) {
+  $roots = @(Get-FolderRoots)
+  if (-not $Path) { $Path = $(if (Test-Path -LiteralPath $ProjectsRoot) { $ProjectsRoot } else { $env:USERPROFILE }) }
+  try { $l = Get-FolderListing -Path $Path } catch { Stop-Request 400 $_.Exception.Message }
+  return [ordered]@{ path = $l.path; parent = $l.parent; kind = $l.kind; entries = @($l.entries); roots = $roots }
+}
+
+# install.ps1 -DryRun for a deployment folder: which application files an upgrade would update (changes nothing).
+function Invoke-UpgradePreview($Body) {
+  $path = Get-ProjectPathFromBody $Body
+  if ((Get-ProjectKind $path) -ne 'manager') { Stop-Request 409 'Only an installed deployment of this tool can be upgraded.' }
+  $u = Get-UpgradeStatus -Path $path -SourceRoot $here
+  $r = Invoke-PowerShellFile (Join-Path $here 'install.ps1') @('-InstallPath', $path, '-DryRun')
+  $files = @($r.Lines | ForEach-Object {
+      if ($_ -match '^\s+\[dry-run\] (update|add)\s+(\S+)') { [ordered]@{ action = $Matches[1]; file = $Matches[2] } }
+      elseif ($_ -match '^\s+\[dry-run\] keep\s+(\S+)') { [ordered]@{ action = 'keep'; file = $Matches[1] } } })
+  $key = Get-TextSha256 ((ConvertTo-Json -Compress -Depth 4 -InputObject @($path, $u.changed, $u.added, $u.modified)))
+  $State.Upgrades[$key] = [pscustomobject]@{ Path = $path; Created = (Get-Date) }
+  return [ordered]@{
+    path = $path; upgrade = $u; ok = ($r.ExitCode -eq 0); files = $files; lines = $r.Lines; previewKey = $key
+    notes = @(
+      'Only application files (scripts, web pages, packaged Traefik files) are updated. .env, config\, secrets\, generated routes, backups and logs are kept.'
+      'Files you edited by hand are kept; the new version is written next to them as <file>.dist.'
+      $(if ($u.composeChanged) { 'compose.yaml changes: the running containers keep their current settings until you restart the instance (install.ps1 -Start). Nothing is restarted by the upgrade.' } else { 'compose.yaml is unchanged: no container needs a restart.' })
+      'The previous copies are saved in backups\<time>\ and can be restored with install.ps1 -Rollback.'
+    )
+  }
+}
+
+function Invoke-UpgradeApply($Body) {
+  Assert-Confirmed $Body
+  $path = Get-ProjectPathFromBody $Body
+  $key = [string](Get-Field $Body 'previewKey' '')
+  if (-not $key -or -not $State.Upgrades.ContainsKey($key) -or -not (Test-SamePath $State.Upgrades[$key].Path $path)) { Stop-Request 409 'Preview the upgrade first.' }
+  $u = Get-UpgradeStatus -Path $path -SourceRoot $here
+  $now = Get-TextSha256 ((ConvertTo-Json -Compress -Depth 4 -InputObject @($path, $u.changed, $u.added, $u.modified)))
+  if ($now -ne $key) { Stop-Request 409 'The files changed since the preview. Preview the upgrade again.' }
+  $State.Upgrades.Remove($key)
+  $recovery = $null
+  try { $recovery = New-RecoveryPoint -Settings (Get-ProjectSettings $path) -Reason 'before upgrade' -SourceRoot $here } catch { Stop-Request 500 "No change was made: the recovery point could not be written ($($_.Exception.Message))." }
+  $r = Invoke-PowerShellFile (Join-Path $here 'install.ps1') @('-InstallPath', $path)
+  if (Test-SamePath $path $InstallPath) { Write-Audit 'upgrade' "exit=$($r.ExitCode) recovery=$recovery" }
+  return [ordered]@{ ok = ($r.ExitCode -eq 0); lines = $r.Lines; recoveryPoint = $recovery; upgrade = (Get-UpgradeStatus -Path $path -SourceRoot $here) }
+}
+
+function Invoke-ManagerStop($Body) {
+  Assert-Confirmed $Body
+  if (-not $StopFile) { Stop-Request 409 'This manager was started without a stop file. Close its PowerShell window (or press Ctrl+C there) to stop it.' }
+  [IO.File]::WriteAllText($StopFile, 'stop')
+  return [ordered]@{ stopping = $true }
+}
+
 # --- Router ----------------------------------------------------------------------------------------------------
 
 function Invoke-ApiRoute($Request, $Body) {
   $m = $Request.Method
   $p = $Request.Path
+  # Until a deployment is chosen, nothing may change any folder: only the project and manager actions are allowed.
+  if (-not $State.Chosen -and $m -ne 'GET' -and -not ($p.StartsWith('/api/projects/') -or $p -eq '/api/manager/stop')) {
+    Stop-Request 409 'Choose a deployment first (open an existing one or start a new one).'
+  }
   $settings = Get-Settings
   switch -Exact ("$m $p") {
     'GET /api/session' { return [ordered]@{ ok = $true } }
@@ -1463,6 +1640,15 @@ function Invoke-ApiRoute($Request, $Body) {
     }
     'POST /api/backups/import/preview' { return Invoke-ImportPreview $Body }
     'POST /api/backups/import/apply' { return Invoke-ImportApply $Body }
+    'GET /api/projects' { return Get-ProjectsData }
+    'POST /api/projects/inspect' { return Invoke-ProjectInspect $Body }
+    'POST /api/projects/attach' { return Invoke-ProjectAttach $Body }
+    'POST /api/projects/new' { return Invoke-ProjectNew $Body }
+    'POST /api/projects/forget' { return Invoke-ProjectForget $Body }
+    'GET /api/projects/browse' { return Get-FolderBrowseData ([string]$Request.Query['path']) }
+    'POST /api/projects/upgrade/preview' { return Invoke-UpgradePreview $Body }
+    'POST /api/projects/upgrade/apply' { return Invoke-UpgradeApply $Body }
+    'POST /api/manager/stop' { return Invoke-ManagerStop $Body }
     'GET /api/dashboard' { return Get-DashboardData }
     'POST /api/dashboard/settings' { return Save-DashboardSettingsRequest $Body }
     'GET /api/overview' { return Get-OverviewData }
@@ -1579,6 +1765,9 @@ function Invoke-Request($Request) {
       if (-not (Test-ConstantTimeEqual ([string]$Request.Query['k']) $State.LaunchKey)) { return @{ Status = 403; Body = "Invalid or expired link. Use the link printed by webui.ps1.`n"; Headers = $SecurityHeaders } }
       $sid = New-RandomKey
       $State.Sessions[$sid] = [pscustomobject]@{ Csrf = (New-RandomKey); Created = (Get-Date) }
+      # Launcher mode: a link works once (it may linger in browser history or a process listing); the next one is
+      # written to the user-only link file for "open again".
+      if ($SingleUseLaunch) { $State.LaunchKey = New-RandomKey; Write-LaunchUrlFile }
       $h = @{} + $SecurityHeaders
       $h['Set-Cookie'] = "$($State.Cookie)=$sid; Path=/; HttpOnly; SameSite=Strict"
       $h['Location'] = '/'
@@ -1607,7 +1796,7 @@ function Invoke-Request($Request) {
   }
   try {
     $data = Invoke-ApiRoute $Request $body
-    if ($Request.Path -eq '/api/session') { $data = [ordered]@{ ok = $true; csrf = $session.Csrf; installPath = $InstallPath } }
+    if ($Request.Path -eq '/api/session') { $data = [ordered]@{ ok = $true; csrf = $session.Csrf; installPath = $InstallPath; chosen = [bool]$State.Chosen; canStop = [bool]$StopFile } }
     if ($data -is [pscustomobject] -and $data.PSObject.Properties['IsDownload']) {
       $h = @{} + $SecurityHeaders
       $h['Content-Disposition'] = "attachment; filename=`"$($data.FileName -replace '[^A-Za-z0-9._-]', '_')`""
@@ -1626,13 +1815,27 @@ function Invoke-Request($Request) {
 
 # --- Start -------------------------------------------------------------------------------------------------------
 
+# The current sign-in link, readable by this Windows user only (the launcher reads it to open the browser again).
+function Write-LaunchUrlFile {
+  if (-not $LaunchUrlFile) { return }
+  $dir = Split-Path -Parent $LaunchUrlFile
+  if ($dir -and -not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
+  # Written to a temporary file that is restricted first, then moved into place: the link file never exists with
+  # default permissions, not even for a moment.
+  $tmp = "$LaunchUrlFile.tmp-" + [Guid]::NewGuid().ToString('N').Substring(0, 8)
+  [IO.File]::WriteAllText($tmp, "http://127.0.0.1:$Port/?k=$($State.LaunchKey)")
+  if ($SingleUseLaunch) { Set-SecretFileAcl $tmp }
+  Move-Item -LiteralPath $tmp -Destination $LaunchUrlFile -Force
+}
+
 try { $listener = New-LoopbackListener $Port }
 catch { throw "Cannot listen on 127.0.0.1:$Port ($($_.Exception.Message)). Is the web UI already running? Use -Port to pick another port." }
 $launchUrl = "http://127.0.0.1:$Port/?k=$($State.LaunchKey)"
-Write-Host "Traefik proxy web UI for $InstallPath" -ForegroundColor Cyan
+Write-Host "Deployment Manager (Traefik + Cloudflare) for $(if ($ProjectChosen) { $InstallPath } else { 'your deployments' })" -ForegroundColor Cyan
 Write-Host "Listening on http://127.0.0.1:$Port/ (this PC only). Press Ctrl+C to stop."
 if ($LaunchUrlFile) {
-  [IO.File]::WriteAllText($LaunchUrlFile, $launchUrl)
+  Write-LaunchUrlFile
+  if ($OpenBrowser -and -not $NoBrowser) { Start-Process "http://127.0.0.1:$Port/?k=$($State.LaunchKey)" }
 } else {
   Write-Host ''
   Write-Host 'Open this link (it signs this browser in; do not share it):' -ForegroundColor Yellow

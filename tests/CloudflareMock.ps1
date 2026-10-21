@@ -57,9 +57,10 @@ $handler = {
   #   One       only the zone example.test        NoZone    no Zone Read (no zones, no DNS)
   #   NoTunnel  no Cloudflare Tunnel permission    NoAccess  no Access permission
   #   Disabled  verify reports status 'disabled'   ReadOnly  reads everything, every write fails (403)
+  #   NoAccounts  like Full, but GET /accounts lists nothing (real tokens limited to account resources behave so)
   $tokenProfile = ''
   if ($auth -eq "Bearer $Token") { $tokenProfile = 'Full' }
-  elseif ($auth -match '^Bearer mock(One|NoZone|NoTunnel|NoAccess|Disabled|ReadOnly)_[A-Za-z0-9]{24,}$') { $tokenProfile = $Matches[1] }
+  elseif ($auth -match '^Bearer mock(One|NoZone|NoTunnel|NoAccess|Disabled|ReadOnly|NoAccounts)_[A-Za-z0-9]{24,}$') { $tokenProfile = $Matches[1] }
   $authOk = ($tokenProfile -eq 'Full')
   $entry = [ordered]@{ method = $req.Method; path = $req.Path; query = $req.Query; body = $req.Body; authOk = $authOk; profile = $tokenProfile }
   [IO.File]::AppendAllText($LogFile, (ConvertTo-Json -InputObject $entry -Compress -Depth 5) + "`n")
@@ -78,7 +79,8 @@ $handler = {
     if ($tokenProfile -ne 'Full') { return Fail 403 9109 'Unauthorized to access requested resource' }
     return Ok ([pscustomobject]@{ id = 'user1'; email = 'owner@example.test' })
   }
-  if ($m -eq 'GET' -and $p -eq '/accounts') { return Ok $db.accounts }
+  if ($m -eq 'GET' -and $p -eq '/accounts') { if ($tokenProfile -eq 'NoAccounts') { return Ok @() }; return Ok $db.accounts }
+  if ($tokenProfile -eq 'NoAccounts' -and $m -ne 'GET') { return Fail 403 10000 'Authentication error' }
   if ($m -eq 'GET' -and $p -eq '/zones') {
     $z = @($db.zones)
     if ($tokenProfile -eq 'NoZone') { $z = @() }

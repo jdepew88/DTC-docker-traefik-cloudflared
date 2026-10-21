@@ -10,7 +10,7 @@ Set-StrictMode -Version 2.0
 
 $script:TraefikImage = 'traefik:v3.7.15'   # keep in sync with compose.yaml
 # Version of this manager (scripts + web UI). Recorded in configuration backups; bump it when the package changes.
-$script:ManagerVersion = '1.1.0'
+$script:ManagerVersion = '1.2.0'
 $script:RegistryVersion = 1
 $script:ManagedPrefix = 'svc-'
 $script:HostnamePattern = '^(?=.{1,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$'

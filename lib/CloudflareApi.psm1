@@ -387,11 +387,25 @@ function Get-CloudflareResourceCheck {
   $accountOk = $false
   if (-not $AccountId) { $out.Account = & $item '' '' 'none' 'The backup has no Cloudflare account.' }
   else {
-    try {
-      $acct = @(Invoke-CloudflareApi -Settings $Settings -Path '/accounts' -All | Where-Object { $_.id -eq $AccountId })
-      if ($acct.Count -gt 0) { $accountOk = $true; $out.Account = & $item $AccountId ([string]$acct[0].name) 'verified' "The API token can see account '$($acct[0].name)'." }
-      else { $out.Account = & $item $AccountId '' 'missing' 'The stored API token cannot see this account. Connect a token for the account the backup was made from.' }
-    } catch { $out.Account = & $item $AccountId '' 'unknown' $_.Exception.Message }
+    $acct = @()
+    try { $acct = @(Invoke-CloudflareApi -Settings $Settings -Path '/accounts' -All | Where-Object { $_.id -eq $AccountId }) } catch { }
+    if ($acct.Count -gt 0) { $accountOk = $true; $out.Account = & $item $AccountId ([string]$acct[0].name) 'verified' "The API token can see account '$($acct[0].name)'." }
+    else {
+      # Tokens limited to account resources often cannot list /accounts (that needs Account Settings Read) although they
+      # work on the account. Reading the account's tunnels proves access; only a refusal there means "missing".
+      $probe = if ($TunnelId) { "/accounts/$AccountId/cfd_tunnel/$TunnelId" } else { "/accounts/$AccountId/cfd_tunnel" }
+      try {
+        $null = Invoke-CloudflareApi -Settings $Settings -Path $probe -Query @{ per_page = 1 }
+        $accountOk = $true; $out.Account = & $item $AccountId '' 'verified' 'The API token can work on this account (it cannot list accounts, which is normal for tokens limited to account resources).'
+      } catch {
+        $code = Get-CfErrorStatus $_
+        if ($code -eq 404 -and $TunnelId) {
+          try { $null = Invoke-CloudflareApi -Settings $Settings -Path "/accounts/$AccountId/cfd_tunnel" -Query @{ per_page = 1 }; $accountOk = $true; $out.Account = & $item $AccountId '' 'verified' 'The API token can work on this account.' }
+          catch { $out.Account = & $item $AccountId '' 'missing' 'The stored API token cannot see this account. Connect a token for the account this deployment uses.' }
+        } elseif ($code -in @(401, 403, 404)) { $out.Account = & $item $AccountId '' 'missing' 'The stored API token cannot see this account. Connect a token for the account this deployment uses.' }
+        else { $out.Account = & $item $AccountId '' 'unknown' $_.Exception.Message }
+      }
+    }
   }
   if (-not $TunnelId) { $out.Tunnel = & $item '' '' 'none' 'The backup has no tunnel.' }
   elseif (-not $accountOk) { $out.Tunnel = & $item $TunnelId '' 'unknown' 'The tunnel cannot be checked without access to its account.' }

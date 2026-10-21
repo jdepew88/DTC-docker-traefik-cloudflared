@@ -31,15 +31,19 @@ function Start-CloudflareMock {
 }
 
 function Start-WebUiServer {
-  param([Parameter(Mandatory = $true)][string]$Script, [Parameter(Mandatory = $true)][string]$InstallPath, [Parameter(Mandatory = $true)][string]$WorkDir, [string]$ApiBase)
+  # Without -InstallPath the web UI starts on the project chooser (as when started by START-HERE.cmd).
+  param([Parameter(Mandatory = $true)][string]$Script, [string]$InstallPath, [Parameter(Mandatory = $true)][string]$WorkDir, [string]$ApiBase, [string[]]$ExtraArgs = @(), [string]$StateFile)
   $port = Get-FreeTcpPort
   $urlFile = Join-Path $WorkDir 'webui.url'
   $stop = Join-Path $WorkDir 'webui.stop'
   $out = Join-Path $WorkDir 'webui.out'
   Remove-Item -LiteralPath $urlFile, $stop -ErrorAction SilentlyContinue
-  $args2 = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$Script`"", '-Port', $port, '-InstallPath', "`"$InstallPath`"", '-NoBrowser',
-    '-LaunchUrlFile', "`"$urlFile`"", '-StopFile', "`"$stop`"", '-StateFile', "`"$(Join-Path $WorkDir 'webui-state.json')`"")
+  if (-not $StateFile) { $StateFile = Join-Path $WorkDir 'webui-state.json' }
+  $args2 = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$Script`"", '-Port', $port, '-NoBrowser',
+    '-LaunchUrlFile', "`"$urlFile`"", '-StopFile', "`"$stop`"", '-StateFile', "`"$StateFile`"")
+  if ($InstallPath) { $args2 += @('-InstallPath', "`"$InstallPath`"") }
   if ($ApiBase) { $args2 += @('-CloudflareApiBase', $ApiBase) }
+  $args2 += $ExtraArgs
   $p = Start-Process powershell.exe -PassThru -WindowStyle Hidden -RedirectStandardOutput $out -RedirectStandardError ($out + '.err') -ArgumentList $args2
   if (-not (Wait-TcpPort $port 40)) { throw ('Web UI did not start: ' + (Get-Content -Raw -LiteralPath ($out + '.err') -ErrorAction SilentlyContinue)) }
   $deadline = (Get-Date).AddSeconds(10)
