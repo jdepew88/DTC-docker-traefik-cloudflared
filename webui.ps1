@@ -94,6 +94,11 @@ $StaticFiles = @{
   '/'           = @('index.html', 'text/html; charset=utf-8')
   '/index.html' = @('index.html', 'text/html; charset=utf-8')
   '/app.js'     = @('app.js', 'text/javascript; charset=utf-8')
+  '/ui.js'      = @('ui.js', 'text/javascript; charset=utf-8')
+  '/logic.js'   = @('logic.js', 'text/javascript; charset=utf-8')
+  '/setup.js'   = @('setup.js', 'text/javascript; charset=utf-8')
+  '/pages.js'   = @('pages.js', 'text/javascript; charset=utf-8')
+  '/learn.json' = @('learn.json', 'application/json; charset=utf-8')
   '/app.css'    = @('app.css', 'text/css; charset=utf-8')
   '/icon.svg'   = @('icon.svg', 'image/svg+xml')
 }
@@ -299,8 +304,9 @@ function Get-ServiceFromBody($Body) {
   $resolved = Resolve-Target $target
   $hostnames = @(Get-Field $svc 'hostnames' @())
   if ($hostnames.Count -gt 20) { Stop-Request 400 'At most 20 hostnames per service.' }
+  $displayName = ([string](Get-Field $svc 'displayName' '')).Trim()
   $definition = ConvertTo-ServiceDefinition @{
-    name = Get-Field $svc 'name' ''; description = ([string](Get-Field $svc 'description' '')).Substring(0, [Math]::Min(200, ([string](Get-Field $svc 'description' '')).Length))
+    name = Get-Field $svc 'name' ''; displayName = $displayName.Substring(0, [Math]::Min(80, $displayName.Length)); description = ([string](Get-Field $svc 'description' '')).Substring(0, [Math]::Min(200, ([string](Get-Field $svc 'description' '')).Length))
     enabled = [bool](Get-Field $svc 'enabled' $true); hostnames = $hostnames; pathPrefix = Get-Field $svc 'pathPrefix' ''
     stripPrefix = [bool](Get-Field $svc 'stripPrefix' $false); middlewares = @(Get-Field $svc 'middlewares' @('default-headers@file'))
     target = @{ type = $resolved.Type; host = $resolved.Host; port = (Get-Field $target 'port' 0); protocol = (Get-Field $target 'protocol' 'http'); tlsSkipVerify = [bool](Get-Field $target 'tlsSkipVerify' $false) }
@@ -683,9 +689,15 @@ function Get-DashboardData {
     enabled      = $dash.enabled
     hostname     = $dash.hostname
     publicUrl    = $(if ($dash.enabled -and $dash.hostname) { "https://$($dash.hostname)/dashboard/" } else { '' })
-    subdomain    = $(if ($dash.subdomain) { $dash.subdomain } else { Get-DashboardDefaultSubdomain $settings })
+    # Follows the instance name until the user edits it (or it was published / restored with another name).
+    subdomain    = $(if ($dash.enabled -and $dash.subdomain) { $dash.subdomain } elseif ($dash.subdomainCustom -and $dash.subdomain) { $dash.subdomain } else { Get-DashboardDefaultSubdomain $settings })
+    subdomainCustom = [bool]($dash.subdomainCustom -and $dash.subdomain)
+    defaultSubdomain = Get-DashboardDefaultSubdomain $settings
+    publish      = [bool]$dash.publish
+    configured   = (Test-Path -LiteralPath (Join-Path $InstallPath 'config\dashboard.json'))
     zoneId       = $suggestZone
     accessEmails = @($dash.accessEmails)
+    contactEmail = (Read-SetupDraft).contactEmail
     domains      = @($cf.domains)
     cloudflareReady = [bool]($token.Stored -and $token.Readable -and $cf.accountId -and $cf.tunnelId)
     tunnelName   = $cf.tunnelName
@@ -718,13 +730,44 @@ function ConvertTo-DashboardPlanView($Plan, [string]$PlanId) {
   }
 }
 
+# Dashboard choices made during setup (before or after installation). Nothing in Traefik or Cloudflare changes.
+function Save-DashboardSettingsRequest($Body) {
+  $settings = Get-Settings
+  $cfg = Read-DashboardConfig -Settings $settings
+  $cf = Read-CloudflareConfig -Settings $settings
+  $custom = [bool](Get-Field $Body 'subdomainCustom' $false)
+  $sub = ([string](Get-Field $Body 'subdomain' '')).Trim().ToLowerInvariant().TrimEnd('.')
+  if ($custom -and -not (Test-DashboardSubdomain $sub)) { Stop-Request 400 "'$sub' is not a valid subdomain (letters, digits and dashes)." }
+  $zoneId = [string](Get-Field $Body 'zoneId' '')
+  $zone = @($cf.domains | Where-Object { $_.id -eq $zoneId })
+  if ($zoneId -and $zone.Count -eq 0) { Stop-Request 400 'Choose one of the allowed Cloudflare domains.' }
+  $emails = Get-AccessEmailsFromBody $Body
+  if ($cfg.enabled -and (($custom -and $sub -ne $cfg.subdomain) -or ($zoneId -and $zoneId -ne $cfg.zoneId))) { Stop-Request 409 "The dashboard is published as $($cfg.hostname). Remove it first to change its name." }
+  if (-not $cfg.enabled) {
+    $cfg.subdomainCustom = $custom
+    $cfg.subdomain = $(if ($custom) { $sub } else { '' })
+    if ($zone.Count -gt 0) { $cfg.zoneId = $zone[0].id; $cfg.zoneName = $zone[0].name }
+  }
+  $cfg.accessEmails = @($emails)
+  $cfg.publish = [bool](Get-Field $Body 'publish' $cfg.publish)
+  Save-DashboardConfig -Settings $settings -Config $cfg
+  Save-RememberedPath
+  Write-Audit 'dashboard-settings' "publish=$($cfg.publish) custom=$custom"
+  return Get-DashboardData
+}
+
 function Get-DashboardPlanFromBody($Body) {
-  Assert-Installed
   $settings = Get-Settings
   $registry = Read-ServiceRegistry -Settings $settings
   $disable = [bool](Get-Field $Body 'disable' $false)
   $emails = Get-AccessEmailsFromBody $Body
-  return Get-DashboardPlan -Settings $settings -Subdomain ([string](Get-Field $Body 'subdomain' '')) -ZoneId ([string](Get-Field $Body 'zoneId' '')) -AccessEmails $emails -Disable:$disable -Services @($registry.services)
+  # Before installation the chosen existing tunnel is only in the setup draft; plan against it (read-only).
+  $cfConfig = Read-CloudflareConfig -Settings $settings
+  $draft = Read-SetupDraft
+  if (-not (Test-Installed) -and -not $cfConfig.tunnelId -and $draft.deployment.mode -eq 'tunnel' -and $draft.deployment.tunnelChoice -eq 'existing' -and $draft.deployment.tunnelId) {
+    $cfConfig.tunnelId = $draft.deployment.tunnelId; $cfConfig.tunnelName = $draft.deployment.tunnelName
+  }
+  return Get-DashboardPlan -Settings $settings -Subdomain ([string](Get-Field $Body 'subdomain' '')) -ZoneId ([string](Get-Field $Body 'zoneId' '')) -AccessEmails $emails -Disable:$disable -Services @($registry.services) -CloudflareConfig $cfConfig
 }
 
 function Invoke-DashboardPlanRequest($Body) {
@@ -737,6 +780,7 @@ function Invoke-DashboardPlanRequest($Body) {
 
 function Invoke-DashboardApplyRequest($Body) {
   Assert-Confirmed $Body
+  Assert-Installed
   $id = [string](Get-Field $Body 'planId' '')
   if (-not $id -or -not $State.Plans.ContainsKey($id) -or -not $State.Plans[$id].PSObject.Properties['Kind']) { Stop-Request 409 'This preview has expired or was already applied. Preview again.' }
   $stored = $State.Plans[$id]
@@ -810,6 +854,7 @@ function ConvertTo-DiscoveryView($Discovery, $Config) {
     tunnels     = @($Discovery.Tunnels)
     permissions = @($Discovery.Permissions)
     domains     = @($Config.domains)
+    profileEmail = $(if ($Discovery.PSObject.Properties['ProfileEmail']) { $Discovery.ProfileEmail } else { '' })
   }
 }
 
@@ -901,6 +946,8 @@ function Get-SetupData {
     settings       = ConvertTo-InstanceValues $settings
     deployment     = [ordered]@{ mode = $mode; tunnelChoice = $draft.deployment.tunnelChoice; tunnelId = $draft.deployment.tunnelId; tunnelName = $draft.deployment.tunnelName; newTunnelName = $draft.deployment.newTunnelName }
     installedAt    = $draft.installedAt
+    contactEmail   = $draft.contactEmail
+    defaultInstallPath = (Join-Path $env:USERPROFILE '.docker\projects\traefik-proxy')
     modes          = $DeploymentModes
     tls            = $TlsInfo
     cloudflare     = [ordered]@{
@@ -1143,6 +1190,10 @@ function Invoke-InstallRequest($Body) {
   $plan = Get-InstallPlan -NoDryRun
   if (-not $plan.canInstall) { Stop-Request 409 ('Installation is blocked: ' + ($plan.blockers -join ' ')) }
   if ([string](Get-Field $Body 'planKey' '') -ne $plan.planKey) { Stop-Request 409 'The settings changed since the preview. Preview the installation again.' }
+  # Local and Cloudflare changes are approved separately (setup steps 5 and 6).
+  if (@($plan.steps | Where-Object { $_.kind -eq 'cloudflare' }).Count -gt 0 -and -not [bool](Get-Field $Body 'confirmCloudflare' $false)) {
+    Stop-Request 400 'This installation creates a resource in your Cloudflare account. Approve the Cloudflare changes separately.' @{ needsConfirm = 'cloudflare' }
+  }
   $settings = Get-Settings
   $draft = Read-SetupDraft
   $mode = $draft.deployment.mode
@@ -1245,6 +1296,129 @@ function Install-ConnectorRequest($Body) {
   return [ordered]@{ ok = $start.Ok; message = $start.Message; output = @($start.Output | Select-Object -Last 20); previousTokenBackedUp = [bool]$installed.PreviousTokenBackup }
 }
 
+# --- Environment, overview, expert view -------------------------------------------------------------------------
+
+# Whether the install folder can be created/written: the nearest existing folder on the path gets a temporary file
+# that is deleted when closed.
+function Test-InstallPathAccess([string]$Path) {
+  $probe = $Path
+  while ($probe -and -not (Test-Path -LiteralPath $probe)) { $probe = Split-Path -Parent $probe }
+  if (-not $probe) { return [ordered]@{ ok = $false; exists = $false; message = 'No part of this path exists (is the drive present?).' } }
+  $exists = Test-Path -LiteralPath $Path
+  try {
+    $f = [IO.File]::Create((Join-Path $probe ('.tpx-write-check-' + [Guid]::NewGuid().ToString('N').Substring(0, 8))), 1, [IO.FileOptions]::DeleteOnClose)
+    $f.Dispose()
+    return [ordered]@{ ok = $true; exists = $exists; message = $(if ($exists) { "$Path exists and is writable." } else { "$Path will be created inside $probe (writable)." }) }
+  } catch { return [ordered]@{ ok = $false; exists = $exists; message = "Windows refused to write in $probe. Choose a folder in your user profile." } }
+}
+
+# Everything setup step 2 checks, read-only (apart from the deleted write probe).
+function Get-EnvironmentData {
+  $settings = Get-Settings
+  $docker = Get-DockerStatus
+  $installed = Test-Installed
+  # Before the user saved any settings, check (and offer) values that collide with nothing on this PC rather than
+  # the packaged defaults, which often clash with an existing stack.
+  $suggested = $false
+  if (-not $installed -and (Get-SettingsSource) -eq 'defaults' -and $docker.EngineRunning) { $settings = Get-SuggestedStackSettings -InstallPath $InstallPath; $suggested = $true }
+  $conflicts = @()
+  if (-not $installed) { $conflicts = @(Get-StackConflicts -Settings $settings) }
+  $others = 0
+  if ($docker.EngineRunning) { $others = @((Invoke-Docker ps -a --format '{{.Names}}').Output | Where-Object { $_ -and -not $_.StartsWith("$($settings.StackName)-") }).Count }
+  return [ordered]@{
+    docker = $docker; installed = $installed; path = (Test-InstallPathAccess $InstallPath); conflicts = $conflicts
+    otherContainers = $others; settings = ConvertTo-InstanceValues $settings; suggested = $suggested
+  }
+}
+
+function Set-ContactEmailRequest($Body) {
+  $email = ([string](Get-Field $Body 'email' '')).Trim()
+  if ($email -and $email -notmatch $EmailPattern) { Stop-Request 400 "'$email' is not a valid email address." }
+  $draft = Read-SetupDraft
+  $draft.contactEmail = $email
+  Save-SetupDraft $draft
+  return [ordered]@{ contactEmail = $email }
+}
+
+function Get-OverviewData {
+  $status = Get-StatusData
+  $settings = Get-Settings
+  $installed = Test-Installed
+  $dash = Get-DashboardData
+  $services = @(); $issues = @()
+  if ($installed) { try { $reg = Read-ServiceRegistry -Settings $settings; $services = @($reg.services); $issues = @((Get-ServicePlan -Settings $settings -Services $services).Issues | Where-Object { $_.Level -eq 'Error' }) } catch { } }
+  $cf = Read-CloudflareConfig -Settings $settings
+  $mode = (Read-SetupDraft).deployment.mode
+  if (-not $mode -and $installed) { $mode = $(if (Test-TunnelTokenFile $settings) { 'tunnel' } else { 'local' }) }
+  $tunnel = $null
+  if ($status.cloudflare.tokenStored -and $status.cloudflare.tokenReadable -and $cf.accountId -and $cf.tunnelId) {
+    try {
+      $t = Invoke-CloudflareApi -Settings $settings -Path "/accounts/$($cf.accountId)/cfd_tunnel/$($cf.tunnelId)"
+      $tunnel = [ordered]@{ name = [string]$t.name; status = [string]$t.status; connections = @($(if ($t.PSObject.Properties['connections']) { $t.connections } else { @() })).Count; error = '' }
+    } catch { $tunnel = [ordered]@{ name = $cf.tunnelName; status = 'unknown'; connections = 0; error = $_.Exception.Message } }
+  }
+  $warnings = @()
+  $c = @{}; foreach ($x in @($status.stack.Containers)) { $c[$x.Role] = $x }
+  if ($installed) {
+    foreach ($role in @('traefik', 'socket-proxy')) { if ($c[$role].State -ne 'running') { $warnings += "Container $($c[$role].Name) is $($c[$role].State)." } }
+    if ($mode -eq 'tunnel' -and $c['cloudflared'].State -ne 'running') { $warnings += "The tunnel connector ($($c['cloudflared'].Name)) is $($c['cloudflared'].State)." }
+    if ($c['traefik'].State -eq 'running' -and -not $status.stack.TraefikApi) { $warnings += 'Traefik is running but its API does not answer.' }
+    if ($status.services.drift -gt 0) { $warnings += "$($status.services.drift) route file(s) differ from the service registry." }
+    if (@($issues).Count -gt 0) { $warnings += "$(@($issues).Count) service definition error(s)." }
+  }
+  if ($status.cloudflare.tokenStored -and -not $status.cloudflare.tokenReadable) { $warnings += 'The stored Cloudflare API token cannot be decrypted by this Windows account.' }
+  if ($tunnel -and $tunnel.status -ne 'healthy' -and $mode -eq 'tunnel') { $warnings += "Cloudflare reports the tunnel as '$($tunnel.status)'." }
+  $recent = @()
+  $file = Join-Path $InstallPath 'logs\webui-audit.log'
+  if (Test-Path -LiteralPath $file) {
+    $fs = [IO.File]::Open($file, 'Open', 'Read', 'ReadWrite')
+    try { $null = $fs.Seek([Math]::Max(0, $fs.Length - 32768), 'Begin'); $text = (New-Object IO.StreamReader($fs, [Text.Encoding]::UTF8)).ReadToEnd() } finally { $fs.Dispose() }
+    $recent = @($text -split "`r?`n" | Where-Object { $_ -match '^\d{4}-' } | Select-Object -Last 8)
+    [array]::Reverse($recent)
+  }
+  return [ordered]@{
+    installed = $installed; mode = $mode; status = $status; dashboard = $dash; tunnel = $tunnel
+    domains = @($cf.domains); services = [ordered]@{ total = $services.Count; enabled = @($services | Where-Object { $_.enabled }).Count; published = @($services | Where-Object { $_.enabled -and $_.cloudflare.publish }).Count }
+    warnings = $warnings; recent = $recent
+  }
+}
+
+# Expert view: the generated configuration of this instance and the commands the tool runs. Non-secret files only;
+# anything credential-like is withheld.
+function Get-ExpertConfigData {
+  $settings = Get-Settings
+  $files = New-Object System.Collections.ArrayList
+  $envPath = Join-Path $InstallPath '.env'
+  if (Test-Path -LiteralPath $envPath) { $null = $files.Add([ordered]@{ path = '.env (known keys)'; content = (Get-FilteredEnv $envPath) }) }
+  else { $null = $files.Add([ordered]@{ path = '.env (would be written)'; content = (New-DotEnvContent ([IO.File]::ReadAllText((Join-Path $here '.env.example'))) (Get-EnvValues $settings)) }) }
+  $rels = @('config\setup.json', 'config\cloudflare.json', 'config\dashboard.json', 'config\services.json')
+  if (Test-Path -LiteralPath $settings.DynamicDir) { $rels += @(Get-ChildItem -LiteralPath $settings.DynamicDir -File | Where-Object { $_.Extension -in '.yml', '.yaml' } | ForEach-Object { "traefik\dynamic\$($_.Name)" }) }
+  foreach ($rel in $rels) {
+    $p = Join-Path $InstallPath $rel
+    if (-not (Test-Path -LiteralPath $p)) { continue }
+    $text = ([IO.File]::ReadAllText($p)).Replace("`r`n", "`n")
+    $hit = Find-CredentialPattern $text
+    if (-not $hit -and (Test-TextContainsApiToken -Settings $settings -Text $text)) { $hit = 'the API token' }
+    $null = $files.Add([ordered]@{ path = $rel; content = $(if ($hit) { "(withheld: contains what looks like $hit)" } else { $text }) })
+  }
+  $mode = (Read-SetupDraft).deployment.mode
+  $compose = (@('docker') + @(Get-ComposeArgs -Settings $settings -Profiles @($(if ($mode -eq 'tunnel') { 'tunnel' }) | Where-Object { $_ })) + @('up', '-d', '--wait')) | ForEach-Object { if ("$_" -match '\s') { "`"$_`"" } else { "$_" } }
+  return [ordered]@{
+    installPath = $InstallPath; sourcePath = $here; managerVersion = Get-ManagerVersion
+    commands = @(
+      [ordered]@{ purpose = 'Preview the installation (changes nothing)'; command = "powershell -ExecutionPolicy Bypass -File `"$here\install.ps1`" -InstallPath `"$InstallPath`" -DryRun" }
+      [ordered]@{ purpose = 'Install and start'; command = "powershell -ExecutionPolicy Bypass -File `"$here\install.ps1`" -InstallPath `"$InstallPath`" -Start$(if ($mode -eq 'tunnel') { ' -EnableTunnel' })" }
+      [ordered]@{ purpose = 'What the installer runs to start this instance'; command = ($compose -join ' ') }
+      [ordered]@{ purpose = 'Re-read traefik\dynamic without a restart'; command = "powershell -ExecutionPolicy Bypass -File `"$InstallPath\install.ps1`" -InstallPath `"$InstallPath`" -Reload" }
+      [ordered]@{ purpose = 'Stop this instance only'; command = "powershell -ExecutionPolicy Bypass -File `"$InstallPath\install.ps1`" -InstallPath `"$InstallPath`" -Stop" }
+    )
+    images = Get-ComposeImages $(if (Test-Installed) { Join-Path $InstallPath 'compose.yaml' } else { Join-Path $here 'compose.yaml' })
+    containers = Get-StackContainerNames $settings
+    networks = [ordered]@{ proxy = $settings.ProxyNetwork; tunnel = $settings.TunnelNetwork; tunnelSubnet = $settings.TunnelSubnet; tunnelIpRange = $settings.TunnelIpRange; cloudflaredIp = $settings.CloudflaredIp }
+    files = $files.ToArray()
+  }
+}
+
 # --- Router ----------------------------------------------------------------------------------------------------
 
 function Invoke-ApiRoute($Request, $Body) {
@@ -1290,6 +1464,11 @@ function Invoke-ApiRoute($Request, $Body) {
     'POST /api/backups/import/preview' { return Invoke-ImportPreview $Body }
     'POST /api/backups/import/apply' { return Invoke-ImportApply $Body }
     'GET /api/dashboard' { return Get-DashboardData }
+    'POST /api/dashboard/settings' { return Save-DashboardSettingsRequest $Body }
+    'GET /api/overview' { return Get-OverviewData }
+    'GET /api/environment' { return Get-EnvironmentData }
+    'GET /api/expert/config' { return Get-ExpertConfigData }
+    'POST /api/setup/contact' { return Set-ContactEmailRequest $Body }
     'POST /api/dashboard/plan' { return Invoke-DashboardPlanRequest $Body }
     'POST /api/dashboard/apply' { return Invoke-DashboardApplyRequest $Body }
     'POST /api/dashboard/verify' { return Invoke-DashboardVerifyRequest $Body }

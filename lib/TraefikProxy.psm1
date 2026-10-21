@@ -369,7 +369,7 @@ function ConvertTo-ServiceDefinition($InputObject) {
   $hostnames = @(Get-ServiceProperty $InputObject 'hostnames' @() | ForEach-Object { ([string]$_).Trim().ToLowerInvariant() } | Where-Object { $_ })
   $middlewares = @(Get-ServiceProperty $InputObject 'middlewares' $script:DefaultMiddlewares | ForEach-Object { ([string]$_).Trim() } | Where-Object { $_ })
 
-  return [pscustomobject][ordered]@{
+  $definition = [ordered]@{
     name        = ([string](Get-ServiceProperty $InputObject 'name' '')).Trim().ToLowerInvariant()
     description = [string](Get-ServiceProperty $InputObject 'description' '')
     enabled     = [bool](Get-ServiceProperty $InputObject 'enabled' $true)
@@ -389,6 +389,11 @@ function ConvertTo-ServiceDefinition($InputObject) {
       access  = [bool](Get-ServiceProperty $cloudflare 'access' $true)
     }
   }
+  # Optional human-readable name ("Notflix"); the name above stays the id. Only stored when set, so registries
+  # written by earlier versions are unchanged.
+  $displayName = ([string](Get-ServiceProperty $InputObject 'displayName' '')).Trim()
+  if ($displayName) { $definition.Insert(1, 'displayName', $displayName) }
+  return [pscustomobject]$definition
 }
 
 function New-ServiceDefinition {
@@ -495,6 +500,7 @@ function Test-ServiceDefinition {
   $err = { param($f, $m) $null = $issues.Add((New-Issue 'Error' $n $f $m)) }
   $warn = { param($f, $m) $null = $issues.Add((New-Issue 'Warning' $n $f $m)) }
 
+  if ($s.PSObject.Properties['displayName'] -and ($s.displayName.Length -gt 60 -or $s.displayName -match '[\x00-\x1f<>]')) { & $err 'displayName' 'Display name: at most 60 characters, no line breaks or angle brackets.' }
   if ($n -notmatch $script:ServiceNamePattern) { & $err 'name' 'Name must be 1-40 lowercase letters, digits or dashes (e.g. plex, home-assistant).' }
   elseif (@($OtherServices | Where-Object { $_.name -eq $n }).Count -gt 0) { & $err 'name' "A service named '$n' already exists." }
 

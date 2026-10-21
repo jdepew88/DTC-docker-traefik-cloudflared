@@ -26,13 +26,15 @@ function Get-DashboardRouterName { return "$($script:RouterName)@file" }
 
 function Read-DashboardConfig {
   param([Parameter(Mandatory = $true)]$Settings)
-  $config = [pscustomobject][ordered]@{ version = 1; enabled = $false; subdomain = ''; zoneId = ''; zoneName = ''; hostname = ''; accessEmails = @(); enabledAt = '' }
+  # subdomainCustom: the user edited the subdomain (otherwise it follows the instance name). publish: the user chose to
+  # publish the dashboard during setup (a wish, not a state: enabled says whether it is published).
+  $config = [pscustomobject][ordered]@{ version = 1; enabled = $false; subdomain = ''; subdomainCustom = $false; zoneId = ''; zoneName = ''; hostname = ''; accessEmails = @(); publish = $false; enabledAt = '' }
   $path = Join-Path $Settings.InstallPath $script:ConfigFile
   if (-not (Test-Path -LiteralPath $path)) { return $config }
   try {
     $json = [IO.File]::ReadAllText($path) | ConvertFrom-Json
     foreach ($p in @('subdomain', 'zoneId', 'zoneName', 'hostname', 'enabledAt')) { if ($json.PSObject.Properties[$p] -and $json.$p) { $config.$p = [string]$json.$p } }
-    if ($json.PSObject.Properties['enabled']) { $config.enabled = [bool]$json.enabled }
+    foreach ($p in @('enabled', 'subdomainCustom', 'publish')) { if ($json.PSObject.Properties[$p]) { $config.$p = [bool]$json.$p } }
     if ($json.PSObject.Properties['accessEmails'] -and $json.accessEmails) { $config.accessEmails = @($json.accessEmails | ForEach-Object { [string]$_ } | Where-Object { $_ }) }
   } catch { }
   return $config
@@ -45,7 +47,8 @@ function Save-DashboardConfig {
 
 # Default subdomain: the instance name, made DNS-safe (traefik-ext1 -> traefik-ext1).
 function Get-DashboardDefaultSubdomain($Settings) {
-  $s = ($Settings.StackName.ToLowerInvariant() -replace '[^a-z0-9-]', '-').Trim('-')
+  # Same rule as suggestLabel in webui\logic.js: runs of other characters become one dash.
+  $s = ($Settings.StackName.ToLowerInvariant() -replace '[^a-z0-9]+', '-').Trim('-')
   if (-not $s) { $s = 'traefik' }
   if ($s.Length -gt 63) { $s = $s.Substring(0, 63).Trim('-') }
   return $s

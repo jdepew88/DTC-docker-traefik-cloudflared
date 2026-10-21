@@ -293,7 +293,7 @@ function Get-CfErrorStatus($ErrorRecord) {
 # a message. Editing rights cannot be proven without making a change, so DNS shows "readable".
 function Get-CloudflareDiscovery {
   param([Parameter(Mandatory = $true)]$Settings, [string]$Token, [string]$AccountId, [string[]]$ZoneIds = @())
-  $d = [ordered]@{ Valid = $false; Status = ''; Message = ''; Accounts = @(); Zones = @(); AccountId = ''; AccountName = ''; Tunnels = @(); Permissions = @() }
+  $d = [ordered]@{ Valid = $false; Status = ''; Message = ''; Accounts = @(); Zones = @(); AccountId = ''; AccountName = ''; Tunnels = @(); Permissions = @(); ProfileEmail = '' }
   $call = { param($Path, $Query, [switch]$All)
     $p = @{ Settings = $Settings; Path = $Path; Query = $(if ($Query) { $Query } else { @{} }); All = [bool]$All }
     if ($Token) { $p['Token'] = $Token }
@@ -312,6 +312,9 @@ function Get-CloudflareDiscovery {
   } catch { $errors += $_.Exception.Message }
   $d.Valid = ($d.Status -eq 'active') -or $d.Accounts.Count -gt 0 -or $d.Zones.Count -gt 0
   if (-not $d.Valid) { $d.Message = 'Cloudflare rejected this token (invalid, expired or revoked), or it has no permissions at all. ' + ($errors -join ' '); return [pscustomobject]$d }
+  # The profile email is only readable with "User Details Read", which the template does not ask for. When the token
+  # happens to have it, the email is offered as a prefill (the user confirms or edits it); otherwise nothing.
+  try { $u = & $call '/user'; if ($u -and $u.PSObject.Properties['email'] -and [string]$u.email -match '^[^@\s]+@[^@\s]+\.[A-Za-z]{2,}$') { $d.ProfileEmail = [string]$u.email } } catch { }
 
   # Account: the requested one, else the only one visible (from /accounts or from the zones' owners).
   $candidates = @($d.Accounts)

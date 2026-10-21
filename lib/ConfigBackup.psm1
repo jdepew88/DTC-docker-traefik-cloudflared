@@ -73,7 +73,7 @@ function Assert-CredentialFree($Settings, [string]$Text, [string]$What) {
 # --- Setup draft (config\setup.json) -----------------------------------------------------------------------------
 
 function Read-SetupDraftFile([string]$InstallPath) {
-  $draft = [pscustomobject][ordered]@{ version = 1; settings = $null; deployment = [pscustomobject][ordered]@{ mode = ''; tunnelChoice = ''; tunnelId = ''; tunnelName = ''; newTunnelName = '' }; installedAt = '' }
+  $draft = [pscustomobject][ordered]@{ version = 1; settings = $null; deployment = [pscustomobject][ordered]@{ mode = ''; tunnelChoice = ''; tunnelId = ''; tunnelName = ''; newTunnelName = '' }; contactEmail = ''; installedAt = '' }
   $path = Join-Path $InstallPath 'config\setup.json'
   if (-not (Test-Path -LiteralPath $path)) { return $draft }
   try {
@@ -83,6 +83,7 @@ function Read-SetupDraftFile([string]$InstallPath) {
       foreach ($p in $draft.deployment.PSObject.Properties.Name) { if ($json.deployment.PSObject.Properties[$p]) { $draft.deployment.$p = [string]$json.deployment.$p } }
     }
     if ($json.PSObject.Properties['installedAt']) { $draft.installedAt = [string]$json.installedAt }
+    if ($json.PSObject.Properties['contactEmail']) { $draft.contactEmail = [string]$json.contactEmail }
   } catch { }
   return $draft
 }
@@ -575,7 +576,7 @@ function Get-RestorePlan {
     if ($dash.enabled -and $dash.hostname -eq $md.hostname) { $null = $items.Add((New-RestoreItem 'dashboard' 'unchanged' "Public dashboard $($md.hostname) is already set up")) }
     elseif ($dash.enabled) { $null = $items.Add((New-RestoreItem 'dashboard' 'keep' "This instance publishes its dashboard as $($dash.hostname); kept" "The backup used $($md.hostname).")) }
     elseif ($dash.hostname -ne $md.hostname -or $dash.subdomain -ne $md.subdomain -or $dash.zoneId -ne $md.zoneId -or (@($dash.accessEmails) -join ',') -ne (@($md.accessEmails) -join ',')) {
-      $newDash = [pscustomobject][ordered]@{ version = 1; enabled = $false; subdomain = $md.subdomain; zoneId = $md.zoneId; zoneName = $md.zoneName; hostname = $md.hostname; accessEmails = @($md.accessEmails); enabledAt = '' }
+      $newDash = [pscustomobject][ordered]@{ version = 1; enabled = $false; subdomain = $md.subdomain; subdomainCustom = $true; zoneId = $md.zoneId; zoneName = $md.zoneName; hostname = $md.hostname; accessEmails = @($md.accessEmails); publish = $true; enabledAt = '' }
       $writes['config\dashboard.json'] = $newDash
       $null = $items.Add((New-RestoreItem 'dashboard' 'create' "Public dashboard settings: $($md.hostname)" 'Saved as settings only. The dashboard is published in the Cloudflare part of the restore (or on the Setup page) after Cloudflare Access is confirmed.'))
     }
@@ -756,6 +757,6 @@ function Get-RecoveryPointBytes {
   return , [IO.File]::ReadAllBytes($path)
 }
 
-Export-ModuleMember -Function Find-CredentialPattern, Read-SetupDraftFile, ConvertTo-SetupDraftJson, Get-CredentialInventory, Get-ConfigManifest, ConvertTo-ManifestJson,
+Export-ModuleMember -Function Find-CredentialPattern, Get-FilteredEnv, Read-SetupDraftFile, ConvertTo-SetupDraftJson, Get-CredentialInventory, Get-ConfigManifest, ConvertTo-ManifestJson,
   Export-ConfigManifest, New-ConfigBackupArchive, Read-ConfigBackup, Get-RestorePlan, Invoke-RestoreLocal, Invoke-RestoreCloudflare, New-RecoveryPoint,
   Get-RecoveryPoints, Get-RecoveryPointBytes

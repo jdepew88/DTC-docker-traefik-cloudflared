@@ -74,6 +74,10 @@ $handler = {
   if ($tokenProfile -eq 'NoTunnel' -and $p -match '/cfd_tunnel') { return Fail 403 10000 'Authentication error' }
   if ($tokenProfile -eq 'NoAccess' -and $p -match '/access/') { return Fail 403 10000 'Authentication error' }
   if ($tokenProfile -eq 'NoZone' -and $p -match '^/zones/') { return Fail 403 10000 'Authentication error' }
+  if ($m -eq 'GET' -and $p -eq '/user') {
+    if ($tokenProfile -ne 'Full') { return Fail 403 9109 'Unauthorized to access requested resource' }
+    return Ok ([pscustomobject]@{ id = 'user1'; email = 'owner@example.test' })
+  }
   if ($m -eq 'GET' -and $p -eq '/accounts') { return Ok $db.accounts }
   if ($m -eq 'GET' -and $p -eq '/zones') {
     $z = @($db.zones)
