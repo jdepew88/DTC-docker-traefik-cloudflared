@@ -39,6 +39,7 @@
     const actions = [];
     if (o.mode === 'tunnel' && !dash.enabled && cfReady(s.setup || st)) actions.push(['Publish the Traefik dashboard to test the whole path', 'dashboard']);
     if (o.services.total === 0) actions.push(['Add your first service', 'services']);
+    if (o.upgrade && o.upgrade.state === 'available') actions.push([`Newer application files are available (${o.upgrade.installedVersion} → ${o.upgrade.sourceVersion}): preview the upgrade`, 'upgrade']);
     if (!s.verify) actions.push(['Run the end-to-end verification', 'verify']);
     const verifyBox = h('div', { id: 'overview-verify' }, s.verify ? window.TPMPages.renderVerification(ctx, s.verify) : null);
     fill(main,
@@ -54,7 +55,8 @@
         dash.enabled ? ext(dash.publicUrl, 'Public dashboard') : null, ext(dash.localUrl, 'Local dashboard')), U.topology(nodes, links)),
       o.warnings.length || actions.length ? h('section', { class: 'card' }, h('h2', null, 'Needs attention'),
         h('ul', { class: 'checks' }, o.warnings.map((w) => checkItem('warn', w)), actions.map(([text, target]) => h('li', null, h('span', { class: 'ci neutral' }, icon('chevron')),
-          h('span', null, h('a', { href: target === 'verify' ? '#overview' : `#${target}`, onclick: target === 'verify' ? (e) => { e.preventDefault(); verify(e.currentTarget); } : null }, text)))))) : null,
+          h('span', null, h('a', { href: target === 'verify' || target === 'upgrade' ? '#overview' : `#${target}`,
+            onclick: target === 'verify' ? (e) => { e.preventDefault(); verify(e.currentTarget); } : target === 'upgrade' ? (e) => { e.preventDefault(); window.TPMPages.previewUpgrade(ctx, o.path, null); } : null }, text)))))) : null,
       h('section', { class: 'card' }, h('div', { class: 'card-head' }, h('h2', null, 'Verification'), h('span', { class: 'grow' }),
         h('button', { type: 'button', class: 'btn small', onclick: (e) => verify(e.currentTarget) }, icon('pulse'), 'Verify now')),
         h('p', { class: 'muted small' }, 'Checks each component on its own: containers, tunnel, local dashboard, routing, DNS and Access.'), verifyBox),
@@ -275,6 +277,9 @@
     const managed = arr(cf.managed);
     fill(main,
       head('Operate', 'Cloudflare', 'The API token, the account and tunnel of this instance, and the resources this tool created. Changes are always previewed; nothing is deleted that this tool did not create.'),
+      (!t.Stored || !t.Readable) && (cf.config.accountId || cf.config.tunnelId) ? h('div', { class: 'callout warn', role: 'status' },
+        h('p', null, h('strong', null, 'Reconnect Cloudflare. '), !t.Stored ? 'No API token is stored for this deployment. ' : 'The stored token cannot be decrypted by this Windows account. ',
+          `Paste a token below. The saved account (${cf.config.accountName || cf.config.accountId || '—'}), tunnel (${cf.config.tunnelName || cf.config.tunnelId || '—'}) and domains are kept; nothing is recreated. The tunnel itself keeps running meanwhile.`)) : null,
       h('section', { class: 'card', 'data-help-host': '' }, h('div', { class: 'card-head' }, h('h2', null, 'API token'), help('cf-api-tokens', 'API token')),
         h('div', { class: 'status-line' }, t.Stored ? chip(t.Readable ? 'validated' : 'failed', t.Readable ? 'Stored (encrypted)' : 'Stored token unreadable') : plainChip('No token stored'),
           t.Stored ? h('span', { class: 'muted small' }, `Saved ${t.SavedAt} by ${t.User}`) : null, cf.apiBase !== 'https://api.cloudflare.com/client/v4' ? plainChip(`API: ${cf.apiBase} (test mock)`, 'warn') : null),
@@ -546,7 +551,14 @@
         h('ol', null, h('li', null, 'Download a full backup on the Backups page.'), h('li', null, 'Update the program folder (git pull or a new release).'),
           h('li', null, 'See what would change (nothing is written):'), h('li', null, 'Update the files without restarting containers:')),
         U.output([`powershell -ExecutionPolicy Bypass -File "${setup.sourcePath}\\install.ps1" -InstallPath "${setup.installPath}" -DryRun`, `powershell -ExecutionPolicy Bypass -File "${setup.sourcePath}\\install.ps1" -InstallPath "${setup.installPath}"`], 'Upgrade commands'),
-        h('p', { class: 'muted small' }, 'Your settings, services and Cloudflare configuration are kept; you do not repeat the onboarding.')));
+        h('p', { class: 'muted small' }, 'Your settings, services and Cloudflare configuration are kept; you do not repeat the onboarding.'),
+        setup.installed ? h('div', { class: 'actions' }, h('button', { type: 'button', class: 'btn', onclick: (e) => window.TPMPages.previewUpgrade(ctx, setup.installPath, e.currentTarget) }, icon('download'), 'Preview upgrade from this manager')) : null),
+      h('section', { class: 'card' }, h('h2', null, 'The manager itself'),
+        h('p', { class: 'muted small' }, 'This website runs on this PC only. Stopping it does not stop your deployments: Traefik, cloudflared and your apps keep running.'),
+        ctx.state.session.canStop ? h('div', { class: 'actions' }, h('button', { type: 'button', class: 'btn danger-outline', onclick: async (e) => {
+          const ok = await U.confirmDialog({ title: 'Stop the manager?', body: 'The website stops. Your deployments keep running. Start it again with START-HERE.cmd.', okText: 'Stop the manager', danger: true });
+          if (ok) await withBusy(e.currentTarget, async () => { await api('POST', '/api/manager/stop', { confirm: true }); fill(main, h('div', { class: 'callout' }, h('h1', null, 'The manager has stopped.'), h('p', null, 'You can close this tab. Double-click START-HERE.cmd to start it again.'))); });
+        } }, 'Stop the manager')) : h('p', { class: 'small' }, 'To stop it, close its PowerShell window or press Ctrl+C there. Started with START-HERE.cmd, it can also be stopped here or with STOP-MANAGER.cmd.')));
   };
 
   // --- Help and Learning -----------------------------------------------------------------------------------------------------

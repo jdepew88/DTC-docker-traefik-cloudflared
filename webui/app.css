@@ -113,6 +113,8 @@ body:not([data-level="beginner"]) [data-only-level="beginner"] { display: none !
 .brand img { width: 26px; height: 26px; }
 .brand small { color: var(--muted); font-weight: 500; }
 .topbar .spacer { flex: 1; }
+a.instance-pill { text-decoration: none; }
+a.instance-pill:hover { color: var(--text); border-color: var(--border-strong); }
 .instance-pill { display: flex; align-items: center; gap: .45rem; font-size: .84rem; color: var(--muted); border: 1px solid var(--border); border-radius: 999px; padding: .2rem .7rem; max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .dot { width: .55rem; height: .55rem; border-radius: 50%; background: var(--muted); flex: none; }
 .dot.ok { background: var(--ok); box-shadow: 0 0 0 3px var(--ok-soft); }
@@ -291,7 +293,8 @@ details.more > summary { cursor: pointer; font-weight: 600; color: var(--text-2)
 .rv-toggle { appearance: none; border: 0; background: none; color: var(--text); font: inherit; font-weight: 650; cursor: pointer; display: flex; align-items: center; gap: .5rem; padding: 0; text-align: left; flex: 1; min-width: 12rem; }
 .rv-toggle .chev { transition: transform .15s; color: var(--muted); }
 .rv-toggle[aria-expanded="true"] .chev { transform: rotate(90deg); }
-.rv-summary { flex-basis: 100%; margin: 0 0 0 1.6rem; color: var(--muted); font-size: .86rem; }
+.rv-summary { flex-basis: 100%; margin: 0 0 0 1.6rem; color: var(--muted); font-size: .86rem; overflow-wrap: anywhere; }
+.rv-summary .msg { display: block; margin-top: .2rem; }
 .rv-body { padding: .2rem .9rem .8rem 2.4rem; }
 .rv-actions { display: flex; flex-wrap: wrap; gap: .4rem; margin-top: .6rem; }
 .checks { list-style: none; padding: 0; margin: .3rem 0; }

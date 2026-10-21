@@ -12,7 +12,7 @@
     installPlan: null, installResult: null, verify: null, expert: null,
     services: [], middlewares: [], zones: [], cf: null, backups: null,
     plan: null, planBody: null, planApplyPath: '/api/services/apply', replan: null, afterApply: null,
-    restore: null, page: 'setup', sub: '', journeyOpen: {}, forms: {},
+    restore: null, page: 'setup', sub: '', journeyOpen: {}, forms: {}, session: { chosen: true, canStop: false }, projects: null, reviewPath: '',
     approvals: { local: null, cloudflare: null, dashboardSig: null, overwrites: [] },
   };
 
@@ -41,7 +41,9 @@
   function route() {
     let { page, sub } = parseHash();
     const pages = window.TPMPages || {};
-    if (!pages[page]) page = installed() ? 'overview' : 'setup';
+    if (!pages[page]) page = !state.session.chosen ? 'projects' : installed() ? 'overview' : 'setup';
+    // Until a deployment is chosen, only the chooser and general pages are shown.
+    if (!state.session.chosen && !['projects', 'help', 'settings'].includes(page)) page = 'projects';
     // Focus moves to the new page on navigation, but not on the first load (keyboard users start at the skip link).
     const changed = page !== state.page && state.routed;
     state.page = page; state.sub = sub; state.routed = true;
@@ -64,7 +66,14 @@
     const select = h('select', { 'aria-label': 'Go to' });
     const add = (value, label, selected) => select.append(h('option', { value, selected }, label));
     const steps = stepStatusList();
-    if (installed()) {
+    rail.append(h('h2', null, 'Deployment'));
+    rail.append(h('ul', null, h('li', null, h('a', { href: '#projects', 'aria-current': state.page === 'projects' ? 'page' : null }, icon('folder'), state.session.chosen ? 'Switch deployment' : 'Choose a deployment'))));
+    add('projects', state.session.chosen ? 'Switch deployment' : 'Choose a deployment', state.page === 'projects');
+    if (!state.session.chosen) {
+      rail.append(h('h2', null, 'Also'));
+      rail.append(h('ul', null, [['help', 'Help and Learning', 'book'], ['settings', 'Settings', 'settings']].map(([id, label, ic]) => h('li', null, h('a', { href: `#${id}`, 'aria-current': state.page === id ? 'page' : null }, icon(ic), label)))));
+      add('help', 'Help and Learning', state.page === 'help'); add('settings', 'Settings', state.page === 'settings');
+    } else if (installed()) {
       rail.append(h('h2', null, 'Operate'));
       rail.append(h('ul', null, OPS_NAV.map(([id, label, ic]) => h('li', null, h('a', { href: `#${id}`, 'aria-current': state.page === id ? 'page' : null }, icon(ic), label)))));
       rail.append(h('h2', null, 'Installation'));
@@ -90,7 +99,7 @@
     }
     select.addEventListener('change', () => { const [p, s] = select.value.split('/'); navigate(p, s || ''); });
     mobile.append(select);
-    if (!installed()) {
+    if (state.session.chosen && !installed()) {
       const done = steps.filter((s) => s.cls === 'done').length;
       const bar = h('div', { class: 'progress', role: 'progressbar', 'aria-valuemin': '0', 'aria-valuemax': '7', 'aria-valuenow': String(done), 'aria-label': 'Setup progress' }, h('span'));
       bar.firstChild.style.width = `${Math.round((done / 7) * 100)}%`;
@@ -102,6 +111,7 @@
     const s = state.status;
     const pill = $('#instance-pill');
     if (!s) return;
+    if (!state.session.chosen) { fill(pill, h('span', { class: 'dot' }), 'No deployment open'); return; }
     const i = s.instance;
     const running = arr(s.stack && s.stack.Containers).filter((c) => c.State === 'running').length;
     const tone = !i.installed ? '' : s.stack.TraefikApi ? 'ok' : running ? 'warn' : 'err';
@@ -265,7 +275,11 @@
     U.session.onSignedOut = showSignedOut;
     $$('input[name="detail-level"]').forEach((i) => i.addEventListener('change', () => { if (i.checked) U.setLevel(i.value); }));
     U.onLevelChange(() => { if (window.TPMPages && window.TPMPages.onLevelChange) window.TPMPages.onLevelChange(ctx); });
-    try { const s = await api('GET', '/api/session'); U.session.csrf = s.csrf; } catch (e) { if (e.status !== 401) toast(e.message, true); return; }
+    try {
+      const s = await api('GET', '/api/session');
+      U.session.csrf = s.csrf;
+      state.session = { chosen: s.chosen !== false, canStop: !!s.canStop };
+    } catch (e) { if (e.status !== 401) toast(e.message, true); return; }
     await U.loadCatalog();
     try { await refresh(); } catch (e) { toast(e.message, true); }
     $('#brand-link').addEventListener('click', (e) => { e.preventDefault(); navigate(installed() ? 'overview' : 'setup'); });

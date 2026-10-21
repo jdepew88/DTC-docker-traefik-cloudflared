@@ -11,6 +11,7 @@
   <script src="/ui.js" defer></script>
   <script src="/setup.js" defer></script>
   <script src="/pages.js" defer></script>
+  <script src="/projects.js" defer></script>
   <script src="/app.js" defer></script>
 </head>
 <body data-level="beginner">
@@ -21,7 +22,7 @@
       <span>Deployment Manager <small>Traefik + Cloudflare</small></span>
     </a>
     <div class="spacer"></div>
-    <span class="instance-pill" id="instance-pill" aria-live="polite"><span class="dot"></span>Loading…</span>
+    <a class="instance-pill" id="instance-pill" href="#projects" aria-live="polite" title="Switch deployment"><span class="dot"></span>Loading…</a>
     <div class="segmented" role="radiogroup" aria-label="Detail level" id="level-switch">
       <label title="Essential settings and plain explanations"><input type="radio" name="detail-level" value="beginner"><span>Beginner</span></label>
       <label title="Adds ports, addresses and summaries"><input type="radio" name="detail-level" value="intermediate"><span>Intermediate</span></label>

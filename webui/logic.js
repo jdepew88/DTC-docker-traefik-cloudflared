@@ -107,6 +107,13 @@
     skipped: { label: 'Skipped', tone: 'neutral', icon: 'minus' },
     unknown: { label: 'Not checked', tone: 'neutral', icon: 'minus' },
     stale: { label: 'Changed since review', tone: 'warn', icon: 'refresh' },
+    // Attaching an existing deployment: found in files (detected), confirmed live (verified), absent (missing),
+    // credentials to reconnect, newer application files available.
+    detected: { label: 'Detected', tone: 'info', icon: 'eye' },
+    verified: { label: 'Verified', tone: 'ok', icon: 'check' },
+    missing: { label: 'Missing', tone: 'err', icon: 'x' },
+    reconnect: { label: 'Needs reconnection', tone: 'warn', icon: 'key' },
+    upgrade: { label: 'Upgrade available', tone: 'info', icon: 'download' },
   };
   // Server review items use ok/failed/warning/pending/info; map them onto the vocabulary for a given stage.
   function statusFromReview(state, stage) {
@@ -118,7 +125,7 @@
   }
   // The worst status of a list (failed > warning > pending > ok-ish).
   function worstStatus(list) {
-    const rank = { failed: 4, warning: 3, stale: 3, pending: 2, unknown: 1, info: 0, skipped: 0, validated: 0, reviewed: 0, applied: 0, healthy: 0 };
+    const rank = { failed: 4, missing: 4, warning: 3, stale: 3, reconnect: 3, pending: 2, upgrade: 1, unknown: 1, info: 0, skipped: 0, validated: 0, reviewed: 0, applied: 0, healthy: 0, detected: 0, verified: 0 };
     let worst = 'validated';
     for (const s of list || []) if ((rank[s] || 0) > (rank[worst] || 0)) worst = s;
     return worst;

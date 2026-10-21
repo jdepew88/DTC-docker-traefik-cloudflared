@@ -25,6 +25,50 @@ Internet --HTTPS--> Cloudflare edge (+ Access) ==tunnel==> cloudflared
 traefik --socket-internal (internal)--> socket-proxy --> docker.sock (read-only, GET only)
 ```
 
+## Getting started (no terminal needed)
+
+**Download → Extract → Double-click `START-HERE.cmd` → Follow the website.**
+
+1. Install **Docker Desktop** for Windows (WSL 2 backend, Linux containers) and start it. This is the main
+   prerequisite; the website opens without it and explains what is missing.
+2. Download this project as a ZIP (or a release) and extract it to any folder, for example your Desktop.
+3. Double-click **`START-HERE.cmd`**. It checks Windows PowerShell and the program files, starts the local website
+   (127.0.0.1 only) and opens it in your browser. Keep its window open while you use the website; close it (or use
+   *Settings > Stop the manager*, or `STOP-MANAGER.cmd`) to stop. Your deployments keep running either way.
+4. In the website choose:
+   - **Continue where you left off**: the manager lists deployments it finds (recently opened folders, the folders
+     in `%USERPROFILE%\.docker\projects`, and the folders of running Traefik + socket-proxy stacks) and lets you pick
+     another folder. *Review and open* shows what was found and opens it without changing anything.
+   - **Start a new deployment**: the guided seven-step installation.
+
+Double-clicking `START-HERE.cmd` again while the manager runs offers to open it again instead of starting a second
+copy. If port 8190 is taken, the next free port is used. No administrator rights are needed.
+
+### Reopening an existing deployment (for example `traefik-ext1`)
+
+Start the manager with `START-HERE.cmd`; under *Continue where you left off* select the deployment (or *Open another
+folder…* and choose its folder, such as `C:\Users\<you>\.docker\projects\traefik-proxy`), then **Review and open**.
+The review reads the folder, Docker and, with the deployment's own stored token, Cloudflare (read-only) and shows
+what was **detected**, **verified**, **missing**, what **needs reconnection** (for example a token saved by another
+Windows account) and whether an **upgrade is available**. **Open existing deployment** makes it the active one; the
+Overview then shows its containers, tunnel, domain, dashboard and services.
+
+### Attach, Upgrade and Restore
+
+| Operation | What it does | Changes |
+| --- | --- | --- |
+| **Attach** (*Open existing deployment*) | Manages a deployment as it is. | Nothing: no file, container or Cloudflare resource is created, changed or restarted. |
+| **Upgrade** (*Preview upgrade*) | Updates the deployment's application files to this manager's version (`install.ps1` without `-Start`). Optional: an older deployment can be opened and managed without it. | Application files only, after a dry-run preview, your confirmation and a recovery point. `.env`, `config\`, `secrets\`, routes, backups and logs are kept; edited files are kept with the new version as `.dist`. No container is restarted. |
+| **Restore** (*Backups* page) | Recovers configuration from a backup file. | Configuration files (and, with a separate approval, missing Cloudflare resources). Not needed to open an existing deployment. |
+
+### Several deployments
+
+Each deployment lives in its own folder with its own settings and credentials; the manager switches between them
+(*Switch deployment*) without mixing them. The list of recent deployments is kept outside every deployment in
+`%LOCALAPPDATA%\TraefikProxy\webui.json` (paths and names only); *Remove from list* forgets a folder without touching
+its files or containers. The earlier single-app layout (fixed container names) is listed for information only and is
+never changed.
+
 ## Project status
 
 | Area | Status |
@@ -42,6 +86,7 @@ traefik --socket-internal (internal)--> socket-proxy --> docker.sock (read-only,
 | Portable backups (.json / .zip export, import with preview, two-part restore, recovery points) | **Implemented and tested** against the mock (round trip, version compatibility, credential exclusion, idempotency) and live in an isolated instance (local restore). |
 | Traefik dashboard bootstrap (public `/dashboard/` behind Cloudflare Access, fail closed) | **Implemented**; routing **live-tested** in an isolated instance, Cloudflare steps mock-tested. Not yet run against a real Access application. |
 | Deployment review (prepared / validated / applied / verified / action required, technical output) | **Implemented** for the installation, restores and the dashboard. |
+| One-click launcher (`START-HERE.cmd`) and existing-deployment discovery / attach | **Implemented and tested** (launcher, discovery, attach without changes, recent projects, upgrade preview/apply on test folders, browser); discovery and read-only Cloudflare verification also run against a real installation. |
 | Redesigned web UI: seven-step journey, four detail levels, review states, topology, operational pages, learning catalog | **Implemented and browser-tested** in headless Edge (desktop, tablet and phone widths, keyboard and accessible-name checks), including an installation of a disposable instance through the UI. The tunnel path through the UI has only run against the Cloudflare API mock. |
 
 ## Requirements
@@ -64,7 +109,14 @@ traefik --socket-internal (internal)--> socket-proxy --> docker.sock (read-only,
 
 Full digests are in `compose.yaml`.
 
-## Quick start
+## Advanced: using the terminal
+
+Everything the website does is also available from PowerShell.
+
+```powershell
+.\Start-DeploymentManager.ps1                  # what START-HERE.cmd runs; -Status, -Stop, -Restart, -Port, -InstallPath
+.\Start-DeploymentManager.ps1 -InstallPath D:\proxy   # open one deployment directly (skips the chooser)
+```
 
 ```powershell
 cd <this repo>
@@ -444,6 +496,9 @@ container on this PC already uses.
 .\tests\Test-UiBrowser.ps1 -ScreenshotDir .\screens   # the UI in headless Edge (DevTools protocol): journey,
                                         # detail levels, naming, reviews, approvals, a disposable local install,
                                         # responsive layout (390/820/1366 px), keyboard and accessible names
+.\tests\Test-Projects.ps1               # launcher (single-use link, duplicate start, ports, stop, START-HERE.cmd), discovery,
+                                        # attach without changes, recent projects, upgrade preview/apply, browser;
+                                        # -LiveReadOnly also inspects %USERPROFILE%\.docker\projects\traefik-proxy read-only
 node .\tests\ui-logic.test.js           # developer-only unit tests of webui\logic.js (Node is not needed to run the tool)
 .\tests\Invoke-UiPreview.ps1            # developer tool: quick screenshots of pages at chosen levels and widths
 .\tests\Invoke-IsolatedTest.ps1         # (repository only) disposable second instance: install, live tests,
