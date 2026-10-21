@@ -39,6 +39,9 @@ traefik --socket-internal (internal)--> socket-proxy --> docker.sock (read-only,
 | Browser-based setup and management UI (`webui.ps1`) | **Implemented and tested** against a Cloudflare API mock and a live isolated instance. Not yet run against the real Cloudflare API. |
 | Cloudflare-first onboarding (token template link, permission discovery, domain allowlist, local-only path) | **Implemented and mock-tested**, including a confirmed local-only install of a disposable instance. The template link has not been opened against a real Cloudflare account. |
 | Cloudflare API automation (tunnel create, connector token, DNS, tunnel routes, Access apps) | **Implemented and mock-tested**; DPAPI-encrypted API token. |
+| Portable backups (.json / .zip export, import with preview, two-part restore, recovery points) | **Implemented and tested** against the mock (round trip, version compatibility, credential exclusion, idempotency) and live in an isolated instance (local restore). |
+| Traefik dashboard bootstrap (public `/dashboard/` behind Cloudflare Access, fail closed) | **Implemented**; routing **live-tested** in an isolated instance, Cloudflare steps mock-tested. Not yet run against a real Access application. |
+| Deployment review (prepared / validated / applied / verified / action required, technical output) | **Implemented** for the installation, restores and the dashboard. |
 
 ## Requirements
 
@@ -115,8 +118,70 @@ you confirm the installation in its last step:
 5. **Domains and DNS**: the allowed domains; DNS records are created per service, after their own preview.
 6. **HTTPS certificates**: provided by Cloudflare at its edge in tunnel mode. Let's Encrypt is not available in
    this version, so no ACME email is asked for.
-7. **Review and install**: a preview of every step (with an installer dry run), then the confirmed installation
-   (write `.env`, create the tunnel if requested, install the connector token, `install.ps1 -Start`).
+7. **Review and install**: a review of what is prepared, what was validated (Docker, conflicts,
+   `docker compose config`, an installer dry run) and what still needs you, with the full technical output in an
+   expandable section; then the confirmed installation (write `.env`, create the tunnel if requested, install the
+   connector token, `install.ps1 -Start`) and runtime checks of the containers and the Traefik API.
+8. **Traefik dashboard**: check Traefik itself before publishing applications. The local dashboard
+   (`http://127.0.0.1:<dashboard port>/dashboard/`) always works. With Cloudflare connected you can also publish
+   it through the instance's tunnel; the hostname defaults to `<instance name>.<allowed domain>` (for example
+   `https://traefik-ext1.jrtechconsult.com/dashboard/`) and the subdomain can be edited. See
+   [Public Traefik dashboard](#public-traefik-dashboard).
+9. **Services**: add the applications.
+
+### Public Traefik dashboard
+
+Generated into `traefik\dynamic\admin-dashboard.yml` from `config\dashboard.json`. Only `/dashboard/` and `/api`
+(plus a redirect from `/`) are routed to Traefik's `api@internal`, on the `web` entry point that cloudflared uses.
+
+- **Cloudflare Access is mandatory and comes first.** The apply order is: create (or reuse) the Access
+  application, confirm through the API that it protects the hostname, validate the route in a throwaway Traefik,
+  write the route, then add the tunnel route and the DNS record. If Access cannot be established (no Access
+  permission, no sign-in emails, Cloudflare refuses the change), nothing is published: no route, no tunnel route,
+  no DNS record.
+- The router also requires the `Cf-Access-Jwt-Assertion` header that Cloudflare Access adds to authenticated
+  requests, so a request that did not pass through Access gets 404 from Traefik. Traefik does not verify the
+  token's signature; Cloudflare Access is the authentication.
+- **Verify** runs independent checks: local dashboard, route file, local routing through the `web` entry point
+  (with and without the Access header), the Access application, the tunnel route, the connector, the DNS record
+  and the public URL (it must redirect to the Cloudflare Access login).
+- Running it again changes nothing; existing Access applications are reused. Removing it deletes the route first,
+  then only the DNS record, tunnel route and Access application this tool created.
+
+### Backups and restore
+
+The Backups page:
+
+- **Export configuration (.json)**: a versioned manifest (`format: traefik-proxy-config`, `schemaVersion: 1`,
+  manager version) of this instance: settings, Docker names and images, the Cloudflare account, zones, tunnel,
+  DNS record and Access application ids, public hostnames, routes, middlewares, service definitions and the
+  public dashboard settings.
+- **Download full backup (.zip)**: the manifest plus this instance's configuration files (`.env` with known keys
+  only, `config\*.json`, `traefik\dynamic\*.yml`) and an `INVENTORY.txt`.
+- **Never exported**: the Cloudflare API token, the tunnel connector token and anything under `secrets\`, plus
+  logs and earlier backups. Every exported text is scanned for credential patterns and for the stored tokens;
+  an export that would contain one is refused (a credential-like hand-written file is left out and listed). The
+  manifest lists the credentials to reconnect after a restore.
+- Only this instance's install folder is read, so other applications, other Traefik instances and other projects
+  on the PC are never packaged.
+- **Import backup** accepts a .json or .zip made by this tool, or a `config\services.json` from an earlier
+  version. The format, schema version (newer schemas are refused with an upgrade hint), file names and contents
+  are checked; a file containing a credential is refused. The preview shows every change before anything happens.
+- **Restore** has two separately approved parts:
+  1. *Local configuration*: setup choices (for a not yet installed folder, as the setup draft, so the Setup page
+     continues at *Review and install*), Cloudflare selections, the service registry and generated routes,
+     hand-written Traefik files from a .zip, the dashboard settings; then a Traefik reload. An installed
+     instance's `.env` is never changed. No container is started.
+  2. *Cloudflare*: recorded ids are verified first (the tunnel and zones must exist in the expected account; DNS
+     record and Access application ids are adopted only if they still match). Missing DNS records, tunnel routes
+     and Access applications are created; an existing DNS record is only replaced after a per-record
+     confirmation; an existing Access application is reused, never duplicated; tunnels are never recreated.
+     The public dashboard is republished with the same fail-closed order.
+  Restoring the same backup again changes nothing.
+- **Recovery points**: before every configuration change (service changes, rollbacks, restores, the dashboard)
+  a backup .zip is written to `backups\recovery\` (read-only, readable only by your Windows account, SYSTEM and
+  Administrators). They can be downloaded or restored like an imported backup and are never deleted
+  automatically. The change is refused if the recovery point cannot be written.
 
 **Adding a service** (Services > Add a service): enter a name, pick a domain (loaded from Cloudflare) and a
 subdomain, the backend IP address or hostname and port. The target type is detected (container name,
@@ -339,9 +404,13 @@ container on this PC already uses.
 .\tests\Test-FirstRun.ps1               # first run: web UI and diagnostics from the source folder, nothing installed yet
 .\tests\Test-Onboarding.ps1             # Cloudflare-first wizard against the mock: token link, discovery, permissions,
                                         # allowlist, local-only, preview, confirmed install of a disposable instance
+.\tests\Test-Backup.ps1                 # export/import/restore against the mock: round trip, version compatibility,
+                                        # credential exclusion, idempotency, authorization failures, recovery points
+.\tests\Test-Dashboard.ps1              # dashboard bootstrap: route, fail-closed Access, no duplicates, removal
 .\tests\Invoke-IsolatedTest.ps1         # (repository only) disposable second instance: install, live tests,
                                         # services.ps1 walkthrough with docker/LAN/host targets, a web UI
-                                        # end-to-end change (mock Cloudflare), teardown
+                                        # end-to-end change (mock Cloudflare), live dashboard routing and a live
+                                        # restore, teardown
 .\tests\Test-Stack.ps1                  # live checks against a running instance, exit code 1 on failure
 .\tests\Test-Stack.ps1 -PublicTestHost whoami-test.example.com
 .\scripts\Get-Diagnostics.ps1 -OutFile diag.txt
@@ -349,6 +418,30 @@ container on this PC already uses.
 
 `Invoke-IsolatedTest.ps1` takes before/after snapshots of every other container on the engine (ID, start
 time, state) and fails if anything outside its own instance changed.
+
+## Upgrading the manager on an installed instance
+
+The installer never overwrites instance data: `.env`, `config\`, `secrets\`, generated routes
+(`traefik\dynamic\svc-*.yml`, `admin-dashboard.yml`), `backups\` and `logs\` stay as they are. Package files
+(scripts, web UI, `compose.yaml`, `security.yml`, `dashboard.yml`) are updated only if you did not edit them; the
+previous copy goes to `backups\<timestamp>\`, and an edited file is kept with the new version written next to it
+as `<file>.dist`.
+
+```powershell
+cd <this repo>; git fetch; git checkout <new version>
+# 1. Back up first (read-only): Backups > "Download full backup (.zip)". Keep the file outside the install folder.
+powershell -ExecutionPolicy Bypass -File .\webui.ps1 -InstallPath <install folder>      # Ctrl+C when done
+# 2. See what would change (nothing is written):
+powershell -ExecutionPolicy Bypass -File .\install.ps1 -InstallPath <install folder> -DryRun
+# 3. Update the package files. Without -Start, no container is started, stopped or recreated (a running Traefik
+#    is only asked to re-read traefik\dynamic\, which a throwaway container triggers):
+powershell -ExecutionPolicy Bypass -File .\install.ps1 -InstallPath <install folder>
+```
+
+If the dry run lists `compose.yaml` as `same`, the running containers need nothing. If it changed, apply it
+when convenient with `.\install.ps1 -InstallPath <install folder> -Start` (add `-EnableTunnel` in tunnel mode).
+Undo the file update with `.\install.ps1 -InstallPath <install folder> -Rollback`. If configuration is ever lost,
+import the backup on the Backups page and apply part 1 (and part 2 for Cloudflare).
 
 ## Upgrades
 
@@ -399,7 +492,10 @@ routes from the old `traefik\dynamic\` folder can be copied over as-is, or re-cr
   first real use. The console wizard and `services.ps1` remain guided (manual Cloudflare steps).
 - The tunnel path (cloudflared, public test) has not been validated end to end from this repository.
 - The web UI handles one request at a time; long operations (installer, deep validation) block it briefly.
-  Cloudflare changes are not part of backups/rollback.
+  Service snapshots and rollback cover Traefik only; a backup restore re-creates missing Cloudflare resources but
+  never deletes Cloudflare resources that are not in the backup.
+- The public dashboard relies on Cloudflare Access for authentication; Traefik only checks that the Access header
+  is present, not its signature.
 - HTTP only between Cloudflare and Traefik inside Docker; TLS terminates at the Cloudflare edge. LAN clients
   cannot use the proxy (ports are loopback-only by design).
 - Cloudflare edge limits apply: 100 MB request body (Free/Pro), 100 s response timeout (HTTP 524), and

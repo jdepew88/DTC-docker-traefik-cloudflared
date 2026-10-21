@@ -56,10 +56,10 @@ $handler = {
   # -Token has every permission. Tokens named mock<Profile>_<random> simulate restricted tokens:
   #   One       only the zone example.test        NoZone    no Zone Read (no zones, no DNS)
   #   NoTunnel  no Cloudflare Tunnel permission    NoAccess  no Access permission
-  #   Disabled  verify reports status 'disabled'
+  #   Disabled  verify reports status 'disabled'   ReadOnly  reads everything, every write fails (403)
   $tokenProfile = ''
   if ($auth -eq "Bearer $Token") { $tokenProfile = 'Full' }
-  elseif ($auth -match '^Bearer mock(One|NoZone|NoTunnel|NoAccess|Disabled)_[A-Za-z0-9]{24,}$') { $tokenProfile = $Matches[1] }
+  elseif ($auth -match '^Bearer mock(One|NoZone|NoTunnel|NoAccess|Disabled|ReadOnly)_[A-Za-z0-9]{24,}$') { $tokenProfile = $Matches[1] }
   $authOk = ($tokenProfile -eq 'Full')
   $entry = [ordered]@{ method = $req.Method; path = $req.Path; query = $req.Query; body = $req.Body; authOk = $authOk; profile = $tokenProfile }
   [IO.File]::AppendAllText($LogFile, (ConvertTo-Json -InputObject $entry -Compress -Depth 5) + "`n")
@@ -92,6 +92,13 @@ $handler = {
       return Ok $t
     }
   }
+  if ($m -eq 'GET' -and $p -match '^/accounts/([^/]+)/cfd_tunnel/([0-9a-f-]{36})$') {
+    if ($Matches[1] -ne $acct) { return Fail 403 9109 'Unauthorized to access requested resource' }
+    $id = $Matches[2]
+    $t = @($db.tunnels | Where-Object { $_.id -eq $id })
+    if ($t.Count -eq 0) { return Fail 404 1003 'Tunnel not found' }
+    return Ok $t[0]
+  }
   if ($m -eq 'GET' -and $p -match '^/accounts/[^/]+/cfd_tunnel/([^/]+)/token$') {
     $json = ConvertTo-Json -Compress -InputObject ([ordered]@{ a = $acct; t = $Matches[1]; s = 'bW9jay1zZWNyZXQtbm90LXJlYWwtMDEyMzQ1Njc4OWFiY2RlZg==' })
     return Ok ([Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($json)))
@@ -119,6 +126,7 @@ $handler = {
     $id = $Matches[2]
     $rec = @($db.dns | Where-Object { $_.id -eq $id })
     if ($rec.Count -eq 0) { return Fail 404 81044 'Record does not exist.' }
+    if ($m -eq 'GET') { return Ok $rec[0] }
     if ($m -eq 'PUT') { $rec[0].type = $body.type; $rec[0].content = $body.content; $rec[0].proxied = [bool]$body.proxied; return Ok $rec[0] }
     if ($m -eq 'DELETE') { $db.dns.Remove($rec[0]); return Ok ([pscustomobject]@{ id = $id }) }
   }
@@ -130,10 +138,11 @@ $handler = {
       return Ok $app
     }
   }
-  if ($m -eq 'DELETE' -and $p -match '^/accounts/[^/]+/access/apps/([^/]+)$') {
+  if ($m -in @('GET', 'DELETE') -and $p -match '^/accounts/[^/]+/access/apps/([^/]+)$') {
     $id = $Matches[1]
     $app = @($db.apps | Where-Object { $_.id -eq $id })
     if ($app.Count -eq 0) { return Fail 404 12130 'access.api.error.not_found' }
+    if ($m -eq 'GET') { return Ok $app[0] }
     $db.apps.Remove($app[0])
     return Ok ([pscustomobject]@{ id = $id })
   }

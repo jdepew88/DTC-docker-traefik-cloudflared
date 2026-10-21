@@ -129,6 +129,21 @@ function Invoke-WebUi {
   return [pscustomobject]@{ Status = $r.Status; Data = $data; Body = $r.Body; Headers = $r.Headers }
 }
 
+# GET as the signed-in browser, returning the raw bytes (for file downloads).
+function Invoke-WebUiDownload($Server, [string]$Path) {
+  $req = [System.Net.HttpWebRequest]::Create("http://127.0.0.1:$($Server.Port)$Path")
+  $req.Proxy = $null
+  $req.Headers.Add('Cookie', $Server.Cookie)
+  $req.Timeout = 120000
+  $response = $null
+  try { $response = $req.GetResponse() } catch [System.Net.WebException] { $response = $_.Exception.Response }
+  $ms = New-Object System.IO.MemoryStream
+  $response.GetResponseStream().CopyTo($ms)
+  $out = [pscustomobject]@{ Status = [int]$response.StatusCode; Bytes = $ms.ToArray(); ContentType = $response.ContentType; Disposition = [string]$response.Headers['Content-Disposition'] }
+  $response.Close()
+  return $out
+}
+
 function Get-MockState($Mock) {
   $r = Invoke-RestMethod -Uri ($Mock.Base + '/_state') -Headers @{ Authorization = "Bearer $($Mock.Token)" }
   return $r.result
@@ -137,6 +152,22 @@ function Get-MockState($Mock) {
 function Get-MockRequests($Mock) {
   if (-not (Test-Path -LiteralPath $Mock.Log)) { return @() }
   return @(Get-Content -LiteralPath $Mock.Log | Where-Object { $_ } | ForEach-Object { $_ | ConvertFrom-Json })
+}
+
+# An "installed" instance folder that is never started: package files and a .env with a unique name and unused
+# loopback ports. Docker is not touched; tests use it for configuration-only flows.
+function New-TestInstance {
+  param([Parameter(Mandatory = $true)][string]$Repo, [Parameter(Mandatory = $true)][string]$Path, [Parameter(Mandatory = $true)][string]$StackName, [string]$Subnet = '172.30.199.0/28')
+  New-Item -ItemType Directory -Force -Path (Join-Path $Path 'traefik\dynamic'), (Join-Path $Path 'config') | Out-Null
+  Copy-Item -LiteralPath (Join-Path $Repo 'compose.yaml') -Destination $Path
+  Copy-Item -LiteralPath (Join-Path $Repo '.env.example') -Destination $Path
+  foreach ($f in @('security.yml', 'dashboard.yml')) { Copy-Item -LiteralPath (Join-Path $Repo "traefik\dynamic\$f") -Destination (Join-Path $Path 'traefik\dynamic') }
+  $o = $Subnet.Split('/')[0].Split('.')
+  $http = Get-FreeTcpPort; $dash = Get-FreeTcpPort
+  $env = @("STACK_NAME=$StackName", "TRAEFIK_HTTP_PORT=$http", "TRAEFIK_DASHBOARD_PORT=$dash", "PROXY_NETWORK=$StackName-proxy", "TUNNEL_SUBNET=$Subnet",
+    "TUNNEL_IP_RANGE=$($o[0]).$($o[1]).$($o[2]).$($o[3])/29", "CLOUDFLARED_IP=$($o[0]).$($o[1]).$($o[2]).$([int]$o[3] + 10)", 'TRAEFIK_LOG_LEVEL=INFO', 'TRAEFIK_READ_TIMEOUT=300s')
+  [IO.File]::WriteAllText((Join-Path $Path '.env'), (($env -join "`n") + "`n"))
+  return $Path
 }
 
 # Plan + apply through the API, the way the browser does it.
@@ -149,4 +180,4 @@ function Invoke-WebUiChange {
 }
 
 Export-ModuleMember -Function Get-FreeTcpPort, Wait-TcpPort, Start-CloudflareMock, Start-WebUiServer, Stop-TestServer, Invoke-RawHttp, Connect-WebUi,
-  Invoke-WebUi, Get-MockState, Get-MockRequests, Invoke-WebUiChange
+  Invoke-WebUi, Invoke-WebUiDownload, Get-MockState, Get-MockRequests, Invoke-WebUiChange, New-TestInstance

@@ -59,6 +59,16 @@ function Get-Http([string]$HostHeader, [string]$Path = '/') {
   $lines = $out -split "`n"
   return [pscustomobject]@{ Code = $lines[-1].Trim(); Body = (($lines | Select-Object -SkipLast 1) -join "`n") }
 }
+# GET with extra request headers; also returns where a redirect points.
+function Get-HttpWith([string]$HostHeader, [string]$Path, [string[]]$Headers = @(), [int]$Port = $HttpPort) {
+  $previous = $ErrorActionPreference
+  $ErrorActionPreference = 'Continue'
+  $hArgs = @('-H', "Host: $HostHeader"); foreach ($x in $Headers) { $hArgs += @('-H', $x) }
+  try { $out = (& curl.exe -s --max-time 15 -w "`n@@CODE=%{http_code}@@LOC=%{redirect_url}@@END" @hArgs "http://127.0.0.1:$Port$Path" 2>&1 | ForEach-Object { "$_" }) -join "`n" }
+  finally { $ErrorActionPreference = $previous }
+  $m = [regex]::Match($out, '@@CODE=(\d*)@@LOC=(.*?)@@END')
+  return [pscustomobject]@{ Code = $m.Groups[1].Value; Location = $m.Groups[2].Value.Trim(); Body = $out.Substring(0, [Math]::Max(0, $m.Index)) }
+}
 # Polls until the route answers as expected (Traefik reloads asynchronously after an apply).
 function Wait-Http([string]$HostHeader, [string]$Path, [scriptblock]$Until, [int]$Seconds = 20) {
   $deadline = (Get-Date).AddSeconds($Seconds)
@@ -198,6 +208,50 @@ try {
     $r = Wait-Http 'ui-demo.example.test' '/' { param($x) $x.Code -eq '404' }
     $dnsLeft = @((Get-MockState $mock).dns | Where-Object { $_.name -eq 'ui-demo.example.test' }).Count
     Test-Condition 'web UI: remove with cleanup (route 404, Cloudflare records gone)' ($change.Apply.Status -eq 200 -and $r.Code -eq '404' -and $dnsLeft -eq 0) "HTTP $($r.Code)"
+
+    # Dashboard bootstrap, live: Access (mock) first, then the route; Traefik routes it only with the Access header.
+    $dashHost = "$stack.example.test"
+    $access = 'Cf-Access-Jwt-Assertion: isolated-test'
+    $dp = Invoke-WebUi $ui POST '/api/dashboard/plan' @{ zoneId = 'zone00000000000000000000000000001'; accessEmails = @('owner@example.com') }
+    $da = Invoke-WebUi $ui POST '/api/dashboard/apply' @{ planId = $dp.Data.planId; confirm = $true }
+    $deadline = (Get-Date).AddSeconds(20)
+    do { $api = Get-HttpWith $dashHost '/api/version' @($access); if ($api.Code -eq '200') { break }; Start-Sleep -Milliseconds 700 } while ((Get-Date) -lt $deadline)
+    Test-Condition 'dashboard: published (Access first) and loaded by Traefik' ($dp.Data.canApply -and $da.Status -eq 200 -and $da.Data.ok -and
+      @($da.Data.steps | Where-Object { $_.name -eq 'Write the dashboard route' -and $_.status -eq 'Done' }).Count -eq 1) "$($da.Body)"
+    $page = Get-HttpWith $dashHost '/dashboard/' @($access)
+    Test-Condition 'dashboard: /api and /dashboard/ answer through the web entry point (with the Access header)' ($api.Code -eq '200' -and $api.Body -match '"Version"' -and $page.Code -eq '200') "api $($api.Code) page $($page.Code)"
+    $noAccess = Get-HttpWith $dashHost '/dashboard/'
+    $noAccessApi = Get-HttpWith $dashHost '/api/rawdata'
+    Test-Condition 'dashboard: without the Cloudflare Access header -> 404 (fail closed)' ($noAccess.Code -eq '404' -and $noAccessApi.Code -eq '404') "$($noAccess.Code) $($noAccessApi.Code)"
+    $root = Get-HttpWith $dashHost '/' @($access)
+    Test-Condition 'dashboard: / redirects to /dashboard/' ($root.Code -in @('302', '307') -and $root.Location -match '/dashboard/$') "$($root.Code) $($root.Location)"
+    $local = Get-HttpWith '127.0.0.1' '/dashboard/' @() $DashboardPort
+    Test-Condition 'dashboard: the local dashboard keeps working independently' ($local.Code -eq '200') $local.Code
+    $vr = Invoke-WebUi $ui POST '/api/dashboard/verify' @{ public = $false }
+    $vs = @{}; foreach ($c in @($vr.Data.checks)) { $vs[$c.id] = $c.state }
+    Test-Condition 'dashboard: verification (local dashboard, local routing, fail closed, Access, tunnel route, DNS)' ($vs['local-dashboard'] -eq 'ok' -and $vs['local-routing'] -eq 'ok' -and
+      $vs['fail-closed'] -eq 'ok' -and $vs['access'] -eq 'ok' -and $vs['tunnel-route'] -eq 'ok' -and $vs['dns'] -eq 'ok') ($vr.Data.checks | ConvertTo-Json -Compress)
+    $dp = Invoke-WebUi $ui POST '/api/dashboard/plan' @{ disable = $true }
+    $da = Invoke-WebUi $ui POST '/api/dashboard/apply' @{ planId = $dp.Data.planId; confirm = $true }
+    $deadline = (Get-Date).AddSeconds(20)
+    do { $gone = Get-HttpWith $dashHost '/api/version' @($access); if ($gone.Code -eq '404') { break }; Start-Sleep -Milliseconds 700 } while ((Get-Date) -lt $deadline)
+    Test-Condition 'dashboard: removal stops the public route' ($da.Status -eq 200 -and $da.Data.ok -and $gone.Code -eq '404') "$($gone.Code) $($da.Body)"
+
+    # Backup and restore, live: export, lose a service, restore the local part, Traefik serves it again.
+    $body = @{ op = 'add'; name = 'ui-restore'; service = @{ name = 'ui-restore'; hostnames = @('ui-restore.example.test'); target = @{ type = 'auto'; host = "$stack-whoami"; port = 80; protocol = 'http' }; cloudflare = @{ publish = $false; access = $false } }; cloudflare = @{ automate = $false } }
+    $null = Invoke-WebUiChange $ui $body
+    $r = Wait-Http 'ui-restore.example.test' '/' { param($x) $x.Code -eq '200' }
+    $zip = Invoke-WebUiDownload $ui '/api/backups/export?format=zip'
+    $null = Invoke-WebUiChange $ui @{ op = 'remove'; name = 'ui-restore'; cloudflare = @{ automate = $false } }
+    $gone = Wait-Http 'ui-restore.example.test' '/' { param($x) $x.Code -eq '404' }
+    $pv = Invoke-WebUi $ui POST '/api/backups/import/preview' @{ fileName = 'live.zip'; contentBase64 = [Convert]::ToBase64String($zip.Bytes) }
+    $ap = Invoke-WebUi $ui POST '/api/backups/import/apply' @{ importId = $pv.Data.importId; part = 'local'; confirm = $true }
+    $back = Wait-Http 'ui-restore.example.test' '/' { param($x) $x.Code -eq '200' }
+    Test-Condition 'restore (live): a removed service comes back after the local restore and Traefik reload' ($r.Code -eq '200' -and $zip.Status -eq 200 -and $gone.Code -eq '404' -and $pv.Data.local.canApply -and
+      $ap.Status -eq 200 -and $ap.Data.result.ok -and @($ap.Data.result.steps | Where-Object { $_.name -eq 'Reload Traefik' -and $_.status -eq 'Done' }).Count -eq 1 -and $back.Code -eq '200') "$($ap.Body)"
+    Test-Condition 'restore (live): restoring again changes nothing' (-not $ap.Data.local.hasWork) ''
+    $null = Invoke-WebUiChange $ui @{ op = 'remove'; name = 'ui-restore'; cloudflare = @{ automate = $false } }
+
     $logs = Invoke-WebUi $ui GET '/api/logs?role=traefik&tail=20'
     Test-Condition 'web UI: container logs of the instance' ($logs.Status -eq 200 -and $logs.Data.Ok -and @($logs.Data.Lines).Count -gt 0) "HTTP $($logs.Status)"
   } finally {

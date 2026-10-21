@@ -5,6 +5,9 @@ secrets/
 # Site-specific state rendered on the deployed host
 config/services.json
 config/cloudflare.json
+config/setup.json
+config/dashboard.json
+traefik/dynamic/admin-dashboard.yml
 logs/
 traefik/dynamic/svc-*.yml
 traefik/dynamic/zz-test-*.yml

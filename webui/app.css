@@ -222,6 +222,22 @@ dialog::backdrop { background: rgba(10, 14, 20, .55); }
 .action-list li.blocked { border-color: var(--err); background: var(--err-soft); }
 .file-head { display: flex; align-items: center; gap: .5rem; font-weight: 600; margin-top: .5rem; }
 
+/* Deployment review: grouped status lines + expandable technical output */
+.review { margin: .4rem 0 .9rem; }
+.review h4 { font-size: .8rem; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); margin: .7rem 0 .2rem; }
+.review ul { list-style: none; padding: 0; margin: 0; }
+.review li { display: grid; grid-template-columns: 1.5rem 1fr; gap: .35rem; padding: .3rem 0; border-bottom: 1px solid var(--border); }
+.review li:last-child { border-bottom: 0; }
+.review .ri { font-weight: 700; text-align: center; }
+.review .ri.ok { color: var(--ok); }
+.review .ri.failed { color: var(--err); }
+.review .ri.warning { color: var(--warn); }
+.review .ri.pending, .review .ri.info { color: var(--muted); }
+.review .msg { display: block; font-size: .88rem; color: var(--muted); }
+details.tech { margin: .5rem 0; }
+details.tech summary { cursor: pointer; font-weight: 600; padding: .3rem 0; }
+.card-head { padding: 1rem 1.2rem 0; }
+
 @media (max-width: 640px) {
   .topbar { padding: .6rem 1rem; }
   main { padding: 1rem 1rem 3rem; }

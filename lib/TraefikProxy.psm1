@@ -9,6 +9,8 @@
 Set-StrictMode -Version 2.0
 
 $script:TraefikImage = 'traefik:v3.7.15'   # keep in sync with compose.yaml
+# Version of this manager (scripts + web UI). Recorded in configuration backups; bump it when the package changes.
+$script:ManagerVersion = '1.1.0'
 $script:RegistryVersion = 1
 $script:ManagedPrefix = 'svc-'
 $script:HostnamePattern = '^(?=.{1,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$'
@@ -55,6 +57,32 @@ function Read-DotEnv([string]$Path) {
 
 function Get-FileSha256([string]$Path) {
   return (Get-FileHash -Algorithm SHA256 -LiteralPath $Path).Hash
+}
+
+function Get-TextSha256([string]$Text) {
+  $sha = [Security.Cryptography.SHA256]::Create()
+  return [BitConverter]::ToString($sha.ComputeHash($script:Utf8NoBom.GetBytes($Text))).Replace('-', '')
+}
+
+function Get-ManagerVersion { return $script:ManagerVersion }
+
+# One line of a deployment review, shown grouped by stage in the web UI:
+#   Stage: prepared | validated | applied | verified | action (requires user action)
+#   State: ok | failed | warning | pending | info
+function New-ReviewItem([string]$Stage, [string]$State, [string]$Label, [string]$Message = '') {
+  return [pscustomobject][ordered]@{ stage = $Stage; state = $State; label = $Label; message = $Message }
+}
+
+# image: lines of a compose file, as role -> image (e.g. traefik -> traefik:v3.7.15@sha256:...).
+function Get-ComposeImages([string]$ComposePath) {
+  $images = [ordered]@{}
+  if (-not (Test-Path -LiteralPath $ComposePath)) { return $images }
+  $service = ''
+  foreach ($line in [IO.File]::ReadAllLines($ComposePath)) {
+    if ($line -match '^  ([a-z0-9-]+):\s*$') { $service = $Matches[1] }
+    elseif ($service -and $line -match '^    image:\s*(\S+)') { $images[$service] = $Matches[1] }
+  }
+  return $images
 }
 
 # Writes UTF-8 (no BOM) with LF line endings via a temporary file, so readers never see a half-written file.
@@ -408,8 +436,10 @@ function ConvertTo-StableJson($Value, [int]$Indent = 0) {
   if ($Value -is [int] -or $Value -is [long] -or $Value -is [double]) { return [string]$Value }
   if ($Value -is [string]) { return (ConvertTo-Json -InputObject $Value -Compress) }
   if ($Value -is [System.Collections.IDictionary] -or $Value -is [System.Management.Automation.PSCustomObject]) {
-    $pairs = if ($Value -is [System.Collections.IDictionary]) { @($Value.Keys | ForEach-Object { ,@($_, $Value[$_]) }) }
-             else { @($Value.PSObject.Properties | ForEach-Object { ,@($_.Name, $_.Value) }) }
+    # A list, not @(... ,@(k, v)): with a single pair PowerShell 5.1 would flatten it into (k, v).
+    $pairs = New-Object System.Collections.Generic.List[object]
+    if ($Value -is [System.Collections.IDictionary]) { foreach ($k in @($Value.Keys)) { $pairs.Add(@($k, $Value[$k])) } }
+    else { foreach ($p in $Value.PSObject.Properties) { $pairs.Add(@($p.Name, $p.Value)) } }
     if ($pairs.Count -eq 0) { return '{}' }
     $items = foreach ($p in $pairs) { $pad + (ConvertTo-Json -InputObject ([string]$p[0]) -Compress) + ': ' + (ConvertTo-StableJson $p[1] ($Indent + 1)) }
     return "{`n" + ($items -join ",`n") + "`n$end}"
@@ -539,9 +569,10 @@ function Test-ServiceDefinition {
 }
 
 # Validates the whole set: every definition against all the others.
+# $ExtraMiddlewares: names defined by files that are about to be written (a restore), counted as available.
 function Test-ServiceRegistry {
-  param([Parameter(Mandatory = $true)]$Settings, [Parameter(Mandatory = $true)]$Services)
-  $available = Get-AvailableMiddlewares $Settings
+  param([Parameter(Mandatory = $true)]$Settings, [Parameter(Mandatory = $true)]$Services, [string[]]$ExtraMiddlewares = @())
+  $available = @(@(Get-AvailableMiddlewares $Settings) + @($ExtraMiddlewares) | Select-Object -Unique)
   $issues = @()
   $list = @($Services)
   for ($i = 0; $i -lt $list.Count; $i++) {
@@ -610,9 +641,9 @@ function ConvertTo-TraefikRouteYaml($Service) {
 
 # Compares the desired files (from $Services) with traefik\dynamic\svc-*.yml. Never writes anything.
 function Get-ServicePlan {
-  param([Parameter(Mandatory = $true)]$Settings, [Parameter(Mandatory = $true)]$Services)
+  param([Parameter(Mandatory = $true)]$Settings, [Parameter(Mandatory = $true)]$Services, [string[]]$ExtraMiddlewares = @())
   $list = @($Services | ForEach-Object { ConvertTo-ServiceDefinition $_ })
-  $issues = @(Test-ServiceRegistry -Settings $Settings -Services $list)
+  $issues = @(Test-ServiceRegistry -Settings $Settings -Services $list -ExtraMiddlewares $ExtraMiddlewares)
   $desired = @{}
   foreach ($s in $list | Where-Object { $_.enabled }) {
     if (@($issues | Where-Object { $_.Level -eq 'Error' -and $_.Service -eq $s.name }).Count -gt 0) { continue }
@@ -779,8 +810,10 @@ function Restore-ServiceBackup {
 
 # Loads the planned traefik\dynamic directory into a throwaway Traefik container (no network, removed
 # afterwards) and asks Traefik itself whether every router, service and middleware is valid.
+# $ExtraFiles (name -> content) are added to (or replace files in) the staged directory; $ExpectRouters are router
+# names (name@file) that must load in addition to the plan's generated ones.
 function Test-TraefikDynamicConfig {
-  param([Parameter(Mandatory = $true)]$Settings, $Plan, [int]$TimeoutSeconds = 20)
+  param([Parameter(Mandatory = $true)]$Settings, $Plan, [int]$TimeoutSeconds = 20, [hashtable]$ExtraFiles = @{}, [string[]]$ExpectRouters = @())
   $stage = Join-Path ([IO.Path]::GetTempPath()) ('traefik-validate-' + [Guid]::NewGuid().ToString('N').Substring(0, 12))
   New-Item -ItemType Directory -Path $stage | Out-Null
   $name = "$($Settings.StackName)-validate-" + [Guid]::NewGuid().ToString('N').Substring(0, 8)
@@ -792,12 +825,17 @@ function Test-TraefikDynamicConfig {
         Copy-Item -LiteralPath $f.FullName -Destination $stage
       }
     }
-    $expected = @()
+    $expected = @($ExpectRouters)
     if ($Plan) {
       foreach ($c in $Plan.Changes | Where-Object { $_.NewContent }) {
         [IO.File]::WriteAllText((Join-Path $stage $c.File), $c.NewContent, $script:Utf8NoBom)
         $expected += "$($script:ManagedPrefix)$($c.Service)@file"
       }
+    }
+    foreach ($name in $ExtraFiles.Keys) {
+      $target = Join-Path $stage $name
+      if ($null -eq $ExtraFiles[$name]) { Remove-Item -LiteralPath $target -Force -ErrorAction SilentlyContinue }
+      else { [IO.File]::WriteAllText($target, $ExtraFiles[$name], $script:Utf8NoBom) }
     }
     $run = Invoke-Docker run -d --name $name --network none --read-only -v "${stage}:/etc/traefik/dynamic:ro" $Settings.TraefikImage `
       --api=true --entryPoints.web.address=:80 --entryPoints.traefik.address=:8080 --api.insecure=true `
@@ -839,7 +877,7 @@ function Test-TraefikDynamicConfig {
     }
     $result.Errors = @($errors | Select-Object -Unique)
     $result.Warnings = $warnings
-    $result.Routers = @($routers | Where-Object { $_.name -like "$($script:ManagedPrefix)*" } | ForEach-Object { [pscustomobject]@{ Name = $_.name; Rule = $_.rule; Status = $_.status } })
+    $result.Routers = @($routers | Where-Object { $_.name -like "$($script:ManagedPrefix)*" -or $ExpectRouters -contains $_.name } | ForEach-Object { [pscustomobject]@{ Name = $_.name; Rule = $_.rule; Status = $_.status } })
     $result.Ok = ($result.Errors.Count -eq 0)
     return $result
   } finally {
@@ -1069,7 +1107,8 @@ function Get-StackLogs {
   return [pscustomobject]@{ Container = $names[$Role]; Ok = ($r.ExitCode -eq 0); Lines = @(ConvertTo-RedactedText $r.Output) }
 }
 
-Export-ModuleMember -Function Invoke-Docker, Read-DotEnv, Get-FileSha256, Write-TextFileAtomic, ConvertTo-IPv4Range, Test-CidrOverlap,
+Export-ModuleMember -Function Invoke-Docker, Read-DotEnv, Get-FileSha256, Get-TextSha256, Get-ManagerVersion, New-ReviewItem, Get-ComposeImages, Write-TextFileAtomic,
+  Get-ServiceProperty, ConvertTo-StableJson, ConvertTo-IPv4Range, Test-CidrOverlap,
   Get-TunnelTokenPattern, ConvertFrom-TunnelToken, Find-ConnectorForTunnel, Set-SecretFileAcl, Save-TunnelTokenFile, Test-TunnelTokenFile,
   Start-ProxyStack, Start-TunnelConnector, Get-PortUser, ConvertTo-RedactedText, Get-DockerStatus, Get-StackContainerNames, Get-StackStatus, Get-StackLogs,
   Test-PrivateIPv4, Test-IPv4Address, Get-StackSettings, ConvertTo-StackSettings, ConvertTo-InstanceValues, New-DotEnvContent,

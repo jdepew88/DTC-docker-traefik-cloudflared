@@ -21,6 +21,11 @@
     editing: null,
     planBody: null,
     plan: null,
+    planApplyPath: '/api/services/apply',
+    replan: null,
+    dashboard: null,
+    dashboardVerify: null,
+    restore: null,
   };
 
   // --- DOM helpers ----------------------------------------------------------------------------------
@@ -178,6 +183,7 @@
     const [s, setup] = await Promise.all([api('GET', '/api/status'), api('GET', '/api/setup')]);
     state.status = s;
     state.setup = setup;
+    state.dashboard = setup.installed ? await api('GET', '/api/dashboard').catch(() => null) : null;
     if (!setup.cloudflare.tokenStored) state.discovery = null;
     renderInstance(s);
     renderSetup(s);
@@ -199,6 +205,31 @@
 
   function check(ok, text, warn = false) {
     return h('li', null, badge(ok ? 'OK' : warn ? 'Check' : 'Missing', ok ? 'ok' : warn ? 'warn' : 'err'), ' ', text);
+  }
+
+  // Deployment review: status lines grouped by stage, plus the full technical output in an expandable section.
+  const REVIEW_STAGES = [
+    ['prepared', 'Configuration prepared'],
+    ['validated', 'Validation'],
+    ['applied', 'Changes applied'],
+    ['verified', 'Runtime verified'],
+    ['action', 'Requires your action'],
+  ];
+  const REVIEW_ICONS = { ok: ['✓', 'OK'], failed: ['✗', 'Failed'], warning: ['!', 'Warning'], pending: ['…', 'Pending'], info: ['i', 'Note'] };
+  function renderReview(review, technical, technicalTitle = 'Technical output') {
+    const items = arr(review);
+    const groups = REVIEW_STAGES.map(([stage, title]) => {
+      const list = items.filter((i) => i.stage === stage);
+      if (!list.length) return null;
+      return [h('h4', null, title), h('ul', null, list.map((i) => {
+        const [icon, label] = REVIEW_ICONS[i.state] || ['?', i.state];
+        return h('li', null, h('span', { class: `ri ${i.state}`, 'aria-hidden': 'true' }, icon),
+          h('span', null, h('span', { class: 'sr-only' }, `${label}: `), h('strong', null, i.label), i.message ? h('span', { class: 'msg' }, i.message) : null));
+      }))];
+    });
+    const lines = arr(technical);
+    return h('div', { class: 'review' }, groups,
+      lines.length ? h('details', { class: 'tech' }, h('summary', null, technicalTitle), h('pre', { class: 'output', tabindex: '0' }, lines.join('\n'))) : null);
   }
 
   function step(n, title, status, badgeEl, ...body) {
@@ -269,9 +300,15 @@
       badge(setup.installed ? 'Installed' : 'Not installed', setup.installed ? 'ok' : 'neutral'),
       renderInstall(setup, dockerOk)));
 
-    // 8. Services
+    // 8. Traefik dashboard: check Traefik itself before publishing applications.
+    const dsh = state.dashboard;
+    steps.push(step(8, 'Traefik dashboard', setup.installed ? 'done' : 'todo',
+      badge(!setup.installed ? 'After installation' : dsh && dsh.enabled ? 'Local + public (Access)' : 'Local', setup.installed ? 'ok' : 'neutral'),
+      renderDashboardStep(setup)));
+
+    // 9. Services
     const svc = s.services;
-    steps.push(step(8, 'Services', svc.total > 0 ? 'done' : 'todo', badge(`${svc.enabled} enabled / ${svc.total} total`, svc.total > 0 ? 'ok' : 'neutral'),
+    steps.push(step(9, 'Services', svc.total > 0 ? 'done' : 'todo', badge(`${svc.enabled} enabled / ${svc.total} total`, svc.total > 0 ? 'ok' : 'neutral'),
       h('p', null, 'Add each app you want to publish: a name, its public hostname and where it runs. You can manage many apps through this one Traefik.'),
       svc.drift > 0 ? h('p', { class: 'hint warn' }, `${svc.drift} route file(s) differ from the service registry. Open Services to review.`) : null,
       h('div', { class: 'actions' }, h('button', {
@@ -534,7 +571,6 @@
       ];
     }
     const plan = state.installPlan;
-    const out = h('pre', { class: 'output', hidden: !plan || !arr(plan.dryRun).length, tabindex: '0' }, plan ? arr(plan.dryRun).join('\n') : '');
     const box = h('input', { type: 'checkbox', id: 'wiz-install-ok' });
     const go = h('button', { type: 'button', class: 'btn primary', disabled: true }, 'Install…');
     box.addEventListener('change', () => { go.disabled = !(box.checked && plan && plan.canInstall); });
@@ -549,17 +585,75 @@
         }),
       }, plan ? 'Preview again' : 'Preview installation')),
       plan ? h('div', { class: 'plan-section' },
-        h('h3', null, 'Steps'),
+        h('h3', null, 'Review'),
+        renderReview(plan.review, plan.diagnostics, 'Technical output (installer dry run, compose check)'),
+        h('h3', null, 'What the installation will do'),
         h('ol', { class: 'action-list' }, arr(plan.steps).map((s) => h('li', null, badge((kind[s.kind] || ['', 'neutral'])[0], (kind[s.kind] || ['', 'neutral'])[1]), ' ', s.text))),
-        arr(plan.blockers).length ? [h('h3', null, 'Blocking problems'), h('ul', { class: 'issue-list' }, arr(plan.blockers).map((b) => h('li', { class: 'err' }, b)))] : null,
-        arr(plan.warnings).length ? [h('h3', null, 'Notes'), h('ul', { class: 'issue-list' }, arr(plan.warnings).map((w) => h('li', { class: 'warn' }, w)))] : null,
-        h('h3', null, 'Installer dry run'), out,
         plan.canInstall ? h('div', { class: 'actions' }, h('label', { class: 'check' }, box, h('span', null, 'I reviewed these steps')), go) : null) : null,
       !dockerOk ? h('p', { class: 'hint warn' }, 'Docker Desktop must be running to install.') : null,
-      state.installResult ? h('div', { class: 'plan-section' }, h('h3', null, state.installResult.ok ? 'Installation finished' : 'Installation failed'),
-        h('ul', { class: 'result-list' }, arr(state.installResult.steps).map((s) => h('li', null, badge(s.status, s.status === 'Done' ? 'ok' : 'err'), ' ', s.name, s.message ? h('p', { class: 'hint' }, s.message) : null))),
-        h('pre', { class: 'output', tabindex: '0' }, arr(state.installResult.lines).join('\n'))) : null,
+      renderInstallResult(),
     ];
+  }
+
+  function renderInstallResult() {
+    const r = state.installResult;
+    if (!r) return null;
+    return h('div', { class: 'plan-section' }, h('h3', null, r.ok ? 'Installation finished' : 'Installation failed'),
+      renderReview(r.review, r.lines, 'Technical output (installer)'));
+  }
+
+  // --- Traefik dashboard (setup step 8) ----------------------------------------------------------------
+  function renderDashboardStep(setup) {
+    const d = state.dashboard;
+    if (!setup.installed || !d) {
+      return h('p', null, 'After the installation you can check Traefik itself here, before you publish any application.');
+    }
+    const link = (url) => h('a', { href: url, target: '_blank', rel: 'noopener noreferrer' }, url);
+    const out = [
+      h('p', null, 'Traefik\'s dashboard lists its routers, services and middlewares. Check it before publishing applications.'),
+      h('p', null, h('strong', null, 'On this PC: '), link(d.localUrl), h('span', { class: 'muted' }, ' (127.0.0.1 only, always available)')),
+    ];
+    if (d.enabled) {
+      out.push(h('p', null, h('strong', null, 'Public: '), link(d.publicUrl), h('span', { class: 'muted' }, ' (Cloudflare Access login required)')));
+    } else if (!d.cloudflareReady) {
+      out.push(h('p', { class: 'hint' }, 'Publishing the dashboard needs Cloudflare automation (API token, account and tunnel), because it is always protected by a Cloudflare Access login.'));
+    } else {
+      const sub = h('input', { id: 'dash-sub', value: d.subdomain, spellcheck: 'false', autocomplete: 'off', 'aria-describedby': 'dash-sub-hint' });
+      const zone = h('select', { id: 'dash-zone', 'aria-label': 'Domain' }, arr(d.domains).map((z) => h('option', { value: z.id, selected: z.id === d.zoneId }, z.name)));
+      const emails = h('input', { id: 'dash-emails', value: arr(d.accessEmails).join(', '), spellcheck: 'false', autocomplete: 'off', placeholder: 'you@example.com' });
+      const preview = (e) => startDashboardPlan({ subdomain: sub.value.trim(), zoneId: zone.value, accessEmails: emails.value.split(/[\s,;]+/).filter(Boolean) }, e.currentTarget);
+      out.push(h('fieldset', { class: 'exposure' }, h('legend', null, 'Publish the dashboard through the tunnel'),
+        h('div', { class: 'field' }, h('label', { for: 'dash-sub' }, 'Hostname'),
+          h('div', { class: 'hostname-row' }, sub, h('span', { class: 'dot' }, '.'), zone),
+          h('p', { class: 'hint', id: 'dash-sub-hint' }, `Suggested from the instance name. Uses tunnel "${d.tunnelName}". Only /dashboard/ and /api are routed.`)),
+        h('div', { class: 'field' }, h('label', { for: 'dash-emails' }, 'Who may sign in (Cloudflare Access)'), emails,
+          h('p', { class: 'hint' }, 'Needed only when Cloudflare Access has no application for this hostname yet. Nothing is published unless Access protects it.')),
+        h('div', { class: 'actions' }, h('button', { type: 'button', class: 'btn primary', onclick: preview }, 'Preview…'))));
+    }
+    out.push(h('div', { class: 'actions' },
+      h('button', { type: 'button', class: 'btn', onclick: (e) => verifyDashboard(e.currentTarget) }, d.enabled ? 'Verify (local, Cloudflare, public URL)' : 'Verify local dashboard'),
+      d.enabled ? h('button', { type: 'button', class: 'btn danger-outline', onclick: (e) => startDashboardPlan({ disable: true }, e.currentTarget) }, 'Remove public dashboard…') : null));
+    if (state.dashboardVerify) out.push(h('div', { class: 'plan-section' }, h('h3', null, 'Verification'), renderReview(state.dashboardVerify.review)));
+    return out;
+  }
+
+  async function verifyDashboard(button) {
+    await withBusy(button, async () => {
+      state.dashboardVerify = await api('POST', '/api/dashboard/verify', { public: !!(state.dashboard && state.dashboard.enabled) });
+      renderSetup(state.status);
+    });
+  }
+
+  async function startDashboardPlan(body, button) {
+    state.planBody = body;
+    state.planApplyPath = '/api/dashboard/apply';
+    state.replan = () => startDashboardPlan(body);
+    return withBusy(button, async () => {
+      const plan = await api('POST', '/api/dashboard/plan', body);
+      state.plan = plan;
+      renderPlan(plan, { op: 'dashboard' });
+      openDialog($('#plan-dialog'));
+    });
   }
 
   async function runInstall(button) {
@@ -817,6 +911,8 @@
   // --- Plan / apply ---------------------------------------------------------------------------------
   async function startPlan(body, button) {
     state.planBody = body;
+    state.planApplyPath = '/api/services/apply';
+    state.replan = () => startPlan(body);
     return withBusy(button, async () => {
       const plan = await api('POST', '/api/services/plan', body);
       state.plan = plan;
@@ -841,6 +937,7 @@
   function renderPlan(plan, body) {
     $('#plan-title').textContent = plan.summary;
     const content = clear($('#plan-content'));
+    if (arr(plan.review).length) content.append(h('div', { class: 'plan-section' }, renderReview(plan.review)));
     const notes = arr(plan.notes);
     if (notes.length) content.append(h('div', { class: 'plan-section' }, h('ul', { class: 'issue-list' }, notes.map((n) => h('li', { class: 'warn' }, n)))));
 
@@ -920,31 +1017,36 @@
     const overwrites = $$('.overwrite-confirm:checked', $('#plan-content')).map((b) => b.dataset.id);
     button.disabled = true;
     button.setAttribute('aria-busy', 'true');
+    const path = state.planApplyPath;
     try {
-      const r = await api('POST', '/api/services/apply', { planId: state.plan.planId, confirm: true, confirmOverwrites: overwrites });
+      const r = await api('POST', path, { planId: state.plan.planId, confirm: true, confirmOverwrites: overwrites });
       renderResult(r);
-      closeServiceForm();
+      if (path === '/api/services/apply') closeServiceForm();
+      else state.dashboardVerify = null;
     } catch (e) {
       const content = $('#plan-content');
+      const replan = state.replan;
       content.prepend(h('div', { class: 'card callout err', role: 'alert' }, h('p', null, e.message),
-        e.status === 409 ? h('button', { type: 'button', class: 'btn', onclick: () => startPlan(state.planBody) }, 'Preview again') : null));
+        e.status === 409 && replan ? h('button', { type: 'button', class: 'btn', onclick: () => replan() }, 'Preview again') : null));
       content.scrollTop = 0;
     } finally {
       button.removeAttribute('aria-busy');
     }
-    loadServices().catch(() => {});
+    if (path === '/api/services/apply') loadServices().catch(() => {});
     refreshStatus().catch(() => {});
   }
 
   function renderResult(r) {
-    $('#plan-title').textContent = r.ok ? 'Changes applied' : 'Some changes failed';
+    $('#plan-title').textContent = r.failClosed ? 'Nothing was published' : r.ok ? 'Changes applied' : 'Some changes failed';
     const statusKind = { Done: 'ok', Unchanged: 'neutral', Warning: 'warn', Skipped: 'warn', 'Not run': 'neutral', Failed: 'err' };
     fill($('#plan-content'),
-      h('ul', { class: 'result-list', 'aria-live': 'polite' }, arr(r.steps).map((s) => h('li', null,
+      arr(r.review).length ? renderReview(r.review) : h('ul', { class: 'result-list', 'aria-live': 'polite' }, arr(r.steps).map((s) => h('li', null,
         badge(s.status, statusKind[s.status] || 'neutral'), ' ', s.name, s.message ? h('p', { class: 'hint' }, s.message) : null))),
       arr(r.warnings).map((w) => h('p', { class: 'hint warn' }, w)),
+      r.url ? h('p', null, h('strong', null, 'Dashboard: '), h('a', { href: r.url, target: '_blank', rel: 'noopener noreferrer' }, r.url), h('span', { class: 'muted' }, ' (Cloudflare Access login; a new DNS record can take a few minutes)')) : null,
       r.backup ? h('p', { class: 'muted' }, `The previous state was saved as backup ${r.backup}. Restore it on the Backups page if needed.`) : null,
-      !r.ok ? h('p', null, 'Traefik changes that were applied stay in place. Fix the cause and preview again, or restore the backup.') : null);
+      r.recoveryPoint ? h('p', { class: 'muted' }, `Recovery point: ${r.recoveryPoint} (Backups page).`) : null,
+      !r.ok && !r.failClosed ? h('p', null, 'Changes that were applied stay in place. Fix the cause and preview again, or restore the backup.') : null);
     fill($('#plan-foot'), h('button', { type: 'button', class: 'btn primary', 'data-close': true }, 'Close'));
     $('#plan-foot .btn').focus();
   }
@@ -1018,8 +1120,20 @@
   // --- Backups ----------------------------------------------------------------------------------------
   async function loadBackups() {
     if (!state.status) await refreshStatus();
-    if (!state.status.instance.installed) { $('#backups-empty').hidden = false; clear($('#backups-table tbody')); return; }
     const r = await api('GET', '/api/backups');
+    fill($('#backup-credentials'), arr(r.credentials).map((c) => h('li', null, h('strong', null, c.label), ` (${c.present ? 'present on this PC' : 'not stored here'}): `, h('span', { class: 'muted' }, c.recover))));
+    const rp = arr(r.recoveryPoints);
+    const rtbody = clear($('#recovery-table tbody'));
+    $('#recovery-empty').hidden = rp.length > 0;
+    for (const p of rp) {
+      rtbody.append(h('tr', null,
+        h('td', null, h('span', { class: 'mono' }, p.id), p.protected ? [' ', badge('Protected', 'ok')] : null),
+        h('td', null, p.createdAt),
+        h('td', null, p.reason),
+        h('td', { class: 'actions-cell' },
+          h('button', { type: 'button', class: 'btn small', onclick: (e) => withBusy(e.currentTarget, () => download(`/api/backups/recovery/download?id=${encodeURIComponent(p.id)}`, p.id)) }, 'Download'),
+          h('button', { type: 'button', class: 'btn small', onclick: (e) => previewImport({ recoveryId: p.id }, e.currentTarget) }, 'Preview restore'))));
+    }
     const list = arr(r.backups);
     const tbody = clear($('#backups-table tbody'));
     $('#backups-empty').hidden = list.length > 0;
@@ -1057,8 +1171,137 @@
     });
   }
 
+  // Downloads a file from the API (the session cookie authenticates the request).
+  async function download(path, fallbackName) {
+    const res = await fetch(path, { credentials: 'same-origin' });
+    if (!res.ok) {
+      let msg = '';
+      try { msg = (await res.json()).error; } catch (e) { msg = ''; }
+      throw new Error(msg || `Download failed (HTTP ${res.status}).`);
+    }
+    const blob = await res.blob();
+    const m = /filename="([^"]+)"/.exec(res.headers.get('Content-Disposition') || '');
+    const a = h('a', { href: URL.createObjectURL(blob), download: m ? m[1] : fallbackName, hidden: true });
+    document.body.append(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+    toast(`Saved ${m ? m[1] : fallbackName}.`);
+  }
+
+  function readFileBase64(file) {
+    return new Promise((resolve, reject) => {
+      const r = new FileReader();
+      r.onload = () => { const s = String(r.result); resolve(s.slice(s.indexOf(',') + 1)); };
+      r.onerror = () => reject(new Error('The file could not be read.'));
+      r.readAsDataURL(file);
+    });
+  }
+
+  const importEmails = () => $('#import-emails').value.split(/[\s,;]+/).map((x) => x.trim()).filter(Boolean);
+
+  async function previewImport(body, button) {
+    await withBusy(button, async () => {
+      const view = await api('POST', '/api/backups/import/preview', { ...body, accessEmails: importEmails() });
+      state.restore = view;
+      renderRestore(view);
+      openDialog($('#plan-dialog'));
+    });
+  }
+
+  const ACTION_BADGES = { create: ['Create', 'info'], update: ['Update', 'warn'], delete: ['Remove', 'err'], unchanged: ['No change', 'neutral'], keep: ['Kept', 'neutral'] };
+  function renderRestore(view) {
+    const src = view.source;
+    $('#plan-title').textContent = `Restore ${src.fileName}`;
+    const content = clear($('#plan-content'));
+    const res = view.result;
+    if (res) {
+      content.append(h('div', { class: `card callout ${res.ok ? 'info' : 'err'}`, role: 'status' },
+        h('p', null, h('strong', null, `${res.part === 'local' ? 'Local configuration' : 'Cloudflare'}: ${res.ok ? 'applied' : 'not completed'}.`),
+          res.recoveryPoint ? ` Recovery point ${res.recoveryPoint} was written first.` : ''),
+        renderReview(arr(res.steps).map((s) => ({ stage: 'applied', state: { Done: 'ok', Unchanged: 'info', Warning: 'warning', Skipped: 'warning', 'Not run': 'info', Failed: 'failed' }[s.status] || 'info', label: s.name, message: s.message })))));
+    }
+    content.append(h('p', { class: 'muted' }, `Into ${src.installPath}. Backup sha256 ${String(src.sha256).slice(0, 16)}…`));
+    content.append(renderReview(view.review));
+
+    const local = view.local;
+    const ls = h('div', { class: 'plan-section' }, h('h3', null, 'Part 1: local configuration (this PC)'));
+    for (const e of arr(local.errors)) ls.append(h('p', { class: 'form-error' }, e));
+    for (const i of arr(local.items)) {
+      const [t, k] = ACTION_BADGES[i.action] || [i.action, 'neutral'];
+      ls.append(h('div', { class: 'file-head' }, badge(t, k), h('span', null, i.summary)));
+      if (i.detail) ls.append(h('p', { class: 'hint' }, i.detail));
+      if (arr(i.diff).length && i.action !== 'unchanged') ls.append(diffBlock(i.diff));
+    }
+    ls.append(h('p', { class: 'muted' }, 'Writes configuration files and reloads Traefik if it runs. No container is started, stopped or recreated, and credentials are not touched.'));
+    content.append(ls);
+
+    const cf = view.cloudflare;
+    const cs = h('div', { class: 'plan-section' }, h('h3', null, 'Part 2: Cloudflare'));
+    if (cf.message) cs.append(h('p', { class: 'muted' }, cf.message));
+    for (const n of arr(cf.notes)) cs.append(h('p', { class: 'muted' }, n));
+    for (const e of arr(cf.errors)) cs.append(h('p', { class: 'form-error' }, e));
+    const actions = arr(cf.actions);
+    if (actions.length) {
+      cs.append(h('ul', { class: 'action-list' }, actions.map((a) => {
+        const li = h('li', { class: a.overwrite ? 'overwrite' : a.kind === 'blocked' ? 'blocked' : '' },
+          (kindBadge[a.kind] || kindBadge.none)(), ' ', badge({ dns: 'DNS', tunnel: 'Tunnel route', access: 'Access', route: 'Traefik route' }[a.step] || a.step, 'neutral'), ' ', a.summary,
+          a.detail ? h('p', { class: 'detail' }, a.detail) : null);
+        if (a.overwrite) li.append(h('label', { class: 'check' }, h('input', { type: 'checkbox', class: 'restore-overwrite', 'data-id': a.id }), h('span', null, h('strong', null, 'Yes, overwrite this existing Cloudflare resource.'))));
+        return li;
+      })));
+    } else if (cf.connected) cs.append(h('p', { class: 'muted' }, 'Everything recorded in the backup already exists in Cloudflare.'));
+    cs.append(h('p', { class: 'muted' }, 'Existing resources are reused, never duplicated. Missing ones are created; an existing DNS record is only replaced after you tick its box.'));
+    content.append(cs);
+
+    const foot = clear($('#plan-foot'));
+    const okLocal = h('input', { type: 'checkbox' });
+    const goLocal = h('button', { type: 'button', class: 'btn primary', disabled: true }, 'Apply local configuration');
+    okLocal.addEventListener('change', () => { goLocal.disabled = !okLocal.checked; });
+    goLocal.addEventListener('click', () => applyRestore('local', goLocal));
+    const okCf = h('input', { type: 'checkbox' });
+    const goCf = h('button', { type: 'button', class: 'btn primary', disabled: true }, 'Apply Cloudflare changes');
+    const syncCf = () => { goCf.disabled = !(okCf.checked && $$('.restore-overwrite', content).every((b) => b.checked)); };
+    okCf.addEventListener('change', syncCf);
+    $$('.restore-overwrite', content).forEach((b) => b.addEventListener('change', syncCf));
+    goCf.addEventListener('click', () => applyRestore('cloudflare', goCf));
+    if (local.canApply) foot.append(h('label', { class: 'check grow' }, okLocal, h('span', null, 'I approve the local changes in part 1')), goLocal);
+    if (cf.canApply && !cf.needsLocal) foot.append(h('label', { class: 'check grow' }, okCf, h('span', null, 'I approve the Cloudflare changes in part 2')), goCf);
+    else if (cf.canApply) foot.append(h('span', { class: 'grow muted' }, 'Part 2 becomes available after part 1 is applied.'));
+    if (!local.canApply && !cf.canApply) foot.append(h('span', { class: 'grow muted' }, local.hasWork || cf.hasWork ? 'Resolve the problems above, then preview again.' : 'Nothing to restore: this instance already matches the backup.'));
+    foot.append(h('button', { type: 'button', class: 'btn', 'data-close': true }, 'Close'));
+  }
+
+  async function applyRestore(part, button) {
+    const view = state.restore;
+    const overwrites = $$('.restore-overwrite:checked', $('#plan-content')).map((b) => b.dataset.id);
+    await withBusy(button, async () => {
+      try {
+        const next = await api('POST', '/api/backups/import/apply', { importId: view.importId, part, confirm: true, confirmOverwrites: overwrites, accessEmails: importEmails() });
+        state.restore = next;
+        renderRestore(next);
+        toast(next.result.ok ? `${part === 'local' ? 'Local configuration' : 'Cloudflare'} restored.` : 'The restore did not complete; see the details.', !next.result.ok);
+      } finally {
+        loadBackups().catch(() => {});
+        refreshStatus().catch(() => {});
+      }
+    });
+  }
+
   // --- Event wiring -------------------------------------------------------------------------------------
   function wire() {
+    $('#btn-export-json').addEventListener('click', (e) => withBusy(e.currentTarget, () => download('/api/backups/export?format=json', 'traefik-proxy-config.json')));
+    $('#btn-export-zip').addEventListener('click', (e) => withBusy(e.currentTarget, () => download('/api/backups/export?format=zip', 'traefik-proxy-backup.zip')));
+    $('#import-form').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const file = $('#import-file').files[0];
+      if (!file) { toast('Choose a backup file first.', true); return; }
+      if (file.size > 2 * 1024 * 1024) { toast('That file is larger than 2 MB; a configuration backup is much smaller.', true); return; }
+      const button = e.submitter || $('#import-form button[type="submit"]');
+      let contentBase64;
+      try { contentBase64 = await readFileBase64(file); } catch (err) { toast(err.message, true); return; }
+      await previewImport({ fileName: file.name, contentBase64 }, button);
+    });
     $('#btn-add-service').addEventListener('click', () => openServiceForm(null));
     $('#btn-cancel-service').addEventListener('click', closeServiceForm);
     $('#f-target-host').addEventListener('input', updateTargetHint);

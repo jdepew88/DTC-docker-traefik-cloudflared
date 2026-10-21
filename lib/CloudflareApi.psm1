@@ -79,6 +79,18 @@ function Get-CloudflareApiTokenInfo {
   return [pscustomobject]@{ Stored = $true; SavedAt = [string]$doc.savedAt; User = [string]$doc.user; Readable = $readable }
 }
 
+# True when $Text contains the stored API token. Lets export code prove that a backup is free of the token without
+# the token ever leaving this module.
+function Test-TextContainsApiToken {
+  param([Parameter(Mandatory = $true)]$Settings, [string]$Text)
+  if (-not $Text) { return $false }
+  $token = $null
+  try { $token = Read-CloudflareApiToken $Settings } catch { return $false }
+  $found = [bool]($token -and $Text.Contains($token))
+  $token = $null
+  return $found
+}
+
 # Not exported: the plaintext token never leaves this module.
 function Read-CloudflareApiToken($Settings) {
   $path = Get-CloudflareSecretPath $Settings
@@ -136,8 +148,14 @@ function Set-ManagedResource($Config, [string]$Hostname, [string]$Field, [string
 }
 
 function Get-ManagedResource($Config, [string]$Hostname, [string]$Field) {
-  if ($Config.managed.PSObject.Properties[$Hostname]) { return [string]$Config.managed.$Hostname.$Field }
+  if ($Config.managed.PSObject.Properties[$Hostname] -and $Config.managed.$Hostname.PSObject.Properties[$Field]) { return [string]$Config.managed.$Hostname.$Field }
   return ''
+}
+
+# Who may sign in through an Access application this tool created (kept so a restore can recreate it).
+function Get-ManagedAccessEmails($Config, [string]$Hostname) {
+  if ($Config.managed.PSObject.Properties[$Hostname] -and $Config.managed.$Hostname.PSObject.Properties['accessEmails']) { return @($Config.managed.$Hostname.accessEmails | Where-Object { $_ }) }
+  return @()
 }
 
 # --- HTTP client -----------------------------------------------------------------------------------------------
@@ -349,6 +367,94 @@ function Get-CloudflareZones {
   return @(Invoke-CloudflareApi -Settings $Settings -Path '/zones' -Query $query -All | ForEach-Object { [pscustomobject]@{ id = [string]$_.id; name = [string]$_.name; status = [string]$_.status } })
 }
 
+# Read-only check that Cloudflare resources recorded in a backup still exist and belong to the expected account:
+# the account, the tunnel, the allowed zones, and per hostname the DNS record and Access application ids.
+# $Hostnames: objects with hostname, dnsRecordId, accessAppId. Never throws. Every item has
+# state = verified | missing | mismatch | unknown | none, and a message.
+function Get-CloudflareResourceCheck {
+  param([Parameter(Mandatory = $true)]$Settings, [string]$AccountId, [string]$TunnelId, $Domains = @(), $Hostnames = @())
+  $item = { param($Id, $Name, $State, $Message) [pscustomobject][ordered]@{ id = $Id; name = $Name; state = $State; message = $Message } }
+  $out = [ordered]@{ Connected = $false; Message = ''; Account = $null; Tunnel = $null; Domains = @(); Hostnames = @() }
+  $token = Get-CloudflareApiTokenInfo -Settings $Settings
+  if (-not ($token.Stored -and $token.Readable)) {
+    $out.Message = 'No usable Cloudflare API token is stored, so the Cloudflare resources in the backup were not verified.'
+    return [pscustomobject]$out
+  }
+  $out.Connected = $true
+  $accountOk = $false
+  if (-not $AccountId) { $out.Account = & $item '' '' 'none' 'The backup has no Cloudflare account.' }
+  else {
+    try {
+      $acct = @(Invoke-CloudflareApi -Settings $Settings -Path '/accounts' -All | Where-Object { $_.id -eq $AccountId })
+      if ($acct.Count -gt 0) { $accountOk = $true; $out.Account = & $item $AccountId ([string]$acct[0].name) 'verified' "The API token can see account '$($acct[0].name)'." }
+      else { $out.Account = & $item $AccountId '' 'missing' 'The stored API token cannot see this account. Connect a token for the account the backup was made from.' }
+    } catch { $out.Account = & $item $AccountId '' 'unknown' $_.Exception.Message }
+  }
+  if (-not $TunnelId) { $out.Tunnel = & $item '' '' 'none' 'The backup has no tunnel.' }
+  elseif (-not $accountOk) { $out.Tunnel = & $item $TunnelId '' 'unknown' 'The tunnel cannot be checked without access to its account.' }
+  else {
+    try {
+      $t = Invoke-CloudflareApi -Settings $Settings -Path "/accounts/$AccountId/cfd_tunnel/$TunnelId"
+      $remote = ($t.PSObject.Properties['remote_config'] -and [bool]$t.remote_config) -or ($t.PSObject.Properties['config_src'] -and $t.config_src -eq 'cloudflare')
+      if ($t.PSObject.Properties['deleted_at'] -and $t.deleted_at) { $out.Tunnel = & $item $TunnelId ([string]$t.name) 'missing' "Tunnel '$($t.name)' was deleted in Cloudflare." }
+      elseif (-not $remote) { $out.Tunnel = & $item $TunnelId ([string]$t.name) 'mismatch' "Tunnel '$($t.name)' is locally managed; only dashboard/API-managed tunnels can be automated." }
+      else { $out.Tunnel = & $item $TunnelId ([string]$t.name) 'verified' "Tunnel '$($t.name)' exists in this account (status $($t.status))." }
+    } catch {
+      $code = Get-CfErrorStatus $_
+      if ($code -eq 404) { $out.Tunnel = & $item $TunnelId '' 'missing' 'The tunnel does not exist in this account any more.' }
+      else { $out.Tunnel = & $item $TunnelId '' 'unknown' $_.Exception.Message }
+    }
+  }
+  $zones = $null
+  try { $zones = @(Invoke-CloudflareApi -Settings $Settings -Path '/zones' -All) } catch { $out.Message = 'Zones could not be listed: ' + $_.Exception.Message }
+  $out.Domains = @(foreach ($d in @($Domains)) {
+      if ($null -eq $zones) { & $item $d.id $d.name 'unknown' 'Zones could not be listed.'; continue }
+      $z = @($zones | Where-Object { $_.id -eq $d.id })
+      if ($z.Count -eq 0) { & $item $d.id $d.name 'missing' "The API token cannot see the zone $($d.name)."; continue }
+      $owner = ''; if ($z[0].PSObject.Properties['account'] -and $z[0].account) { $owner = [string]$z[0].account.id }
+      if ($AccountId -and $owner -and $owner -ne $AccountId) { & $item $d.id $d.name 'mismatch' "The zone $($d.name) belongs to another account."; continue }
+      & $item $d.id $d.name 'verified' "Zone $($d.name) is visible."
+    })
+  $target = "$TunnelId.cfargotunnel.com"
+  $out.Hostnames = @(foreach ($h in @($Hostnames)) {
+      $name = [string]$h.hostname
+      $dns = & $item ([string]$h.dnsRecordId) $name 'none' 'No DNS record id recorded.'
+      if ($h.dnsRecordId) {
+        $zone = $null
+        if ($null -ne $zones) { $zone = Find-CloudflareZone @($zones | ForEach-Object { [pscustomobject]@{ id = [string]$_.id; name = [string]$_.name } }) $name }
+        if (-not $zone) { $dns = & $item $h.dnsRecordId $name 'unknown' "No visible zone for $name." }
+        else {
+          try {
+            $rec = Invoke-CloudflareApi -Settings $Settings -Path "/zones/$($zone.id)/dns_records/$($h.dnsRecordId)"
+            if ($rec.name -eq $name -and $rec.type -eq 'CNAME' -and $rec.content -eq $target) { $dns = & $item $h.dnsRecordId $name 'verified' "DNS record $name points at this tunnel." }
+            else { $dns = & $item $h.dnsRecordId $name 'mismatch' "DNS record $($h.dnsRecordId) now is $($rec.type) $($rec.name) -> $($rec.content); it is not adopted." }
+          } catch {
+            if ((Get-CfErrorStatus $_) -eq 404) { $dns = & $item $h.dnsRecordId $name 'missing' "The DNS record of $name no longer exists." }
+            else { $dns = & $item $h.dnsRecordId $name 'unknown' $_.Exception.Message }
+          }
+        }
+      }
+      $access = & $item ([string]$h.accessAppId) $name 'none' 'No Access application id recorded.'
+      if ($h.accessAppId) {
+        if (-not $accountOk) { $access = & $item $h.accessAppId $name 'unknown' 'The Access application cannot be checked without access to its account.' }
+        else {
+          try {
+            $app = Invoke-CloudflareApi -Settings $Settings -Path "/accounts/$AccountId/access/apps/$($h.accessAppId)"
+            $domains = @(); if ($app.PSObject.Properties['domain']) { $domains += [string]$app.domain }
+            if ($app.PSObject.Properties['self_hosted_domains']) { $domains += @($app.self_hosted_domains | ForEach-Object { [string]$_ }) }
+            if ($domains -contains $name) { $access = & $item $h.accessAppId $name 'verified' "Access application '$($app.name)' protects $name." }
+            else { $access = & $item $h.accessAppId $name 'mismatch' "Access application $($h.accessAppId) no longer protects $name; it is not adopted." }
+          } catch {
+            if ((Get-CfErrorStatus $_) -eq 404) { $access = & $item $h.accessAppId $name 'missing' "The Access application of $name no longer exists." }
+            else { $access = & $item $h.accessAppId $name 'unknown' $_.Exception.Message }
+          }
+        }
+      }
+      [pscustomobject][ordered]@{ hostname = $name; dns = $dns; access = $access }
+    })
+  return [pscustomobject]$out
+}
+
 function Get-CloudflareTunnels {
   param([Parameter(Mandatory = $true)]$Settings, [Parameter(Mandatory = $true)][string]$AccountId, [string]$Token)
   $p = @{ Settings = $Settings; Path = "/accounts/$AccountId/cfd_tunnel"; Query = @{ is_deleted = 'false' }; All = $true }
@@ -433,6 +539,7 @@ function Get-CloudflareManualSteps($Service, [string]$TunnelId) {
 #   $OtherServices    every other service in the new registry (hostnames they publish are never cleaned up)
 #   $AccessEmails     who may log in, when an Access app has to be created
 #   $Cleanup          remove DNS / tunnel routes / Access apps for hostnames this change stops publishing
+#   $Config           use these selections (account, tunnel, allowed domains) instead of config\cloudflare.json
 function Get-CloudflareServicePlan {
   param(
     [Parameter(Mandatory = $true)]$Settings,
@@ -440,9 +547,10 @@ function Get-CloudflareServicePlan {
     $PreviousService,
     $OtherServices = @(),
     [string[]]$AccessEmails = @(),
-    [switch]$Cleanup
+    [switch]$Cleanup,
+    $Config
   )
-  $config = Read-CloudflareConfig -Settings $Settings
+  $config = if ($Config) { $Config } else { Read-CloudflareConfig -Settings $Settings }
   $plan = [ordered]@{ Connected = $false; Actions = @(); Notes = @(); Errors = @(); ManualSteps = @(); Fingerprint = ''; TunnelId = $config.tunnelId; AccountId = $config.accountId; Ingress = $null; IngressChanged = $false; Config = $null }
   $tokenInfo = Get-CloudflareApiTokenInfo -Settings $Settings
   if (-not $tokenInfo.Stored -or -not $config.accountId -or -not $config.tunnelId) {
@@ -596,12 +704,14 @@ function Get-CloudflareServicePlan {
 
 # Executes a plan from Get-CloudflareServicePlan. Actions with Overwrite=$true run only when their Id is listed in
 # $ConfirmedOverwrites. Stops at the first failure; returns one result per action (Done / Skipped / Failed / Not run).
+# $Steps limits the run to some steps (access, tunnel, dns), so a caller can do work between them.
 function Invoke-CloudflareServicePlan {
   param(
     [Parameter(Mandatory = $true)]$Settings,
     [Parameter(Mandatory = $true)]$Plan,
     [Parameter(Mandatory = $true)][string]$ServiceName,
-    [string[]]$ConfirmedOverwrites = @()
+    [string[]]$ConfirmedOverwrites = @(),
+    [string[]]$Steps = @('access', 'tunnel', 'dns')
   )
   $results = New-Object System.Collections.ArrayList
   if (-not $Plan.Connected) { return @() }
@@ -610,7 +720,7 @@ function Invoke-CloudflareServicePlan {
   $acct = $Plan.AccountId
   $failed = $false
   $tunnelDone = $false
-  foreach ($a in $Plan.Actions) {
+  foreach ($a in @($Plan.Actions | Where-Object { $Steps -contains $_.Step })) {
     $entry = [pscustomobject][ordered]@{ Id = $a.Id; Summary = $a.Summary; Status = 'Done'; Message = '' }
     if ($a.Kind -eq 'none') { $entry.Status = 'Unchanged'; $null = $results.Add($entry); continue }
     if ($failed) { $entry.Status = 'Not run'; $null = $results.Add($entry); continue }
@@ -621,6 +731,8 @@ function Invoke-CloudflareServicePlan {
           if ($a.Kind -eq 'create') {
             $app = Invoke-CloudflareApi -Settings $Settings -Method POST -Path "/accounts/$acct/access/apps" -Body $a.Data
             Set-ManagedResource $config $a.Hostname 'accessAppId' ([string]$app.id) $ServiceName
+            $emails = @(@($a.Data.policies) | ForEach-Object { @($_.include) } | ForEach-Object { $_.email.email } | Where-Object { $_ })
+            $config.managed.($a.Hostname) | Add-Member -NotePropertyName accessEmails -NotePropertyValue $emails -Force
             $entry.Message = "Access app id $($app.id)"
           } elseif ($a.Kind -eq 'delete') {
             $null = Invoke-CloudflareApi -Settings $Settings -Method DELETE -Path "/accounts/$acct/access/apps/$($a.Data.AppId)"
@@ -660,6 +772,7 @@ function Invoke-CloudflareServicePlan {
 }
 
 Export-ModuleMember -Function Set-CloudflareApiBase, Get-CloudflareApiBase, Test-CloudflareApiToken, Save-CloudflareApiToken, Remove-CloudflareApiToken,
-  Get-CloudflareApiTokenInfo, Read-CloudflareConfig, Save-CloudflareConfig, Invoke-CloudflareApi, Test-CloudflareToken, Get-CloudflareZones,
+  Get-CloudflareApiTokenInfo, Test-TextContainsApiToken, Read-CloudflareConfig, Save-CloudflareConfig, Get-ManagedResource, Get-ManagedAccessEmails,
+  Get-CloudflareResourceCheck, Get-CfErrorStatus, Invoke-CloudflareApi, Test-CloudflareToken, Get-CloudflareZones,
   Get-CloudflareTunnels, Test-CloudflareId, Select-AllowedZones, Get-CloudflareTokenPermissions, Get-CloudflareTokenTemplateUrl, Get-CloudflareDiscovery, Find-CloudflareZone, New-CloudflareTunnel, Install-CloudflareTunnelToken, Get-CloudflareManualSteps,
   Get-CloudflareServicePlan, Invoke-CloudflareServicePlan

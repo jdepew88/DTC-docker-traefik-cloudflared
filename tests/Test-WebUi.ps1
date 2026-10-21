@@ -129,8 +129,8 @@ try {
   $paths = @('/webui.ps1', '/../webui.ps1', '/%2e%2e/lib/CloudflareApi.psm1', '/..%5Cwebui.ps1', '/secrets/cloudflare_api.dpapi', '/app.js/../../webui.ps1')
   $bad = @($paths | Where-Object { (Invoke-RawHttp -Port $port -Path $_).Status -ne 404 })
   Test-Condition 'only whitelisted static files are served (traversal -> 404)' ($bad.Count -eq 0) ($bad -join ', ')
-  $big = Invoke-WebUi $ui POST '/api/validate' $null -Headers @{ 'Content-Length' = '1100000' }
-  Test-Condition 'request bodies over 1 MB are refused (413)' ($big.Status -eq 413) "HTTP $($big.Status)"
+  $big = Invoke-WebUi $ui POST '/api/validate' $null -Headers @{ 'Content-Length' = '3200000' }
+  Test-Condition 'request bodies over 3 MB are refused (413)' ($big.Status -eq 413) "HTTP $($big.Status)"
   $r = Invoke-RawHttp -Port $port -Method 'POST' -Path '/' -Headers @{ Cookie = $ui.Cookie }
   Test-Condition 'non-GET on static paths -> 405' ($r.Status -eq 405) (Short $r)
 

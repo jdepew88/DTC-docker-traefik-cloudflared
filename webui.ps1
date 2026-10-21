@@ -40,6 +40,8 @@ Set-StrictMode -Version 2.0
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
 Import-Module (Join-Path $here 'lib\TraefikProxy.psm1') -Force
 Import-Module (Join-Path $here 'lib\CloudflareApi.psm1') -Force
+Import-Module (Join-Path $here 'lib\Dashboard.psm1') -Force
+Import-Module (Join-Path $here 'lib\ConfigBackup.psm1') -Force
 Import-Module (Join-Path $here 'lib\LocalHttp.psm1') -Force
 Set-CloudflareApiBase $CloudflareApiBase
 
@@ -72,6 +74,7 @@ $State = @{
   LaunchKey = New-RandomKey
   Sessions  = @{}
   Plans     = @{}
+  Imports   = @{}
   Cookie    = "tpx_session_$Port"
   Origins   = @("http://127.0.0.1:$Port", "http://localhost:$Port")
   Hosts     = @("127.0.0.1:$Port", "localhost:$Port")
@@ -125,6 +128,17 @@ function Get-Settings {
   return ConvertTo-StackSettings -InstallPath $InstallPath -Values $values
 }
 
+# The .env values the installer writes: the instance keys plus TRAEFIK_LOG_LEVEL / TRAEFIK_READ_TIMEOUT when the setup
+# draft has them (a restored backup).
+function Get-EnvValues($Settings) {
+  $values = ConvertTo-InstanceValues $Settings
+  $draft = Read-SetupDraft
+  foreach ($k in @('TRAEFIK_LOG_LEVEL', 'TRAEFIK_READ_TIMEOUT')) {
+    if ($draft.settings -and $draft.settings.PSObject.Properties[$k] -and [string]$draft.settings.$k -match '^[A-Za-z0-9_.:-]{1,32}$') { $values[$k] = [string]$draft.settings.$k }
+  }
+  return $values
+}
+
 function Get-SettingsSource {
   if (Test-Path -LiteralPath (Join-Path $InstallPath '.env')) { return 'env' }
   if ((Read-SetupDraft).settings) { return 'draft' }
@@ -132,24 +146,23 @@ function Get-SettingsSource {
 }
 
 # Setup wizard choices that are not secret and not yet installed: config\setup.json in the install folder.
-function Read-SetupDraft {
-  $draft = [pscustomobject][ordered]@{ version = 1; settings = $null; deployment = [pscustomobject][ordered]@{ mode = ''; tunnelChoice = ''; tunnelId = ''; tunnelName = ''; newTunnelName = '' }; installedAt = '' }
-  $path = Join-Path $InstallPath 'config\setup.json'
-  if (-not (Test-Path -LiteralPath $path)) { return $draft }
-  try {
-    $json = [IO.File]::ReadAllText($path) | ConvertFrom-Json
-    if ($json.PSObject.Properties['settings'] -and $json.settings) { $draft.settings = $json.settings }
-    if ($json.PSObject.Properties['deployment'] -and $json.deployment) {
-      foreach ($p in $draft.deployment.PSObject.Properties.Name) { if ($json.deployment.PSObject.Properties[$p]) { $draft.deployment.$p = [string]$json.deployment.$p } }
-    }
-    if ($json.PSObject.Properties['installedAt']) { $draft.installedAt = [string]$json.installedAt }
-  } catch { }
-  return $draft
-}
+function Read-SetupDraft { return Read-SetupDraftFile $InstallPath }
 
 function Save-SetupDraft($Draft) {
-  Write-TextFileAtomic (Join-Path $InstallPath 'config\setup.json') ((ConvertTo-Json -InputObject $Draft -Depth 5) + "`n")
+  Write-TextFileAtomic (Join-Path $InstallPath 'config\setup.json') (ConvertTo-SetupDraftJson $Draft)
   Save-RememberedPath
+}
+
+# A protected recovery point (backups\recovery\) before a configuration change. A change is refused when the
+# recovery point cannot be written.
+function New-ChangeRecoveryPoint([string]$Reason) {
+  try { return New-RecoveryPoint -Settings (Get-Settings) -Reason $Reason -SourceRoot $here }
+  catch { Stop-Request 500 "No change was made: the recovery point could not be written ($($_.Exception.Message))." }
+}
+
+# A file download (not JSON). Invoke-Request sends it as-is with Content-Disposition: attachment.
+function New-Download([string]$FileName, [string]$ContentType, $Body) {
+  return [pscustomobject]@{ IsDownload = $true; FileName = $FileName; ContentType = $ContentType; Body = $Body }
 }
 
 # Remembers the install folder for the next start of webui.ps1 (only the path; nothing secret).
@@ -367,8 +380,13 @@ function Build-ChangePlan($Body) {
   if ($emails.Count -gt 50) { Stop-Request 400 'At most 50 Access emails.' }
   foreach ($e in $emails) { if ($e -notmatch $EmailPattern) { Stop-Request 400 "'$e' is not a valid email address." } }
 
+  # The public dashboard's hostname belongs to the dashboard: no service may route it, and its Cloudflare records are
+  # never cleaned up by a service change.
+  $dash = Read-DashboardConfig -Settings $settings
+  if ($dash.hostname -and $new -and @($new.hostnames) -contains $dash.hostname) { Stop-Request 400 "$($dash.hostname) is the public Traefik dashboard's hostname. Choose another hostname." }
   $traefik = Get-ServicePlan -Settings $settings -Services $list
   $others = @($list | Where-Object { $null -eq $new -or $_.name -ne $new.name })
+  if ($dash.hostname) { $others += Get-DashboardPseudoService $settings $dash.hostname }
   $cf = $null
   if ($automate) {
     try { $cf = Get-CloudflareServicePlan -Settings $settings -Service $new -PreviousService $previous -OtherServices $others -AccessEmails $emails -Cleanup:$cleanup }
@@ -432,7 +450,8 @@ function Invoke-ApplyRequest($Body) {
 
   $settings = $plan.Settings
   $steps = New-Object System.Collections.ArrayList
-  $result = [ordered]@{ ok = $true; steps = $null; backup = ''; warnings = @() }
+  $result = [ordered]@{ ok = $true; steps = $null; backup = ''; recoveryPoint = ''; warnings = @() }
+  $result.recoveryPoint = New-ChangeRecoveryPoint $plan.Summary
   $t = $plan.Traefik
   if ($t.FileChanges -gt 0 -or $t.RegistryChanged) {
     if ($t.FileChanges -gt 0) {
@@ -500,6 +519,256 @@ function Get-BackupPreview($Body) {
   $regNew = if (Test-Path -LiteralPath (Join-Path $dir 'services.json')) { [IO.File]::ReadAllText((Join-Path $dir 'services.json')) } else { $null }
   if ($regOld -ne $regNew) { $changes += [ordered]@{ file = 'config\services.json'; action = $(if ($null -eq $regNew) { 'remove' } else { 'update' }); diff = @(Get-LineDiff $regOld $regNew) } }
   return [ordered]@{ id = $id; changes = $changes; note = 'Rollback restores Traefik routes and the service registry only. Cloudflare DNS, tunnel routes and Access apps are not rolled back.' }
+}
+
+# --- Portable backups and restore ---------------------------------------------------------------------------------
+
+function Get-AccessEmailsFromBody($Body) {
+  $emails = @(@(Get-Field $Body 'accessEmails' @()) | ForEach-Object { ([string]$_).Trim() } | Where-Object { $_ } | Select-Object -Unique)
+  if ($emails.Count -gt 50) { Stop-Request 400 'At most 50 Access emails.' }
+  foreach ($e in $emails) { if ($e -notmatch $EmailPattern) { Stop-Request 400 "'$e' is not a valid email address." } }
+  return $emails
+}
+
+function ConvertTo-CheckReview($Check) {
+  $items = @()
+  if (-not $Check) { return $items }
+  if (-not $Check.Connected) { return @(New-ReviewItem 'validated' 'pending' 'Cloudflare resources not verified' $Check.Message) }
+  $map = @{ verified = 'ok'; none = 'info'; missing = 'warning'; mismatch = 'warning'; unknown = 'warning' }
+  foreach ($x in @($Check.Account, $Check.Tunnel)) { if ($x) { $items += New-ReviewItem 'validated' $map[$x.state] $(if ($x -eq $Check.Account) { 'Cloudflare account' } else { 'Cloudflare tunnel' }) $x.message } }
+  foreach ($d in $Check.Domains) { $items += New-ReviewItem 'validated' $map[$d.state] "Allowed domain $($d.name)" $d.message }
+  foreach ($h in $Check.Hostnames) {
+    foreach ($x in @($h.dns, $h.access)) { if ($x.state -ne 'none') { $items += New-ReviewItem 'validated' $map[$x.state] "$(if ($x -eq $h.dns) { 'DNS record' } else { 'Access application' }) of $($h.hostname)" $x.message } }
+  }
+  return $items
+}
+
+# What the browser sees of a restore plan.
+function ConvertTo-RestoreView($Backup, $Plan, [string]$ImportId) {
+  $m = $Backup.Manifest
+  $review = New-Object System.Collections.ArrayList
+  $add = { param($Stage, $State, $Label, $Message) $null = $review.Add((New-ReviewItem $Stage $State $Label $Message)) }
+  $kindText = @{ zip = 'Full backup (.zip)'; json = 'Configuration export (.json)'; 'legacy-services' = 'Service registry from an earlier version' }[$Backup.Kind]
+  & $add 'prepared' 'ok' 'Backup read' "$kindText of instance '$($m.sourceStackName)', created $($m.createdAt)$(if ($m.managerVersion) { " by manager $($m.managerVersion)" }); $(@($m.services).Count) service(s)."
+  $localCount = @($Plan.Local.Items | Where-Object { $_.action -in @('create', 'update', 'delete') }).Count
+  & $add 'prepared' $(if ($localCount) { 'ok' } else { 'info' }) 'Local configuration' $(if ($localCount) { "$localCount change(s) prepared." } else { 'Already matches the backup.' })
+  & $add 'validated' 'ok' 'Format and version' "Schema $($m.schemaVersion); this manager ($(Get-ManagerVersion)) reads schema 1 and earlier service registries."
+  & $add 'validated' 'ok' 'No credentials in the backup' 'The file was scanned for tokens, keys and secrets.'
+  foreach ($w in $Backup.Warnings) { & $add 'validated' 'warning' 'Backup contents' $w }
+  $svcErrors = @($Plan.Local.Errors)
+  & $add 'validated' $(if ($svcErrors.Count) { 'failed' } else { 'ok' }) 'Configuration checks' $(if ($svcErrors.Count) { $svcErrors -join ' ' } else { 'Instance settings and service definitions are valid.' })
+  foreach ($i in @(ConvertTo-CheckReview $Plan.Cloudflare.Check)) { $null = $review.Add($i) }
+  & $add 'applied' 'pending' 'Local configuration' $(if ($Plan.Local.CanApply) { 'Waiting for your approval.' } else { 'Nothing to apply.' })
+  & $add 'applied' 'pending' 'Cloudflare' $(if ($Plan.Cloudflare.CanApply) { 'Waiting for your separate approval.' } elseif ($Plan.Cloudflare.Message) { $Plan.Cloudflare.Message } else { 'Nothing to change in Cloudflare.' })
+  foreach ($a in $Plan.ActionsNeeded) { & $add 'action' 'warning' 'Requires your action' $a }
+  foreach ($e in @($Plan.Cloudflare.Errors)) { & $add 'action' 'failed' 'Cloudflare' $e }
+  foreach ($c in $Plan.Credentials) { & $add 'action' $(if ($c.present) { 'info' } else { 'warning' }) "$($c.label) ($(if ($c.present) { 'present on this PC' } else { 'missing on this PC' }))" $c.recover }
+  $cf = $Plan.Cloudflare
+  return [ordered]@{
+    importId    = $ImportId
+    source      = [ordered]@{ fileName = $Backup.FileName; kind = $Backup.Kind; schemaVersion = $m.schemaVersion; managerVersion = $m.managerVersion; createdAt = $m.createdAt; stackName = $m.sourceStackName; services = @($m.services).Count; sha256 = $Backup.Sha256; installPath = $InstallPath }
+    warnings    = @($Backup.Warnings)
+    local       = [ordered]@{ items = @($Plan.Local.Items); errors = @($Plan.Local.Errors); canApply = $Plan.Local.CanApply; hasWork = $Plan.Local.HasWork }
+    cloudflare  = [ordered]@{
+      connected = $cf.Connected; message = $cf.Message; needsLocal = $cf.NeedsLocal; canApply = $cf.CanApply; hasWork = $cf.HasWork
+      actions = @($cf.Actions); errors = @($cf.Errors); notes = @($cf.Notes | Select-Object -Unique)
+    }
+    credentials = @($Plan.Credentials)
+    actions     = @($Plan.ActionsNeeded)
+    review      = $review.ToArray()
+  }
+}
+
+function Get-ImportBackup($Body) {
+  $recoveryId = [string](Get-Field $Body 'recoveryId' '')
+  if ($recoveryId) {
+    try { $bytes = Get-RecoveryPointBytes -Settings (Get-Settings) -Id $recoveryId } catch { Stop-Request 404 $_.Exception.Message }
+    return [pscustomobject]@{ Bytes = $bytes; FileName = $recoveryId }
+  }
+  $b64 = [string](Get-Field $Body 'contentBase64' '')
+  if (-not $b64) { Stop-Request 400 'Choose a backup file.' }
+  try { $bytes = [Convert]::FromBase64String($b64) } catch { Stop-Request 400 'The file could not be read.' }
+  $name = ([string](Get-Field $Body 'fileName' 'backup')) -replace '[^A-Za-z0-9._ -]', ''
+  return [pscustomobject]@{ Bytes = $bytes; FileName = $name.Substring(0, [Math]::Min(100, $name.Length)) }
+}
+
+function Get-RestoreState([string]$ImportId, $Emails) {
+  foreach ($k in @($State.Imports.Keys)) { if (((Get-Date) - $State.Imports[$k].Created).TotalMinutes -gt 30) { $State.Imports.Remove($k) } }
+  if (-not $ImportId -or -not $State.Imports.ContainsKey($ImportId)) { Stop-Request 409 'This restore preview has expired. Choose the backup file again.' }
+  $entry = $State.Imports[$ImportId]
+  $backup = Read-ConfigBackup -Bytes $entry.Bytes -FileName $entry.FileName
+  $plan = Get-RestorePlan -Settings (Get-Settings) -Backup $backup -SourceRoot $here -AccessEmails $Emails
+  return [pscustomobject]@{ Entry = $entry; Backup = $backup; Plan = $plan }
+}
+
+# Reads and validates an uploaded backup (or a recovery point) and returns the restore preview. Writes nothing.
+function Invoke-ImportPreview($Body) {
+  $file = Get-ImportBackup $Body
+  $emails = Get-AccessEmailsFromBody $Body
+  $backup = Read-ConfigBackup -Bytes $file.Bytes -FileName $file.FileName
+  if (@($backup.Errors).Count -gt 0) { Stop-Request 400 (@($backup.Errors) -join ' ') }
+  while ($State.Imports.Count -ge 5) { $oldest = @($State.Imports.Keys | Sort-Object { $State.Imports[$_].Created })[0]; $State.Imports.Remove($oldest) }
+  $id = New-RandomKey 12
+  $State.Imports[$id] = [pscustomobject]@{ Created = (Get-Date); Bytes = $file.Bytes; FileName = $file.FileName; Emails = $emails }
+  $plan = Get-RestorePlan -Settings (Get-Settings) -Backup $backup -SourceRoot $here -AccessEmails $emails
+  $State.Imports[$id] | Add-Member -NotePropertyName LocalKey -NotePropertyValue $plan.Local.Key
+  $State.Imports[$id] | Add-Member -NotePropertyName CfFingerprint -NotePropertyValue $plan.Cloudflare.Fingerprint
+  return ConvertTo-RestoreView $backup $plan $id
+}
+
+# Applies one part of a previewed restore: 'local' (configuration files, Traefik reload) or 'cloudflare'.
+# Each part needs its own confirmation and is refused if the state changed since the preview.
+function Invoke-ImportApply($Body) {
+  Assert-Confirmed $Body
+  $part = [string](Get-Field $Body 'part' '')
+  if ($part -notin @('local', 'cloudflare')) { Stop-Request 400 "Unknown restore part '$part'." }
+  $importId = [string](Get-Field $Body 'importId' '')
+  $emails = Get-AccessEmailsFromBody $Body
+  $r = Get-RestoreState $importId $emails
+  $entry = $r.Entry
+  $settings = Get-Settings
+  $steps = @()
+  $ok = $true
+  if ($part -eq 'local') {
+    if ($r.Plan.Local.Key -ne $entry.LocalKey) { Stop-Request 409 'The configuration changed since the preview. Preview the restore again.' }
+    if (-not $r.Plan.Local.CanApply) { Stop-Request 400 'The local part has errors or nothing to change.' }
+    $recovery = New-ChangeRecoveryPoint "before restore of $($entry.FileName)"
+    $res = Invoke-RestoreLocal -Settings $settings -Plan $r.Plan
+    $steps = @($res.Steps); $ok = $res.Ok
+    Save-RememberedPath
+    Write-Audit 'restore-local' "file=$($entry.FileName) ok=$ok recovery=$recovery"
+  } else {
+    if ($r.Plan.Cloudflare.Fingerprint -ne $entry.CfFingerprint) {
+      Stop-Request 409 'Cloudflare changed since the preview. Preview the restore again.'
+    }
+    if (-not $r.Plan.Cloudflare.CanApply) { Stop-Request 400 $(if ($r.Plan.Cloudflare.NeedsLocal) { 'Apply the local configuration first.' } elseif ($r.Plan.Cloudflare.Message) { $r.Plan.Cloudflare.Message } else { 'The Cloudflare part has errors or nothing to change.' }) }
+    $confirmed = @(@(Get-Field $Body 'confirmOverwrites' @()) | ForEach-Object { [string]$_ })
+    $missing = @($r.Plan.Cloudflare.Actions | Where-Object { $_.overwrite -and $confirmed -notcontains $_.id } | ForEach-Object { $_.id })
+    if ($missing.Count -gt 0) { Stop-Request 400 ('Confirm each overwrite of an existing Cloudflare resource: ' + ($missing -join ', ')) }
+    $recovery = New-ChangeRecoveryPoint "before cloudflare restore of $($entry.FileName)"
+    $res = Invoke-RestoreCloudflare -Settings $settings -Plan $r.Plan -ConfirmedOverwrites $confirmed
+    $steps = @($res.Steps); $ok = $res.Ok
+    Write-Audit 'restore-cloudflare' ("file=$($entry.FileName) ok=$ok recovery=$recovery " + ((@($steps | ForEach-Object { "$($_.name)=$($_.status)" })) -join '; '))
+  }
+  # The next part is previewed against the new state.
+  $after = Get-RestoreState $importId $emails
+  $entry.LocalKey = $after.Plan.Local.Key
+  $entry.CfFingerprint = $after.Plan.Cloudflare.Fingerprint
+  $view = ConvertTo-RestoreView $after.Backup $after.Plan $importId
+  $view['result'] = [ordered]@{ part = $part; ok = $ok; steps = $steps; recoveryPoint = $recovery }
+  return $view
+}
+
+function Get-BackupsData {
+  $settings = Get-Settings
+  return [ordered]@{
+    installed      = (Test-Installed)
+    backups        = @(Get-BackupData)
+    recoveryPoints = @(Get-RecoveryPoints -Settings $settings)
+    credentials    = @(Get-CredentialInventory $settings)
+  }
+}
+
+# --- Public Traefik dashboard ---------------------------------------------------------------------------------------
+
+function Get-DashboardData {
+  $settings = Get-Settings
+  $dash = Read-DashboardConfig -Settings $settings
+  $cf = Read-CloudflareConfig -Settings $settings
+  $token = Get-CloudflareApiTokenInfo -Settings $settings
+  $suggestZone = if ($dash.zoneId) { $dash.zoneId } elseif (@($cf.domains).Count -gt 0) { @($cf.domains)[0].id } else { '' }
+  return [ordered]@{
+    installed    = (Test-Installed)
+    localUrl     = "http://127.0.0.1:$($settings.DashboardPort)/dashboard/"
+    enabled      = $dash.enabled
+    hostname     = $dash.hostname
+    publicUrl    = $(if ($dash.enabled -and $dash.hostname) { "https://$($dash.hostname)/dashboard/" } else { '' })
+    subdomain    = $(if ($dash.subdomain) { $dash.subdomain } else { Get-DashboardDefaultSubdomain $settings })
+    zoneId       = $suggestZone
+    accessEmails = @($dash.accessEmails)
+    domains      = @($cf.domains)
+    cloudflareReady = [bool]($token.Stored -and $token.Readable -and $cf.accountId -and $cf.tunnelId)
+    tunnelName   = $cf.tunnelName
+  }
+}
+
+function ConvertTo-DashboardPlanView($Plan, [string]$PlanId) {
+  $cf = $Plan.Cloudflare
+  $changes = @()
+  if ($Plan.FileAction -ne 'unchanged') { $changes += [ordered]@{ file = "traefik\dynamic\$(Get-DashboardRouteFile)"; action = $Plan.FileAction; diff = @(Get-LineDiff $Plan.OldContent $Plan.NewContent) } }
+  $cfActions = @(); if ($cf) { $cfActions = @($cf.Actions | ForEach-Object { [ordered]@{ id = $_.Id; step = $_.Step; kind = $_.Kind; hostname = $_.Hostname; summary = $_.Summary; detail = $_.Detail; overwrite = $_.Overwrite } }) }
+  $hasWork = $changes.Count -gt 0 -or @($cfActions | Where-Object { $_.kind -ne 'none' }).Count -gt 0
+  $errors = @($Plan.Errors)
+  $review = @(
+    New-ReviewItem 'prepared' 'ok' $(if ($Plan.Disable) { 'Remove the public dashboard' } else { 'Public dashboard' }) $(if ($Plan.Hostname) { "https://$($Plan.Hostname)/dashboard/ (and /api), through tunnel '$((Read-CloudflareConfig -Settings (Get-Settings)).tunnelName)'." } else { '' })
+    New-ReviewItem 'validated' $(if ($errors.Count) { 'failed' } else { 'ok' }) 'Checks' $(if ($errors.Count) { $errors -join ' ' } else { 'Hostname, allowed domain and Cloudflare state checked.' })
+  )
+  if (-not $Plan.Disable) {
+    $access = @($cfActions | Where-Object { $_.step -eq 'access' })
+    $review += New-ReviewItem 'validated' $(if ($access.Count -and -not $errors.Count) { 'ok' } else { 'failed' }) 'Cloudflare Access (required)' $(if ($access.Count) { $access[0].summary } else { 'Access cannot be ensured, so nothing will be published (fail closed).' })
+  }
+  $review += New-ReviewItem 'applied' 'pending' 'Changes' $(if ($hasWork -and -not $errors.Count) { 'Waiting for your confirmation.' } elseif (-not $hasWork) { 'Nothing to change.' } else { 'Blocked.' })
+  return [ordered]@{
+    planId = $PlanId; summary = $(if ($Plan.Disable) { "Remove the public dashboard $($Plan.Hostname)" } else { "Publish the Traefik dashboard as $($Plan.Hostname)" })
+    hostname = $Plan.Hostname; url = $(if ($Plan.Hostname) { "https://$($Plan.Hostname)/dashboard/" } else { '' })
+    notes = @($(if (-not $Plan.Disable) { 'Order: Cloudflare Access first; the Traefik route, tunnel route and DNS record are only created once Access protects the hostname.' }))
+    traefik = [ordered]@{ changes = $changes; issues = @(); registryChanged = $false; fileChanges = $changes.Count }
+    cloudflare = [ordered]@{ connected = [bool]($cf -and $cf.Connected); actions = $cfActions; notes = @($(if ($cf) { $cf.Notes })); errors = $errors; manualSteps = @() }
+    canApply = ($errors.Count -eq 0 -and $hasWork); hasWork = $hasWork; review = $review
+  }
+}
+
+function Get-DashboardPlanFromBody($Body) {
+  Assert-Installed
+  $settings = Get-Settings
+  $registry = Read-ServiceRegistry -Settings $settings
+  $disable = [bool](Get-Field $Body 'disable' $false)
+  $emails = Get-AccessEmailsFromBody $Body
+  return Get-DashboardPlan -Settings $settings -Subdomain ([string](Get-Field $Body 'subdomain' '')) -ZoneId ([string](Get-Field $Body 'zoneId' '')) -AccessEmails $emails -Disable:$disable -Services @($registry.services)
+}
+
+function Invoke-DashboardPlanRequest($Body) {
+  $plan = Get-DashboardPlanFromBody $Body
+  foreach ($k in @($State.Plans.Keys)) { if (((Get-Date) - $State.Plans[$k].Created).TotalMinutes -gt 15) { $State.Plans.Remove($k) } }
+  $id = New-RandomKey 12
+  $State.Plans[$id] = [pscustomobject]@{ Created = (Get-Date); Kind = 'dashboard'; Body = ($Body | ConvertTo-Json -Depth 6 -Compress); Key = $plan.Key }
+  return ConvertTo-DashboardPlanView $plan $id
+}
+
+function Invoke-DashboardApplyRequest($Body) {
+  Assert-Confirmed $Body
+  $id = [string](Get-Field $Body 'planId' '')
+  if (-not $id -or -not $State.Plans.ContainsKey($id) -or -not $State.Plans[$id].PSObject.Properties['Kind']) { Stop-Request 409 'This preview has expired or was already applied. Preview again.' }
+  $stored = $State.Plans[$id]
+  $State.Plans.Remove($id)
+  if (((Get-Date) - $stored.Created).TotalMinutes -gt 15) { Stop-Request 409 'This preview has expired. Preview again.' }
+  $plan = Get-DashboardPlanFromBody ($stored.Body | ConvertFrom-Json)
+  if ($plan.Key -ne $stored.Key) { Stop-Request 409 'Traefik or Cloudflare changed since the preview. Preview again.' }
+  $view = ConvertTo-DashboardPlanView $plan $id
+  if (-not $view.canApply) { Stop-Request 400 'This plan has errors or nothing to change.' }
+  $confirmed = @(@(Get-Field $Body 'confirmOverwrites' @()) | ForEach-Object { [string]$_ })
+  $missing = @($plan.Cloudflare.Actions | Where-Object { $_.Overwrite -and $confirmed -notcontains $_.Id } | ForEach-Object { $_.Id })
+  if ($missing.Count -gt 0) { Stop-Request 400 ('Confirm each overwrite of an existing Cloudflare resource: ' + ($missing -join ', ')) }
+  $recovery = New-ChangeRecoveryPoint $(if ($plan.Disable) { 'before removing the public dashboard' } else { 'before publishing the dashboard' })
+  $settings = Get-Settings
+  $r = Invoke-DashboardPlan -Settings $settings -Plan $plan -ConfirmedOverwrites $confirmed
+  Write-Audit 'dashboard' ("$($view.summary): ok=$($r.Ok) failClosed=$($r.FailClosed) " + ((@($r.Steps | ForEach-Object { "$($_.name)=$($_.status)" })) -join '; '))
+  $review = @($r.Steps | ForEach-Object { New-ReviewItem 'applied' $(@{ Done = 'ok'; Unchanged = 'info'; Warning = 'warning'; Skipped = 'warning'; 'Not run' = 'info'; Failed = 'failed' }[$_.status]) $_.name $_.message })
+  if ($r.FailClosed) { $review += New-ReviewItem 'action' 'failed' 'Nothing was published (fail closed)' 'Fix the Cloudflare Access problem above, then preview again. The local dashboard keeps working.' }
+  return [ordered]@{
+    ok = $r.Ok; failClosed = $r.FailClosed; steps = @($r.Steps); recoveryPoint = $recovery; warnings = @()
+    url = $(if (-not $plan.Disable -and $r.Ok) { "https://$($plan.Hostname)/dashboard/" } else { '' }); review = $review
+  }
+}
+
+function Invoke-DashboardVerifyRequest($Body) {
+  Assert-Installed
+  $v = Get-DashboardVerification -Settings (Get-Settings) -Public:([bool](Get-Field $Body 'public' $false))
+  $map = @{ ok = 'ok'; failed = 'failed'; warning = 'warning'; skipped = 'info' }
+  return [ordered]@{
+    hostname = $v.Hostname; localUrl = $v.LocalUrl; publicUrl = $v.PublicUrl; checks = @($v.Checks)
+    review = @($v.Checks | ForEach-Object { New-ReviewItem $(if ($_.state -eq 'failed') { 'action' } else { 'verified' }) $map[$_.state] $_.label $_.message })
+  }
 }
 
 # --- Cloudflare ------------------------------------------------------------------------------------------------
@@ -670,7 +939,8 @@ function Save-SettingsRequest($Body) {
   Assert-NotInstalled 'The instance settings'
   $settings = Get-SettingsFromBody $Body
   $draft = Read-SetupDraft
-  $draft.settings = [pscustomobject](ConvertTo-InstanceValues $settings)
+  $keep = Get-EnvValues $settings
+  $draft.settings = [pscustomobject]$keep
   Save-SetupDraft $draft
   Write-Audit 'setup-settings' (($draft.settings.PSObject.Properties | ForEach-Object { "$($_.Name)=$($_.Value)" }) -join ' ')
   return [ordered]@{ settings = ConvertTo-InstanceValues $settings; conflicts = @(Get-StackConflicts -Settings $settings) }
@@ -792,24 +1062,79 @@ function Get-InstallPlan([switch]$NoDryRun) {
   $steps += [ordered]@{ kind = 'docker'; text = "Run install.ps1 -Start$(if ($mode -eq 'tunnel') { ' -EnableTunnel' }): copy the stack files, create the Docker network '$($settings.ProxyNetwork)' if it does not exist, and start this instance's containers only ($containers)." }
 
   $lines = @()
+  $dryExit = $null
+  $composeOk = $null
+  $composeLines = @()
   if (-not $NoDryRun -and (Test-Path -LiteralPath (Join-Path $here 'install.ps1')) -and $docker.EngineRunning) {
     $installArgs = @('-InstallPath', $InstallPath, '-DryRun')
     $tmp = $null
+    $envFile = $envPath
     if (-not (Test-Path -LiteralPath $envPath)) {
       $tmp = Join-Path ([IO.Path]::GetTempPath()) ("tpx-draft-{0}.env" -f [Guid]::NewGuid().ToString('N').Substring(0, 8))
-      [IO.File]::WriteAllText($tmp, (New-DotEnvContent ([IO.File]::ReadAllText((Join-Path $here '.env.example'))) (ConvertTo-InstanceValues $settings)))
+      [IO.File]::WriteAllText($tmp, (New-DotEnvContent ([IO.File]::ReadAllText((Join-Path $here '.env.example'))) (Get-EnvValues $settings)))
       $installArgs += @('-EnvFile', $tmp)
+      $envFile = $tmp
     }
-    try { $r = Invoke-PowerShellFile (Join-Path $here 'install.ps1') $installArgs; $lines = $r.Lines }
-    finally { if ($tmp) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue } }
+    try {
+      $r = Invoke-PowerShellFile (Join-Path $here 'install.ps1') $installArgs
+      $lines = $r.Lines; $dryExit = $r.ExitCode
+      # Compose syntax and variable check of the file that will be installed (offline: docker compose config).
+      $composeFile = if ($installed) { Join-Path $InstallPath 'compose.yaml' } else { Join-Path $here 'compose.yaml' }
+      $projectDir = if (Test-Path -LiteralPath $InstallPath) { $InstallPath } else { $here }
+      $ccArgs = @('compose', '-f', $composeFile, '--project-directory', $projectDir, '--env-file', $envFile)
+      if ($mode -eq 'tunnel') { $ccArgs += @('--profile', 'tunnel') }
+      $cc = Invoke-Docker @($ccArgs + @('config', '--quiet'))
+      $composeOk = ($cc.ExitCode -eq 0)
+      $composeLines = @(ConvertTo-RedactedText @($cc.Output))
+    } finally { if ($tmp) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue } }
   }
   $keyText = (ConvertTo-Json -Compress -Depth 5 -InputObject @((ConvertTo-InstanceValues $settings), $draft.deployment, $InstallPath, @($config.domains | ForEach-Object { $_.id }), $config.accountId))
   $sha = [Security.Cryptography.SHA256]::Create()
   $planKey = [BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($keyText))).Replace('-', '').Substring(0, 32)
+
+  # Readable review: what is prepared, what was validated, and what still needs the user.
+  $review = New-Object System.Collections.ArrayList
+  $add = { param($Stage, $State, $Label, $Message) $null = $review.Add((New-ReviewItem $Stage $State $Label $Message)) }
+  $v = ConvertTo-InstanceValues $settings
+  & $add 'prepared' $(if ((Get-SettingsSource) -eq 'defaults') { 'info' } else { 'ok' }) 'Instance settings' "'$($v.STACK_NAME)', ports 127.0.0.1:$($v.TRAEFIK_HTTP_PORT)/$($v.TRAEFIK_DASHBOARD_PORT), network '$($v.PROXY_NETWORK)', tunnel subnet $($v.TUNNEL_SUBNET)$(if ((Get-SettingsSource) -eq 'defaults') { ' (defaults: not saved yet)' })."
+  & $add 'prepared' $(if ($mode) { 'ok' } else { 'failed' }) 'Deployment method' $(if ($mode -eq 'tunnel') { "Cloudflare Tunnel$(if ($tunnelLabel) { ": $(if ($draft.deployment.tunnelChoice -eq 'new') { "new tunnel '$tunnelLabel', created when you confirm" } else { "existing tunnel '$tunnelLabel'" })" })" } elseif ($mode) { 'Local only (nothing is published).' } else { 'Not chosen yet (step 4).' })
+  & $add 'validated' $(if ($docker.CliFound -and $docker.EngineRunning -and $docker.OsType -eq 'linux' -and $docker.ComposeOk) { 'ok' } else { 'failed' }) 'Docker Desktop' $(if ($docker.EngineRunning) { "Engine $($docker.ServerVersion), Compose $($docker.ComposeVersion)." } else { 'Not running.' })
+  if (-not $installed) {
+    $errs = @($conflicts | Where-Object { $_.Level -eq 'error' })
+    & $add 'validated' $(if ($errs.Count) { 'failed' } else { 'ok' }) 'Names, ports and networks' $(if ($errs.Count) { "$($errs.Count) conflict(s) with what already runs on this PC." } else { 'No conflict with existing containers, ports or networks.' })
+  }
+  if ($mode -eq 'tunnel') {
+    $token = Get-CloudflareApiTokenInfo -Settings $settings
+    & $add 'validated' $(if ($token.Stored -and $token.Readable) { 'ok' } else { 'failed' }) 'Cloudflare API token' $(if ($token.Stored -and $token.Readable) { "Stored (encrypted) for account '$($config.accountName)'." } else { 'Not connected (step 1).' })
+  }
+  if ($null -eq $composeOk) { & $add 'validated' 'pending' 'Compose configuration' $(if ($NoDryRun) { '' } else { 'Not checked: Docker is not running.' }) }
+  else { & $add 'validated' $(if ($composeOk) { 'ok' } else { 'failed' }) 'Compose configuration' $(if ($composeOk) { 'docker compose config accepts the configuration.' } else { 'docker compose config reported errors (see technical output).' }) }
+  if ($null -eq $dryExit) { & $add 'validated' 'pending' 'Installer dry run' $(if ($NoDryRun) { '' } else { 'Not run: Docker is not running.' }) }
+  else { & $add 'validated' $(if ($dryExit -eq 0) { 'ok' } else { 'failed' }) 'Installer dry run' $(if ($dryExit -eq 0) { 'install.ps1 -DryRun finished without errors; nothing was changed.' } else { "install.ps1 -DryRun stopped with exit code $dryExit (see technical output)." }) }
+  & $add 'applied' $(if ($installed) { 'ok' } else { 'pending' }) 'Installation' $(if ($installed) { 'Already installed.' } else { 'Nothing has been changed yet. Docker and Cloudflare change only after you confirm.' })
+  & $add 'verified' 'pending' 'Runtime checks' 'Containers, Traefik API and the tunnel connector are checked after the installation.'
+  foreach ($b in $blockers) { & $add 'action' 'failed' 'Blocking' $b }
+  foreach ($w in $warnings) { & $add 'action' 'warning' 'Note' $w }
+  $diagnostics = @()
+  if ($lines.Count) { $diagnostics += @('== install.ps1 -DryRun ==') + @($lines) }
+  if ($null -ne $composeOk) { $diagnostics += @('', "== docker compose config --quiet (exit $(if ($composeOk) { 0 } else { 'non-zero' })) ==") + @($(if ($composeLines.Count) { $composeLines } else { '(no output)' })) }
   return [ordered]@{
     installed = $installed; mode = $mode; steps = $steps; blockers = $blockers; warnings = $warnings
-    conflicts = $conflicts; dryRun = $lines; canInstall = ($blockers.Count -eq 0); planKey = $planKey
+    conflicts = $conflicts; dryRun = $lines; canInstall = ($blockers.Count -eq 0 -and ($null -eq $dryExit -or $dryExit -eq 0) -and $composeOk -ne $false); planKey = $planKey
+    review = $review.ToArray(); diagnostics = $diagnostics
   }
+}
+
+# Runtime review after an installation (read-only).
+function Get-RuntimeReview($Settings, [string]$Mode) {
+  $items = @()
+  $st = Get-StackStatus -Settings $Settings
+  foreach ($c in @($st.Containers | Where-Object { $_.Role -ne 'cloudflared' -or $Mode -eq 'tunnel' })) {
+    $healthy = $c.State -eq 'running' -and ($c.Health -in @('', 'healthy'))
+    $items += New-ReviewItem $(if ($healthy) { 'verified' } else { 'action' }) $(if ($healthy) { 'ok' } elseif ($c.State -eq 'running') { 'warning' } else { 'failed' }) "Container $($c.Name)" "$($c.State)$(if ($c.Health) { " ($($c.Health))" })"
+  }
+  $items += New-ReviewItem $(if ($st.TraefikApi) { 'verified' } else { 'action' }) $(if ($st.TraefikApi) { 'ok' } else { 'failed' }) 'Traefik API (local dashboard)' $(if ($st.TraefikApi) { "Traefik $($st.TraefikVersion) answers on http://127.0.0.1:$($Settings.DashboardPort)/dashboard/" } else { 'Not answering.' })
+  return $items
 }
 
 # Runs the previewed installation. The only place where the setup wizard changes Docker or Cloudflare.
@@ -828,7 +1153,7 @@ function Invoke-InstallRequest($Body) {
   try {
     $envPath = Join-Path $InstallPath '.env'
     if (-not (Test-Path -LiteralPath $envPath)) {
-      Write-TextFileAtomic $envPath (New-DotEnvContent ([IO.File]::ReadAllText((Join-Path $here '.env.example'))) (ConvertTo-InstanceValues $settings))
+      Write-TextFileAtomic $envPath (New-DotEnvContent ([IO.File]::ReadAllText((Join-Path $here '.env.example'))) (Get-EnvValues $settings))
       & $step 'Write .env' 'Done' $envPath
     }
     Save-RememberedPath
@@ -861,7 +1186,12 @@ function Invoke-InstallRequest($Body) {
   }
   if ($ok) { $draft = Read-SetupDraft; $draft.installedAt = (Get-Date -Format 's'); Save-SetupDraft $draft }
   Write-Audit 'setup-install' "ok=$ok mode=$mode"
-  return [ordered]@{ ok = $ok; steps = $results.ToArray(); lines = $lines }
+  $review = @($results | ForEach-Object { New-ReviewItem 'applied' $(if ($_.status -eq 'Done') { 'ok' } else { 'failed' }) $_.name $_.message })
+  if ($ok) {
+    $review += @(Get-RuntimeReview $settings $mode)
+    $review += New-ReviewItem 'action' 'info' 'Next' 'Check Traefik itself on the Traefik dashboard step before you publish applications.'
+  } else { $review += New-ReviewItem 'action' 'failed' 'Installation failed' 'See the technical output, fix the cause and preview again.' }
+  return [ordered]@{ ok = $ok; steps = $results.ToArray(); lines = $lines; review = $review }
 }
 
 function Select-CloudflareRequest($Body) {
@@ -939,13 +1269,37 @@ function Invoke-ApiRoute($Request, $Body) {
       }
       return $out
     }
-    'GET /api/backups' { return [ordered]@{ backups = @(Get-BackupData) } }
+    'GET /api/backups' { return Get-BackupsData }
+    'GET /api/backups/export' {
+      $format = [string]$Request.Query['format']
+      if ($format -eq 'zip') {
+        $a = New-ConfigBackupArchive -Settings $settings -SourceRoot $here
+        Write-Audit 'backup-export' "zip files=$(@($a.Manifest.archive.files).Count) excluded=$(@($a.Excluded).Count)"
+        return New-Download $a.FileName 'application/zip' $a.Bytes
+      }
+      if ($format -ne 'json') { Stop-Request 400 "Unknown export format '$format'." }
+      $e = Export-ConfigManifest -Settings $settings -SourceRoot $here
+      Write-Audit 'backup-export' 'json'
+      return New-Download $e.FileName 'application/json; charset=utf-8' $e.Text
+    }
+    'GET /api/backups/recovery/download' {
+      $id = [string]$Request.Query['id']
+      try { [byte[]]$bytes = Get-RecoveryPointBytes -Settings $settings -Id $id } catch { Stop-Request 404 $_.Exception.Message }
+      return New-Download $id 'application/zip' $bytes
+    }
+    'POST /api/backups/import/preview' { return Invoke-ImportPreview $Body }
+    'POST /api/backups/import/apply' { return Invoke-ImportApply $Body }
+    'GET /api/dashboard' { return Get-DashboardData }
+    'POST /api/dashboard/plan' { return Invoke-DashboardPlanRequest $Body }
+    'POST /api/dashboard/apply' { return Invoke-DashboardApplyRequest $Body }
+    'POST /api/dashboard/verify' { return Invoke-DashboardVerifyRequest $Body }
     'POST /api/backups/preview' { return Get-BackupPreview $Body }
     'POST /api/backups/restore' {
       Assert-Installed
       Assert-Confirmed $Body
       $id = [string](Get-Field $Body 'id' '')
       if (@(Get-ServiceBackups $settings | Where-Object { $_.Id -eq $id }).Count -eq 0) { Stop-Request 404 "No backup '$id'." }
+      $null = New-ChangeRecoveryPoint "before rollback to $id"
       $r = Restore-ServiceBackup -Settings $settings -Id $id
       Write-Audit 'rollback' "restored=$($r.Restored) saved=$($r.SavedCurrentAs)"
       return [ordered]@{ restored = $r.Restored; savedCurrentAs = $r.SavedCurrentAs; warning = $r.ReloadWarning }
@@ -1075,6 +1429,11 @@ function Invoke-Request($Request) {
   try {
     $data = Invoke-ApiRoute $Request $body
     if ($Request.Path -eq '/api/session') { $data = [ordered]@{ ok = $true; csrf = $session.Csrf; installPath = $InstallPath } }
+    if ($data -is [pscustomobject] -and $data.PSObject.Properties['IsDownload']) {
+      $h = @{} + $SecurityHeaders
+      $h['Content-Disposition'] = "attachment; filename=`"$($data.FileName -replace '[^A-Za-z0-9._-]', '_')`""
+      return @{ Status = 200; ContentType = $data.ContentType; Body = $data.Body; Headers = $h }
+    }
     return New-JsonResponse $data
   } catch {
     $status = 500
@@ -1102,7 +1461,8 @@ if ($LaunchUrlFile) {
   if (-not $NoBrowser) { Start-Process $launchUrl }
 }
 try {
-  Start-HttpLoop -Listener $listener -StopFile $StopFile -Handler { param($r) Invoke-Request $r }
+  # 3 MB: a backup upload (at most 2 MB) arrives base64-encoded in a JSON body.
+  Start-HttpLoop -Listener $listener -StopFile $StopFile -MaxBodyBytes 3145728 -Handler { param($r) Invoke-Request $r }
 } finally {
   $listener.Stop()
   Write-Host 'Web UI stopped.'
