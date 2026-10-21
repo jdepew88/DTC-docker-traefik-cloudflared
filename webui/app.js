@@ -896,6 +896,7 @@
     });
     const validate = (deep) => async (e) => withBusy(e.currentTarget, async () => {
       const r = await api('POST', '/api/validate', { deep });
+      if (r.installed === false) { showOutput($('#validate-output'), [r.message]); return; }
       const lines = [];
       for (const i of arr(r.issues)) lines.push(`[${i.Level.toUpperCase()}] ${i.Service}: ${i.Message}`);
       if (r.drift > 0) lines.push(`${r.drift} route file(s) differ from config\\services.json.`);

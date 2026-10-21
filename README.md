@@ -87,6 +87,11 @@ powershell -ExecutionPolicy Bypass -File .\webui.ps1 -Port 8190 -NoBrowser -Inst
 
 The console prints a one-time sign-in link (`http://127.0.0.1:8190/?k=...`). Stop the server with Ctrl+C.
 
+On a new machine, start it from the repository: modules, scripts and the installer always load from the folder
+`webui.ps1` runs from, while the install folder only holds the instance's `.env`, configuration, secrets, backups
+and logs, so it does not need to exist yet. Until the stack is installed, status, logs, validation and
+diagnostics report *Not installed*; the Setup page installs it.
+
 **Adding a service** (Services > Add a service): enter a name, pick a domain (loaded from Cloudflare) and a
 subdomain, the backend IP address or hostname and port. The target type is detected (container name,
 `localhost` = this PC, IP / DNS name = network device) and can be overridden. Choose who can reach it (Cloudflare
@@ -302,6 +307,7 @@ container on this PC already uses.
 ```powershell
 .\tests\Test-ServiceConfig.ps1          # 63 checks: generator, validation, plan/apply, rollback, deep validation
 .\tests\Test-WebUi.ps1                  # web UI + Cloudflare automation against a loopback Cloudflare API mock
+.\tests\Test-FirstRun.ps1               # first run: web UI and diagnostics from the source folder, nothing installed yet
 .\tests\Invoke-IsolatedTest.ps1         # (repository only) disposable second instance: install, live tests,
                                         # services.ps1 walkthrough with docker/LAN/host targets, a web UI
                                         # end-to-end change (mock Cloudflare), teardown

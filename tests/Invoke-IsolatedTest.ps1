@@ -85,7 +85,7 @@ $octets = $TunnelSubnet.Split('/')[0].Split('.')
 $ipRange = "$($octets[0]).$($octets[1]).$($octets[2]).$($octets[3])/29"
 $cfIp = "$($octets[0]).$($octets[1]).$($octets[2]).$([int]$octets[3] + 10)"
 foreach ($p in @($HttpPort, $DashboardPort)) {
-  if (@(Get-NetTCPConnection -State Listen -LocalPort $p -ErrorAction SilentlyContinue).Count -gt 0) { throw "Port $p is in use; pass -HttpPort/-DashboardPort." }
+  if (Get-PortUser $p) { throw "Port $p is in use; pass -HttpPort/-DashboardPort." }
 }
 $envFile = Join-Path ([IO.Path]::GetTempPath()) "$stack.env"
 @(

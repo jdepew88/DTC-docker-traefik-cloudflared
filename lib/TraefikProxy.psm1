@@ -159,6 +159,26 @@ function Test-ContainerRunning([string]$Name) {
   return (((Invoke-Docker inspect $Name --format '{{.State.Running}}').Output -join '').Trim() -eq 'true')
 }
 
+# Who is using a TCP port on this PC. Get-NetTCPConnection does not always list Docker Desktop's port
+# forwards, so a loopback connect and the published ports of running containers are checked as well.
+# Returns $null when the port is free, otherwise a short description of the user.
+function Get-PortUser([int]$Port) {
+  if (@(Get-NetTCPConnection -State Listen -LocalPort $Port -ErrorAction SilentlyContinue).Count -gt 0) { return 'a listening process' }
+  $r = Invoke-Docker ps --format '{{.Names}}|{{.Ports}}'
+  if ($r.ExitCode -eq 0) {
+    foreach ($line in @($r.Output)) {
+      $parts = ([string]$line).Split('|', 2)
+      if ($parts.Count -eq 2 -and $parts[1] -match ('(^|[\s,])[^\s,]*:' + $Port + '->')) { return "container '$($parts[0])'" }
+    }
+  }
+  $client = New-Object System.Net.Sockets.TcpClient
+  try {
+    $task = $client.ConnectAsync([System.Net.IPAddress]::Loopback, $Port)
+    if ($task.Wait(500) -and $client.Connected) { return 'a process accepting connections' }
+  } catch { } finally { $client.Close() }
+  return $null
+}
+
 # Docker Desktop does not forward file-change events from Windows paths into the Linux VM, so Traefik's
 # file provider never notices edits made on Windows. Touching a file from a container inside the VM does
 # raise the event, and Traefik reloads traefik\dynamic\ without a restart.
@@ -898,7 +918,10 @@ function Get-StackStatus {
   }
   $version = $null
   $routers = $null
-  if (-not $SkipDocker) {
+  # Only ask the dashboard port when this instance's own Traefik runs; otherwise another Traefik on the same
+  # port (e.g. before the first install, with default settings) would be reported as this one.
+  $traefikRunning = @($containers | Where-Object { $_.Role -eq 'traefik' -and $_.State -eq 'running' }).Count -gt 0
+  if (-not $SkipDocker -and $traefikRunning) {
     $version = Get-TraefikApi $Settings '/api/version'
     if ($null -ne $version) { $routers = Get-TraefikApi $Settings '/api/http/routers' }
   }
@@ -907,7 +930,7 @@ function Get-StackStatus {
     Containers         = $containers
     TraefikApi         = ($null -ne $version)
     TraefikVersion     = $(if ($version) { [string]@($version)[0].Version } else { '' })
-    Routers            = $(if ($null -ne $routers) { @($routers | ForEach-Object { [pscustomobject]@{ Name = $_.name; Status = $_.status; Rule = $_.rule } }) } else { @() })
+    Routers            = @(if ($null -ne $routers) { $routers | ForEach-Object { [pscustomobject]@{ Name = $_.name; Status = $_.status; Rule = $_.rule } } })
     TunnelTokenPresent = (Test-TunnelTokenFile $Settings)
   }
 }
@@ -924,7 +947,7 @@ function Get-StackLogs {
 
 Export-ModuleMember -Function Invoke-Docker, Read-DotEnv, Get-FileSha256, Write-TextFileAtomic, ConvertTo-IPv4Range, Test-CidrOverlap,
   Get-TunnelTokenPattern, ConvertFrom-TunnelToken, Find-ConnectorForTunnel, Set-SecretFileAcl, Save-TunnelTokenFile, Test-TunnelTokenFile,
-  Start-ProxyStack, Start-TunnelConnector, ConvertTo-RedactedText, Get-DockerStatus, Get-StackContainerNames, Get-StackStatus, Get-StackLogs,
+  Start-ProxyStack, Start-TunnelConnector, Get-PortUser, ConvertTo-RedactedText, Get-DockerStatus, Get-StackContainerNames, Get-StackStatus, Get-StackLogs,
   Test-PrivateIPv4, Test-IPv4Address, Get-StackSettings, Test-StackSettings, Get-ComposeArgs, Test-ContainerRunning, Sync-TraefikDynamic, ConvertTo-ServiceDefinition,
   New-ServiceDefinition, Read-ServiceRegistry, ConvertTo-RegistryJson, Get-AvailableMiddlewares, Test-ServiceDefinition,
   Test-ServiceRegistry, Get-ServiceFileName, Get-ServiceUrl, Get-ServiceRule, ConvertTo-TraefikRouteYaml, Get-ServicePlan,

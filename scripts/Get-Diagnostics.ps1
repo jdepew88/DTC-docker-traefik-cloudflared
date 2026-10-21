@@ -16,11 +16,16 @@ param(
 )
 
 $ErrorActionPreference = 'Continue'
+# Code is always loaded from this script's own package (the source folder or an installation); -ProjectPath only
+# selects the instance to inspect, which may not be installed yet.
 # Resolved here: $PSScriptRoot/$MyInvocation are not populated in param() defaults on PowerShell 5.1.
-if (-not $ProjectPath) { $ProjectPath = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path) }
-Import-Module (Join-Path $ProjectPath 'lib\TraefikProxy.psm1') -Force
+$toolRoot = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
+if (-not $ProjectPath) { $ProjectPath = $toolRoot }
+$ProjectPath = [IO.Path]::GetFullPath($ProjectPath)
+Import-Module (Join-Path $toolRoot 'lib\TraefikProxy.psm1') -Force
 $s = Get-StackSettings -InstallPath $ProjectPath
 $dashPort = $s.DashboardPort
+$installed = Test-Path -LiteralPath (Join-Path $ProjectPath 'compose.yaml')
 
 function Section([string]$Title, [scriptblock]$Body) {
   "`n===== $Title"
@@ -31,12 +36,17 @@ $report = & {
   Section 'Instance' {
     "stack=$($s.StackName) path=$ProjectPath http=127.0.0.1:$($s.HttpPort) dashboard=127.0.0.1:$($s.DashboardPort)"
     "proxyNetwork=$($s.ProxyNetwork) tunnelSubnet=$($s.TunnelSubnet) cloudflaredIp=$($s.CloudflaredIp)"
+    if ($installed) { 'installed=yes' } else { "Not installed: no compose.yaml in $ProjectPath. Run the installer (web UI Setup page or .\install.ps1 -Start)." }
   }
   Section 'Docker' {
     docker version --format 'client {{.Client.Version}} (API {{.Client.APIVersion}}) / server {{.Server.Version}} (API {{.Server.APIVersion}}, min {{.Server.MinAPIVersion}})'
     docker info --format 'os={{.OSType}} name={{.Name}} root={{.DockerRootDir}} kernel={{.KernelVersion}}'
     docker compose version
     docker context show
+  }
+  if (-not $installed) {
+    Section 'Stack' { 'Not installed: stack containers, routes, Traefik API and logs are skipped.' }
+    return
   }
   Section 'Stack containers' { docker compose --project-directory $ProjectPath --profile tunnel --profile test ps -a }
   Section 'Images' { docker inspect $s.TraefikContainer $s.SocketProxyContainer $s.CloudflaredContainer --format '{{.Name}} {{.Config.Image}}' }

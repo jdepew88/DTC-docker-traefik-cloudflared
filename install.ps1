@@ -83,6 +83,7 @@ $ManagedFiles = @(
   'tests\Test-Stack.ps1',
   'tests\Test-ServiceConfig.ps1',
   'tests\Test-WebUi.ps1',
+  'tests\Test-FirstRun.ps1',
   'tests\WebUiTestHelpers.psm1',
   'tests\CloudflareMock.ps1',
   'scripts\Get-Diagnostics.ps1',
@@ -244,15 +245,15 @@ foreach ($containerName in @($Settings.TraefikContainer, $Settings.SocketProxyCo
 Write-Step 'Checking loopback ports'
 foreach ($key in $ports.Keys) {
   $port = $ports[$key]
-  $listeners = @(Get-NetTCPConnection -State Listen -LocalPort $port -ErrorAction SilentlyContinue)
-  if ($listeners.Count -gt 0) {
+  $user = Get-PortUser $port
+  if ($user) {
     $ours = $false
     if ($ownTraefikRunning) {
       $published = Invoke-Docker port $Settings.TraefikContainer
       $ours = [bool]($published.Output | Where-Object { $_ -match (":$port" + '$') })
     }
     if ($ours) { Write-Note "$key $port is published by this stack's traefik container (ok)" }
-    else { throw "$key $port is already in use on this PC. Set $key to a free port in $InstallPath\.env and re-run." }
+    else { throw "$key $port is already in use on this PC (by $user). Set $key to a free port in $InstallPath\.env and re-run." }
   } else {
     Write-Note "$key $port is free"
   }

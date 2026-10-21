@@ -33,9 +33,16 @@ param(
 
 $ErrorActionPreference = 'Stop'
 # Resolved here: $PSScriptRoot/$MyInvocation are not populated in param() defaults on PowerShell 5.1.
-if (-not $ProjectPath) { $ProjectPath = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path) }
+# Code comes from this script's own package; -ProjectPath only selects the instance under test.
+$toolRoot = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
+if (-not $ProjectPath) { $ProjectPath = $toolRoot }
+$ProjectPath = [IO.Path]::GetFullPath($ProjectPath)
 Set-StrictMode -Version 2.0
-Import-Module (Join-Path $ProjectPath 'lib\TraefikProxy.psm1') -Force
+Import-Module (Join-Path $toolRoot 'lib\TraefikProxy.psm1') -Force
+if (-not (Test-Path -LiteralPath (Join-Path $ProjectPath 'compose.yaml'))) {
+  Write-Host "Not installed: no compose.yaml in $ProjectPath. Install first with .\install.ps1 -Start." -ForegroundColor Red
+  exit 1
+}
 
 $settings = Get-StackSettings -InstallPath $ProjectPath
 $ExpectedVersion = '3.7.15'

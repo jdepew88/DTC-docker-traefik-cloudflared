@@ -107,6 +107,11 @@ function Get-Settings { return Get-StackSettings -InstallPath $InstallPath }
 
 function Test-Installed { return (Test-Path -LiteralPath (Join-Path $InstallPath 'compose.yaml')) }
 
+# Code (modules, scripts, static files) always comes from $here, the folder webui.ps1 runs from; $InstallPath
+# holds only the instance's configuration and runtime files and may not exist before the first install.
+function Get-NotInstalledMessage { return "Not installed: no Traefik installation at $InstallPath yet. Finish the Traefik step on the Setup page first." }
+function Assert-Installed { if (-not (Test-Installed)) { Stop-Request 409 (Get-NotInstalledMessage) } }
+
 function Write-Audit([string]$Action, [string]$Detail) {
   if (-not (Test-Path -LiteralPath $InstallPath)) { return }
   $dir = Join-Path $InstallPath 'logs'
@@ -188,13 +193,16 @@ function ConvertTo-ServiceView($Service, $Routers, $Managed) {
 }
 
 function Get-ServicesData {
-  if (-not (Test-Installed)) { Stop-Request 409 "No installation at $InstallPath yet. Finish the Traefik step on the Setup page first." }
+  if (-not (Test-Installed)) {
+    return [ordered]@{ installed = $false; message = (Get-NotInstalledMessage); services = @(); middlewares = @(); drift = @(); issues = @(); traefikUp = $false }
+  }
   $settings = Get-Settings
   $registry = Read-ServiceRegistry -Settings $settings
   $routers = Get-TraefikApi $settings '/api/http/routers'
   $plan = Get-ServicePlan -Settings $settings -Services $registry.services
   $cf = Read-CloudflareConfig -Settings $settings
   return [ordered]@{
+    installed   = $true
     services    = @($registry.services | ForEach-Object { ConvertTo-ServiceView $_ $routers $cf.managed })
     middlewares = @(Get-AvailableMiddlewares $settings | ForEach-Object { "$_@file" })
     drift       = @($plan.Changes | Where-Object { $_.Action -ne 'unchanged' } | ForEach-Object { [ordered]@{ file = $_.File; action = $_.Action } })
@@ -260,7 +268,7 @@ function Get-TargetWarnings($Settings, $Service) {
 
 # Builds the Traefik + Cloudflare plan for a change request. Pure read: nothing is written.
 function Build-ChangePlan($Body) {
-  if (-not (Test-Installed)) { Stop-Request 409 'Install the stack first (Setup page).' }
+  Assert-Installed
   $settings = Get-Settings
   $registry = Read-ServiceRegistry -Settings $settings
   $services = @($registry.services)
@@ -469,7 +477,7 @@ function Get-CloudflareData {
 
 function Save-TokenRequest($Body) {
   $settings = Get-Settings
-  if (-not (Test-Path -LiteralPath $InstallPath)) { Stop-Request 409 'Install the stack first; the token is stored in its secrets folder.' }
+  if (-not (Test-Installed)) { Stop-Request 409 ((Get-NotInstalledMessage) + ' The API token is stored in its secrets folder.') }
   $token = ([string](Get-Field $Body 'token' '')).Trim()
   if (-not (Test-CloudflareApiToken $token)) { Stop-Request 400 'That does not look like a Cloudflare API token (it should be a long string of letters, digits, - and _).' }
   $info = Get-CloudflareApiTokenInfo -Settings $settings
@@ -526,7 +534,7 @@ function Install-ConnectorRequest($Body) {
   Assert-Confirmed $Body
   $config = Assert-CloudflareReady -NeedTunnel
   $settings = Get-Settings
-  if (-not (Test-Installed)) { Stop-Request 409 'Install the stack first.' }
+  Assert-Installed
   if ((Test-TunnelTokenFile $settings) -and -not [bool](Get-Field $Body 'confirmReplace' $false)) {
     Stop-Request 409 'secrets\cloudflare_tunnel_token already exists. Confirm that it should be replaced with the token of the selected tunnel.' @{ needsConfirm = 'replace' }
   }
@@ -551,9 +559,10 @@ function Invoke-ApiRoute($Request, $Body) {
     'POST /api/services/plan' { return Invoke-PlanRequest $Body }
     'POST /api/services/apply' { return Invoke-ApplyRequest $Body }
     'POST /api/validate' {
+      if (-not (Test-Installed)) { return [ordered]@{ ok = $false; installed = $false; message = (Get-NotInstalledMessage); issues = @(); drift = 0; deep = $null } }
       $registry = Read-ServiceRegistry -Settings $settings
       $plan = Get-ServicePlan -Settings $settings -Services $registry.services
-      $out = [ordered]@{ ok = -not $plan.HasErrors; issues = @($plan.Issues); drift = $plan.FileChanges; deep = $null }
+      $out = [ordered]@{ ok = -not $plan.HasErrors; installed = $true; message = ''; issues = @($plan.Issues); drift = $plan.FileChanges; deep = $null }
       if ([bool](Get-Field $Body 'deep' $false)) {
         $deep = Test-TraefikDynamicConfig -Settings $settings -Plan $plan
         $out.deep = $deep
@@ -564,6 +573,7 @@ function Invoke-ApiRoute($Request, $Body) {
     'GET /api/backups' { return [ordered]@{ backups = @(Get-BackupData) } }
     'POST /api/backups/preview' { return Get-BackupPreview $Body }
     'POST /api/backups/restore' {
+      Assert-Installed
       Assert-Confirmed $Body
       $id = [string](Get-Field $Body 'id' '')
       if (@(Get-ServiceBackups $settings | Where-Object { $_.Id -eq $id }).Count -eq 0) { Stop-Request 404 "No backup '$id'." }
@@ -576,6 +586,7 @@ function Invoke-ApiRoute($Request, $Body) {
       if (@((Get-StackContainerNames $settings).Keys) -notcontains $role) { Stop-Request 400 "Unknown container '$role'." }
       $tail = 200
       if ($Request.Query.ContainsKey('tail')) { [int]::TryParse($Request.Query['tail'], [ref]$tail) | Out-Null }
+      if (-not (Test-Installed)) { return [ordered]@{ Container = (Get-StackContainerNames $settings)[$role]; Ok = $false; Lines = @(Get-NotInstalledMessage) } }
       return Get-StackLogs -Settings $settings -Role $role -Tail $tail
     }
     'GET /api/audit' {
