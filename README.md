@@ -42,6 +42,7 @@ traefik --socket-internal (internal)--> socket-proxy --> docker.sock (read-only,
 | Portable backups (.json / .zip export, import with preview, two-part restore, recovery points) | **Implemented and tested** against the mock (round trip, version compatibility, credential exclusion, idempotency) and live in an isolated instance (local restore). |
 | Traefik dashboard bootstrap (public `/dashboard/` behind Cloudflare Access, fail closed) | **Implemented**; routing **live-tested** in an isolated instance, Cloudflare steps mock-tested. Not yet run against a real Access application. |
 | Deployment review (prepared / validated / applied / verified / action required, technical output) | **Implemented** for the installation, restores and the dashboard. |
+| Redesigned web UI: seven-step journey, four detail levels, review states, topology, operational pages, learning catalog | **Implemented and browser-tested** in headless Edge (desktop, tablet and phone widths, keyboard and accessible-name checks), including an installation of a disposable instance through the UI. The tunnel path through the UI has only run against the Cloudflare API mock. |
 
 ## Requirements
 
@@ -79,9 +80,9 @@ with the [web UI](#web-ui), the guided console wizard (`.\install.ps1 -Wizard` t
 
 ## Web UI
 
-A local browser interface for the whole lifecycle: Docker Desktop checks, installing and starting the stack,
-connecting Cloudflare, choosing or creating a tunnel, adding / editing / disabling / removing services,
-backups and rollback, logs, validation and diagnostics.
+A local browser interface (the *Deployment Manager*) for the whole lifecycle: a guided seven-step installation,
+then an operational dashboard for services, Cloudflare, the Traefik dashboard, backups and diagnostics. It is
+plain HTML, CSS and JavaScript served by `webui.ps1`; nothing else needs to be installed.
 
 ```powershell
 # from the repository (targets %USERPROFILE%\.docker\projects\traefik-proxy) or from the install folder
@@ -96,8 +97,23 @@ On a new machine, start it from the repository: modules, scripts and the install
 and logs, so it does not need to exist yet. Until the stack is installed, status, logs, validation and
 diagnostics report *Not installed*; the Setup page installs it.
 
-**First run (Setup page).** The wizard starts with Cloudflare and changes nothing in Docker or Cloudflare until
-you confirm the installation in its last step:
+**Detail levels.** *Beginner*, *Intermediate*, *Advanced* and *Expert* (top bar, remembered in this browser) only
+change what is shown: Beginner tucks Docker networks, subnets and static addresses away and explains every check;
+Intermediate adds ports, addresses and summaries; Advanced adds networks, DNS records and Traefik details; Expert
+adds generated files, exact commands, identifiers and raw output. A level never changes what is allowed, how
+changes are validated, or anything on the server. Small **?** buttons next to fields open a short explanation
+from the learning catalog (`webui\learn.json`), and *Help and Learning* lists every topic with links to official
+documentation. Topic ids are stable, so a future learning site can be linked without changing the app.
+
+**Review states.** *Validated* (the tool checked it), *Reviewed* (you looked at it; changes nothing technical),
+*Applied* (the change was made), *Healthy* (a live check passed), *Warning* and *Failed*. Review sections can be
+expanded, collapsed, marked reviewed (which collapses them to a summary) and reopened, and show their technical
+output and differences on request. When the content of a reviewed section changes, the mark is invalidated
+("Changed since review").
+
+**Setup journey (first run).** One vertical page with a step rail (a progress menu on phones). Nothing in
+Docker or Cloudflare changes until you approve the local changes (step 5) and the Cloudflare changes (step 6)
+separately and select *Install* (step 7):
 
 1. **Connect Cloudflare.** *Create Cloudflare API Token* opens Cloudflare's pre-filled token page
    (`dash.cloudflare.com/profile/api-tokens?permissionGroupKeys=...&accountId=*&zoneId=all`) asking for
@@ -108,26 +124,38 @@ you confirm the installation in its last step:
    which accounts, domains, tunnels and permissions it has; missing permissions are explained. One visible
    domain is allowed automatically; with several, you choose. Services can only be published under these
    allowed domains. You can replace or remove the token at any time, or **skip** this step for a local-only
-   installation.
-2. **Docker Desktop** checks (read-only).
-3. **Install folder and instance settings**: the folder (changeable until installed and remembered for the
-   next start) and the name, ports, network and tunnel subnet, with *Suggest free values* and a conflict check
-   against existing containers, ports and networks.
-4. **Deployment method**: *Cloudflare Tunnel* (new or existing dashboard-managed tunnel) or *Local only*.
-   *Public IP with port forwarding* is shown as not supported by this version.
-5. **Domains and DNS**: the allowed domains; DNS records are created per service, after their own preview.
-6. **HTTPS certificates**: provided by Cloudflare at its edge in tunnel mode. Let's Encrypt is not available in
-   this version, so no ACME email is asked for.
-7. **Review and install**: a review of what is prepared, what was validated (Docker, conflicts,
-   `docker compose config`, an installer dry run) and what still needs you, with the full technical output in an
-   expandable section; then the confirmed installation (write `.env`, create the tunnel if requested, install the
-   connector token, `install.ps1 -Start`) and runtime checks of the containers and the Traefik API.
-8. **Traefik dashboard**: check Traefik itself before publishing applications. The local dashboard
-   (`http://127.0.0.1:<dashboard port>/dashboard/`) always works. With Cloudflare connected you can also publish
-   it through the instance's tunnel; the hostname defaults to `<instance name>.<allowed domain>` (for example
-   `https://traefik-ext1.jrtechconsult.com/dashboard/`) and the subdomain can be edited. See
-   [Public Traefik dashboard](#public-traefik-dashboard).
-9. **Services**: add the applications.
+   installation. Account-level and zone-level permissions are explained. If the token can read your Cloudflare
+   profile email (not part of the template), it is offered as your contact email for you to confirm.
+2. **Prepare Docker Desktop**: automatic, read-only checks with the reason for each: Docker CLI, engine, Linux
+   containers, Compose, a writable install folder, container names, ports, networks, subnet overlap, the
+   installation state, and how many other containers stay untouched. Instructions appear if Docker is not ready.
+3. **Configure the deployment**: install folder (default under your profile), instance name, ports and, in
+   Advanced, the Docker network, tunnel subnet and static address. Values that collide with nothing on this PC
+   are pre-filled (*Suggest free values* re-computes them); subnet validation always runs, even when hidden. The
+   Traefik dashboard hostname is suggested from the instance name (`traefik-ext1` →
+   `traefik-ext1.<allowed domain>`); you can edit it, and later name changes no longer overwrite your edit until
+   you select *Reset to automatic*.
+4. **Configure ingress**: *Cloudflare Tunnel* (new or existing dashboard-managed tunnel, with a summary of the
+   account, domains, connector, Traefik destination and DNS behaviour) or *Local only* (no Cloudflare; how
+   internal DNS such as Pi-hole fits in, and that Traefik's ports are loopback-only in this version).
+   *Public IP* is shown as planned and cannot be selected.
+5. **Review local infrastructure**: the installer's checks, `docker compose config` and an installer dry run as
+   review sections, an optional contact email (used only as the default Cloudflare Access sign-in; not for
+   certificates, and nothing is sent), then your approval of the local changes.
+6. **Review Cloudflare changes**: account and domain, the tunnel to create or reuse, the public dashboard
+   (Access application, tunnel route, DNS record), DNS safety (email records are never touched; existing records
+   are only replaced after a per-record confirmation), security and rollback; then your separate approval.
+7. **Install and verify**: applies both approvals (the server refuses an installation that creates Cloudflare
+   resources without the Cloudflare approval), publishes the dashboard behind Access if chosen, then verifies
+   each component on its own (containers, tunnel connectivity, local dashboard, internal router, DNS, Access,
+   requests without Access refused) with a topology diagram. A running container alone is never reported as a
+   healthy deployment. On success: **Your reverse proxy is ready.**
+
+**After installation** the menu switches to *Overview* (health, containers, tunnel, domains, dashboard links,
+services, warnings, recent changes and a request-flow diagram), *Services*, *Cloudflare*, *Traefik Dashboard*,
+*Backups*, *Diagnostics* (logs, validation, report, activity, and in Expert the generated configuration and
+commands), *Settings* (detail level, theme, instance, upgrade commands) and *Help and Learning*. The setup journey
+stays available.
 
 ### Public Traefik dashboard
 
@@ -183,9 +211,15 @@ The Backups page:
   Administrators). They can be downloaded or restored like an imported backup and are never deleted
   automatically. The change is refused if the recovery point cannot be written.
 
-**Adding a service** (Services > Add a service): enter a name, pick a domain (loaded from Cloudflare) and a
-subdomain, the backend IP address or hostname and port. The target type is detected (container name,
-`localhost` = this PC, IP / DNS name = network device) and can be overridden. Choose who can reach it (Cloudflare
+**Adding a service** (Services > Add a service): *name → hostname → destination → publish*. Enter a display name
+(for example *Notflix*); the subdomain is suggested from it (`notflix`) and can be changed (`movies`, giving
+`movies.<domain>`) without changing the display name, and a manual subdomain is not overwritten by later name
+changes. The domain is chosen from the allowed Cloudflare domains, never typed again. Choose where the app runs:
+a Docker container on the shared network (reached by its container name, for example
+`http://uptime-kuma:3001`), this Windows PC, another device on the LAN, or (Advanced) a container on another
+network reached by address. Path-prefix routing, extra hostnames, TLS verification and middlewares are in
+Advanced, with a warning that many apps need a configured base path. Only HTTP(S) (including WebSockets and
+h2c to the backend) is published; raw TCP or UDP is not. Choose who can reach it (Cloudflare
 Access with a list of emails, public, or local only), then **Preview changes**. The preview shows the Traefik
 file diff, validation warnings (for example the media-streaming notice for Plex) and every Cloudflare action:
 create the Access application, add the tunnel route `hostname -> http://traefik:80`, create the proxied CNAME to
@@ -407,6 +441,11 @@ container on this PC already uses.
 .\tests\Test-Backup.ps1                 # export/import/restore against the mock: round trip, version compatibility,
                                         # credential exclusion, idempotency, authorization failures, recovery points
 .\tests\Test-Dashboard.ps1              # dashboard bootstrap: route, fail-closed Access, no duplicates, removal
+.\tests\Test-UiBrowser.ps1 -ScreenshotDir .\screens   # the UI in headless Edge (DevTools protocol): journey,
+                                        # detail levels, naming, reviews, approvals, a disposable local install,
+                                        # responsive layout (390/820/1366 px), keyboard and accessible names
+node .\tests\ui-logic.test.js           # developer-only unit tests of webui\logic.js (Node is not needed to run the tool)
+.\tests\Invoke-UiPreview.ps1            # developer tool: quick screenshots of pages at chosen levels and widths
 .\tests\Invoke-IsolatedTest.ps1         # (repository only) disposable second instance: install, live tests,
                                         # services.ps1 walkthrough with docker/LAN/host targets, a web UI
                                         # end-to-end change (mock Cloudflare), live dashboard routing and a live
