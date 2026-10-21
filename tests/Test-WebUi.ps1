@@ -104,7 +104,7 @@ try {
   } else { Add-Result 'SKIP' 'not reachable on a LAN address' 'no non-loopback IPv4 address' }
 
   $r = Invoke-RawHttp -Port $port -Path '/'
-  Test-Condition 'index page is served with security headers' ($r.Status -eq 200 -and $r.Body -match 'Traefik Proxy Manager' -and $r.Headers['content-security-policy'] -match "script-src 'self'" -and
+  Test-Condition 'index page is served with security headers' ($r.Status -eq 200 -and $r.Body -match 'Deployment Manager' -and $r.Headers['content-security-policy'] -match "script-src 'self'" -and
     $r.Headers['x-frame-options'] -eq 'DENY' -and $r.Headers['x-content-type-options'] -eq 'nosniff' -and $r.Headers['referrer-policy'] -eq 'no-referrer') (Short $r)
   $r = Invoke-RawHttp -Port $port -Path '/api/status'
   Test-Condition 'API without a session -> 401' ($r.Status -eq 401) (Short $r)

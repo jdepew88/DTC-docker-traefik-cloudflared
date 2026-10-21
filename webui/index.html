@@ -1,378 +1,54 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" data-theme="dark">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="referrer" content="no-referrer">
-  <title>Traefik Proxy Manager</title>
+  <title>Deployment Manager</title>
   <link rel="icon" href="/icon.svg" type="image/svg+xml">
   <link rel="stylesheet" href="/app.css">
+  <script src="/logic.js" defer></script>
+  <script src="/ui.js" defer></script>
+  <script src="/setup.js" defer></script>
+  <script src="/pages.js" defer></script>
   <script src="/app.js" defer></script>
 </head>
-<body>
+<body data-level="beginner">
   <a class="skip-link" href="#main">Skip to content</a>
   <header class="topbar">
-    <div class="brand">
-      <img src="/icon.svg" alt="" width="28" height="28">
-      <span>Traefik Proxy Manager</span>
+    <a class="brand" href="#" id="brand-link">
+      <img src="/icon.svg" alt="">
+      <span>Deployment Manager <small>Traefik + Cloudflare</small></span>
+    </a>
+    <div class="spacer"></div>
+    <span class="instance-pill" id="instance-pill" aria-live="polite"><span class="dot"></span>Loading…</span>
+    <div class="segmented" role="radiogroup" aria-label="Detail level" id="level-switch">
+      <label title="Essential settings and plain explanations"><input type="radio" name="detail-level" value="beginner"><span>Beginner</span></label>
+      <label title="Adds ports, addresses and summaries"><input type="radio" name="detail-level" value="intermediate"><span>Intermediate</span></label>
+      <label title="Adds Docker networking, DNS records and Traefik details"><input type="radio" name="detail-level" value="advanced"><span>Advanced</span></label>
+      <label title="Everything: generated files, commands, raw output"><input type="radio" name="detail-level" value="expert"><span>Expert</span></label>
     </div>
-    <div class="instance" id="instance-badge" aria-live="polite"></div>
   </header>
 
-  <nav class="tabs" role="tablist" aria-label="Sections">
-    <button type="button" role="tab" id="tab-setup" aria-controls="panel-setup" aria-selected="true">Setup</button>
-    <button type="button" role="tab" id="tab-services" aria-controls="panel-services" aria-selected="false" tabindex="-1">Services</button>
-    <button type="button" role="tab" id="tab-cloudflare" aria-controls="panel-cloudflare" aria-selected="false" tabindex="-1">Cloudflare</button>
-    <button type="button" role="tab" id="tab-backups" aria-controls="panel-backups" aria-selected="false" tabindex="-1">Backups</button>
-    <button type="button" role="tab" id="tab-logs" aria-controls="panel-logs" aria-selected="false" tabindex="-1">Logs &amp; diagnostics</button>
-  </nav>
+  <div id="signed-out" class="callout warn" hidden>
+    <h2>Not signed in</h2>
+    <p>This page only works with the one-time link that <code>webui.ps1</code> printed in its PowerShell window
+      (it looks like <code>http://127.0.0.1:8190/?k=...</code>). Open that link in this browser. If the server was
+      restarted, use the new link.</p>
+  </div>
 
-  <main id="main" tabindex="-1">
-    <div id="signed-out" class="card callout warn" hidden>
-      <h2>Not signed in</h2>
-      <p>This page only works with the one-time link that <code>webui.ps1</code> printed in its PowerShell window
-        (it looks like <code>http://127.0.0.1:8190/?k=...</code>). Open that link in this browser. If the server was
-        restarted, use the new link.</p>
+  <div class="layout" id="layout">
+    <nav class="rail" id="rail" aria-label="Main"></nav>
+    <div>
+      <nav class="mobile-nav" id="mobile-nav" aria-label="Main (compact)"></nav>
+      <main id="main" tabindex="-1"></main>
     </div>
-
-    <!-- Setup -->
-    <section id="panel-setup" class="panel" role="tabpanel" aria-labelledby="tab-setup">
-      <div class="intro">
-        <h1>Publish your apps safely</h1>
-        <p>This tool runs <strong>Traefik</strong> (a reverse proxy) in Docker Desktop and connects it to the Internet through a
-          <strong>Cloudflare Tunnel</strong>. The tunnel is an outbound connection from this PC, so you do not open any ports on your
-          router. Cloudflare receives HTTPS requests for your hostnames, can require a login (<strong>Cloudflare Access</strong>), and
-          forwards allowed requests through the tunnel to Traefik, which sends each hostname to the right app: a Docker
-          container, a program on this PC, or a device on your network.</p>
-        <p class="muted">Every change is shown as a preview first and only applied after you confirm it. Nothing outside this
-          instance's own containers is started, stopped or modified.</p>
-        <p>Start with <strong>step 1, Connect Cloudflare</strong>, or skip it to install for local use only. Docker and Cloudflare
-          are not changed until you confirm the installation in step 7. Moving an existing configuration? Import its backup on
-          the Backups page instead of repeating the steps.</p>
-      </div>
-      <ol class="steps" id="setup-steps"></ol>
-    </section>
-
-    <!-- Services -->
-    <section id="panel-services" class="panel" role="tabpanel" aria-labelledby="tab-services" hidden>
-      <div class="panel-head">
-        <div>
-          <h1>Services</h1>
-          <p class="muted">Each service maps one or more public hostnames to a backend. All of them share this one Traefik.</p>
-        </div>
-        <button type="button" class="btn primary" id="btn-add-service">Add a service</button>
-      </div>
-      <div id="services-alerts"></div>
-
-      <form id="service-form" class="card" hidden novalidate>
-        <h2 id="service-form-title">Add a service</h2>
-        <p class="muted" id="service-form-help">Enter a name, the public address and where the app runs. You will see exactly
-          what changes in Traefik and Cloudflare before anything is applied.</p>
-        <div class="grid">
-          <div class="field">
-            <label for="f-name">Service name</label>
-            <input id="f-name" name="name" required autocomplete="off" spellcheck="false" maxlength="40" pattern="[a-z0-9]([a-z0-9-]{0,38}[a-z0-9])?" aria-describedby="f-name-hint">
-            <p class="hint" id="f-name-hint">Lowercase letters, digits and dashes, e.g. <code>plex</code> or <code>home-assistant</code>.</p>
-          </div>
-          <div class="field">
-            <span class="label" id="f-host-label">Public hostname</span>
-            <div class="hostname-row" role="group" aria-labelledby="f-host-label">
-              <label class="sr-only" for="f-sub">Subdomain</label>
-              <input id="f-sub" autocomplete="off" spellcheck="false" placeholder="app" aria-describedby="f-host-hint">
-              <span class="dot" aria-hidden="true">.</span>
-              <label class="sr-only" for="f-domain">Domain</label>
-              <select id="f-domain" aria-describedby="f-host-hint"></select>
-              <label class="sr-only" for="f-domain-text">Domain</label>
-              <input id="f-domain-text" autocomplete="off" spellcheck="false" placeholder="example.com" hidden>
-            </div>
-            <p class="hint" id="f-host-hint">Leave the subdomain empty to use the domain itself.</p>
-          </div>
-          <div class="field">
-            <label for="f-target-host">Backend IP address or hostname</label>
-            <input id="f-target-host" required autocomplete="off" spellcheck="false" placeholder="10.10.0.11" aria-describedby="f-target-hint">
-            <p class="hint" id="f-target-hint" aria-live="polite"></p>
-          </div>
-          <div class="field small">
-            <label for="f-port">Port</label>
-            <input id="f-port" type="number" inputmode="numeric" min="1" max="65535" required placeholder="32400">
-          </div>
-          <div class="field small">
-            <label for="f-protocol">Protocol</label>
-            <select id="f-protocol">
-              <option value="http">http</option>
-              <option value="https">https</option>
-              <option value="h2c">h2c (gRPC, cleartext)</option>
-            </select>
-          </div>
-          <div class="field">
-            <label for="f-target-type">Where does the app run?</label>
-            <select id="f-target-type">
-              <option value="auto">Detect from the address (recommended)</option>
-              <option value="docker">Docker container on the shared network</option>
-              <option value="host">This Windows PC (host.docker.internal)</option>
-              <option value="lan">Another device on the network</option>
-            </select>
-          </div>
-        </div>
-
-        <fieldset class="exposure">
-          <legend>Who can reach it?</legend>
-          <label class="radio"><input type="radio" name="exposure" value="access" checked>
-            <span><strong>Internet, behind Cloudflare Access</strong> (recommended): only people you list can sign in.</span></label>
-          <label class="radio"><input type="radio" name="exposure" value="public">
-            <span><strong>Internet, no extra login</strong>: only for apps with their own secure login.</span></label>
-          <label class="radio"><input type="radio" name="exposure" value="local">
-            <span><strong>Local only</strong>: a Traefik route without anything in Cloudflare.</span></label>
-        </fieldset>
-
-        <div class="field" id="f-emails-field">
-          <label for="f-emails">Emails allowed through Cloudflare Access</label>
-          <textarea id="f-emails" rows="2" spellcheck="false" placeholder="you@example.com, family@example.com" aria-describedby="f-emails-hint"></textarea>
-          <p class="hint" id="f-emails-hint">Used only when a new Access application has to be created. Separate with commas or new lines.</p>
-        </div>
-
-        <label class="check" id="f-automate-wrap"><input type="checkbox" id="f-automate" checked>
-          <span>Configure Cloudflare automatically (DNS record, tunnel route, Access application)</span></label>
-        <p class="hint" id="f-automate-hint"></p>
-
-        <details class="advanced">
-          <summary>Advanced options</summary>
-          <div class="grid">
-            <div class="field">
-              <label for="f-extra-hosts">Additional hostnames</label>
-              <input id="f-extra-hosts" autocomplete="off" spellcheck="false" placeholder="www.example.com, other.example.com">
-            </div>
-            <div class="field">
-              <label for="f-path">Path prefix</label>
-              <input id="f-path" autocomplete="off" spellcheck="false" placeholder="/api" aria-describedby="f-path-hint">
-              <p class="hint" id="f-path-hint">Only route requests under this path (optional).</p>
-            </div>
-            <div class="field">
-              <label for="f-description">Description</label>
-              <input id="f-description" maxlength="200" autocomplete="off">
-            </div>
-          </div>
-          <label class="check"><input type="checkbox" id="f-strip"> <span>Strip the path prefix before forwarding</span></label>
-          <label class="check"><input type="checkbox" id="f-tls-skip"> <span>Skip certificate verification to the backend (self-signed https devices on a trusted LAN only)</span></label>
-          <fieldset class="middlewares">
-            <legend>Middlewares</legend>
-            <div id="f-middlewares" class="chips"></div>
-          </fieldset>
-          <label class="check"><input type="checkbox" id="f-enabled" checked> <span>Enabled</span></label>
-        </details>
-
-        <div class="form-error" id="service-form-error" role="alert"></div>
-        <div class="actions">
-          <button type="submit" class="btn primary">Preview changes</button>
-          <button type="button" class="btn" id="btn-cancel-service">Cancel</button>
-        </div>
-      </form>
-
-      <div class="card table-card">
-        <table class="table" id="services-table">
-          <caption class="sr-only">Configured services</caption>
-          <thead><tr><th scope="col">Service</th><th scope="col">Hostnames</th><th scope="col">Backend</th><th scope="col">Exposure</th><th scope="col">Traefik</th><th scope="col"><span class="sr-only">Actions</span></th></tr></thead>
-          <tbody></tbody>
-        </table>
-        <p class="empty muted" id="services-empty" hidden>No services yet. Use <strong>Add a service</strong> to publish your first app.</p>
-      </div>
-    </section>
-
-    <!-- Cloudflare -->
-    <section id="panel-cloudflare" class="panel" role="tabpanel" aria-labelledby="tab-cloudflare" hidden>
-      <h1>Cloudflare</h1>
-      <p class="muted">Optional but recommended: with a scoped API token this tool creates the tunnel, the DNS records, the
-        tunnel routes and Cloudflare Access applications for you, always after a preview and your confirmation. It never
-        deletes anything it did not create, and existing DNS records are only replaced after a separate confirmation.</p>
-
-      <div class="card">
-        <h2>1. API token</h2>
-        <p>The token needs only these permissions. Limit it to the account and domains this PC should manage.</p>
-        <ul class="perm-list">
-          <li><strong>Zone</strong> &middot; Zone &middot; Read, and <strong>Zone</strong> &middot; DNS &middot; Edit</li>
-          <li><strong>Account</strong> &middot; Cloudflare Tunnel &middot; Edit</li>
-          <li><strong>Account</strong> &middot; Access: Apps and Policies &middot; Edit <span class="muted">(optional, for automatic Access)</span></li>
-        </ul>
-        <div class="actions"><a class="btn" id="cf-tab-create-token" href="https://dash.cloudflare.com/profile/api-tokens" target="_blank" rel="noopener noreferrer">Create Cloudflare API Token</a></div>
-        <p class="hint">Cloudflare will display your API token when you create it. Copy it before closing that page. For security,
-          Cloudflare won't display the same secret again. If you lose it, revoke or delete the old token and create a replacement.</p>
-        <p class="muted">The token is encrypted with Windows DPAPI for your Windows account and stored in
-          <code>secrets\cloudflare_api.dpapi</code>. It is never shown again or sent back to the browser.</p>
-        <div id="cf-token-status" class="status-line"></div>
-        <form id="cf-token-form" class="inline-form" autocomplete="off">
-          <label for="cf-token">API token</label>
-          <input id="cf-token" type="password" autocomplete="new-password" spellcheck="false" placeholder="Paste the token">
-          <button type="submit" class="btn primary">Verify and save</button>
-          <button type="button" class="btn danger-outline" id="btn-cf-token-remove" hidden>Remove stored token</button>
-        </form>
-      </div>
-
-      <div class="card" id="cf-account-card">
-        <h2>2. Account and tunnel</h2>
-        <p>A <strong>tunnel</strong> is the private connection between Cloudflare and this PC. Use one tunnel per proxy instance.
-          Choose an existing tunnel managed from the dashboard, or create a new one.</p>
-        <div class="grid">
-          <div class="field">
-            <label for="cf-account">Account</label>
-            <select id="cf-account"></select>
-          </div>
-          <div class="field">
-            <label for="cf-tunnel">Tunnel</label>
-            <select id="cf-tunnel"></select>
-          </div>
-        </div>
-        <div class="actions">
-          <button type="button" class="btn" id="btn-cf-load">Load from Cloudflare</button>
-          <button type="button" class="btn primary" id="btn-cf-select">Use this account and tunnel</button>
-        </div>
-        <form id="cf-tunnel-form" class="inline-form">
-          <label for="cf-tunnel-name">New tunnel name</label>
-          <input id="cf-tunnel-name" autocomplete="off" spellcheck="false" placeholder="home-proxy">
-          <button type="submit" class="btn">Create tunnel&hellip;</button>
-        </form>
-      </div>
-
-      <div class="card">
-        <h2>3. Connector (cloudflared)</h2>
-        <p>The <strong>cloudflared</strong> container of this instance keeps the tunnel connected. This step downloads the
-          selected tunnel's connector token into <code>secrets\cloudflare_tunnel_token</code> and starts (or restarts) only this
-          instance's cloudflared container.</p>
-        <div id="cf-connector-status" class="status-line"></div>
-        <div class="actions"><button type="button" class="btn primary" id="btn-cf-connector">Install token and start cloudflared&hellip;</button></div>
-        <pre class="output" id="cf-connector-output" hidden></pre>
-      </div>
-
-      <div class="card">
-        <h2>Created by this tool</h2>
-        <p class="muted">Hostnames whose DNS record or Access application this tool created (and may clean up when you remove the service).</p>
-        <div id="cf-managed"></div>
-      </div>
-
-      <div class="card callout info">
-        <h2>Streaming media</h2>
-        <p>Cloudflare's terms restrict serving video or large amounts of non-HTML content through its proxy and tunnels
-          unless you use a Cloudflare media product, and uploads are capped at 100 MB on Free/Pro plans. Media servers such as
-          Plex or Jellyfin work for browsing and light use, but heavy streaming should use the app's own remote access or a
-          private network (WARP / Cloudflare One).</p>
-      </div>
-    </section>
-
-    <!-- Backups -->
-    <section id="panel-backups" class="panel" role="tabpanel" aria-labelledby="tab-backups" hidden>
-      <h1>Backups and restore</h1>
-      <p class="muted">Portable backups move this instance's configuration to another folder or PC, or back after a manager
-        upgrade. Recovery points and service snapshots are made automatically before changes.</p>
-
-      <div class="card">
-        <h2>Export</h2>
-        <p>A versioned copy of this instance's configuration: instance settings, Docker names, the Cloudflare account, zone,
-          tunnel, DNS record and Access application ids, public hostnames, routes, middlewares and service definitions. Only this
-          instance's install folder is read; other applications and Traefik instances are never included.</p>
-        <div class="actions">
-          <button type="button" class="btn" id="btn-export-json">Export configuration (.json)</button>
-          <button type="button" class="btn primary" id="btn-export-zip">Download full backup (.zip)</button>
-        </div>
-        <p class="hint">The .zip also contains this instance's configuration files and an inventory (INVENTORY.txt).</p>
-        <h3>Never exported: reconnect after a restore</h3>
-        <ul class="perm-list" id="backup-credentials"></ul>
-      </div>
-
-      <div class="card">
-        <h2>Import and restore</h2>
-        <p>Choose a .json or .zip backup made by this tool, or a <code>config\services.json</code> from an earlier version. Its
-          format, version and contents are checked and you see a preview first. The local configuration and the Cloudflare
-          changes are approved separately; Cloudflare ids are verified before they are reused.</p>
-        <form id="import-form" class="inline-form" autocomplete="off">
-          <label for="import-file">Backup file</label>
-          <input id="import-file" type="file" accept=".json,.zip,application/json,application/zip">
-          <button type="submit" class="btn primary">Preview restore</button>
-        </form>
-        <div class="field">
-          <label for="import-emails">Access sign-in emails (optional)</label>
-          <input id="import-emails" autocomplete="off" spellcheck="false" placeholder="you@example.com">
-          <p class="hint">Only used when a Cloudflare Access application has to be created again and the backup does not record who may sign in.</p>
-        </div>
-      </div>
-
-      <div class="card table-card">
-        <div class="card-head">
-          <h2>Recovery points</h2>
-          <p class="muted">Written automatically before each configuration change (read-only, readable only by your Windows
-            account and administrators). Restore one like an imported backup.</p>
-        </div>
-        <table class="table" id="recovery-table">
-          <caption class="sr-only">Recovery points</caption>
-          <thead><tr><th scope="col">Recovery point</th><th scope="col">Created</th><th scope="col">Before</th><th scope="col"><span class="sr-only">Actions</span></th></tr></thead>
-          <tbody></tbody>
-        </table>
-        <p class="empty muted" id="recovery-empty" hidden>No recovery points yet.</p>
-      </div>
-
-      <div class="card table-card">
-        <div class="card-head">
-          <h2>Service snapshots</h2>
-          <p class="muted">Every applied service change first saves the previous Traefik routes and service registry. Restoring a
-            snapshot saves the current state as well. Cloudflare resources are not rolled back.</p>
-        </div>
-        <table class="table" id="backups-table">
-          <caption class="sr-only">Service configuration backups</caption>
-          <thead><tr><th scope="col">Backup</th><th scope="col">Created</th><th scope="col">Route files</th><th scope="col"><span class="sr-only">Actions</span></th></tr></thead>
-          <tbody></tbody>
-        </table>
-        <p class="empty muted" id="backups-empty" hidden>No snapshots yet. One is made automatically before each change.</p>
-      </div>
-    </section>
-
-    <!-- Logs -->
-    <section id="panel-logs" class="panel" role="tabpanel" aria-labelledby="tab-logs" hidden>
-      <h1>Logs and diagnostics</h1>
-      <div class="card">
-        <h2>Container logs</h2>
-        <form id="logs-form" class="inline-form">
-          <label for="logs-role">Container</label>
-          <select id="logs-role">
-            <option value="traefik">traefik</option>
-            <option value="cloudflared">cloudflared</option>
-            <option value="socket-proxy">socket-proxy</option>
-          </select>
-          <label for="logs-tail">Lines</label>
-          <select id="logs-tail"><option>100</option><option selected>200</option><option>500</option><option>1000</option></select>
-          <button type="submit" class="btn">Show</button>
-        </form>
-        <pre class="output" id="logs-output" tabindex="0" aria-label="Container log output">Choose a container and select Show.</pre>
-      </div>
-      <div class="card">
-        <h2>Validate configuration</h2>
-        <p class="muted">Checks every service definition and, with the deep check, loads the full configuration into a
-          throwaway Traefik container that has no network access.</p>
-        <div class="actions">
-          <button type="button" class="btn" id="btn-validate">Validate</button>
-          <button type="button" class="btn" id="btn-validate-deep">Deep validate</button>
-        </div>
-        <pre class="output" id="validate-output" hidden></pre>
-      </div>
-      <div class="card">
-        <h2>Diagnostics report</h2>
-        <p class="muted">Read-only report of Docker, the stack, routes and recent logs. Tokens are redacted, so it is safe to share.</p>
-        <div class="actions">
-          <button type="button" class="btn" id="btn-diagnostics">Run diagnostics</button>
-          <button type="button" class="btn" id="btn-diagnostics-copy" hidden>Copy</button>
-        </div>
-        <pre class="output" id="diagnostics-output" hidden tabindex="0"></pre>
-      </div>
-      <div class="card">
-        <h2>Activity log</h2>
-        <p class="muted">Changes made through this web interface (<code>logs\webui-audit.log</code>).</p>
-        <div class="actions"><button type="button" class="btn" id="btn-audit">Show activity</button></div>
-        <pre class="output" id="audit-output" hidden tabindex="0"></pre>
-      </div>
-    </section>
-  </main>
+  </div>
 
   <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
 
   <dialog id="plan-dialog" aria-labelledby="plan-title">
-    <form method="dialog" class="dialog-body" id="plan-form">
+    <form method="dialog" class="dialog-body">
       <header class="dialog-head">
         <h2 id="plan-title">Review changes</h2>
         <button type="button" class="icon-btn" data-close aria-label="Close">&times;</button>
@@ -383,7 +59,7 @@
   </dialog>
 
   <dialog id="confirm-dialog" aria-labelledby="confirm-title">
-    <form method="dialog" class="dialog-body small">
+    <form method="dialog" class="dialog-body">
       <header class="dialog-head">
         <h2 id="confirm-title">Confirm</h2>
         <button type="button" class="icon-btn" data-close aria-label="Close">&times;</button>
