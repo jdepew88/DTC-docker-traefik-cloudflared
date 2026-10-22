@@ -51,7 +51,8 @@ function Fail([string]$Text, [int]$Code = 1) { Say ''; Say "Problem: $Text" 'Red
 
 if ($PSVersionTable.PSVersion -lt [version]'5.1') { Fail "Windows PowerShell 5.1 or later is required (found $($PSVersionTable.PSVersion)). It is part of Windows 10 and 11." }
 $required = @('webui.ps1', 'install.ps1', 'compose.yaml', 'lib\TraefikProxy.psm1', 'lib\CloudflareApi.psm1', 'lib\LocalHttp.psm1', 'lib\Dashboard.psm1', 'lib\ConfigBackup.psm1',
-  'lib\ProjectDiscovery.psm1', 'webui\index.html', 'webui\app.js', 'webui\ui.js', 'webui\logic.js', 'webui\setup.js', 'webui\pages.js', 'webui\projects.js', 'webui\app.css', 'webui\learn.json')
+  'lib\ProjectDiscovery.psm1', 'lib\Infrastructure.psm1', 'lib\DockerDiscovery.psm1', 'lib\ServiceHealth.psm1', 'lib\AppCatalog.psm1',
+  'webui\explorer.js', 'webui\brands.js', 'webui\discover.js', 'webui\catalog.js', 'catalog\apps\echo.json', 'webui\index.html', 'webui\app.js', 'webui\ui.js', 'webui\logic.js', 'webui\setup.js', 'webui\pages.js', 'webui\projects.js', 'webui\app.css', 'webui\learn.json')
 $missing = @($required | Where-Object { -not (Test-Path -LiteralPath (Join-Path $here $_)) })
 if ($missing.Count) { Fail ("These program files are missing next to Start-DeploymentManager.ps1: $($missing -join ', '). Extract the whole ZIP again (all folders) and start START-HERE.cmd from the extracted folder.") }
 

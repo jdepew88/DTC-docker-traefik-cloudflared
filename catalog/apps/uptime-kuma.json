@@ -1,0 +1,71 @@
+{
+  "schema": 1,
+  "id": "uptime-kuma",
+  "name": "Uptime Kuma",
+  "category": "monitoring",
+  "description": "Self-hosted monitoring: checks websites, ports and services and notifies you when they go down; status pages included.",
+  "maintainer": "Louis Lam and contributors (louislam/uptime-kuma)",
+  "license": "MIT",
+  "source": {
+    "type": "curated",
+    "url": "https://github.com/louislam/uptime-kuma"
+  },
+  "docs": [
+    {
+      "title": "Uptime Kuma wiki",
+      "url": "https://github.com/louislam/uptime-kuma/wiki"
+    },
+    {
+      "title": "Docker installation",
+      "url": "https://github.com/louislam/uptime-kuma/wiki/%F0%9F%94%A7-How-to-Install"
+    }
+  ],
+  "platforms": {
+    "windows-docker-desktop": "supported",
+    "linux-docker": "untested",
+    "unraid": "untested",
+    "podman": "untested"
+  },
+  "installable": true,
+  "services": {
+    "app": {
+      "image": "louislam/uptime-kuma:2.5.6@sha256:9912da7d7d9b6ddc0c2d904beb84d24689c1ed9c33b81419eb9008663a92a329",
+      "ports": [
+        {
+          "container": 3001,
+          "protocol": "http",
+          "primary": true
+        }
+      ],
+      "volumes": [
+        {
+          "name": "data",
+          "target": "/app/data",
+          "kind": "volume",
+          "description": "Monitors, history and settings (SQLite)."
+        }
+      ],
+      "environment": {
+        "TZ": "{{timezone}}"
+      }
+    }
+  },
+  "inputs": [],
+  "privileges": [],
+  "dependencies": [],
+  "security": [
+    "Create the admin account right after the first start: until then anyone who can open the page can claim it. Publish it behind Cloudflare Access.",
+    "Keep its data in a Docker volume: its SQLite database must not live on a network share."
+  ],
+  "update": {
+    "strategy": "pinned-digest",
+    "notes": "Version 2 migrates the database on the first start; the volume is kept."
+  },
+  "web": {
+    "service": "app",
+    "path": "/"
+  },
+  "exposure": {
+    "default": "access"
+  }
+}

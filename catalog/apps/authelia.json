@@ -1,0 +1,35 @@
+{
+  "schema": 1,
+  "id": "authelia",
+  "name": "Authelia",
+  "category": "authentication",
+  "description": "Single sign-on and two-factor login portal in front of your apps (Traefik forward authentication).",
+  "maintainer": "Authelia contributors",
+  "license": "Apache-2.0",
+  "source": {
+    "type": "curated",
+    "url": "https://github.com/authelia/authelia"
+  },
+  "docs": [
+    {
+      "title": "Authelia documentation",
+      "url": "https://www.authelia.com/integration/prologue/get-started/"
+    },
+    {
+      "title": "Traefik integration",
+      "url": "https://www.authelia.com/integration/proxies/traefik/"
+    }
+  ],
+  "platforms": {
+    "windows-docker-desktop": "supported",
+    "linux-docker": "untested",
+    "unraid": "untested",
+    "podman": "untested"
+  },
+  "installable": false,
+  "installNote": "Authelia needs a configuration file, users with hashed passwords and a session domain. It is set up by the optional authentication integration (a later milestone); Cloudflare Access protects apps until then.",
+  "imageReference": "authelia/authelia:4.39@sha256:bd97cff4fcbf715b5ff1f9ae286afbe6033afce385302520b0368122d43a6f54",
+  "exposure": {
+    "default": "access"
+  }
+}

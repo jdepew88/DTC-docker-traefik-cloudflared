@@ -1,0 +1,79 @@
+{
+  "schema": 1,
+  "id": "portainer",
+  "name": "Portainer CE",
+  "category": "management",
+  "description": "Web interface to manage Docker containers, images, volumes, networks and Compose stacks.",
+  "maintainer": "Portainer.io",
+  "license": "Zlib",
+  "source": {
+    "type": "curated",
+    "url": "https://github.com/portainer/portainer"
+  },
+  "docs": [
+    {
+      "title": "Install Portainer CE with Docker",
+      "url": "https://docs.portainer.io/start/install-ce/server/docker/linux"
+    },
+    {
+      "title": "Portainer documentation",
+      "url": "https://docs.portainer.io/"
+    }
+  ],
+  "platforms": {
+    "windows-docker-desktop": "supported",
+    "linux-docker": "untested",
+    "unraid": "untested",
+    "podman": "untested"
+  },
+  "installable": true,
+  "services": {
+    "app": {
+      "image": "portainer/portainer-ce:2.45.2@sha256:03f94a406496dc84d37b552795fc424ccad8d0d7200353b6a82915f6e8f73ab0",
+      "ports": [
+        {
+          "container": 9443,
+          "protocol": "https",
+          "primary": true,
+          "selfSigned": true
+        }
+      ],
+      "volumes": [
+        {
+          "name": "data",
+          "target": "/data",
+          "kind": "volume",
+          "description": "Portainer's users and settings."
+        }
+      ],
+      "dockerSocket": true,
+      "environment": {}
+    }
+  },
+  "inputs": [],
+  "privileges": [
+    {
+      "kind": "docker-socket",
+      "explain": "Portainer mounts the Docker socket. Anyone who can sign in to Portainer controls every container on this PC and, through Docker, the PC itself."
+    }
+  ],
+  "dependencies": [],
+  "security": [
+    "Create the administrator within 5 minutes of the first start; otherwise Portainer locks setup until it is restarted.",
+    "Never publish it without Cloudflare Access in front of its own login."
+  ],
+  "update": {
+    "strategy": "pinned-digest",
+    "notes": "LTS channel (2.45.2 at the time of curation)."
+  },
+  "web": {
+    "service": "app",
+    "path": "/",
+    "tlsSkipVerify": true
+  },
+  "exposure": {
+    "default": "access",
+    "allowPublic": false,
+    "warning": "Portainer controls Docker on this PC: publish it only behind Cloudflare Access."
+  }
+}

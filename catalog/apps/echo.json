@@ -1,0 +1,61 @@
+{
+  "schema": 1,
+  "id": "echo",
+  "name": "HTTP echo (whoami)",
+  "category": "tools",
+  "description": "A tiny web server that answers every request with the request it received. Use it to test a hostname, Cloudflare Access and the whole request path before publishing a real app.",
+  "maintainer": "Traefik Labs (traefik/whoami)",
+  "license": "Apache-2.0",
+  "source": {
+    "type": "curated",
+    "url": "https://github.com/traefik/whoami"
+  },
+  "docs": [
+    {
+      "title": "traefik/whoami",
+      "url": "https://github.com/traefik/whoami"
+    }
+  ],
+  "platforms": {
+    "windows-docker-desktop": "supported",
+    "linux-docker": "untested",
+    "unraid": "untested",
+    "podman": "untested"
+  },
+  "installable": true,
+  "services": {
+    "app": {
+      "image": "traefik/whoami:v1.12.0@sha256:c4717a8d1f0134a7444e24f881160e033991f23027c6c5a9a3f8fd22e70d1d44",
+      "ports": [
+        {
+          "container": 80,
+          "protocol": "http",
+          "primary": true
+        }
+      ],
+      "volumes": [],
+      "environment": {}
+    }
+  },
+  "inputs": [],
+  "privileges": [],
+  "dependencies": [],
+  "security": [
+    "It shows request headers (including the Cloudflare Access identity header) to whoever can open it: keep it behind Access or local only."
+  ],
+  "update": {
+    "strategy": "pinned-digest",
+    "notes": "Stateless; updates only replace the container."
+  },
+  "health": {
+    "path": "/health",
+    "expect": 200
+  },
+  "web": {
+    "service": "app",
+    "path": "/"
+  },
+  "exposure": {
+    "default": "access"
+  }
+}

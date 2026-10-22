@@ -80,12 +80,18 @@
     if (!c) { fill(main, head('Services', 'Publish an application', ''), h('div', { class: 'callout err' }, h('p', null, `No container named ${name}.`)), h('a', { href: '#discover' }, 'Back to the containers')); return; }
     s.zones = s.zones && s.zones.length ? s.zones : [];
     if (!s.zones.length && cfReady(s.status)) { try { s.zones = arr((await api('GET', '/api/cloudflare/zones')).zones).filter((z) => z.status !== 'deleted'); } catch (e) { s.zones = []; } }
-    const label = L.suggestAppName(c);
-    const port = L.choosePort(c.ports);
+    // Apps from the catalog bring their own defaults: web port and scheme, exposure, warnings.
+    if (c.managedBy && !s.catalog) { try { s.catalog = await api('GET', '/api/catalog'); } catch (e) { s.catalog = null; } }
+    const app = c.managedBy && s.catalog ? arr(s.catalog.apps).find((x) => x.id === c.managedBy) : null;
+    const appPort = app ? arr(app.services).flatMap((x) => x.ports).find((p) => p.primary) : null;
+    const label = app ? L.suggestLabel(c.name) : L.suggestAppName(c);
+    const port = (appPort && arr(c.ports).find((p) => p.port === appPort.container)) || L.choosePort(c.ports);
     if (!s.forms.pub || s.forms.pub.container !== c.name) {
       const reach = L.reachOptions(c, port ? port.port : 0);
-      s.forms.pub = { container: c.name, display: L.displayNameFromLabel(label), sub: L.autoName(label), domain: (s.zones[0] || {}).name || '', port: port ? port.port : 0,
-        scheme: port && port.guess === 'https' ? 'https' : 'http', tls: false, reach: reach.default, exposure: cfReady(s.status) ? 'access' : 'local', emails: s.setup.contactEmail || '', probes: {}, claims: null };
+      const exp = app && app.exposure ? app.exposure.default : 'access';
+      s.forms.pub = { container: c.name, display: app ? app.name : L.displayNameFromLabel(label), sub: L.autoName(label), domain: (s.zones[0] || {}).name || '', port: port ? port.port : 0,
+        scheme: (appPort && appPort.protocol === 'https') || (port && port.guess === 'https') ? 'https' : 'http', tls: !!(app && app.web && app.web.tlsSkipVerify), reach: reach.default,
+        exposure: cfReady(s.status) && exp !== 'local' ? exp : 'local', emails: s.setup.contactEmail || '', probes: {}, claims: null, warning: app && app.exposure ? app.exposure.warning || '' : '', noPublic: !!(app && app.exposure && app.exposure.allowPublic === false) };
     }
     renderWizard(main, ctx, c, data.proxyNetwork);
   };
@@ -147,10 +153,10 @@
     // 5. Who can reach it
     const exposure = h('div', { class: 'choice-cards', role: 'radiogroup', 'aria-label': 'Who can reach it?' },
       [['access', 'Internet, Cloudflare Access login', 'Recommended: only the emails you allow can sign in.', !ready],
-        ['public', 'Internet, no extra login', 'Only for apps with their own secure login.', !ready],
+        ['public', 'Internet, no extra login', f.noPublic ? 'Not offered for this app: it controls Docker on this PC.' : 'Only for apps with their own secure login.', !ready || f.noPublic],
         ['local', 'Local only', 'A Traefik route on this PC; nothing in Cloudflare.', false]].map(([v, title, text, needsCf]) =>
         h('label', { class: `choice ${needsCf ? 'disabled' : ''}` }, h('input', { type: 'radio', name: 'pub-exp', value: v, checked: f.exposure === v, disabled: needsCf, onchange: () => { f.exposure = v; rerender(); } }),
-          h('strong', null, title), h('span', { class: 'small muted' }, needsCf ? 'Connect Cloudflare (tunnel) first.' : text))));
+          h('strong', null, title), h('span', { class: 'small muted' }, needsCf && !(v === 'public' && f.noPublic && ready) ? 'Connect Cloudflare (tunnel) first.' : text))));
     const emails = h('input', { id: 'pub-emails', value: f.emails, spellcheck: 'false', placeholder: 'you@example.com' });
     emails.addEventListener('input', () => { f.emails = emails.value; });
     const tls = h('input', { type: 'checkbox', checked: f.tls }); tls.addEventListener('change', () => { f.tls = tls.checked; });
@@ -168,7 +174,7 @@
           f.scheme === 'https' ? h('label', { class: 'check' }, tls, h('span', null, 'Skip certificate verification to the app (self-signed certificate)')) : null),
         step(3, 'Hostname', h('div', { class: 'field' }, h('label', { for: 'pub-sub' }, 'Hostname ', subTag), h('div', { class: 'hostname-row' }, subInput, h('span', { class: 'sep' }, '.'), domain), h('p', { class: 'hint' }, preview)), claimBox),
         step(4, 'How Traefik reaches it', reachChoices, reach.loopbackOnly ? h('p', { class: 'hint warn' }, 'Its published port listens on 127.0.0.1 only, which containers cannot reach; attach it to the network instead.') : null),
-        step(5, 'Who can reach it', exposure, f.exposure === 'access' ? field({ id: 'pub-emails', label: 'Allowed emails (Cloudflare Access)', control: emails }) : null,
+        step(5, 'Who can reach it', f.warning ? h('div', { class: 'callout warn' }, h('p', null, f.warning)) : null, exposure, f.exposure === 'access' ? field({ id: 'pub-emails', label: 'Allowed emails (Cloudflare Access)', control: emails }) : null,
           f.exposure === 'public' ? h('div', { class: 'callout warn' }, h('p', null, 'Anyone on the Internet can reach this app. Only choose this when the app has its own secure login.')) : null),
         h('section', { class: 'wiz-step' }, h('h2', null, h('span', { class: 'step-num' }, icon('eye')), 'Review'),
           kv([['Application', `${f.display} (${c.name})`], ['Address', `${f.exposure === 'local' ? 'http' : 'https'}://${host()}`], ['Traefik forwards to', target],

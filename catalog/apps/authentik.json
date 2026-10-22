@@ -1,0 +1,35 @@
+{
+  "schema": 1,
+  "id": "authentik",
+  "name": "authentik",
+  "category": "authentication",
+  "description": "Identity provider with single sign-on, invitations, social logins (e.g. Google) and per-application policies.",
+  "maintainer": "Authentik Security",
+  "license": "MIT (enterprise features under a separate licence)",
+  "source": {
+    "type": "curated",
+    "url": "https://github.com/goauthentik/authentik"
+  },
+  "docs": [
+    {
+      "title": "Docker Compose installation",
+      "url": "https://docs.goauthentik.io/install-config/install/docker-compose/"
+    },
+    {
+      "title": "Traefik forward auth",
+      "url": "https://docs.goauthentik.io/add-secure-apps/providers/proxy/server_traefik/"
+    }
+  ],
+  "platforms": {
+    "windows-docker-desktop": "supported",
+    "linux-docker": "untested",
+    "unraid": "untested",
+    "podman": "untested"
+  },
+  "installable": false,
+  "installNote": "authentik runs a server, a worker and PostgreSQL, and is configured through its own setup flow. It is set up by the optional authentication integration (a later milestone); Cloudflare Access protects apps until then.",
+  "imageReference": "ghcr.io/goauthentik/server:2026.8.5@sha256:602227a86455d6772e3d16b7d852713c4f864f40df5df894abd1285bb53979a5",
+  "exposure": {
+    "default": "access"
+  }
+}

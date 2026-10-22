@@ -1,0 +1,94 @@
+{
+  "schema": 1,
+  "id": "jellyfin",
+  "name": "Jellyfin",
+  "category": "media",
+  "description": "Free media server for your films, series, music and photos, with apps for TVs, phones and browsers.",
+  "maintainer": "The Jellyfin project",
+  "license": "GPL-2.0-only",
+  "source": {
+    "type": "curated",
+    "url": "https://github.com/jellyfin/jellyfin"
+  },
+  "docs": [
+    {
+      "title": "Jellyfin with Docker",
+      "url": "https://jellyfin.org/docs/general/installation/container"
+    },
+    {
+      "title": "Networking and reverse proxies",
+      "url": "https://jellyfin.org/docs/general/post-install/networking/"
+    }
+  ],
+  "platforms": {
+    "windows-docker-desktop": "supported",
+    "linux-docker": "untested",
+    "unraid": "untested",
+    "podman": "untested"
+  },
+  "installable": true,
+  "services": {
+    "app": {
+      "image": "jellyfin/jellyfin:12.2.20261005-225228@sha256:357724bf0ae27a672c7cbaa899db2d9abeb13dbd8657ccce750258a4c059d037",
+      "ports": [
+        {
+          "container": 8096,
+          "protocol": "http",
+          "primary": true
+        }
+      ],
+      "volumes": [
+        {
+          "name": "config",
+          "target": "/config",
+          "kind": "volume",
+          "description": "Library database, users and settings."
+        },
+        {
+          "name": "cache",
+          "target": "/cache",
+          "kind": "volume",
+          "description": "Transcoding and image cache (can be deleted)."
+        },
+        {
+          "name": "media",
+          "target": "/media",
+          "kind": "folder",
+          "input": "mediaFolder",
+          "readOnly": true,
+          "description": "Your media, read-only."
+        }
+      ],
+      "environment": {
+        "TZ": "{{timezone}}"
+      }
+    }
+  },
+  "inputs": [
+    {
+      "id": "mediaFolder",
+      "type": "folder",
+      "label": "Media folder",
+      "required": true,
+      "help": "An existing folder on this PC with your films, series or music, e.g. D:\\Media. Mounted read-only."
+    }
+  ],
+  "privileges": [],
+  "dependencies": [],
+  "security": [
+    "Streaming video through Cloudflare's proxy or Tunnel is restricted by Cloudflare's terms: keep Jellyfin local only (or use your own connection), and use Cloudflare only for occasional, low-volume access.",
+    "Create the administrator in the setup wizard right after the first start."
+  ],
+  "update": {
+    "strategy": "pinned-digest",
+    "notes": "Read the release notes before major versions: the library database is migrated on start."
+  },
+  "web": {
+    "service": "app",
+    "path": "/"
+  },
+  "exposure": {
+    "default": "local",
+    "warning": "Media streaming through Cloudflare is restricted by its terms. Publishing Jellyfin through the tunnel is not recommended."
+  }
+}
