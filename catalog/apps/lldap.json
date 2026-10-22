@@ -95,8 +95,8 @@
   "privileges": [],
   "dependencies": [],
   "security": [
-    "LDAP (3890) is reachable only by apps on the shared network; it is never published on this PC or through Cloudflare.",
-    "Publish the web interface only behind Cloudflare Access."
+    "LLDAP is not on the shared proxy network: it has a private network of its own, so neither its LDAP port (3890) nor its web interface is reachable by other containers, published on this PC (except the web interface on 127.0.0.1) or through Cloudflare.",
+    "Apps that use the directory (authentik, Authelia) must be attached to its private network deliberately; that is not done automatically."
   ],
   "update": {
     "strategy": "pinned-digest",
@@ -105,11 +105,13 @@
   "web": {
     "service": "app",
     "path": "/",
-    "localPort": 17170
+    "localPort": 17170,
+    "proxy": false
   },
   "exposure": {
-    "default": "access",
-    "allowPublic": false
+    "default": "local",
+    "allowPublic": false,
+    "warning": "A directory server is a sensitive dependency: it stays local and is not published through Traefik."
   },
   "resources": {
     "memoryMB": 50,

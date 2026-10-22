@@ -119,7 +119,7 @@ try {
 if ((Get-DockerStatus).CliFound) {
   $tmpAll = Join-Path ([IO.Path]::GetTempPath()) ('tpm-cfgall-' + [Guid]::NewGuid().ToString('N').Substring(0, 6))
   $sampleFolder = (New-Item -ItemType Directory -Force -Path (Join-Path $tmpAll 'folder')).FullName
-  $bad = @(); $secretsInCompose = @(); $n = 0
+  $bad = @(); $secretsInCompose = @(); $n = 0; $sensitiveOnProxy = @(); $lldapCompose = ''
   try {
     foreach ($a in $inst) {
       $m = $a.manifest; $inputs = @{}
@@ -132,12 +132,19 @@ if ((Get-DockerStatus).CliFound) {
       $envAll = [ordered]@{}; foreach ($s in $r.Env.Keys) { foreach ($k in $r.Env[$s].Keys) { $envAll[$k] = $r.Env[$s][$k] } }
       [IO.File]::WriteAllText("$dir\.env", (ConvertTo-EnvFileText $envAll))
       foreach ($k in $r.Secrets) { if ($cy.Contains([string]$envAll[$k])) { $secretsInCompose += "$($m.id):$k" } }
+      # Databases, caches, brokers, socket proxies and directory servers never join the shared proxy network.
+      foreach ($block in [regex]::Split($cy, '(?m)^(?=  [\w-]+:\s*$)')) {
+        if ($block -match '(?m)^    image: (\S+)' -and $Matches[1] -match '(^|/)(postgres|mariadb|mysql|mongo|mongodb-community-server|redis|valkey|nats|lldap|openldap|docker-socket-proxy)(:|@|$)' -and $block -match '(?m)^    networks: \[[^\]]*\bproxy\b') { $sensitiveOnProxy += "$($m.id):$($Matches[0])" }
+      }
+      if ($m.id -eq 'lldap') { $lldapCompose = $cy }
       $vals = $r.Values.Clone(); $vals['installedApps'] = "- Apps: []`n"; $null = Get-AppFiles $m $vals
       $v = Invoke-Docker compose --project-directory $dir -f "$dir\compose.yaml" config -q
       if ($v.ExitCode -ne 0) { $bad += "$($m.id): $($v.Output -join ' ')" } else { $n++ }
     }
   } finally { Remove-Item -LiteralPath $tmpAll -Recurse -Force -ErrorAction SilentlyContinue }
   Test-Condition "compose: all $($inst.Count) installable templates generate a valid project (docker compose config) with their files" ($bad.Count -eq 0 -and $n -eq $inst.Count) ($bad -join ' | ')
+  Test-Condition 'compose: no database, cache, broker, socket proxy or directory service joins the shared proxy network' ($sensitiveOnProxy.Count -eq 0) ($sensitiveOnProxy -join ' | ')
+  Test-Condition 'compose: LLDAP (web.proxy false) has only a private network of its own and its web port on 127.0.0.1' ($lldapCompose -match 'networks: \[internal\]' -and $lldapCompose -notmatch 'proxy-x' -and $lldapCompose -match "127\.0\.0\.1:19999:17170" -and $lldapCompose -match '(?m)^  internal: \{\}') $lldapCompose
   Test-Condition 'compose: no template writes a secret into compose.yaml' ($secretsInCompose.Count -eq 0) ($secretsInCompose -join ', ')
 }
 $envText = ConvertTo-EnvFileText ([ordered]@{ A = 'plain-1.2'; B = 'has space'; C = 'x$y' })

@@ -74,6 +74,9 @@ function ConvertFrom-DockerInspect($C) {
     managedBy = (& $label 'org.traefik-proxy.app')
     # Reverse proxies, tunnel connectors and socket proxies are infrastructure, not applications to publish.
     infrastructure = [bool]($image -match '(^|/)(traefik|docker-socket-proxy|socket-proxy|cloudflared|caddy|nginx-proxy-manager)(:|@|$)' -and $image -notmatch 'traefik/whoami')
+    # Databases, caches, message brokers and directory servers stay on private networks: never attached to the shared
+    # proxy network or published, whatever their ports look like.
+    privateService = [bool]($image -match '(^|/)(postgres|postgresql|mariadb|mysql|mongo|mongodb-community-server|redis|valkey|keydb|memcached|nats|rabbitmq|openldap|lldap)(:|@|$)')
   }
 }
 

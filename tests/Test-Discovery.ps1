@@ -72,6 +72,8 @@ Test-Condition 'ports: the labelled port ranks first as HTTP; UDP is never HTTP;
 $db = [ordered]@{ exposed = @([ordered]@{ port = 5432; proto = 'tcp' }, [ordered]@{ port = 8443; proto = 'tcp' }, [ordered]@{ port = 8191; proto = 'tcp' }); published = @(); traefik = [ordered]@{ servicePorts = @() } }
 $dp = Get-PortCandidates $db
 Test-Condition 'ports: HTTPS and unknown ports rank above database ports' (($dp | ForEach-Object { "$($_.port):$($_.guess)" }) -join ',' -eq '8443:https,8191:unknown,5432:not-http') (($dp | ForEach-Object { "$($_.port):$($_.guess)" }) -join ',')
+$priv = @('valkey/valkey:9', 'postgres:16-alpine', 'ghcr.io/immich-app/postgres:14-vectorchord0.4.3', 'mongodb/mongodb-community-server:8.2-ubi8', 'lldap/lldap:v0.6.3', 'nats:2.11-alpine', 'ghcr.io/hotio/prowlarr:latest', 'traefik/whoami:v1.12.0') | ForEach-Object { $x = ConvertFrom-DockerInspect ("{`"Id`":`"p`",`"Name`":`"/p`",`"Config`":{`"Image`":`"$_`"},`"State`":{`"Status`":`"running`"},`"NetworkSettings`":{}}" | ConvertFrom-Json); "$($_)=$($x.privateService)" }
+Test-Condition 'inspect: databases, caches, brokers and directory servers are private services; applications are not' (($priv -join ',') -eq 'valkey/valkey:9=True,postgres:16-alpine=True,ghcr.io/immich-app/postgres:14-vectorchord0.4.3=True,mongodb/mongodb-community-server:8.2-ubi8=True,lldap/lldap:v0.6.3=True,nats:2.11-alpine=True,ghcr.io/hotio/prowlarr:latest=False,traefik/whoami:v1.12.0=False') ($priv -join ', ')
 $infra = ConvertFrom-DockerInspect ('{"Id":"a","Name":"/x-traefik","Config":{"Image":"traefik:v3.7.15"},"State":{"Status":"running"},"NetworkSettings":{}}' | ConvertFrom-Json)
 $who = ConvertFrom-DockerInspect ('{"Id":"b","Name":"/who","Config":{"Image":"traefik/whoami:v1.12.0"},"State":{"Status":"running"},"NetworkSettings":{}}' | ConvertFrom-Json)
 Test-Condition 'inspect: reverse proxies and tunnel connectors are infrastructure; whoami is an application' ($infra.infrastructure -and -not $who.infrastructure) ''
@@ -128,7 +130,7 @@ else {
   $traefikImage = (Get-StackSettings -InstallPath $repo).TraefikImage
   $before = Get-EngineSnapshot $stack
   $installed = $false; $ui = $null; $mock = $null; $cdp = $null
-  $app1 = "$stack-web1"; $app2 = "$stack-web2"; $dbc = "$stack-db"; $lab = "$stack-labelled"
+  $app1 = "$stack-web1"; $app2 = "$stack-web2"; $dbc = "$stack-db"; $lab = "$stack-labelled"; $cache = "$stack-cache"; $cacheImage = "$stack/valkey:test"
   $pubPort = Get-FreeTcpPort
   try {
     $install = Invoke-Ps (Join-Path $repo 'install.ps1') @('-InstallPath', $installPath, '-EnvFile', $envFile, '-Start')
@@ -180,6 +182,12 @@ else {
     # Attach to the shared network (explicit confirmation) and publish over it.
     $nc0 = Invoke-WebUi $ui POST '/api/docker/connect' @{ container = $app1 }
     $ncOwn = Invoke-WebUi $ui POST '/api/docker/connect' @{ container = "$stack-traefik"; confirm = $true }
+    # A cache (image named like valkey: a local tag of an image already here) is never attached to the shared network.
+    $null = Invoke-Docker tag $traefikImage $cacheImage
+    $null = Invoke-Docker run -d --name $cache --network $appsNet --entrypoint sh $cacheImage -c 'sleep 600'
+    $ncCache = Invoke-WebUi $ui POST '/api/docker/connect' @{ container = $cache; confirm = $true }
+    $cacheNets = (@((Invoke-Docker inspect $cache --format '{{json .NetworkSettings.Networks}}').Output) -join '')
+    Test-Condition 'network: a database or cache container is refused and stays off the shared network' ($ncCache.Status -eq 400 -and $ncCache.Body -match 'private network' -and $cacheNets -notmatch [regex]::Escape($network)) "$($ncCache.Status) $($ncCache.Body)"
     Test-Condition 'network: attaching needs confirmation; the deployment''s own containers are refused' ($nc0.Status -eq 400 -and $ncOwn.Status -eq 400) "$($nc0.Status) $($ncOwn.Status)"
     $nc = Invoke-WebUi $ui POST '/api/docker/connect' @{ container = $app1; confirm = $true }
     $nets = (@((Invoke-Docker inspect $app1 --format '{{json .NetworkSettings.Networks}}').Output) -join '')
@@ -287,7 +295,8 @@ else {
   } finally {
     if ($cdp) { Stop-EdgeSession $cdp }
     Stop-TestServer $ui; Stop-TestServer $mock
-    foreach ($n in @($app1, $app2, $dbc, $lab)) { $null = Invoke-Docker rm -f $n }
+    foreach ($n in @($app1, $app2, $dbc, $lab, $cache)) { $null = Invoke-Docker rm -f $n }
+    $null = Invoke-Docker rmi $cacheImage
     if ($installed) {
       $null = Invoke-Ps (Join-Path $installPath 'install.ps1') @('-InstallPath', $installPath, '-Stop')
       $null = Invoke-Docker rm -f "$stack-whoami"

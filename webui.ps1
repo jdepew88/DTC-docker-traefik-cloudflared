@@ -1643,10 +1643,13 @@ function Get-InstalledAppsYaml($Settings) {
     $href = $(if ($a.PSObject.Properties['localUrl'] -and $a.localUrl) { [string]$a.localUrl } elseif ($a.PSObject.Properties['localPort'] -and [int]$a.localPort) { "http://127.0.0.1:$($a.localPort)/" } else { '' })
     $name = ([string]$a.name).Replace('"', "'")
     $lines += "    - ""$name"":"
+    # A prepared app has no container yet: no link and no status check, so it is never shown as up.
+    if ($a.PSObject.Properties['prepared'] -and $a.prepared) { $lines += '        description: "prepared, not started"'; $n++; continue }
     if ($href) { $lines += "        href: $href" }
     $lines += "        description: ""$(([string]$m[0].category))"""
     if ($m[0].web.PSObject.Properties['status']) { $port = [int]$m[0].web.status.port; $scheme = [string]$m[0].web.status.scheme }
-    $lines += "        siteMonitor: ${scheme}://$(Get-AppContainerName $m[0] $a.project $web):$port"
+    # Apps kept off the shared network (web.proxy false) cannot be checked from Homepage.
+    if (-not ($m[0].web.PSObject.Properties['proxy'] -and -not $m[0].web.proxy)) { $lines += "        siteMonitor: ${scheme}://$(Get-AppContainerName $m[0] $a.project $web):$port" }
     $n++
   }
   if (-not $n) { return "- Apps: []`n" }
@@ -2109,6 +2112,7 @@ function Invoke-NetworkConnect($Body) {
   $own = @((Get-StackContainerNames $settings).Values)
   if ($own -contains $c.name) { Stop-Request 400 'The containers of this deployment are managed by its compose.yaml.' }
   if ($c.infrastructure) { Stop-Request 400 "$($c.name) looks like proxy or tunnel infrastructure; it is not attached automatically." }
+  if ($c.Contains('privateService') -and $c.privateService) { Stop-Request 400 "$($c.name) is a database, cache, message broker or directory server: it stays on its private network and is not attached to '$($settings.ProxyNetwork)'." }
   $snippet = @("services:", "  $(if ($c.compose.service) { $c.compose.service } else { $c.name }):", '    networks:', "      - $($settings.ProxyNetwork)", 'networks:', "  $($settings.ProxyNetwork):", '    external: true')
   if ($c.onProxyNetwork) { return [ordered]@{ connected = $true; changed = $false; message = "$($c.name) is already attached to '$($settings.ProxyNetwork)'."; composeSnippet = $snippet } }
   $r = Invoke-Docker network connect $settings.ProxyNetwork $c.name

@@ -4,7 +4,7 @@
   "name": "Homepage",
   "category": "dashboard",
   "group": "A",
-  "description": "A configurable start page with links to your apps and their status. The first configuration lists the apps installed by this manager; your edits are kept afterwards.",
+  "description": "A configurable start page with links to your apps and their status. The first configuration lists the apps installed by this manager; scripts\\Update-HomepageConfig.ps1 refreshes the generated part and keeps your own edits.",
   "maintainer": "gethomepage contributors",
   "license": "GPL-3.0",
   "source": {
@@ -77,7 +77,7 @@
     },
     {
       "path": "config/services.yaml",
-      "content": "# Apps installed by the Deployment Manager when Homepage was installed. Edit freely; it is never overwritten.\n# Status checks (siteMonitor) use the shared Docker network; no Docker socket is used.\n{{installedApps}}"
+      "content": "# Your own groups and cards: add them outside the generated block, which scripts\\Update-HomepageConfig.ps1 updates.\n# Status checks (siteMonitor) use the shared Docker network; no Docker socket is used.\n# BEGIN Deployment Manager (generated: this block is replaced on every update; edit outside it)\n{{installedApps}}# END Deployment Manager\n"
     },
     {
       "path": "config/widgets.yaml",

@@ -29,12 +29,12 @@ registry metadata on 2026-10-21. RAM figures are the manager's planning estimate
 | A | Traefik Manager | `ghcr.io/chr0nzz/traefik-manager:1.15.4` | :5000 | the existing Traefik API (read-only) | No Docker socket; its routes stay in its own `config/routes` until an ownership plan is approved; admin password set via its own `flask reset-password` |
 | A | Uptime Kuma | `louislam/uptime-kuma:2.5.6` | :3001 | | SQLite in a volume; create the admin on first visit |
 | A | Portainer CE | `portainer/portainer-ce:2.45.2` (LTS) | https :9443 | Docker socket | Admin created right after start (setup token from its log); never public |
-| A | Homepage | `ghcr.io/gethomepage/homepage:v2.6.0` | :3010 | | First `services.yaml` lists installed apps (links + HTTP status); no Docker socket |
+| A | Homepage | `ghcr.io/gethomepage/homepage:v2.6.0` | :3010 | | First `services.yaml` lists installed apps (links + HTTP status); `scripts\Update-HomepageConfig.ps1` refreshes it (see below); no Docker socket |
 | A | Arcane | `getarcaneapp/manager:v2.16.1` | :3552 | Docker socket | Never public |
 | A | HTTP echo | `traefik/whoami:v1.12.0` | :18080 | | For testing routes, tunnel and Access |
 | B | authentik | `ghcr.io/goauthentik/server:2026.8.5` (server + worker) | :9000 | PostgreSQL 16 (`postgres:16-alpine`) | No Redis (removed in 2025.10); initial setup at `/if/flow/initial-setup/`; LDAP not required |
 | B | Authelia | `authelia/authelia:4.39.28` | :9091 | | File-backed users (argon2 hash computed by Authelia), secrets as files; needs a real domain and HTTPS; protects apps only once a forwardAuth middleware is added |
-| B | LLDAP | `lldap/lldap:v0.6.3` | :17170 (LDAP 3890 internal only) | | The installable directory; OpenLDAP itself is listed only (see below) |
+| B | LLDAP | `lldap/lldap:v0.6.3` | :17170 (LDAP 3890 internal only) | | Not on the shared network (`web.proxy: false`): a private network of its own, local only; OpenLDAP itself is listed only (see below) |
 | C | Jellyfin | `jellyfin/jellyfin:12.2.20261005-225228` | :8096 | | Up to three read-only library folders; optional NVIDIA GPU (experimental on Docker Desktop); local only by default |
 | C | Dispatcharr | `ghcr.io/dispatcharr/dispatcharr:0.32.0` (all-in-one) | :9191 | embedded PostgreSQL/Redis | Tuners added by URL (no SSDP through Docker Desktop) |
 | C | Dispatcharr (modular) | same image, web + celery | :9192 | `postgres:17`, Valkey 9.1 | Advanced option of the official modular compose |
@@ -73,6 +73,46 @@ checks memory again, downloads the pinned images and runs the app's first-start 
   Folders you chose (media, photos, recordings) and earlier backups are never deleted. Removal is refused while a
   service route still points at the app.
 
+## Networks
+
+- The shared proxy network (`proxynet` on this PC) carries only the web front end of each app, which Traefik must reach.
+- Databases, caches, brokers, workers and socket proxies join the app's private `<project>_internal` network only.
+- An app whose `web.proxy` is `false` (LLDAP) never joins the shared network.
+- The website refuses to attach a database, cache, broker or directory container to the shared network.
+- `scripts\Get-NetworkAudit.ps1` is a read-only audit. It shows:
+  - which project owns each container and network;
+  - networks in use, needed only by stopped containers, or unused;
+  - Docker networks overlapping the LAN, which capture traffic to LAN targets such as a device behind Traefik;
+  - ports published on all interfaces.
+
+  It never prunes or removes anything.
+
+## Homepage configuration
+
+`scripts\Update-HomepageConfig.ps1 -ProjectPath <deployment>` previews, and with `-Apply` writes, these Homepage files:
+
+- `services.yaml`: cards grouped as Infrastructure, Monitoring, Identity, Media, Communication and Other services. They cover:
+  - the Traefik dashboard (status and the read-only Traefik widget);
+  - the Deployment Manager;
+  - the Cloudflare Tunnel (link only: its status is not checkable without an API token);
+  - every installed app;
+  - selected not-installed apps;
+  - services published through Traefik.
+- `bookmarks.yaml`: public addresses, listed only when the Cloudflare edge answers and Traefik routes the hostname to a working backend.
+- `widgets.yaml`: the Docker VM's CPU, memory and disk.
+- `settings.yaml`: a compact layout.
+
+How the files are written:
+
+- Running apps link to their local URL and are checked over the shared network.
+- Prepared, stopped and not-installed apps get no link and no status check, so they never appear healthy.
+- Generated text sits between `# BEGIN Deployment Manager` and `# END Deployment Manager`; everything else is kept as written.
+- A card whose name you already use outside the block is not generated again.
+- The `services.yaml` written at installation is taken over as a whole.
+- Previous files go to `backups\homepage-config-<time>\` in the Homepage folder.
+- Homepage reloads the files itself, so nothing is restarted.
+- No secrets or API keys are written.
+
 ## Manifest (`catalog\apps\<id>.json`, schema 1)
 
 | Field | Meaning |
@@ -86,7 +126,7 @@ checks memory again, downloads the pinned images and runs the app's first-start 
 | `files` | Created once in the project folder (`secret: true` = restricted ACL) |
 | `postInstall` | First-start steps: `command` (docker exec) or `http` (POST to the app on 127.0.0.1, optional `tokenFromLog`) |
 | `privileges` | `docker-socket`, `host-network`, `device`, `gpu`, `privileged`, with an explanation the user confirms |
-| `web` (`service`, `localPort`, `status`), `exposure` (`default`, `allowPublic`, `warning`), `resources`, `security`, `update` | |
+| `web` (`service`, `localPort`, `status`, `proxy`: false keeps the app off the shared network), `exposure` (`default`, `allowPublic`, `warning`), `resources`, `security`, `update` | |
 
 `tests\Test-Catalog.ps1` validates every manifest, generates every installable project and runs
 `docker compose config` on it, and exercises the lifecycle with fixture apps on a disposable instance.
