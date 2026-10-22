@@ -1,0 +1,118 @@
+{
+  "schema": 1,
+  "id": "lldap",
+  "name": "LLDAP (directory)",
+  "category": "authentication",
+  "group": "B",
+  "description": "Optional lightweight LDAP directory with a web interface for users and groups, usable as a backend for authentik, Authelia and other apps. Neither authentik nor Authelia requires it.",
+  "maintainer": "lldap contributors",
+  "license": "GPL-3.0",
+  "source": {
+    "type": "curated",
+    "url": "https://github.com/lldap/lldap"
+  },
+  "docs": [
+    {
+      "title": "Installation",
+      "url": "https://github.com/lldap/lldap/blob/v0.6.3/docs/install.md"
+    },
+    {
+      "title": "Configuration examples",
+      "url": "https://github.com/lldap/lldap/tree/main/example_configs"
+    }
+  ],
+  "platforms": {
+    "windows-docker-desktop": "supported",
+    "linux-docker": "untested",
+    "unraid": "untested",
+    "podman": "untested"
+  },
+  "installable": true,
+  "services": {
+    "app": {
+      "image": "lldap/lldap:v0.6.3@sha256:2a8454b668c1aba7157e832eab0e242e1e7eb5fb7591d7e7774ba05286511ca8",
+      "ports": [
+        {
+          "container": 17170,
+          "protocol": "http",
+          "primary": true
+        },
+        {
+          "container": 3890,
+          "protocol": "tcp"
+        }
+      ],
+      "environment": {
+        "TZ": "{{timezone}}",
+        "LLDAP_JWT_SECRET": "{{input:jwtSecret}}",
+        "LLDAP_KEY_SEED": "{{input:keySeed}}",
+        "LLDAP_LDAP_BASE_DN": "{{input:baseDn}}",
+        "LLDAP_LDAP_USER_PASS": "{{input:adminPassword}}"
+      },
+      "volumes": [
+        {
+          "name": "data",
+          "target": "/data",
+          "kind": "volume",
+          "description": "Directory database (SQLite)."
+        }
+      ],
+      "stateful": true,
+      "resources": {
+        "memoryMB": 50,
+        "diskMB": 60
+      }
+    }
+  },
+  "inputs": [
+    {
+      "id": "baseDn",
+      "type": "text",
+      "label": "Base DN",
+      "default": "dc=example,dc=com",
+      "pattern": "^dc=[a-z0-9-]+(,dc=[a-z0-9-]+)+$",
+      "help": "Usually your domain, e.g. dc=example,dc=com."
+    },
+    {
+      "id": "adminPassword",
+      "type": "password",
+      "label": "Administrator (admin) password",
+      "help": "Used only when the directory is first created; change it later in the web interface."
+    },
+    {
+      "id": "jwtSecret",
+      "type": "generated",
+      "bytes": 32,
+      "label": "Token secret"
+    },
+    {
+      "id": "keySeed",
+      "type": "generated",
+      "bytes": 32,
+      "label": "Key seed"
+    }
+  ],
+  "privileges": [],
+  "dependencies": [],
+  "security": [
+    "LDAP (3890) is reachable only by apps on the shared network; it is never published on this PC or through Cloudflare.",
+    "Publish the web interface only behind Cloudflare Access."
+  ],
+  "update": {
+    "strategy": "pinned-digest",
+    "notes": "Back up the data volume first."
+  },
+  "web": {
+    "service": "app",
+    "path": "/",
+    "localPort": 17170
+  },
+  "exposure": {
+    "default": "access",
+    "allowPublic": false
+  },
+  "resources": {
+    "memoryMB": 50,
+    "diskMB": 60
+  }
+}

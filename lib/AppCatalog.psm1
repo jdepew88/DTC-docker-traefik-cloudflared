@@ -12,7 +12,11 @@ $script:IdPattern = '^[a-z0-9]([a-z0-9-]{0,30}[a-z0-9])?$'
 $script:ImagePattern = '^[a-z0-9]+([._/-][a-z0-9]+)*(:[A-Za-z0-9_][A-Za-z0-9_.-]{0,127})?@sha256:[0-9a-f]{64}$'
 $script:EnvKeyPattern = '^[A-Z][A-Z0-9_]{0,63}$'
 $script:Platforms = @('windows-docker-desktop', 'linux-docker', 'unraid', 'podman')
-$script:Categories = @('monitoring', 'media', 'management', 'authentication', 'networking', 'tools', 'productivity')
+$script:Categories = @('monitoring', 'media', 'management', 'authentication', 'networking', 'tools', 'productivity', 'communication', 'photos', 'dashboard', 'updates')
+# Paths inside an app's project folder: relative, no '..', no drive letters.
+$script:RelPathPattern = '^(?!.*\.\.)[A-Za-z0-9][A-Za-z0-9_.-]*(/[A-Za-z0-9_.-]+)*$'
+# Values computed at installation time from another input (see Resolve-DerivedValue in webui.ps1).
+$script:DerivedMethods = @('authelia-argon2')
 
 function Get-Prop($Object, [string]$Name, $Default = $null) {
   if ($null -eq $Object) { return $Default }
@@ -33,51 +37,96 @@ function Test-AppManifest($M) {
   if ($id -notmatch $script:IdPattern) { & $add "id '$id' is invalid" }
   foreach ($f in @('name', 'description', 'license', 'maintainer', 'category')) { if (-not [string](Get-Prop $M $f '')) { & $add "$f is required" } }
   if ($script:Categories -notcontains [string](Get-Prop $M 'category' '')) { & $add "category must be one of $($script:Categories -join ', ')" }
+  if ((Get-Prop $M 'group' '') -and [string](Get-Prop $M 'group' '') -notmatch '^[A-E]$') { & $add 'group must be A, B, C, D or E' }
+  $res = Get-Prop $M 'resources' $null
+  if ($res) { foreach ($k in @('memoryMB', 'diskMB')) { $v = Get-Prop $res $k $null; if ($null -ne $v -and ([int]$v -lt 0 -or [int]$v -gt 1048576)) { & $add "resources.$k is out of range" } } }
   foreach ($d in @(Get-Prop $M 'docs' @())) { if ([string](Get-Prop $d 'url' '') -notmatch '^https://') { & $add 'documentation links must be https URLs' } }
   if (-not @(Get-Prop $M 'docs' @()).Count) { & $add 'at least one documentation link is required' }
   $platforms = Get-Prop $M 'platforms' $null
   if (-not $platforms) { & $add 'platforms is required' }
-  else { foreach ($p in $platforms.PSObject.Properties) { if ($script:Platforms -notcontains $p.Name) { & $add "unknown platform '$($p.Name)'" } elseif ($p.Value -notin 'supported', 'untested', 'unsupported') { & $add "platform '$($p.Name)' must be supported, untested or unsupported" } } }
+  else { foreach ($p in $platforms.PSObject.Properties) { if ($script:Platforms -notcontains $p.Name) { & $add "unknown platform '$($p.Name)'" } elseif ($p.Value -notin 'supported', 'untested', 'limited', 'unsupported') { & $add "platform '$($p.Name)' must be supported, limited, untested or unsupported" } } }
   if (-not [bool](Get-Prop $M 'installable' $false)) { if (-not [string](Get-Prop $M 'installNote' '')) { & $add 'a manifest that is not installable needs installNote' }; return $e.ToArray() }
   $services = Get-Prop $M 'services' $null
   if (-not $services -or -not @($services.PSObject.Properties).Count) { & $add 'services is required'; return $e.ToArray() }
+  $serviceNames = @($services.PSObject.Properties | ForEach-Object { $_.Name })
   $inputs = @(Get-Prop $M 'inputs' @())
   $inputIds = @($inputs | ForEach-Object { [string]$_.id })
   foreach ($i in $inputs) {
     if ([string]$i.id -notmatch '^[a-zA-Z][a-zA-Z0-9]{0,40}$') { & $add "input id '$($i.id)' is invalid" }
-    if ([string](Get-Prop $i 'type' '') -notin 'text', 'secret', 'generated', 'folder', 'timezone') { & $add "input '$($i.id)' has an unknown type" }
-    if ((Get-Prop $i 'type' '') -eq 'generated' -and [int](Get-Prop $i 'bytes' 0) -lt 16) { & $add "generated input '$($i.id)' needs bytes >= 16" }
+    $type = [string](Get-Prop $i 'type' '')
+    if ($type -notin 'text', 'secret', 'generated', 'password', 'folder', 'timezone', 'boolean', 'derived') { & $add "input '$($i.id)' has an unknown type" }
+    if ($type -eq 'generated' -and [int](Get-Prop $i 'bytes' 0) -lt 16) { & $add "generated input '$($i.id)' needs bytes >= 16" }
+    if ($type -eq 'derived' -and ([string](Get-Prop $i 'method' '') -notin $script:DerivedMethods -or $inputIds -notcontains [string](Get-Prop $i 'from' ''))) { & $add "derived input '$($i.id)' needs a known method and an existing 'from' input" }
   }
+  $declared = @(Get-Prop $M 'privileges' @() | ForEach-Object { [string]$_.kind })
+  # traefikContainer / proxyNetwork / domains describe the proxy deployment the app is installed next to.
+  $known = @('input', 'project', 'appUrl', 'timezone', 'webPort', 'service', 'localPort', 'traefikContainer', 'proxyNetwork', 'domains')
+  $checkTemplates = { param($where, [string]$text, [string[]]$extra)
+    foreach ($tm in [regex]::Matches($text, '\{\{\s*([a-zA-Z]+)(?::([a-zA-Z0-9-]+))?\s*\}\}')) {
+      $kind = $tm.Groups[1].Value; $ref = $tm.Groups[2].Value
+      if ($kind -eq 'input' -and $inputIds -notcontains $ref) { & $add "${where}: {{input:$ref}} has no input" }
+      elseif ($kind -eq 'service' -and $serviceNames -notcontains $ref) { & $add "${where}: {{service:$ref}} names no service" }
+      elseif (($known + $extra) -notcontains $kind) { & $add "${where}: unknown template variable {{$kind}}" }
+    } }
   $primary = 0
   foreach ($sp in $services.PSObject.Properties) {
-    $s = $sp.Value
+    $s = $sp.Value; $where = "service '$($sp.Name)'"
     if ($sp.Name -notmatch $script:IdPattern) { & $add "service name '$($sp.Name)' is invalid" }
-    if ([string](Get-Prop $s 'image' '') -notmatch $script:ImagePattern) { & $add "service '$($sp.Name)': image must be pinned by digest (name:tag@sha256:...)" }
+    if ([string](Get-Prop $s 'image' '') -notmatch $script:ImagePattern) { & $add "${where}: image must be pinned by digest (name:tag@sha256:...)" }
+    $when = [string](Get-Prop $s 'when' '')
+    if ($when -and -not @($inputs | Where-Object { $_.id -eq $when -and $_.type -eq 'boolean' }).Count) { & $add "${where}: when must name a boolean input" }
     foreach ($p in @(Get-Prop $s 'ports' @())) {
-      if ([int](Get-Prop $p 'container' 0) -lt 1 -or [int](Get-Prop $p 'container' 0) -gt 65535) { & $add "service '$($sp.Name)': invalid port" }
-      if ([string](Get-Prop $p 'protocol' '') -notin 'http', 'https', 'tcp', 'udp') { & $add "service '$($sp.Name)': port protocol must be http, https, tcp or udp" }
+      if ([int](Get-Prop $p 'container' 0) -lt 1 -or [int](Get-Prop $p 'container' 0) -gt 65535) { & $add "${where}: invalid port" }
+      if ([string](Get-Prop $p 'protocol' '') -notin 'http', 'https', 'tcp', 'udp') { & $add "${where}: port protocol must be http, https, tcp or udp" }
       if ([bool](Get-Prop $p 'primary' $false)) { $primary++ }
     }
     foreach ($v in @(Get-Prop $s 'volumes' @())) {
-      if ([string](Get-Prop $v 'name' '') -notmatch $script:IdPattern) { & $add "service '$($sp.Name)': volume name '$($v.name)' is invalid" }
-      if ([string](Get-Prop $v 'target' '') -notmatch '^/[A-Za-z0-9._/-]*$') { & $add "service '$($sp.Name)': volume target must be an absolute container path" }
-      if ([string](Get-Prop $v 'kind' 'volume') -notin 'volume', 'folder') { & $add "service '$($sp.Name)': volume kind must be volume or folder" }
-      if ((Get-Prop $v 'kind' 'volume') -eq 'folder' -and $inputIds -notcontains [string](Get-Prop $v 'input' '')) { & $add "service '$($sp.Name)': folder volume '$($v.name)' needs an input" }
+      $kind = [string](Get-Prop $v 'kind' 'volume')
+      if ([string](Get-Prop $v 'name' '') -notmatch $script:IdPattern) { & $add "${where}: volume name '$($v.name)' is invalid" }
+      if ([string](Get-Prop $v 'target' '') -notmatch '^/[A-Za-z0-9._/-]*$') { & $add "${where}: volume target must be an absolute container path" }
+      if ($kind -notin 'volume', 'folder', 'project', 'tmpfs') { & $add "${where}: volume kind must be volume, folder, project or tmpfs" }
+      if ($kind -eq 'folder' -and $inputIds -notcontains [string](Get-Prop $v 'input' '')) { & $add "${where}: folder volume '$($v.name)' needs an input" }
+      if ($kind -eq 'volume' -and (Get-Prop $v 'input' '') -and $inputIds -notcontains [string]$v.input) { & $add "${where}: volume '$($v.name)' names an unknown folder input" }
+      if ($kind -eq 'project' -and [string](Get-Prop $v 'source' '') -notmatch $script:RelPathPattern) { & $add "${where}: project volume '$($v.name)' needs a relative source inside the project folder" }
+    }
+    foreach ($d in @(Get-Prop $s 'dependsOn' @())) {
+      if ($serviceNames -notcontains [string](Get-Prop $d 'service' '')) { & $add "${where}: dependsOn names no service" }
+      if ([string](Get-Prop $d 'condition' 'service_started') -notin 'service_started', 'service_healthy', 'service_completed_successfully') { & $add "${where}: unknown dependsOn condition" }
     }
     $envObj = Get-Prop $s 'environment' $null
     if ($envObj) { foreach ($ev in $envObj.PSObject.Properties) {
-        if ($ev.Name -notmatch $script:EnvKeyPattern) { & $add "service '$($sp.Name)': environment key '$($ev.Name)' is invalid" }
-        foreach ($tm in [regex]::Matches([string]$ev.Value, '\{\{\s*([a-zA-Z]+)(?::([a-zA-Z0-9]+))?\s*\}\}')) {
-          $kind = $tm.Groups[1].Value; $ref = $tm.Groups[2].Value
-          if ($kind -eq 'input' -and $inputIds -notcontains $ref) { & $add "service '$($sp.Name)': {{input:$ref}} has no input" }
-          elseif ($kind -notin 'input', 'project', 'appUrl', 'timezone', 'webPort') { & $add "service '$($sp.Name)': unknown template variable {{$kind}}" }
-        }
+        if ($ev.Name -notmatch $script:EnvKeyPattern) { & $add "${where}: environment key '$($ev.Name)' is invalid" }
+        & $checkTemplates $where ([string]$ev.Value) @()
       } }
-    if ((Get-Prop $s 'dockerSocket' $false) -and -not @(Get-Prop $M 'privileges' @() | Where-Object { $_.kind -eq 'docker-socket' }).Count) { & $add "service '$($sp.Name)' mounts the Docker socket but privileges does not declare docker-socket" }
+    foreach ($c in @(Get-Prop $s 'command' @())) { & $checkTemplates $where ([string]$c) @() }
+    if ((Get-Prop $s 'user' '') -and [string](Get-Prop $s 'user' '') -notmatch '^\d{1,6}(:\d{1,6})?$') { & $add "${where}: user must be uid[:gid]" }
+    $needs = @()
+    if (Get-Prop $s 'dockerSocket' $false) { $needs += 'docker-socket' }
+    if ([string](Get-Prop $s 'networkMode' '') -eq 'host') { $needs += 'host-network' } elseif (Get-Prop $s 'networkMode' '') { & $add "${where}: networkMode may only be host" }
+    if (@(Get-Prop $s 'devices' @()).Count) { $needs += 'device'; foreach ($dv in @(Get-Prop $s 'devices' @())) { if ([string]$dv -notmatch '^/dev/[A-Za-z0-9/_-]+$') { & $add "${where}: device '$dv' is invalid" } } }
+    $g = Get-Prop $s 'gpus' $false
+    if ($g -is [string] -and -not @($inputs | Where-Object { $_.id -eq $g -and $_.type -eq 'boolean' }).Count) { & $add "${where}: gpus must be true or name a boolean input" }
+    if ($g) { $needs += 'gpu' }
+    if (Get-Prop $s 'privileged' $false) { $needs += 'privileged' }
+    foreach ($n in $needs) { if ($declared -notcontains $n) { & $add "${where} needs '$n' but privileges does not declare it" } }
   }
+  foreach ($f in @(Get-Prop $M 'files' @())) {
+    if ([string](Get-Prop $f 'path' '') -notmatch $script:RelPathPattern) { & $add "file '$($f.path)': path must be relative inside the project folder" }
+    if ([string](Get-Prop $f 'path' '') -in 'compose.yaml', '.env', 'README.md') { & $add "file '$($f.path)' is reserved" }
+    & $checkTemplates "file '$($f.path)'" ([string](Get-Prop $f 'content' '')) @('installedApps')
+  }
+  foreach ($h in @(Get-Prop $M 'postInstall' @())) {
+    if ($serviceNames -notcontains [string](Get-Prop $h 'service' '')) { & $add 'postInstall names no service' }
+    foreach ($c in @(Get-Prop $h 'command' @())) { & $checkTemplates 'postInstall' ([string]$c) @() }
+    $hh = Get-Prop $h 'http' $null
+    if ($hh) { if ([string](Get-Prop $hh 'path' '') -notmatch '^/[A-Za-z0-9/_.-]*$') { & $add 'postInstall http.path must be a path' }; & $checkTemplates 'postInstall' ([string](Get-Prop $hh 'body' '')) @() }
+    elseif (-not @(Get-Prop $h 'command' @()).Count) { & $add 'postInstall needs a command or http' }
+  }
+  foreach ($p in $declared) { if ($p -notin 'docker-socket', 'host-network', 'device', 'gpu', 'privileged') { & $add "unknown privilege '$p'" } }
   if ($primary -ne 1) { & $add 'exactly one port must be marked primary (the web interface)' }
   $web = Get-Prop $M 'web' $null
   if (-not $web -or -not $services.PSObject.Properties[[string](Get-Prop $web 'service' '')]) { & $add 'web.service must name a service' }
+  elseif ((Get-Prop $web 'localPort' $null) -and ([int]$web.localPort -lt 1024 -or [int]$web.localPort -gt 65535)) { & $add 'web.localPort must be between 1024 and 65535' }
   if ([string](Get-Prop (Get-Prop $M 'exposure' $null) 'default' '') -notin 'access', 'public', 'local') { & $add 'exposure.default must be access, public or local' }
   return $e.ToArray()
 }
@@ -118,47 +167,57 @@ function New-SecretValue([int]$Bytes = 32) {
   return (($b | ForEach-Object { $_.ToString('x2') }) -join '')
 }
 
-# Resolves {{input:x}}, {{project}}, {{appUrl}}, {{timezone}}, {{webPort}} in one string. Unknown variables throw.
+# Resolves {{input:x}}, {{service:name}}, {{project}}, {{appUrl}}, {{timezone}}, {{webPort}}, {{localPort}} (and any
+# extra key in $Values, e.g. installedApps for files) in one string. Unknown variables throw.
 function Resolve-TemplateValue([string]$Template, [hashtable]$Values) {
-  return [regex]::Replace($Template, '\{\{\s*([a-zA-Z]+)(?::([a-zA-Z0-9]+))?\s*\}\}', {
+  return [regex]::Replace($Template, '\{\{\s*([a-zA-Z]+)(?::([a-zA-Z0-9-]+))?\s*\}\}', {
       param($m)
       $kind = $m.Groups[1].Value; $ref = $m.Groups[2].Value
-      $key = $(if ($kind -eq 'input') { "input:$ref" } else { $kind })
-      if (-not $Values.ContainsKey($key)) { throw "Template variable {{$($m.Groups[1].Value)$(if ($ref) { ":$ref" })}} has no value." }
+      $key = $(if ($ref) { "${kind}:$ref" } else { $kind })
+      if (-not $Values.ContainsKey($key)) { throw "Template variable {{$key}} has no value." }
       return [string]$Values[$key]
     })
 }
 
 # Validates the user's choices and builds every value the templates need. Generated secrets are created here once and
-# kept server-side with the plan. Returns Values (template map), Env (KEY -> value per service), Secrets (env keys whose
-# values must never be shown), Folders (volume -> host path) and Errors.
+# kept server-side with the plan. Derived values (e.g. a password hash) are computed at installation time and appear
+# here as placeholders. Returns Values (template map), Env (KEY -> value per active service), Secrets (env keys whose
+# values must never be shown), Derived (input ids still to compute) and Errors.
 function Resolve-AppValues {
-  param([Parameter(Mandatory = $true)]$Manifest, [hashtable]$Inputs = @{}, [string]$Project, [string]$AppUrl = '', [string]$TimeZone = 'UTC', [hashtable]$Existing = @{})
+  param([Parameter(Mandatory = $true)]$Manifest, [hashtable]$Inputs = @{}, [string]$Project, [string]$AppUrl = '', [string]$TimeZone = 'UTC', [hashtable]$Existing = @{}, [int]$LocalPort = 0, [hashtable]$Context = @{})
   $errors = New-Object System.Collections.ArrayList
-  $values = @{ project = $Project; appUrl = $AppUrl; timezone = $TimeZone }
-  $secretInputs = @()
+  $values = @{ project = $Project; appUrl = $AppUrl; timezone = $TimeZone; localPort = $LocalPort; traefikContainer = 'traefik'; proxyNetwork = 'proxy'; domains = 'localhost' }
+  foreach ($k in $Context.Keys) { $values[$k] = $Context[$k] }
+  foreach ($sp in (Get-Prop $Manifest 'services').PSObject.Properties) { $values["service:$($sp.Name)"] = Get-AppContainerName $Manifest $Project $sp.Name }
+  $secretInputs = @(); $derived = @()
   foreach ($i in @(Get-Prop $Manifest 'inputs' @())) {
-    $id = [string]$i.id; $type = [string]$i.type
+    $id = [string]$i.id; $type = [string]$i.type; $label = [string](Get-Prop $i 'label' $id)
     $v = $(if ($Inputs.ContainsKey($id)) { [string]$Inputs[$id] } else { '' })
-    if ($type -eq 'generated') { $v = $(if ($Existing.ContainsKey("input:$id")) { $Existing["input:$id"] } else { New-SecretValue ([int]$i.bytes) }); $secretInputs += $id }
-    elseif ($type -eq 'secret') { $secretInputs += $id; if (-not $v -and $Existing.ContainsKey("input:$id")) { $v = $Existing["input:$id"] } }
-    elseif ($type -eq 'timezone') { if (-not $v) { $v = $TimeZone }; if ($v -notmatch '^[A-Za-z_]+(/[A-Za-z0-9_+-]+){0,2}$') { $null = $errors.Add("$($i.label): not a time zone name (e.g. Europe/Berlin).") } }
-    elseif ($type -eq 'folder') {
-      if ($v) { try { $v = ConvertTo-HostFolder $v } catch { $null = $errors.Add("$($i.label): $($_.Exception.Message)") } }
-    } elseif (-not $v -and (Get-Prop $i 'default' '')) { $v = [string]$i.default }
-    if ([bool](Get-Prop $i 'required' $false) -and -not $v) { $null = $errors.Add("$($i.label) is required.") }
+    switch ($type) {
+      'generated' { $v = $(if ($Existing.ContainsKey("input:$id")) { $Existing["input:$id"] } else { New-SecretValue ([int]$i.bytes) }); $secretInputs += $id }
+      'password' {
+        if (-not $v) { $v = $(if ($Existing.ContainsKey("input:$id")) { $Existing["input:$id"] } else { New-PasswordValue }) }
+        elseif ($v.Length -lt 12) { $null = $errors.Add("${label}: use at least 12 characters.") }
+        $secretInputs += $id
+      }
+      'secret' { $secretInputs += $id; if (-not $v -and $Existing.ContainsKey("input:$id")) { $v = $Existing["input:$id"] } }
+      'derived' { $v = "__derived:$id"; $derived += $id; $secretInputs += $id }
+      'timezone' { if (-not $v) { $v = $TimeZone }; if ($v -notmatch '^[A-Za-z_]+(/[A-Za-z0-9_+-]+){0,2}$') { $null = $errors.Add("${label}: not a time zone name (e.g. Europe/Berlin).") } }
+      'boolean' { $raw = $(if ($v) { $v } else { [string](Get-Prop $i 'default' 'false') }); $v = $(if ($raw -match '^(true|1|yes|on)$') { 'true' } else { 'false' }) }
+      'folder' { if ($v) { try { $v = ConvertTo-HostFolder $v } catch { $null = $errors.Add("${label}: $($_.Exception.Message)") } } }
+      default { if (-not $v -and (Get-Prop $i 'default' '')) { $v = [string]$i.default } }
+    }
+    if ([bool](Get-Prop $i 'required' $false) -and -not $v) { $null = $errors.Add("$label is required.") }
     $pattern = [string](Get-Prop $i 'pattern' '')
-    if ($v -and $pattern -and $type -in 'text', 'secret' -and $v -notmatch $pattern) { $null = $errors.Add("$($i.label) has an invalid format.") }
-    if ($v -match "[\r\n]") { $null = $errors.Add("$($i.label) must be a single line.") }
+    if ($v -and $pattern -and $type -in 'text', 'secret' -and $v -notmatch $pattern) { $null = $errors.Add("$label has an invalid format.") }
+    if ($v -match "[\r\n]") { $null = $errors.Add("$label must be a single line.") }
     $values["input:$id"] = $v
   }
-  $envByService = [ordered]@{}; $secretKeys = New-Object System.Collections.ArrayList
   $webPort = 0
-  foreach ($sp in (Get-Prop $Manifest 'services').PSObject.Properties) {
-    foreach ($p in @(Get-Prop $sp.Value 'ports' @())) { if ([bool](Get-Prop $p 'primary' $false)) { $webPort = [int]$p.container } }
-  }
+  foreach ($sp in (Get-Prop $Manifest 'services').PSObject.Properties) { foreach ($p in @(Get-Prop $sp.Value 'ports' @())) { if ([bool](Get-Prop $p 'primary' $false)) { $webPort = [int]$p.container } } }
   $values['webPort'] = $webPort
-  foreach ($sp in (Get-Prop $Manifest 'services').PSObject.Properties) {
+  $envByService = [ordered]@{}; $secretKeys = New-Object System.Collections.ArrayList
+  foreach ($sp in (Get-ActiveServices $Manifest $values)) {
     $env = [ordered]@{}
     $envObj = Get-Prop $sp.Value 'environment' $null
     if ($envObj) { foreach ($ev in $envObj.PSObject.Properties) {
@@ -167,7 +226,7 @@ function Resolve-AppValues {
       } }
     $envByService[$sp.Name] = $env
   }
-  return [pscustomobject]@{ Values = $values; Env = $envByService; Secrets = @($secretKeys); Errors = $errors.ToArray() }
+  return [pscustomobject]@{ Values = $values; Env = $envByService; Secrets = @($secretKeys); Derived = $derived; Errors = $errors.ToArray() }
 }
 
 # A host folder for a bind mount: an existing local folder, not a drive root, not a network path, no quote characters.
@@ -195,79 +254,6 @@ function ConvertTo-EnvFileText($Env) {
 
 function ConvertTo-YamlScalar([string]$Value) { return "'" + $Value.Replace("'", "''") + "'" }
 
-# Pure: the Compose project of one app. $Options: ProxyNetwork, LocalPort (0 = none), Folders (volume name -> host path).
-function ConvertTo-AppCompose {
-  param([Parameter(Mandatory = $true)]$Manifest, [Parameter(Mandatory = $true)][string]$Project, [Parameter(Mandatory = $true)]$Resolved, [Parameter(Mandatory = $true)][string]$ProxyNetwork, [int]$LocalPort = 0)
-  $services = @((Get-Prop $Manifest 'services').PSObject.Properties)
-  $single = $services.Count -eq 1
-  $web = [string](Get-Prop (Get-Prop $Manifest 'web') 'service' '')
-  $L = New-Object System.Collections.Generic.List[string]
-  $L.Add("# Generated by the Deployment Manager from catalog app '$($Manifest.id)' ($($Manifest.name)).")
-  $L.Add('# An ordinary Compose project: manage it with docker compose in this folder, with or without the manager.')
-  $L.Add('# Settings and secrets are in .env next to this file.')
-  $L.Add("name: $Project")
-  $L.Add('services:')
-  $namedVolumes = New-Object System.Collections.ArrayList
-  foreach ($sp in $services) {
-    $s = $sp.Value
-    $cname = $(if ($single) { $Project } else { "$Project-$($sp.Name)" })
-    $L.Add("  $($sp.Name):")
-    $L.Add("    image: $($s.image)")
-    $L.Add("    container_name: $cname")
-    $L.Add('    pull_policy: missing')
-    $L.Add("    restart: $(Get-Prop $s 'restart' 'unless-stopped')")
-    $cmd = @(Get-Prop $s 'command' @())
-    if ($cmd.Count) { $L.Add('    command: [' + (($cmd | ForEach-Object { ConvertTo-YamlScalar ([string]$_) }) -join ', ') + ']') }
-    $env = $Resolved.Env[$sp.Name]
-    if ($env -and $env.Count) {
-      $L.Add('    environment:')
-      foreach ($k in $env.Keys) { $L.Add("      ${k}: `${$k}") }
-    }
-    $vols = @(Get-Prop $s 'volumes' @())
-    if ($vols.Count -or (Get-Prop $s 'dockerSocket' $false)) {
-      $L.Add('    volumes:')
-      foreach ($v in $vols) {
-        $ro = [bool](Get-Prop $v 'readOnly' $false)
-        if ((Get-Prop $v 'kind' 'volume') -eq 'folder') {
-          $src = [string]$Resolved.Values["input:$($v.input)"]
-          if (-not $src) { continue }
-          $L.Add('      - type: bind'); $L.Add("        source: $(ConvertTo-YamlScalar $src)"); $L.Add("        target: $($v.target)")
-          if ($ro) { $L.Add('        read_only: true') }
-        } else {
-          $L.Add("      - $($v.name):$($v.target)$(if ($ro) { ':ro' })")
-          if (-not $namedVolumes.Contains($v.name)) { $null = $namedVolumes.Add($v.name) }
-        }
-      }
-      if (Get-Prop $s 'dockerSocket' $false) { $L.Add('      - /var/run/docker.sock:/var/run/docker.sock') }
-    }
-    if ($LocalPort -gt 0 -and $sp.Name -eq $web) {
-      $wp = [int](@(Get-Prop $s 'ports' @() | Where-Object { Get-Prop $_ 'primary' $false })[0].container)
-      $L.Add('    ports:'); $L.Add("      - '127.0.0.1:${LocalPort}:$wp'")
-    }
-    $nets = @('proxy'); if (-not $single) { $nets += 'internal' }
-    if ($sp.Name -ne $web -and -not $single) { $nets = @('internal') }   # only the web front end joins the shared network
-    $L.Add('    networks: [' + ($nets -join ', ') + ']')
-    $hc = Get-Prop $s 'healthcheck' $null
-    if ($hc) {
-      $L.Add('    healthcheck:')
-      $L.Add('      test: [' + ((@($hc.test) | ForEach-Object { ConvertTo-YamlScalar ([string]$_) }) -join ', ') + ']')
-      foreach ($k in @('interval', 'timeout', 'retries', 'start_period')) { $hv = Get-Prop $hc $k $null; if ($null -ne $hv) { $L.Add("      ${k}: $hv") } }
-    }
-    $L.Add('    security_opt: [no-new-privileges:true]')
-    $L.Add('    logging:'); $L.Add('      driver: json-file'); $L.Add("      options: { max-size: '10m', max-file: '3' }")
-    $L.Add('    labels:')
-    $L.Add("      org.traefik-proxy.app: $($Manifest.id)")
-    $L.Add("      org.traefik-proxy.project: $Project")
-  }
-  $L.Add('networks:')
-  $L.Add('  proxy:'); $L.Add("    name: $ProxyNetwork"); $L.Add('    external: true')
-  if (-not $single) { $L.Add('  internal: {}') }
-  if ($namedVolumes.Count) {
-    $L.Add('volumes:')
-    foreach ($v in $namedVolumes) { $L.Add("  ${v}:"); $L.Add("    name: ${Project}_$v") }
-  }
-  return ($L -join "`n") + "`n"
-}
 
 # The README written next to compose.yaml: how to live without the manager.
 function New-AppReadme($Manifest, [string]$Project, [string]$Folder) {
@@ -351,6 +337,139 @@ function Get-AppUpdateDiff($Manifest, [string]$ComposeText) {
   return $changes
 }
 
-Export-ModuleMember -Function Test-AppManifest, Get-CatalogApps, Get-CatalogApp, Get-PlatformSupport, New-SecretValue, Resolve-TemplateValue, Resolve-AppValues,
+# The container name of a service of an app project.
+function Get-AppContainerName($Manifest, [string]$Project, [string]$Service) {
+  if (@((Get-Prop $Manifest 'services').PSObject.Properties).Count -eq 1) { return $Project }
+  return "$Project-$Service"
+}
+
+# The services an installation actually runs (optional services whose boolean input is off are left out).
+function Get-ActiveServices($Manifest, [hashtable]$Values) {
+  return @((Get-Prop $Manifest 'services').PSObject.Properties | Where-Object {
+      $w = [string](Get-Prop $_.Value 'when' '')
+      -not $w -or [string]$Values["input:$w"] -eq 'true'
+    })
+}
+
+# A readable random password (24 characters from an unambiguous alphabet), for accounts a person signs in with.
+function New-PasswordValue([int]$Length = 24) {
+  $alphabet = 'abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789'
+  $b = New-Object byte[] $Length
+  $rng = [Security.Cryptography.RandomNumberGenerator]::Create()
+  try { $rng.GetBytes($b) } finally { $rng.Dispose() }
+  return -join ($b | ForEach-Object { $alphabet[$_ % $alphabet.Length] })
+}
+
+# Files the app needs in its project folder (e.g. a configuration file), rendered from the manifest. They are written
+# once at installation and never overwritten afterwards, so the user's edits are kept.
+function Get-AppFiles($Manifest, [hashtable]$Values) {
+  return @(foreach ($f in @(Get-Prop $Manifest 'files' @())) {
+      [ordered]@{ path = [string]$f.path; content = (Resolve-TemplateValue ([string]$f.content) $Values); secret = [bool](Get-Prop $f 'secret' $false) }
+    })
+}
+
+# Pure: the Compose project of one app. Only the web service (and services marked proxy) join the shared proxy network;
+# other services of multi-service apps share a private network. $LocalPort publishes the web port on 127.0.0.1 only.
+function ConvertTo-AppCompose {
+  param([Parameter(Mandatory = $true)]$Manifest, [Parameter(Mandatory = $true)][string]$Project, [Parameter(Mandatory = $true)]$Resolved, [Parameter(Mandatory = $true)][string]$ProxyNetwork, [int]$LocalPort = 0)
+  $services = @(Get-ActiveServices $Manifest $Resolved.Values)
+  $multi = @((Get-Prop $Manifest 'services').PSObject.Properties).Count -gt 1
+  $web = [string](Get-Prop (Get-Prop $Manifest 'web') 'service' '')
+  $active = @($services | ForEach-Object { $_.Name })
+  $L = New-Object System.Collections.Generic.List[string]
+  $L.Add("# Generated by the Deployment Manager from catalog app '$($Manifest.id)' ($($Manifest.name)).")
+  $L.Add('# An ordinary Compose project: manage it with docker compose in this folder, with or without the manager.')
+  $L.Add('# Settings and secrets are in .env next to this file.')
+  $L.Add("name: $Project")
+  $L.Add('services:')
+  $namedVolumes = New-Object System.Collections.ArrayList
+  $usesProxy = $false; $usesInternal = $false
+  foreach ($sp in $services) {
+    $s = $sp.Value
+    $L.Add("  $($sp.Name):")
+    $L.Add("    image: $($s.image)")
+    $L.Add("    container_name: $(Get-AppContainerName $Manifest $Project $sp.Name)")
+    $L.Add('    pull_policy: missing')
+    $L.Add("    restart: $(Get-Prop $s 'restart' 'unless-stopped')")
+    if (Get-Prop $s 'user' '') { $L.Add("    user: '$($s.user)'") }
+    $ep = @(Get-Prop $s 'entrypoint' @())
+    if ($ep.Count) { $L.Add('    entrypoint: [' + (($ep | ForEach-Object { ConvertTo-YamlScalar ([string]$_) }) -join ', ') + ']') }
+    $cmd = @(Get-Prop $s 'command' @())
+    if ($cmd.Count) { $L.Add('    command: [' + (($cmd | ForEach-Object { ConvertTo-YamlScalar (Resolve-TemplateValue ([string]$_) $Resolved.Values) }) -join ', ') + ']') }
+    $deps = @(Get-Prop $s 'dependsOn' @() | Where-Object { $active -contains [string]$_.service })
+    if ($deps.Count) {
+      $L.Add('    depends_on:')
+      foreach ($d in $deps) { $L.Add("      $($d.service):"); $L.Add("        condition: $(Get-Prop $d 'condition' 'service_started')") }
+    }
+    $env = $Resolved.Env[$sp.Name]
+    if ($env -and $env.Count) {
+      $L.Add('    environment:')
+      foreach ($k in $env.Keys) { $L.Add("      ${k}: `${$k}") }
+    }
+    $vols = @(Get-Prop $s 'volumes' @() | Where-Object { (Get-Prop $_ 'kind' 'volume') -ne 'tmpfs' })
+    $tmpfs = @(Get-Prop $s 'volumes' @() | Where-Object { (Get-Prop $_ 'kind' 'volume') -eq 'tmpfs' })
+    if ($vols.Count -or (Get-Prop $s 'dockerSocket' $false)) {
+      $L.Add('    volumes:')
+      foreach ($v in $vols) {
+        $ro = [bool](Get-Prop $v 'readOnly' $false)
+        switch ([string](Get-Prop $v 'kind' 'volume')) {
+          'folder' {
+            $src = [string]$Resolved.Values["input:$($v.input)"]
+            if ($src) { $L.Add('      - type: bind'); $L.Add("        source: $(ConvertTo-YamlScalar $src)"); $L.Add("        target: $($v.target)"); if ($ro) { $L.Add('        read_only: true') } }
+          }
+          'project' { $L.Add("      - ./$($v.source):$($v.target)$(if ($ro) { ':ro' })") }
+          default {
+            # A named volume, unless the user chose a folder for it (e.g. a photo library on another drive).
+            $chosen = $(if (Get-Prop $v 'input' '') { [string]$Resolved.Values["input:$($v.input)"] } else { '' })
+            if ($chosen) { $L.Add('      - type: bind'); $L.Add("        source: $(ConvertTo-YamlScalar $chosen)"); $L.Add("        target: $($v.target)"); if ($ro) { $L.Add('        read_only: true') } }
+            else { $L.Add("      - $($v.name):$($v.target)$(if ($ro) { ':ro' })"); if (-not $namedVolumes.Contains($v.name)) { $null = $namedVolumes.Add($v.name) } }
+          }
+        }
+      }
+      if (Get-Prop $s 'dockerSocket' $false) { $L.Add("      - /var/run/docker.sock:/var/run/docker.sock$(if (Get-Prop $s 'dockerSocketReadOnly' $false) { ':ro' })") }
+    }
+    if ($tmpfs.Count) { $L.Add('    tmpfs:'); foreach ($t in $tmpfs) { $L.Add("      - $($t.target)") } }
+    if (Get-Prop $s 'shmSize' '') { $L.Add("    shm_size: '$($s.shmSize)'") }
+    if (@(Get-Prop $s 'devices' @()).Count) { $L.Add('    devices:'); foreach ($d in @($s.devices)) { $L.Add("      - $($d):$($d)") } }
+    $g = Get-Prop $s 'gpus' $false
+    if (($g -is [bool] -and $g) -or ($g -is [string] -and [string]$Resolved.Values["input:$g"] -eq 'true')) { $L.Add('    gpus: all') }
+    if (Get-Prop $s 'privileged' $false) { $L.Add('    privileged: true') }
+    if ([string](Get-Prop $s 'networkMode' '') -eq 'host') { $L.Add('    network_mode: host') }
+    else {
+      if ($LocalPort -gt 0 -and $sp.Name -eq $web) {
+        $wp = [int](@(Get-Prop $s 'ports' @() | Where-Object { Get-Prop $_ 'primary' $false })[0].container)
+        $L.Add('    ports:'); $L.Add("      - '127.0.0.1:${LocalPort}:$wp'")
+      }
+      $nets = @()
+      if ($sp.Name -eq $web -or [bool](Get-Prop $s 'proxy' $false)) { $nets += 'proxy'; $usesProxy = $true }
+      if ($multi) { $nets += 'internal'; $usesInternal = $true }
+      if ($nets.Count) { $L.Add('    networks: [' + ($nets -join ', ') + ']') }
+    }
+    $hc = Get-Prop $s 'healthcheck' $null
+    if ($hc) {
+      $L.Add('    healthcheck:')
+      $L.Add('      test: [' + ((@($hc.test) | ForEach-Object { ConvertTo-YamlScalar ([string]$_) }) -join ', ') + ']')
+      foreach ($k in @('interval', 'timeout', 'retries', 'start_period')) { $hv = Get-Prop $hc $k $null; if ($null -ne $hv) { $L.Add("      ${k}: $hv") } }
+    }
+    if (-not (Get-Prop $s 'privileged' $false)) { $L.Add('    security_opt: [no-new-privileges:true]') }
+    $L.Add('    logging:'); $L.Add('      driver: json-file'); $L.Add("      options: { max-size: '10m', max-file: '3' }")
+    $L.Add('    labels:')
+    $L.Add("      org.traefik-proxy.app: $($Manifest.id)")
+    $L.Add("      org.traefik-proxy.project: $Project")
+    if (Get-Prop $s 'stateful' $false) { $L.Add('      org.traefik-proxy.stateful: "true"') }
+  }
+  if ($usesProxy -or $usesInternal) {
+    $L.Add('networks:')
+    if ($usesProxy) { $L.Add('  proxy:'); $L.Add("    name: $ProxyNetwork"); $L.Add('    external: true') }
+    if ($usesInternal) { $L.Add('  internal: {}') }
+  }
+  if ($namedVolumes.Count) {
+    $L.Add('volumes:')
+    foreach ($v in $namedVolumes) { $L.Add("  ${v}:"); $L.Add("    name: ${Project}_$v") }
+  }
+  return ($L -join "`n") + "`n"
+}
+
+Export-ModuleMember -Function Test-AppManifest, Get-AppContainerName, Get-ActiveServices, New-PasswordValue, Get-AppFiles, Get-CatalogApps, Get-CatalogApp, Get-PlatformSupport, New-SecretValue, Resolve-TemplateValue, Resolve-AppValues,
   ConvertTo-HostFolder, ConvertTo-EnvFileText, ConvertTo-AppCompose, New-AppReadme, Hide-SecretValues, Read-AppEnv, Get-AppsRegistryPath, Read-AppsRegistry,
   Save-AppsRegistry, Get-ComposeServiceImages, Get-AppUpdateDiff

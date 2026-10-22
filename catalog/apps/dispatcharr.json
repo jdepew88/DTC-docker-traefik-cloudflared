@@ -1,0 +1,101 @@
+{
+  "schema": 1,
+  "id": "dispatcharr",
+  "name": "Dispatcharr",
+  "category": "media",
+  "group": "C",
+  "description": "IPTV playlist, EPG, stream and channel management with HDHomeRun emulation for Plex, Jellyfin and Emby. All-in-one container (its own PostgreSQL and Redis inside).",
+  "maintainer": "Dispatcharr contributors",
+  "license": "AGPL-3.0",
+  "source": {
+    "type": "curated",
+    "url": "https://github.com/Dispatcharr/Dispatcharr"
+  },
+  "docs": [
+    {
+      "title": "Dispatcharr",
+      "url": "https://github.com/Dispatcharr/Dispatcharr"
+    },
+    {
+      "title": "All-in-one compose",
+      "url": "https://github.com/Dispatcharr/Dispatcharr/blob/v0.32.0/docker/docker-compose.aio.yml"
+    }
+  ],
+  "platforms": {
+    "windows-docker-desktop": "supported",
+    "linux-docker": "untested",
+    "unraid": "untested",
+    "podman": "untested"
+  },
+  "installable": true,
+  "services": {
+    "app": {
+      "image": "ghcr.io/dispatcharr/dispatcharr:0.32.0@sha256:b7d695c5cc98b9abd64c74a94539c1ebffc23d965021613c820c67e25dea41a3",
+      "ports": [
+        {
+          "container": 9191,
+          "protocol": "http",
+          "primary": true
+        }
+      ],
+      "environment": {
+        "DISPATCHARR_ENV": "aio",
+        "REDIS_HOST": "localhost",
+        "CELERY_BROKER_URL": "redis://localhost:6379/0",
+        "DISPATCHARR_LOG_LEVEL": "info",
+        "TZ": "{{timezone}}"
+      },
+      "volumes": [
+        {
+          "name": "data",
+          "target": "/data",
+          "kind": "volume",
+          "description": "Settings, embedded database and recordings."
+        }
+      ],
+      "stateful": true,
+      "gpus": "nvidiaGpu"
+    }
+  },
+  "inputs": [
+    {
+      "id": "nvidiaGpu",
+      "type": "boolean",
+      "label": "Use an NVIDIA GPU (experimental on Docker Desktop)",
+      "default": "false"
+    }
+  ],
+  "privileges": [
+    {
+      "kind": "gpu",
+      "explain": "Only when the NVIDIA option is enabled."
+    }
+  ],
+  "dependencies": [
+    "PostgreSQL and Redis inside the container (all-in-one)"
+  ],
+  "security": [
+    "Create the administrator from this PC right after the first start (first setup is limited to local networks).",
+    "Plex/Jellyfin cannot discover its HDHomeRun emulation through Docker Desktop: add the tuner by URL (http://<container or this PC>:9191).",
+    "IPTV sources must be ones you are entitled to use."
+  ],
+  "update": {
+    "strategy": "pinned-digest",
+    "notes": "Back up the data volume first: it holds the embedded database."
+  },
+  "alternatives": [
+    "dispatcharr-modular"
+  ],
+  "web": {
+    "service": "app",
+    "path": "/",
+    "localPort": 9191
+  },
+  "exposure": {
+    "default": "access"
+  },
+  "resources": {
+    "memoryMB": 700,
+    "diskMB": 1800
+  }
+}

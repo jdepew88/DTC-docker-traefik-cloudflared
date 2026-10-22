@@ -3,7 +3,8 @@
   "id": "authentik",
   "name": "authentik",
   "category": "authentication",
-  "description": "Identity provider with single sign-on, invitations, social logins (e.g. Google) and per-application policies.",
+  "group": "B",
+  "description": "Identity provider with single sign-on, invitations, social logins (e.g. Google) and per-application policies. Runs a server, a worker and its own PostgreSQL (no Redis since 2025.10).",
   "maintainer": "Authentik Security",
   "license": "MIT (enterprise features under a separate licence)",
   "source": {
@@ -16,8 +17,12 @@
       "url": "https://docs.goauthentik.io/install-config/install/docker-compose/"
     },
     {
-      "title": "Traefik forward auth",
-      "url": "https://docs.goauthentik.io/add-secure-apps/providers/proxy/server_traefik/"
+      "title": "Release 2025.10 (Redis removed)",
+      "url": "https://docs.goauthentik.io/releases/2025.10/"
+    },
+    {
+      "title": "Google social login",
+      "url": "https://docs.goauthentik.io/users-sources/sources/social-logins/google/"
     }
   ],
   "platforms": {
@@ -26,10 +31,173 @@
     "unraid": "untested",
     "podman": "untested"
   },
-  "installable": false,
-  "installNote": "authentik runs a server, a worker and PostgreSQL, and is configured through its own setup flow. It is set up by the optional authentication integration (a later milestone); Cloudflare Access protects apps until then.",
-  "imageReference": "ghcr.io/goauthentik/server:2026.8.5@sha256:602227a86455d6772e3d16b7d852713c4f864f40df5df894abd1285bb53979a5",
+  "installable": true,
+  "services": {
+    "server": {
+      "image": "ghcr.io/goauthentik/server:2026.8.5@sha256:602227a86455d6772e3d16b7d852713c4f864f40df5df894abd1285bb53979a5",
+      "command": [
+        "server"
+      ],
+      "ports": [
+        {
+          "container": 9000,
+          "protocol": "http",
+          "primary": true
+        },
+        {
+          "container": 9443,
+          "protocol": "https"
+        }
+      ],
+      "environment": {
+        "AUTHENTIK_POSTGRESQL__HOST": "postgresql",
+        "AUTHENTIK_POSTGRESQL__NAME": "authentik",
+        "AUTHENTIK_POSTGRESQL__USER": "authentik",
+        "AUTHENTIK_POSTGRESQL__PASSWORD": "{{input:pgPass}}",
+        "AUTHENTIK_SECRET_KEY": "{{input:secretKey}}"
+      },
+      "volumes": [
+        {
+          "name": "data",
+          "target": "/data",
+          "kind": "project",
+          "source": "data",
+          "description": "Uploaded files and media."
+        },
+        {
+          "name": "templates",
+          "target": "/templates",
+          "kind": "project",
+          "source": "custom-templates",
+          "description": "Custom templates."
+        }
+      ],
+      "shmSize": "512mb",
+      "dependsOn": [
+        {
+          "service": "postgresql",
+          "condition": "service_healthy"
+        }
+      ],
+      "resources": {
+        "memoryMB": 700,
+        "diskMB": 900
+      }
+    },
+    "worker": {
+      "image": "ghcr.io/goauthentik/server:2026.8.5@sha256:602227a86455d6772e3d16b7d852713c4f864f40df5df894abd1285bb53979a5",
+      "command": [
+        "worker"
+      ],
+      "user": "0",
+      "environment": {
+        "AUTHENTIK_POSTGRESQL__HOST": "postgresql",
+        "AUTHENTIK_POSTGRESQL__NAME": "authentik",
+        "AUTHENTIK_POSTGRESQL__USER": "authentik",
+        "AUTHENTIK_POSTGRESQL__PASSWORD": "{{input:pgPass}}",
+        "AUTHENTIK_SECRET_KEY": "{{input:secretKey}}"
+      },
+      "volumes": [
+        {
+          "name": "data",
+          "target": "/data",
+          "kind": "project",
+          "source": "data"
+        },
+        {
+          "name": "certs",
+          "target": "/certs",
+          "kind": "project",
+          "source": "certs"
+        },
+        {
+          "name": "templates",
+          "target": "/templates",
+          "kind": "project",
+          "source": "custom-templates"
+        }
+      ],
+      "shmSize": "512mb",
+      "dependsOn": [
+        {
+          "service": "postgresql",
+          "condition": "service_healthy"
+        }
+      ],
+      "resources": {
+        "memoryMB": 600,
+        "diskMB": 0
+      }
+    },
+    "postgresql": {
+      "image": "postgres:16-alpine@sha256:deb28ee471183cb0c303113dac9b2433c51eeeeb678def7af9a9ec5820367815",
+      "stateful": true,
+      "environment": {
+        "POSTGRES_DB": "authentik",
+        "POSTGRES_USER": "authentik",
+        "POSTGRES_PASSWORD": "{{input:pgPass}}"
+      },
+      "volumes": [
+        {
+          "name": "database",
+          "target": "/var/lib/postgresql/data",
+          "kind": "volume",
+          "description": "authentik's PostgreSQL 16 database."
+        }
+      ],
+      "healthcheck": {
+        "test": [
+          "CMD-SHELL",
+          "pg_isready -d authentik -U authentik"
+        ],
+        "interval": "30s",
+        "timeout": "5s",
+        "retries": 5,
+        "start_period": "20s"
+      },
+      "resources": {
+        "memoryMB": 250,
+        "diskMB": 300
+      }
+    }
+  },
+  "inputs": [
+    {
+      "id": "pgPass",
+      "type": "generated",
+      "bytes": 24,
+      "label": "Database password"
+    },
+    {
+      "id": "secretKey",
+      "type": "generated",
+      "bytes": 48,
+      "label": "Secret key"
+    }
+  ],
+  "privileges": [],
+  "dependencies": [
+    "PostgreSQL 16 (in this project)"
+  ],
+  "security": [
+    "Open http://127.0.0.1:<port>/if/flow/initial-setup/ right after the first start and set the akadmin password: until then anyone who can reach it can claim the instance.",
+    "The Docker socket mount from the official file is left out (outposts are then deployed by hand); the worker still runs as root like upstream for its file permissions.",
+    "LDAP is not required. Google sign-in is configured in authentik's admin interface (OAuth source); a Google OAuth client must be created in Google Cloud by hand."
+  ],
+  "update": {
+    "strategy": "pinned-digest",
+    "notes": "Upgrade one minor version at a time and read the release notes; PostgreSQL major upgrades need authentik's documented dump/restore procedure."
+  },
+  "web": {
+    "service": "server",
+    "path": "/",
+    "localPort": 9000
+  },
   "exposure": {
     "default": "access"
+  },
+  "resources": {
+    "memoryMB": 1550,
+    "diskMB": 1200
   }
 }

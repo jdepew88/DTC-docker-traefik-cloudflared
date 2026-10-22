@@ -98,11 +98,17 @@
   },
   "web": {
     "service": "app",
-    "path": "/"
+    "path": "/",
+    "localPort": 3552
   },
   "exposure": {
     "default": "access",
     "allowPublic": false,
     "warning": "Arcane controls Docker on this PC: publish it only behind Cloudflare Access."
+  },
+  "group": "A",
+  "resources": {
+    "memoryMB": 200,
+    "diskMB": 400
   }
 }

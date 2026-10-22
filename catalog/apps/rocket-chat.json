@@ -1,0 +1,207 @@
+{
+  "schema": 1,
+  "id": "rocket-chat",
+  "name": "Rocket.Chat",
+  "category": "communication",
+  "group": "D",
+  "description": "Team chat with channels, direct messages and integrations. Follows the official rocketchat-compose architecture: Rocket.Chat, MongoDB (single-member replica set) and NATS; monitoring left out.",
+  "maintainer": "Rocket.Chat Technologies Corp.",
+  "license": "MIT (enterprise features under a separate licence)",
+  "source": {
+    "type": "curated",
+    "url": "https://github.com/RocketChat/rocketchat-compose"
+  },
+  "docs": [
+    {
+      "title": "Official compose",
+      "url": "https://github.com/RocketChat/rocketchat-compose"
+    },
+    {
+      "title": "System requirements",
+      "url": "https://docs.rocket.chat/docs/system-requirements"
+    },
+    {
+      "title": "Release 8.9.0",
+      "url": "https://github.com/RocketChat/Rocket.Chat/releases/tag/8.9.0"
+    }
+  ],
+  "platforms": {
+    "windows-docker-desktop": "supported",
+    "linux-docker": "untested",
+    "unraid": "untested",
+    "podman": "untested"
+  },
+  "installable": true,
+  "services": {
+    "rocketchat": {
+      "image": "registry.rocket.chat/rocketchat/rocket.chat:8.9.0@sha256:295f7b2c38fc3542024dc404f887eb2e13276b66e5854d31d86bcd069f6ce6dc",
+      "ports": [
+        {
+          "container": 3000,
+          "protocol": "http",
+          "primary": true
+        }
+      ],
+      "environment": {
+        "ROOT_URL": "{{appUrl}}",
+        "PORT": "3000",
+        "DEPLOY_METHOD": "docker",
+        "DEPLOY_PLATFORM": "compose",
+        "MONGO_URL": "mongodb://mongodb:27017/rocketchat?replicaSet=rs0",
+        "TRANSPORTER": "monolith+nats://nats:4222"
+      },
+      "volumes": [
+        {
+          "name": "uploads",
+          "target": "/app/uploads",
+          "kind": "volume",
+          "description": "Uploaded files."
+        }
+      ],
+      "dependsOn": [
+        {
+          "service": "mongodb",
+          "condition": "service_healthy"
+        },
+        {
+          "service": "nats",
+          "condition": "service_started"
+        }
+      ],
+      "healthcheck": {
+        "test": [
+          "CMD",
+          "nc",
+          "-zv",
+          "-w",
+          "10",
+          "rocketchat",
+          "3000"
+        ],
+        "interval": "30s",
+        "timeout": "10s",
+        "retries": 10,
+        "start_period": "30s"
+      },
+      "resources": {
+        "memoryMB": 1500,
+        "diskMB": 1500
+      }
+    },
+    "mongodb-fix-permission": {
+      "image": "docker.io/mongodb/mongodb-community-server:8.2-ubi8@sha256:26948caea975097b3a381ad9c2d531fccebdb826a5c65e3ca274b08d3cfdf987",
+      "restart": "on-failure",
+      "user": "0",
+      "environment": {
+        "MONGODB_USER_ID": "1001"
+      },
+      "volumes": [
+        {
+          "name": "mongodb",
+          "target": "/data/db",
+          "kind": "volume"
+        }
+      ],
+      "entrypoint": [
+        "sh",
+        "-xc",
+        "owner=\"$$(stat -c %u /data/db)\"; if [ \"$$owner\" != \"$$MONGODB_USER_ID\" ]; then echo \"=====> Fixing directory ownership to uid $$MONGODB_USER_ID\"; chown -R \"$$MONGODB_USER_ID\" /data/db; else echo \"=====> Nothing to do\"; fi"
+      ]
+    },
+    "mongodb": {
+      "image": "docker.io/mongodb/mongodb-community-server:8.2-ubi8@sha256:26948caea975097b3a381ad9c2d531fccebdb826a5c65e3ca274b08d3cfdf987",
+      "user": "1001",
+      "stateful": true,
+      "environment": {
+        "MONGODB_USER_ID": "1001",
+        "MONGODB_REPLICA_SET_NAME": "rs0",
+        "MONGODB_PORT_NUMBER": "27017",
+        "MONGODB_ADVERTISED_HOSTNAME": "mongodb"
+      },
+      "volumes": [
+        {
+          "name": "mongodb",
+          "target": "/data/db",
+          "kind": "volume",
+          "description": "MongoDB 8.2 data."
+        }
+      ],
+      "entrypoint": [
+        "sh",
+        "-ec",
+        "for i in $$(seq 1 60); do owner=\"$$(stat -c %u /data/db 2>/dev/null || true)\"; if [ \"$$owner\" = \"$$MONGODB_USER_ID\" ]; then exec mongod --replSet \"$$MONGODB_REPLICA_SET_NAME\" --bind_ip_all; fi; echo \"=====> waiting for /data/db ownership\"; sleep 5; done; exit 1"
+      ],
+      "healthcheck": {
+        "test": [
+          "CMD",
+          "mongosh",
+          "mongodb://mongodb:27017/?directConnection=true",
+          "--eval",
+          "db.adminCommand('ping')"
+        ],
+        "interval": "30s",
+        "timeout": "10s",
+        "retries": 10,
+        "start_period": "30s"
+      },
+      "resources": {
+        "memoryMB": 1000,
+        "diskMB": 1200
+      }
+    },
+    "mongodb-init": {
+      "image": "docker.io/mongodb/mongodb-community-server:8.2-ubi8@sha256:26948caea975097b3a381ad9c2d531fccebdb826a5c65e3ca274b08d3cfdf987",
+      "restart": "on-failure",
+      "user": "0",
+      "environment": {
+        "MONGODB_REPLICA_SET_NAME": "rs0",
+        "MONGODB_PORT_NUMBER": "27017",
+        "MONGODB_URI": "mongodb://mongodb:27017/?directConnection=true",
+        "MONGODB_ADVERTISED_HOSTNAME": "mongodb"
+      },
+      "entrypoint": [
+        "sh",
+        "-xc",
+        "until mongosh \"$$MONGODB_URI\" --eval \"db.adminCommand('ping')\" >/dev/null 2>&1; do echo waiting; sleep 5; done; mongosh \"$$MONGODB_URI\" --eval \"try { rs.status() } catch (e) { rs.initiate({_id: '$$MONGODB_REPLICA_SET_NAME', members: [{ _id: 0, host: '$$MONGODB_ADVERTISED_HOSTNAME:$$MONGODB_PORT_NUMBER' }]}) }\""
+      ]
+    },
+    "nats": {
+      "image": "docker.io/nats:2.11-alpine@sha256:e4bf19f15fd3218814a4e3c9e0064e1334bd8aa20d5984b9f1a0afd084f8cc00",
+      "command": [
+        "--http_port",
+        "8222"
+      ],
+      "resources": {
+        "memoryMB": 30,
+        "diskMB": 30
+      }
+    }
+  },
+  "inputs": [],
+  "privileges": [],
+  "dependencies": [
+    "MongoDB 8.2 (official mongodb-community-server image, replica set)",
+    "NATS 2.11"
+  ],
+  "security": [
+    "MongoDB runs without authentication like the official compose, but only on the app's private network; it is never published.",
+    "Create the administrator account in the setup wizard right after the first start.",
+    "Set ROOT_URL (in .env) to the public address after publishing."
+  ],
+  "update": {
+    "strategy": "pinned-digest",
+    "notes": "MongoDB major upgrades follow Rocket.Chat's documented procedure; Rocket.Chat 8.x needs MongoDB 8.0 or later."
+  },
+  "web": {
+    "service": "rocketchat",
+    "path": "/",
+    "localPort": 3100
+  },
+  "exposure": {
+    "default": "access"
+  },
+  "resources": {
+    "memoryMB": 2530,
+    "diskMB": 2730
+  }
+}

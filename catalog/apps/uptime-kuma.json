@@ -46,7 +46,8 @@
         }
       ],
       "environment": {
-        "TZ": "{{timezone}}"
+        "TZ": "{{timezone}}",
+        "UPTIME_KUMA_DB_TYPE": "sqlite"
       }
     }
   },
@@ -63,9 +64,15 @@
   },
   "web": {
     "service": "app",
-    "path": "/"
+    "path": "/",
+    "localPort": 3001
   },
   "exposure": {
     "default": "access"
+  },
+  "group": "A",
+  "resources": {
+    "memoryMB": 200,
+    "diskMB": 600
   }
 }

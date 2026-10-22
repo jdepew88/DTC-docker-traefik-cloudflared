@@ -1,0 +1,36 @@
+{
+  "schema": 1,
+  "id": "diun",
+  "name": "Diun",
+  "category": "updates",
+  "group": "E",
+  "description": "Docker Image Update Notifier: headless, notification-only image update checks (ntfy, mail, Discord, ...).",
+  "maintainer": "CrazyMax",
+  "license": "MIT",
+  "source": {
+    "type": "curated",
+    "url": "https://github.com/crazy-max/diun"
+  },
+  "docs": [
+    {
+      "title": "Diun",
+      "url": "https://crazymax.dev/diun/"
+    },
+    {
+      "title": "Docker install",
+      "url": "https://github.com/crazy-max/diun/blob/v4.33.0/docs/install/docker.md"
+    }
+  ],
+  "platforms": {
+    "windows-docker-desktop": "supported",
+    "linux-docker": "untested",
+    "unraid": "untested",
+    "podman": "untested"
+  },
+  "installable": false,
+  "installNote": "Diun has no web interface, so it is listed for reference; What's Up Docker covers the same need with a UI and an official read-only proxy recipe. Diun's socket-proxy permissions (CONTAINERS=1, IMAGES=1) were derived from its source, not its docs.",
+  "imageReference": "crazymax/diun:4.33.0@sha256:e324b793eb32dfb7f74d3a39421ebf090141caaadee69b8f78da63112408ee25",
+  "exposure": {
+    "default": "local"
+  }
+}

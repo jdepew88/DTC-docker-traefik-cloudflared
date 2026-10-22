@@ -50,7 +50,14 @@
       "environment": {}
     }
   },
-  "inputs": [],
+  "inputs": [
+    {
+      "id": "adminPassword",
+      "type": "password",
+      "label": "Administrator password (user admin)",
+      "help": "Created right after the first start through Portainer's initial-administrator API, so setup cannot time out or be claimed by someone else."
+    }
+  ],
   "privileges": [
     {
       "kind": "docker-socket",
@@ -59,7 +66,7 @@
   ],
   "dependencies": [],
   "security": [
-    "Create the administrator within 5 minutes of the first start; otherwise Portainer locks setup until it is restarted.",
+    "Portainer controls every container on this PC. The administrator is created immediately after the first start (password in credentials.txt), so the 5-minute setup window cannot be used by someone else.",
     "Never publish it without Cloudflare Access in front of its own login."
   ],
   "update": {
@@ -69,11 +76,35 @@
   "web": {
     "service": "app",
     "path": "/",
-    "tlsSkipVerify": true
+    "tlsSkipVerify": true,
+    "localPort": 9443,
+    "status": {
+      "port": 9000,
+      "scheme": "http"
+    }
   },
   "exposure": {
     "default": "access",
     "allowPublic": false,
     "warning": "Portainer controls Docker on this PC: publish it only behind Cloudflare Access."
-  }
+  },
+  "group": "A",
+  "resources": {
+    "memoryMB": 150,
+    "diskMB": 300
+  },
+  "postInstall": [
+    {
+      "service": "app",
+      "label": "create the administrator (admin)",
+      "http": {
+        "path": "/api/users/admin/init",
+        "body": "{\"Username\":\"admin\",\"Password\":\"{{input:adminPassword}}\"}",
+        "tokenFromLog": {
+          "pattern": "setup_token=\\S*?([A-Za-z0-9_-]{16,})",
+          "header": "X-Setup-Token"
+        }
+      }
+    }
+  ]
 }

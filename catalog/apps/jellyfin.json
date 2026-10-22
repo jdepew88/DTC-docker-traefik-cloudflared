@@ -18,6 +18,10 @@
     {
       "title": "Networking and reverse proxies",
       "url": "https://jellyfin.org/docs/general/post-install/networking/"
+    },
+    {
+      "title": "NVIDIA hardware acceleration",
+      "url": "https://jellyfin.org/docs/general/post-install/transcoding/hardware-acceleration/nvidia/"
     }
   ],
   "platforms": {
@@ -48,7 +52,8 @@
           "name": "cache",
           "target": "/cache",
           "kind": "volume",
-          "description": "Transcoding and image cache (can be deleted)."
+          "description": "Transcoding and image cache (can be deleted).",
+          "backup": false
         },
         {
           "name": "media",
@@ -57,11 +62,28 @@
           "input": "mediaFolder",
           "readOnly": true,
           "description": "Your media, read-only."
+        },
+        {
+          "name": "media2",
+          "target": "/media2",
+          "kind": "folder",
+          "input": "tvFolder",
+          "readOnly": true,
+          "description": "Optional library."
+        },
+        {
+          "name": "media3",
+          "target": "/media3",
+          "kind": "folder",
+          "input": "musicFolder",
+          "readOnly": true,
+          "description": "Optional library."
         }
       ],
       "environment": {
         "TZ": "{{timezone}}"
-      }
+      },
+      "gpus": "nvidiaGpu"
     }
   },
   "inputs": [
@@ -70,10 +92,36 @@
       "type": "folder",
       "label": "Media folder",
       "required": true,
-      "help": "An existing folder on this PC with your films, series or music, e.g. D:\\Media. Mounted read-only."
+      "help": "An existing folder on this PC with your films, series or music, e.g. D:\\Media. Mounted read-only at /media."
+    },
+    {
+      "id": "tvFolder",
+      "type": "folder",
+      "label": "Second library folder",
+      "required": false,
+      "help": "Optional, e.g. D:\\TV. Mounted read-only at /media2."
+    },
+    {
+      "id": "musicFolder",
+      "type": "folder",
+      "label": "Third library folder",
+      "required": false,
+      "help": "Optional, e.g. D:\\Music. Mounted read-only at /media3."
+    },
+    {
+      "id": "nvidiaGpu",
+      "type": "boolean",
+      "label": "Use an NVIDIA GPU for transcoding (experimental on Docker Desktop)",
+      "default": "false",
+      "help": "Needs an NVIDIA card with a current Windows driver; Intel Quick Sync and AMD are not available in Docker Desktop."
     }
   ],
-  "privileges": [],
+  "privileges": [
+    {
+      "kind": "gpu",
+      "explain": "Only when you enable the NVIDIA option: the container gets access to the GPU through Docker Desktop's WSL 2 GPU support."
+    }
+  ],
   "dependencies": [],
   "security": [
     "Streaming video through Cloudflare's proxy or Tunnel is restricted by Cloudflare's terms: keep Jellyfin local only (or use your own connection), and use Cloudflare only for occasional, low-volume access.",
@@ -85,10 +133,16 @@
   },
   "web": {
     "service": "app",
-    "path": "/"
+    "path": "/",
+    "localPort": 8096
   },
   "exposure": {
     "default": "local",
     "warning": "Media streaming through Cloudflare is restricted by its terms. Publishing Jellyfin through the tunnel is not recommended."
+  },
+  "group": "C",
+  "resources": {
+    "memoryMB": 1024,
+    "diskMB": 2500
   }
 }

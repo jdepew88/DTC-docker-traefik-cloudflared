@@ -1,0 +1,32 @@
+{
+  "schema": 1,
+  "id": "postgresql",
+  "name": "PostgreSQL",
+  "category": "tools",
+  "group": "B",
+  "description": "Relational database used by authentik, Immich (with vector extensions) and Dispatcharr's modular mode. Each app runs its own PostgreSQL inside its project.",
+  "maintainer": "PostgreSQL Global Development Group (Docker official image)",
+  "license": "PostgreSQL License",
+  "source": {
+    "type": "curated",
+    "url": "https://hub.docker.com/_/postgres"
+  },
+  "docs": [
+    {
+      "title": "Official image",
+      "url": "https://hub.docker.com/_/postgres"
+    }
+  ],
+  "platforms": {
+    "windows-docker-desktop": "supported",
+    "linux-docker": "untested",
+    "unraid": "untested",
+    "podman": "untested"
+  },
+  "installable": false,
+  "installNote": "Installed as part of the app that needs it (authentik: postgres:16-alpine; Immich: its own image with vector extensions; Dispatcharr modular: postgres:17), on that app's private network and never published. A shared database for several apps is not offered, so one app's upgrade or failure cannot affect another.",
+  "imageReference": "postgres:16-alpine@sha256:deb28ee471183cb0c303113dac9b2433c51eeeeb678def7af9a9ec5820367815",
+  "exposure": {
+    "default": "local"
+  }
+}

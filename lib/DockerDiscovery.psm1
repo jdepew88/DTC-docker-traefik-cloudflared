@@ -164,14 +164,14 @@ function ConvertFrom-ProbeOutput([string[]]$Lines, [int]$ExitCode) {
 # Probes one port. Prefers a short-lived probe container on a network the target is on; falls back to a published
 # host port. Never pulls an image. $Image: the instance's Traefik image (already present).
 function Test-ContainerPort {
-  param([Parameter(Mandatory = $true)]$Container, [Parameter(Mandatory = $true)][int]$Port, [string]$ProxyNetwork, [Parameter(Mandatory = $true)][string]$Image, [string]$NamePrefix = 'tpm')
+  param([Parameter(Mandatory = $true)]$Container, [Parameter(Mandatory = $true)][int]$Port, [string]$ProxyNetwork, [Parameter(Mandatory = $true)][string]$Image, [string]$NamePrefix = 'tpm', [string[]]$Schemes = @('http', 'https'))
   $out = [ordered]@{ port = $Port; method = ''; network = ''; result = 'error'; status = 0; scheme = ''; detail = '' }
   if ($Container.state -ne 'running') { $out.detail = "The container is $($Container.state)."; return $out }
   $net = Get-ProbeNetwork $Container $ProxyNetwork
   if ($net) {
     $out.method = 'probe-container'; $out.network = $net.network
     $probeName = "$NamePrefix-validate-probe-$([Guid]::NewGuid().ToString('N').Substring(0, 8))"
-    foreach ($scheme in @('http', 'https')) {
+    foreach ($scheme in $Schemes) {
       $args2 = @('run', '--rm', '--pull', 'never', '--name', $probeName, '--network', $net.network, '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--memory', '32m',
         '--label', 'org.traefik-proxy.probe=1', '--entrypoint', 'wget', $Image, '-S', '-q', '-O', '/dev/null', '-T', '4')
       if ($scheme -eq 'https') { $args2 += '--no-check-certificate' }

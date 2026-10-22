@@ -11,8 +11,11 @@
   const head = (eyebrow, title, text, ...actions) => h('div', { class: 'page-head' },
     h('div', null, h('div', { class: 'eyebrow' }, eyebrow), h('h1', null, title), text ? h('p', null, text) : null),
     actions.length ? h('div', { class: 'actions' }, actions) : null);
-  const CATEGORY = { monitoring: 'Monitoring', media: 'Media', management: 'Container management', authentication: 'Sign-in and identity', networking: 'Networking', tools: 'Tools', productivity: 'Productivity' };
-  const supportChip = (p) => ({ supported: plainChip('Windows: supported', 'ok'), untested: plainChip('Windows: untested', 'warn') })[p.support] || plainChip('Not on this platform', 'err');
+  const CATEGORY = { monitoring: 'Monitoring', media: 'Media', management: 'Container management', authentication: 'Sign-in and identity', networking: 'Networking', tools: 'Tools', productivity: 'Productivity', communication: 'Communication', photos: 'Photos', dashboard: 'Dashboard', updates: 'Updates' };
+  const GROUPS = { A: 'Group A: basic management', B: 'Group B: identity', C: 'Group C: media', D: 'Group D: heavy services', E: 'Group E: updates', '': 'Other' };
+  const PRIV = { 'docker-socket': 'Controls Docker', 'host-network': 'Host network', device: 'Hardware devices', gpu: 'GPU', privileged: 'Privileged' };
+  const mb = (n) => (n >= 1024 ? `${(n / 1024).toFixed(1)} GB` : `${n} MB`);
+  const supportChip = (p) => ({ supported: plainChip('Windows: supported', 'ok'), limited: plainChip('Windows: limited', 'warn'), untested: plainChip('Windows: untested', 'warn') })[p.support] || plainChip('Not on this platform', 'err');
   const stateTone = (s) => (s === 'ok' ? 'ok' : s === 'failed' ? 'err' : s === 'warning' ? 'warn' : 'neutral');
   async function loadCatalog(ctx) { ctx.state.catalog = await api('GET', '/api/catalog'); return ctx.state.catalog; }
 
@@ -21,18 +24,22 @@
   P.catalog = async (main, ctx) => {
     fill(main, head('Apps', 'App Catalog', 'Loading…'));
     const cat = await loadCatalog(ctx);
-    const gridHost = h('div', { class: 'cat-grid' });
+    const gridHost = h('div', { class: 'cat-groups' });
     const q = h('input', { type: 'search', id: 'cat-q', value: filt.q, placeholder: 'Search apps', autocomplete: 'off' });
     const sel = h('select', { id: 'cat-cat' }, h('option', { value: '' }, 'All categories'), Object.entries(CATEGORY).map(([k, v]) => h('option', { value: k, selected: filt.cat === k }, v)));
     q.addEventListener('input', () => { filt.q = q.value.trim().toLowerCase(); draw(); });
     sel.addEventListener('change', () => { filt.cat = sel.value; draw(); });
     function draw() {
       const list = arr(cat.apps).filter((a) => (!filt.cat || a.category === filt.cat) && (!filt.q || `${a.name} ${a.description} ${a.category}`.toLowerCase().includes(filt.q)));
-      fill(gridHost, list.length ? list.map((a) => appCard(a)) : h('p', { class: 'empty' }, 'No app matches.'));
+      if (!list.length) { fill(gridHost, h('p', { class: 'empty' }, 'No app matches.')); return; }
+      fill(gridHost, Object.keys(GROUPS).map((g) => { const items = list.filter((a) => (a.group || '') === g); return items.length ? h('section', { class: 'cat-group', 'aria-label': GROUPS[g] }, h('h2', null, GROUPS[g]), h('div', { class: 'cat-grid' }, items.map((a) => appCard(a)))) : null; }));
     }
+    const resHost = h('section', { class: 'card res-panel', 'aria-live': 'polite' }, h('p', { class: 'muted small' }, 'Checking free memory and disk…'));
+    api('GET', '/api/system/resources').then((r) => { if (resHost.isConnected) fill(resHost, resourcePanel(r)); }).catch(() => clear(resHost));
     fill(main,
       head('Apps', 'App Catalog', 'Curated applications, installed as ordinary Docker Compose projects in their own folders. They keep running, and stay yours, without this manager.',
         h('a', { class: 'btn', href: '#apps' }, icon('box'), 'Installed apps')),
+      resHost,
       h('div', { class: 'disc-toolbar' }, field({ id: 'cat-q', label: 'Search', control: q }), field({ id: 'cat-cat', label: 'Category', control: sel })),
       gridHost,
       gate('advanced', h('section', { class: 'card' }, h('h2', null, 'Catalog sources'),
@@ -43,12 +50,21 @@
     draw();
   };
 
+  function resourcePanel(r) {
+    return [h('div', { class: 'card-head' }, h('h2', null, 'Free resources'), h('span', { class: 'grow' }), h('span', { class: 'small muted' }, 'Install one group at a time; each installation checks memory and disk first.')),
+      kv([['Docker Desktop memory', `${mb(r.dockerFreeMB)} free of ${mb(r.dockerTotalMB)} (${r.running} running containers use ${mb(r.dockerUsedMB)})`], ['Windows memory', `${mb(r.windowsFreeMB)} free of ${mb(r.windowsTotalMB)}`],
+        ['Disk', `${mb(r.projectsDiskFreeMB)} free for app folders, ${mb(r.dockerDiskFreeMB)} on the system drive (Docker images)`], ['CPUs for Docker', String(r.cpus)]]),
+      U.atLeast('advanced') && arr(r.containers).length ? h('details', { class: 'more' }, h('summary', null, 'Memory by container'), kv(r.containers.slice(0, 15).map((c) => [c.name, mb(c.memoryMB)]))) : null];
+  }
+
   function appCard(a) {
     const socket = arr(a.privileges).some((p) => p.kind === 'docker-socket');
     return h('article', { class: 'card cat-card', 'aria-label': a.name },
       h('div', { class: 'card-head' }, h('span', { class: 'xp-icon' }, brand(a.id, 'box')), h('div', null, h('h2', null, a.name), h('span', { class: 'small muted' }, CATEGORY[a.category] || a.category))),
       h('p', null, a.description),
-      h('div', { class: 'chips' }, supportChip(a.platform), plainChip(a.license), socket ? plainChip('Controls Docker', 'warn') : null, arr(a.installedAs).length ? plainChip(`Installed: ${a.installedAs.join(', ')}`, 'ok') : null),
+      h('div', { class: 'chips' }, a.deprecated ? plainChip('Deprecated', 'err') : null, supportChip(a.platform), plainChip(a.license), arr(a.privileges).filter((p) => p.kind !== 'docker-socket').map((p) => plainChip(PRIV[p.kind] || p.kind, 'warn')), socket ? plainChip('Controls Docker', 'warn') : null,
+        a.resources && a.resources.memoryMB ? plainChip(`~${mb(a.resources.memoryMB)} RAM`) : null, arr(a.installedAs).length ? plainChip(`Installed: ${a.installedAs.join(', ')}`, 'ok') : null),
+      a.deprecated && a.deprecationNote ? h('p', { class: 'small hint warn' }, a.deprecationNote) : null,
       U.gateSpan('advanced', h('p', { class: 'mono small' }, arr(a.services).map((s) => s.image.replace(/@sha256:[0-9a-f]{64}/, '@sha256:…')).join(', ') || (a.imageReference || '').replace(/@sha256:[0-9a-f]{64}/, '@sha256:…'))),
       h('div', { class: 'actions' }, a.installable && a.platform.installable
         ? h('a', { class: 'btn primary', href: `#install/${a.id}`, 'aria-label': `Install ${a.name}` }, icon('download'), 'Install…')
@@ -67,7 +83,8 @@
     if (!s.forms.install || s.forms.install.appId !== a.id) {
       const d = await api('GET', `/api/catalog/defaults?id=${encodeURIComponent(a.id)}`);
       const web = arr(a.services).flatMap((x) => x.ports).find((p) => p.primary) || { container: 8080 };
-      s.forms.install = { appId: a.id, project: d.project, folder: d.folder, folderAuto: true, timezone: d.timezone, local: false, localPort: String(web.container >= 1024 ? web.container : 18000 + web.container), inputs: {}, privileges: false, reviewed: false, plan: null, result: null };
+      const inputs = {}; arr(a.inputs).filter((i) => i.type === 'boolean').forEach((i) => { inputs[i.id] = i.default === 'true' ? 'true' : 'false'; });
+      s.forms.install = { appId: a.id, project: d.project, folder: d.folder, folderAuto: true, timezone: d.timezone, local: d.localPort > 0, localPort: String(d.localPort > 0 ? d.localPort : (web.container >= 1024 ? web.container : 18000 + web.container)), inputs, privileges: false, reviewed: false, plan: null, result: null };
     }
     renderInstall(main, ctx, a);
   };
@@ -85,14 +102,17 @@
     const project = text('inst-project', f.project, (v) => { f.project = v.trim().toLowerCase(); if (f.folderAuto) { f.folder = f.folder.replace(/[^\\]+$/, f.project); folder.value = f.folder; } });
     const folder = text('inst-folder', f.folder, (v) => { f.folder = v.trim(); f.folderAuto = false; });
     const folderInputs = arr(a.inputs).filter((i) => i.type === 'folder');
-    const otherInputs = arr(a.inputs).filter((i) => i.type !== 'folder' && i.type !== 'generated');
+    const otherInputs = arr(a.inputs).filter((i) => !['folder', 'generated', 'derived', 'boolean'].includes(i.type));
+    const boolInputs = arr(a.inputs).filter((i) => i.type === 'boolean');
+    const boolField = (i) => { const b = h('input', { type: 'checkbox', checked: f.inputs[i.id] === 'true' }); b.addEventListener('change', () => { f.inputs[i.id] = b.checked ? 'true' : 'false'; f.plan = null; rerender(); }); return h('div', null, h('label', { class: 'check' }, b, h('span', null, i.label)), i.help ? h('p', { class: 'hint' }, i.help) : null); };
     const generated = arr(a.inputs).filter((i) => i.type === 'generated');
-    const inputField = (i) => field({ id: `inst-in-${i.id}`, label: `${i.label}${i.required ? '' : ' (optional)'}`, hint: i.help,
-      control: text(`inst-in-${i.id}`, f.inputs[i.id] || '', (v) => { f.inputs[i.id] = v; }, i.type === 'secret' ? { type: 'password' } : {}) });
+    const inputField = (i) => field({ id: `inst-in-${i.id}`, label: `${i.label}${i.required ? '' : ' (optional)'}`, hint: i.type === 'password' ? `${i.help ? `${i.help} ` : ''}Leave empty to generate a strong one (shown nowhere; it is in the app's .env).` : i.help,
+      control: text(`inst-in-${i.id}`, f.inputs[i.id] || '', (v) => { f.inputs[i.id] = v; }, i.type === 'secret' || i.type === 'password' ? { type: 'password', autocomplete: 'new-password' } : {}) });
     const localBox = h('input', { type: 'checkbox', checked: f.local }); localBox.addEventListener('change', () => { f.local = localBox.checked; f.plan = null; rerender(); });
     const localPort = text('inst-port', f.localPort, (v) => { f.localPort = v.trim(); }, { inputmode: 'numeric' });
     const tz = text('inst-tz', f.timezone, (v) => { f.timezone = v.trim(); });
     const privBox = h('input', { type: 'checkbox', checked: f.privileges }); privBox.addEventListener('change', () => { f.privileges = privBox.checked; syncDeploy(); });
+    const prepBox = h('input', { type: 'checkbox', checked: !!f.prepareOnly }); prepBox.addEventListener('change', () => { f.prepareOnly = prepBox.checked; f.plan = null; f.reviewed = false; rerender(); });
     const reviewed = h('input', { type: 'checkbox', checked: f.reviewed, disabled: !f.plan || !f.plan.canApply }); reviewed.addEventListener('change', () => { f.reviewed = reviewed.checked; syncDeploy(); });
     const deploy = h('button', { type: 'button', class: 'btn primary' }, icon('rocket'), 'Deploy');
     const needsPriv = arr(a.privileges).length > 0;
@@ -101,13 +121,13 @@
     const preview = h('button', { type: 'button', class: 'btn', onclick: (e) => withBusy(e.currentTarget, async () => {
       err.textContent = '';
       try {
-        f.plan = await api('POST', '/api/catalog/plan', { appId: a.id, project: f.project, folder: f.folder, timezone: f.timezone, localPort: f.local ? parseInt(f.localPort, 10) || 0 : 0, inputs: f.inputs, reuseData: !!f.reuseData });
+        f.plan = await api('POST', '/api/catalog/plan', { appId: a.id, project: f.project, folder: f.folder, timezone: f.timezone, localPort: f.local ? parseInt(f.localPort, 10) || 0 : 0, inputs: f.inputs, reuseData: !!f.reuseData, startNow: !f.prepareOnly });
         f.reviewed = false; rerender(); const p = $('#inst-7'); if (p) p.scrollIntoView({ block: 'start' });
       } catch (x) { err.textContent = x.message; }
     }) }, icon('eye'), f.plan ? 'Preview again' : 'Preview the Compose project');
     deploy.addEventListener('click', () => withBusy(deploy, async () => {
-      const ok = await U.confirmDialog({ title: `Deploy ${a.name}`, okText: 'Deploy',
-        body: [`Creates ${f.plan.folder} (compose.yaml, .env, README.md) and runs docker compose up -d. Images are downloaded first; this can take several minutes.`,
+      const ok = await U.confirmDialog({ title: `${f.prepareOnly ? 'Prepare' : 'Deploy'} ${a.name}`, okText: f.prepareOnly ? 'Prepare' : 'Deploy',
+        body: [f.prepareOnly ? `Creates ${f.plan.folder} (compose.yaml, .env, README.md). Nothing is downloaded or started until you press Start on the Installed apps page.` : `Creates ${f.plan.folder} (compose.yaml, .env, README.md) and runs docker compose up -d. Images are downloaded first; this can take several minutes.`,
           'Nothing is published until you choose to in the last step.'] });
       if (!ok) return;
       f.progress = true; rerender();
@@ -135,19 +155,22 @@
         step(4, 'Networking', h('p', null, `Joins the shared network '${net}', so Traefik can reach it as `, h('code', null, `http://${container}:${webPort}`), '. It is not reachable from the Internet or your LAN until you publish it (step 11).'),
           h('label', { class: 'check' }, localBox, h('span', null, 'Also open it on this PC (127.0.0.1 only)')),
           f.local ? field({ id: 'inst-port', label: 'Local port', control: localPort, hint: `http://127.0.0.1:${f.localPort || '?'}/` }) : null),
-        step(5, 'Settings and secrets', field({ id: 'inst-tz', label: 'Time zone', control: tz, hint: 'IANA name, e.g. Europe/Berlin.' }), otherInputs.map(inputField),
+        step(5, 'Settings and secrets', field({ id: 'inst-tz', label: 'Time zone', control: tz, hint: 'IANA name, e.g. Europe/Berlin.' }), boolInputs.map(boolField), otherInputs.map(inputField),
           generated.length ? h('ul', { class: 'checks' }, generated.map((g) => checkItem('ok', g.label, 'Generated on this PC and stored only in the app\'s .env (readable by your Windows account only). Never shown here.'))) : null),
         step(6, 'Dependencies and privileges',
           needsPriv ? [h('div', { class: 'callout warn' }, arr(a.privileges).map((p) => h('p', null, h('strong', null, 'Elevated access: '), p.explain))), h('label', { class: 'check' }, privBox, h('span', null, 'I understand what this app can do on this PC.'))] : h('p', { class: 'muted' }, 'No elevated privileges: no Docker socket, no host network, no added capabilities.'),
           arr(a.dependencies).length ? h('p', null, `Also runs: ${a.dependencies.join(', ')}`) : null,
           arr(a.security).length ? h('ul', null, a.security.map((x) => h('li', { class: 'small' }, x))) : null),
         step(7, 'Preview the Compose project', h('div', { class: 'actions' }, preview), err,
-          plan && plan.compose ? [technical(plan.compose.split('\n'), 'compose.yaml'), technical(plan.envPreview.split('\n'), '.env (secrets masked)')] : null),
+          plan && plan.compose ? [technical(plan.compose.split('\n'), 'compose.yaml'), technical(plan.envPreview.split('\n'), '.env (secrets masked)'),
+            arr(plan.files).map((x) => technical(String(x.content).split('\n'), `${x.path} (written once; your later edits are kept)`))] : null),
         step(8, 'Validation', plan ? [h('ul', { class: 'checks' }, arr(plan.checks).map((c) => checkItem(stateTone(c.state), c.label, c.message))),
           arr(plan.existingVolumes).length ? h('label', { class: 'check' }, (() => { const b = h('input', { type: 'checkbox', checked: !!f.reuseData }); b.addEventListener('change', () => { f.reuseData = b.checked; f.plan = null; rerender(); }); return b; })(), h('span', null, `Reuse the data in ${plan.existingVolumes.join(', ')} (then preview again)`)) : null] : h('p', { class: 'muted' }, 'Runs with the preview: folder, project name, volumes, ports, network, settings and docker compose config.')),
-        step(9, 'Approve and deploy', h('label', { class: 'check' }, reviewed, h('span', null, 'I reviewed the Compose project and the checks.')), h('div', { class: 'actions' }, deploy),
+        step(9, 'Approve and deploy', h('label', { class: 'check' }, prepBox, h('span', null, 'Prepare only: write the project now, download and start it later (when memory allows)')), h('label', { class: 'check' }, reviewed, h('span', null, 'I reviewed the Compose project and the checks.')), h('div', { class: 'actions' }, deploy),
           f.progress ? h('p', { class: 'muted', role: 'status' }, 'Downloading images and starting… this can take several minutes.') : null),
-        step(10, 'Health', res ? [h('ul', { class: 'checks' }, arr(res.steps).map((x) => checkItem(x.status === 'Done' ? 'ok' : 'err', x.name, x.message))),
+        step(10, 'Health', res ? [h('ul', { class: 'checks' }, arr(res.steps).map((x) => checkItem(x.status === 'Done' ? 'ok' : x.status === 'Skipped' ? 'neutral' : 'err', x.name, x.message))),
+          res.credentialsFile ? h('p', { class: 'hint' }, 'Sign-in details: ', h('code', null, res.credentialsFile), ' (readable by your Windows account only).') : null,
+          res.localUrl && !res.prepared ? h('p', null, h('a', { href: res.localUrl, target: '_blank', rel: 'noopener noreferrer' }, `Open ${a.name} on this PC `, icon('external'))) : null,
           health ? h('ul', { class: 'checks' }, checkItem(health.running ? 'ok' : 'err', 'Container running', arr(health.containers).map((c) => `${c.name}: ${c.status}`).join(', ')),
             health.http ? checkItem(health.http.result === 'http' || health.http.result === 'https' ? 'ok' : 'warn', 'Web interface answers', health.http.detail) : checkItem('neutral', 'Web interface answers', 'Not checked.')) : null,
           gate('expert', res.output ? technical(res.output.split('\n'), 'docker compose output') : null)] : h('p', { class: 'muted' }, 'Checked right after deploying.')),
@@ -181,7 +204,7 @@
     }) }, label);
     return h('article', { class: 'card disc-card', 'aria-label': a.name },
       h('div', { class: 'card-head' }, h('span', { class: 'xp-icon' }, brand(a.appId, 'box')), h('h2', null, a.name), plainChip(a.project), h('span', { class: 'grow' }),
-        a.total === 0 ? plainChip('no containers', 'warn') : up ? chip('healthy', `running ${a.running}/${a.total}`) : plainChip(`running ${a.running}/${a.total}`, 'err')),
+        a.prepared ? plainChip('prepared, not started', 'info') : a.total === 0 ? plainChip('no containers', 'warn') : up ? chip('healthy', `running ${a.running}/${a.total}`) : plainChip(`running ${a.running}/${a.total}`, 'err')),
       a.updateAvailable ? h('p', null, plainChip('Update available', 'info')) : null,
       routes.length ? h('ul', { class: 'checks' }, routes.map((r) => checkItem('ok', `Published as ${r.hostnames.join(', ')}`, r.publish ? 'Through Cloudflare' : 'Local route'))) : h('p', { class: 'small muted' }, 'Not published.'),
       U.gateSpan('intermediate', h('p', { class: 'mono small' }, a.folder)),
@@ -201,15 +224,23 @@
           const d = $('details', out); if (d) d.open = true;
         }) }, icon('terminal'), 'Logs'),
         h('button', { type: 'button', class: 'btn small', 'aria-label': `Check for updates of ${a.name}`, onclick: (e) => withBusy(e.currentTarget, () => updateFlow(a, out, reload)) }, icon('download'), 'Updates'),
+        h('button', { type: 'button', class: 'btn small', 'aria-label': `Back up ${a.name}`, onclick: (e) => withBusy(e.currentTarget, async () => {
+          const ok = await U.confirmDialog({ title: `Back up ${a.name}`, okText: 'Back up', body: ['Copies compose.yaml, .env, configuration folders and the data volumes into the app folder (backups\\<time>), readable by your Windows account only.', 'Apps with a database are stopped for a moment so the copy is consistent. Media and library folders are not copied.'] });
+          if (!ok) return;
+          const r = await api('POST', '/api/apps/backup', { project: a.project, confirm: true });
+          fill(out, h('ul', { class: 'checks' }, checkItem(r.ok ? 'ok' : 'err', 'Backup', r.folder), arr(r.volumes).map((v) => checkItem(v.ok ? 'ok' : 'err', v.volume, `${v.sizeMB} MB`)), arr(r.skipped).map((v) => checkItem('neutral', v, 'Not backed up (cache or user data).'))));
+        }) }, icon('archive'), 'Back up'),
         h('button', { type: 'button', class: 'btn small danger-outline', 'aria-label': `Remove ${a.name}`, onclick: (e) => withBusy(e.currentTarget, () => removeFlow(a, reload)) }, 'Remove')),
       out);
   }
 
   async function updateFlow(a, out, reload) {
     const p = await api('POST', '/api/apps/update/preview', { project: a.project });
-    if (!arr(p.changes).length) { fill(out, h('p', { class: 'hint ok' }, icon('check'), ' Up to date with the catalog.')); return; }
-    const ok = await U.confirmDialog({ title: `Update ${a.name}`, okText: 'Update',
-      body: [h('ul', null, p.changes.map((c) => h('li', { class: 'mono small' }, `${c.service}: ${c.from || '(none)'} → ${c.to}`))), p.notes, h('ul', null, arr(p.keeps).map((k) => h('li', { class: 'small' }, k)))],
+    const blocked = arr(p.blocked).map((c) => h('li', { class: 'small' }, `${c.service}: ${c.note}`));
+    if (!arr(p.changes).length) { fill(out, h('p', { class: 'hint ok' }, icon('check'), ' No update to apply.'), blocked.length ? h('ul', null, blocked) : null); return; }
+    const ok = await U.confirmDialog({ title: `Update ${a.name}`, okText: 'Back up and update',
+      body: [h('ul', null, p.changes.map((c) => h('li', { class: 'mono small' }, `${c.service}: ${c.from || '(none)'} → ${c.to}${c.note ? ` (${c.note})` : ''}`))), blocked.length ? h('ul', null, blocked) : null, p.notes,
+        arr(p.releaseNotes).length ? h('p', null, 'Release notes: ', h('a', { href: p.releaseNotes[0].url, target: '_blank', rel: 'noopener noreferrer' }, p.releaseNotes[0].title)) : null, h('ul', null, arr(p.keeps).map((k) => h('li', { class: 'small' }, k)))],
       checkbox: 'I read the release notes; the app restarts during the update.' });
     if (!ok) return;
     const r = await api('POST', '/api/apps/update/apply', { project: a.project, previewKey: p.previewKey, confirm: true });

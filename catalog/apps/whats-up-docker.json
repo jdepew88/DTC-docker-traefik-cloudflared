@@ -1,0 +1,133 @@
+{
+  "schema": 1,
+  "id": "whats-up-docker",
+  "name": "What's Up Docker",
+  "category": "updates",
+  "group": "E",
+  "description": "Notifies you when newer images exist for your containers, with a web interface. Installed notification-only: it never updates anything, and it reads Docker through a read-only socket proxy.",
+  "maintainer": "getwud",
+  "license": "MIT",
+  "source": {
+    "type": "curated",
+    "url": "https://github.com/getwud/wud"
+  },
+  "docs": [
+    {
+      "title": "What's Up Docker",
+      "url": "https://getwud.github.io/wud/"
+    },
+    {
+      "title": "Remote watcher (read-only proxy)",
+      "url": "https://github.com/getwud/wud/blob/9.5.0/website/docs/configuration/watchers/remote-tls.md"
+    }
+  ],
+  "platforms": {
+    "windows-docker-desktop": "supported",
+    "linux-docker": "untested",
+    "unraid": "untested",
+    "podman": "untested"
+  },
+  "installable": true,
+  "services": {
+    "app": {
+      "image": "getwud/wud:9.5.0@sha256:2dcc930828ce983b1c3b0373e3ca8ee67759835e4a7eb2f78af9ada45eb1a1f9",
+      "ports": [
+        {
+          "container": 3000,
+          "protocol": "http",
+          "primary": true
+        }
+      ],
+      "environment": {
+        "WUD_AUTH_ADMIN_USER": "admin",
+        "WUD_AUTH_ADMIN_PASSWORD": "{{input:adminPassword}}",
+        "WUD_WATCHER_LOCAL_HOST": "socket-proxy",
+        "WUD_WATCHER_LOCAL_PORT": "2375",
+        "TZ": "{{timezone}}"
+      },
+      "volumes": [
+        {
+          "name": "store",
+          "target": "/store",
+          "kind": "volume",
+          "description": "Its database."
+        }
+      ],
+      "dependsOn": [
+        {
+          "service": "socket-proxy",
+          "condition": "service_started"
+        }
+      ],
+      "resources": {
+        "memoryMB": 150,
+        "diskMB": 250
+      }
+    },
+    "socket-proxy": {
+      "image": "tecnativa/docker-socket-proxy:v0.5.0@sha256:1f5038b54f06c3e18422902cf00ba21803d1c97805aae032e5e6673d532d3459",
+      "dockerSocket": true,
+      "dockerSocketReadOnly": true,
+      "environment": {
+        "CONTAINERS": "1",
+        "IMAGES": "1",
+        "INFO": "1",
+        "VERSION": "1",
+        "EVENTS": "1",
+        "PING": "1",
+        "POST": "0",
+        "DELETE": "0",
+        "BUILD": "0",
+        "COMMIT": "0",
+        "EXEC": "0",
+        "SECRETS": "0",
+        "SWARM": "0",
+        "SYSTEM": "0"
+      },
+      "resources": {
+        "memoryMB": 40,
+        "diskMB": 20
+      }
+    }
+  },
+  "inputs": [
+    {
+      "id": "adminPassword",
+      "type": "password",
+      "label": "Administrator password (user admin)"
+    }
+  ],
+  "privileges": [
+    {
+      "kind": "docker-socket",
+      "explain": "A socket proxy on the app's private network gets the Docker socket read-only and allows only reading containers and images (no POST, exec or delete). What's Up Docker itself never sees the socket."
+    }
+  ],
+  "dependencies": [
+    "Docker socket proxy (read-only, private network)"
+  ],
+  "security": [
+    "No update trigger is configured, so it only notifies; updates are still applied here with a backup and your confirmation.",
+    "Notifications (ntfy, mail, Discord, ...) are configured with WUD_TRIGGER_* variables in .env; see its documentation."
+  ],
+  "update": {
+    "strategy": "pinned-digest",
+    "notes": ""
+  },
+  "alternatives": [
+    "diun",
+    "Built-in: Installed apps > Updates (registry check, backup first)"
+  ],
+  "web": {
+    "service": "app",
+    "path": "/",
+    "localPort": 3200
+  },
+  "exposure": {
+    "default": "access"
+  },
+  "resources": {
+    "memoryMB": 190,
+    "diskMB": 270
+  }
+}
