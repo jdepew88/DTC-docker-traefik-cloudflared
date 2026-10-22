@@ -372,18 +372,28 @@ function Find-RegistryService($Services, [string]$Name) {
   return $found[0]
 }
 
-# Extra live checks for docker targets (read-only).
+# Extra live checks of the target (read-only): container membership of the shared network, what a LAN address means
+# inside Docker, then one real request from Traefik's network namespace with the public Host header.
 function Get-TargetWarnings($Settings, $Service) {
   $warnings = @()
-  if ($null -eq $Service -or $Service.target.type -ne 'docker' -or $Service.target.host -notmatch '^[A-Za-z0-9][A-Za-z0-9_.-]*$') { return $warnings }
-  $r = Invoke-Docker inspect $Service.target.host --format '{{json .NetworkSettings.Networks}}'
-  if ($r.ExitCode -ne 0) {
-    $warnings += "No container named '$($Service.target.host)' exists right now. The route will answer 502 until it does."
-  } else {
-    $nets = ((@($r.Output) -join '') | ConvertFrom-Json)
-    if (-not $nets.PSObject.Properties[$Settings.ProxyNetwork]) {
-      $warnings += "Container '$($Service.target.host)' is not attached to the '$($Settings.ProxyNetwork)' network, so Traefik cannot reach it. Add it in its compose file (networks: [$($Settings.ProxyNetwork)], external) or run: docker network connect $($Settings.ProxyNetwork) $($Service.target.host)"
+  if ($null -eq $Service -or $Service.target.host -notmatch '^[A-Za-z0-9][A-Za-z0-9_.-]*$') { return $warnings }
+  $probe = $Service.enabled
+  if ($Service.target.type -eq 'docker') {
+    $r = Invoke-Docker inspect $Service.target.host --format '{{json .NetworkSettings.Networks}}'
+    if ($r.ExitCode -ne 0) {
+      $warnings += "No container named '$($Service.target.host)' exists right now. The route will answer 502 until it does."; $probe = $false
+    } else {
+      $nets = ((@($r.Output) -join '') | ConvertFrom-Json)
+      if (-not $nets.PSObject.Properties[$Settings.ProxyNetwork]) {
+        $warnings += "Container '$($Service.target.host)' is not attached to the '$($Settings.ProxyNetwork)' network, so Traefik cannot reach it. Add it in its compose file (networks: [$($Settings.ProxyNetwork)], external) or run: docker network connect $($Settings.ProxyNetwork) $($Service.target.host)"; $probe = $false
+      }
     }
+  } elseif ($Service.target.type -eq 'lan') {
+    $warnings += @(Get-LanTargetIssues $Service.target.host (Get-LocalIPv4Addresses) (Get-DockerSubnets) | ForEach-Object { $_.message })
+  }
+  if ($probe) {
+    $v = ConvertFrom-BackendProbe (Test-BackendFromTraefik -Settings $Settings -Service $Service) $Service $Settings.ProxyNetwork
+    if ($v[0] -in 'failed', 'warning') { $warnings += "Backend test from Traefik's network: $($v[1])" }
   }
   return $warnings
 }
@@ -545,6 +555,11 @@ function Invoke-ApplyRequest($Body) {
     } elseif (-not (Test-ContainerRunning $settings.TraefikContainer)) {
       $null = $steps.Add([ordered]@{ name = 'Traefik reload'; status = 'Warning'; message = 'Traefik is not running; routes load when it starts.' })
     }
+  }
+  # The route is ready only when Traefik's network reaches the backend: one real request, reported as its own step.
+  if ($plan.New -and $plan.New.enabled) {
+    $v = ConvertFrom-BackendProbe (Test-BackendFromTraefik -Settings $settings -Service $plan.New) $plan.New $settings.ProxyNetwork
+    $null = $steps.Add([ordered]@{ name = 'Backend reachable from Traefik'; status = $(switch ($v[0]) { 'ok' { 'Done' } 'auth' { 'Done' } 'skipped' { 'Skipped' } default { 'Warning' } }); message = $v[1] })
   }
   $serviceName = if ($plan.New) { $plan.New.name } else { $plan.Previous.name }
   foreach ($r in @(Invoke-CloudflareServicePlan -Settings $settings -Plan $plan.Cloudflare -ServiceName $serviceName -ConfirmedOverwrites $confirmed)) {

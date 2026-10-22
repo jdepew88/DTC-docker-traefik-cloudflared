@@ -225,10 +225,14 @@
 
   // --- Request-path health ---------------------------------------------------------------------------------------------
   const ORDER = ['dns', 'access', 'tunnel', 'router', 'service', 'backend', 'http', 'public'];
+  const healthTone = (s) => (s === 'ok' ? 'ok' : s === 'failed' ? 'err' : s === 'warning' ? 'warn' : s === 'auth' ? 'auth' : 'neutral');
+  P.healthTone = healthTone;
   P.healthList = (r) => h('div', { class: 'health' },
-    h('p', { class: 'small muted' }, `${r.performed} of ${r.total} checks performed · ${String(r.checkedAt).replace('T', ' ')}. Grey checks were not performed; they are never counted as passed.`),
+    r.firstFailure ? h('div', { class: 'callout err first-failure' }, h('p', null, h('strong', null, `First failing hop: ${r.firstFailure.label}. `), r.firstFailure.message))
+      : h('p', { class: 'small' }, 'No failing hop among the checks performed.'),
+    h('p', { class: 'small muted' }, `${r.performed} of ${r.total} checks performed · ${String(r.checkedAt).replace('T', ' ')}. Grey checks were not performed; they are never counted as passed. A lock means a login page answered: reachable, but signing in was not tested.`),
     h('ol', { class: 'checks health-path' }, ORDER.map((id) => arr(r.checks).find((x) => x.id === id)).filter(Boolean).map((x) =>
-      checkItem(x.state === 'ok' ? 'ok' : x.state === 'failed' ? 'err' : x.state === 'warning' ? 'warn' : 'neutral', `${x.label}${x.performed ? '' : ' (not checked)'}`, x.message))));
+      checkItem(healthTone(x.state), `${x.label}${x.performed ? '' : ' (not checked)'}`, x.message))));
   P.serviceHealth = async (host, name, opts = {}) => {
     fill(host, h('p', { class: 'muted' }, 'Checking the request path…'));
     try {

@@ -102,10 +102,10 @@ Test-Condition 'probe output: HTTP status (also 404), refused, not HTTP' ($ok.re
 $t404 = ConvertFrom-RoutedStatus 404 "404 page not found`n" '' 'a.example.com'
 $a404 = ConvertFrom-RoutedStatus 404 '<html>Not here</html>' '' 'a.example.com'
 Test-Condition 'routed status: Traefik''s own 404 fails (no router), an app''s 404 means the app answered' ($t404[0] -eq 'failed' -and $a404[0] -eq 'ok') ''
-Test-Condition 'routed status: 502 and 504 fail with the backend named; 401 means the app answered' ((ConvertFrom-RoutedStatus 502 'Bad Gateway' '' 'a')[0] -eq 'failed' -and (ConvertFrom-RoutedStatus 504 '' '' 'a')[0] -eq 'failed' -and (ConvertFrom-RoutedStatus 401 '' '' 'a')[0] -eq 'ok' -and (ConvertFrom-RoutedStatus 0 '' 'refused' 'a')[0] -eq 'failed') ''
+Test-Condition 'routed status: 502 and 504 fail with the backend named; 401 means the app answered and asks for a login' ((ConvertFrom-RoutedStatus 502 'Bad Gateway' '' 'a')[0] -eq 'failed' -and (ConvertFrom-RoutedStatus 504 '' '' 'a')[0] -eq 'failed' -and (ConvertFrom-RoutedStatus 401 '' '' 'a')[0] -eq 'auth' -and (ConvertFrom-RoutedStatus 0 '' 'refused' 'a')[0] -eq 'failed') ''
 Test-Condition 'routed status: a timeout names the backend, not Traefik, as the waiting side' ((ConvertFrom-RoutedStatus 0 '' 'The operation has timed out.' 'a')[1] -match 'waiting for the backend') ''
 $login = ConvertFrom-PublicProbe 302 'https://team.cloudflareaccess.com/cdn-cgi/access/login/a' '' 'access'
-Test-Condition 'public URL: an Access login redirect verifies Access only, never the application' ($login.access -eq 'ok' -and $login.app -eq 'skipped' -and $login.message -match 'not reached') ''
+Test-Condition 'public URL: an Access login redirect verifies Access only, never the application' ($login.access -eq 'ok' -and $login.app -eq 'auth' -and $login.message -match 'not reached') ''
 Test-Condition 'public URL: 200 without a login on an Access-protected service fails Access' ((ConvertFrom-PublicProbe 200 '' '' 'access').access -eq 'failed') ''
 Test-Condition 'public URL: Cloudflare 530 / 502 fail the application path' ((ConvertFrom-PublicProbe 530 '' '' 'public').app -eq 'failed' -and (ConvertFrom-PublicProbe 502 '' '' 'public').app -eq 'failed' -and (ConvertFrom-PublicProbe 200 '' '' 'public').app -eq 'ok') ''
 
@@ -176,7 +176,8 @@ else {
     Test-Condition 'publish: through the published port (host.docker.internal), no Docker change' ($p1.Apply -and $p1.Apply.Data.ok -and -not (@((Invoke-Docker inspect $app1 --format '{{json .NetworkSettings.Networks}}').Output) -join '' -match [regex]::Escape($network))) "$($p1.Plan.Status) $(if ($p1.Apply) { $p1.Apply.Body })"
     Start-Sleep -Seconds 2
     $h1 = Invoke-WebUi $ui POST '/api/services/health' @{ name = 'web-hostport' }
-    Test-Condition 'health: router and service loaded; backend outside Docker not checked; the app answers through Traefik' ($h1.Status -eq 200 -and (Get-Check $h1.Data 'router').state -eq 'ok' -and (Get-Check $h1.Data 'service').state -eq 'ok' -and -not (Get-Check $h1.Data 'backend').performed -and (Get-Check $h1.Data 'http').state -eq 'ok') ($h1.Body)
+    Test-Condition 'health: router and service loaded; Docker Desktop''s host address answers from Traefik''s network; the app answers through Traefik' ($h1.Status -eq 200 -and (Get-Check $h1.Data 'router').state -eq 'ok' -and (Get-Check $h1.Data 'service').state -eq 'ok' -and (Get-Check $h1.Data 'backend').performed -and (Get-Check $h1.Data 'backend').state -eq 'ok' -and (Get-Check $h1.Data 'backend').message -match 'host\.docker\.internal' -and (Get-Check $h1.Data 'http').state -eq 'ok' -and $null -eq $h1.Data.firstFailure) ($h1.Body)
+    Test-Condition 'publish: the apply reports the backend reachable from Traefik as its own step' (@($p1.Apply.Data.steps | Where-Object { $_.name -eq 'Backend reachable from Traefik' -and $_.status -eq 'Done' }).Count -eq 1) ($p1.Apply.Body)
     Test-Condition 'health: local only, so DNS, Access and tunnel are reported as not performed (never as passed)' (@($h1.Data.checks | Where-Object { $_.id -in 'dns', 'access', 'tunnel' -and (-not $_.performed) -and $_.state -eq 'skipped' }).Count -eq 3 -and $h1.Data.performed -lt $h1.Data.total) ''
 
     # Attach to the shared network (explicit confirmation) and publish over it.
@@ -197,6 +198,37 @@ else {
     Start-Sleep -Seconds 2
     $h2 = Invoke-WebUi $ui POST '/api/services/health' @{ name = 'web-net' }
     Test-Condition 'health: backend running on the shared network and HTTP 200 through Traefik' ((Get-Check $h2.Data 'backend').state -eq 'ok' -and (Get-Check $h2.Data 'http').state -eq 'ok' -and (Get-Check $h2.Data 'http').message -match '200') ($h2.Body)
+
+    # Backend diagnosis before anything is applied (one request from Traefik's network namespace per preview).
+    $diagPlan = { param($Target) Invoke-WebUi $ui POST '/api/services/plan' @{ op = 'add'; name = 'diag'; service = @{ name = 'diag'; hostnames = @('diag.example.test'); middlewares = @('default-headers@file'); target = $Target; cloudflare = @{ publish = $false; access = $false } }; cloudflare = @{ automate = $false } } }
+    $wp = & $diagPlan @{ type = 'docker'; host = $app1; port = 8081; protocol = 'http' }
+    Test-Condition 'diagnosis: a wrong backend port is reported before applying (connection refused from Traefik''s network)' ((@($wp.Data.notes) -join ' ') -match 'Connection refused') ($wp.Body)
+    $wpr = & $diagPlan @{ type = 'docker'; host = $app1; port = 80; protocol = 'https' }
+    Test-Condition 'diagnosis: HTTPS to a plain HTTP backend is reported as a protocol mismatch' ((@($wpr.Data.notes) -join ' ') -match 'speaks HTTP,') ($wpr.Body)
+    $app2Ip = ((Invoke-Docker inspect $app2 --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}').Output -join '').Trim()
+    $wsub = & $diagPlan @{ type = 'lan'; host = $app2Ip; port = 80; protocol = 'http' }
+    Test-Condition 'diagnosis: a LAN address inside a Docker network''s subnet is reported with the network''s name' ((@($wsub.Data.notes) -join ' ') -match ([regex]::Escape("inside Docker network '$appsNet'"))) ($wsub.Body)
+    $wlo = & $diagPlan @{ type = 'lan'; host = '127.0.0.1'; port = $pubPort; protocol = 'http' }
+    Test-Condition 'diagnosis: 127.0.0.1 (Windows localhost) as a target is refused: inside a container it is the container itself' (-not $wlo.Data.canApply -and (@($wlo.Data.traefik.issues | ForEach-Object { $_.Message }) -join ' ') -match 'Loopback') ($wlo.Body)
+    $wto = & $diagPlan @{ type = 'lan'; host = '192.0.2.10'; port = 80; protocol = 'http' }
+    Test-Condition 'diagnosis: a backend that never answers is reported as a timeout' ((@($wto.Data.notes) -join ' ') -match 'No answer from 192\.0\.2\.10:80 within') ($wto.Body)
+
+    # Recreating a container keeps its shared-network membership only when its compose file declares the network.
+    $composeDir = Join-Path $work 'composed'; New-Item -ItemType Directory -Force -Path $composeDir | Out-Null
+    $composed = "$stack-composed"
+    [IO.File]::WriteAllText((Join-Path $composeDir 'compose.yaml'), "name: $composed`nservices:`n  web:`n    image: $whoami`n    container_name: $composed`n    networks: [proxy]`nnetworks:`n  proxy:`n    name: $network`n    external: true`n")
+    $cu = Invoke-Docker compose -f (Join-Path $composeDir 'compose.yaml') up -d
+    $pc3 = Invoke-WebUiChange $ui @{ op = 'add'; name = 'composed'; service = @{ name = 'composed'; hostnames = @('composed.example.test'); middlewares = @('default-headers@file'); target = @{ type = 'docker'; host = $composed; port = 80; protocol = 'http' }; cloudflare = @{ publish = $false; access = $false } }; cloudflare = @{ automate = $false } }
+    $cr = Invoke-Docker compose -f (Join-Path $composeDir 'compose.yaml') up -d --force-recreate
+    Start-Sleep -Seconds 2
+    $hc = Invoke-WebUi $ui POST '/api/services/health' @{ name = 'composed' }
+    Test-Condition 'recreation: a compose-declared container is back on the shared network after --force-recreate and still answers through Traefik' ($cu.ExitCode -eq 0 -and $pc3.Apply -and $pc3.Apply.Data.ok -and $cr.ExitCode -eq 0 -and (Get-Check $hc.Data 'backend').state -eq 'ok' -and (Get-Check $hc.Data 'http').state -eq 'ok') "$($cr.Output -join ' ') $($hc.Body)"
+    $null = Invoke-Docker network connect $network $app2
+    $null = Invoke-Docker rm -f $app2
+    $null = Invoke-Docker run -d --name $app2 --network $appsNet $whoami
+    $pc4 = & $diagPlan @{ type = 'docker'; host = $app2; port = 80; protocol = 'http' }
+    Test-Condition 'recreation: an attachment made only with docker network connect is lost on recreation, and the preview says so' ((@($pc4.Data.notes) -join ' ') -match 'is not attached to') ($pc4.Body)
+    $null = Invoke-Docker compose -f (Join-Path $composeDir 'compose.yaml') down
 
     # One owner per hostname.
     [IO.File]::WriteAllText((Join-Path $installPath 'traefik\dynamic\manual.local.yml'), "http:`n  routers:`n    manual:`n      rule: 'Host(``manual.example.test``)'`n      entryPoints: [web]`n      service: manual`n  services:`n    manual:`n      loadBalancer:`n        servers:`n          - url: http://127.0.0.1:9`n")
@@ -271,7 +303,7 @@ else {
           Set-Viewport $cdp $w 900 -Mobile:($w -lt 800)
           $null = & $go $pg[0] $pg[1]; Start-Sleep -Milliseconds 300
           $ov = [int](Invoke-PageScript $cdp "document.documentElement.scrollWidth - window.innerWidth")
-          if ($ov -gt 1) { $bad += "$($pg[0]) at $w px overflows by $ov px" }
+          if ($ov -gt 1) { $wide = [string](Invoke-PageScript $cdp "[...document.querySelectorAll('main *')].filter((e) => e.getBoundingClientRect().right > window.innerWidth + 1).slice(-3).map((e) => e.tagName.toLowerCase() + '.' + String(e.className).replace(/ /g, '.') + ': ' + (e.textContent || '').trim().slice(0, 60)).join(' | ')"); $bad += "$($pg[0]) at $w px overflows by $ov px ($wide)" }
           if ($ScreenshotDir -and $w -eq 390) { Save-PageScreenshot $cdp (Join-Path $ScreenshotDir "$(($pg[0] -split '/')[0])-390.png") }
         }
         Set-Viewport $cdp 1366 900
@@ -295,7 +327,7 @@ else {
   } finally {
     if ($cdp) { Stop-EdgeSession $cdp }
     Stop-TestServer $ui; Stop-TestServer $mock
-    foreach ($n in @($app1, $app2, $dbc, $lab, $cache)) { $null = Invoke-Docker rm -f $n }
+    foreach ($n in @($app1, $app2, $dbc, $lab, $cache, "$stack-composed")) { $null = Invoke-Docker rm -f $n }
     $null = Invoke-Docker rmi $cacheImage
     if ($installed) {
       $null = Invoke-Ps (Join-Path $installPath 'install.ps1') @('-InstallPath', $installPath, '-Stop')

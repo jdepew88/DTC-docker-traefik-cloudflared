@@ -505,6 +505,9 @@ container on this PC already uses.
                                         # removal and data retention, browser; fixture apps only (no image downloads)
 .\tests\Test-Discovery.ps1              # Docker discovery, port probes, hostname claims, publishing (network / published port),
                                         # health, conflicts, browser wizard; throwaway containers only
+.\tests\Test-Routing.ps1                # request-path diagnosis rules (no Docker): first failing hop, container vs Windows
+                                        # localhost, LAN subnets captured by Docker, wrong port/protocol, timeouts, tunnel
+                                        # route mismatches, Access login ("authentication required", never "passed")
 .\tests\Test-Projects.ps1               # launcher (single-use link, duplicate start, ports, stop, START-HERE.cmd), discovery,
                                         # attach without changes, recent projects, upgrade preview/apply, browser;
                                         # -LiveReadOnly also inspects %USERPROFILE%\.docker\projects\traefik-proxy read-only
@@ -579,6 +582,10 @@ routes from the old `traefik\dynamic\` folder can be copied over as-is, or re-cr
 | --- | --- |
 | 404 from Traefik | Host rule doesn't match the hostname; `.\services.ps1 list` and `scripts\Get-Diagnostics.ps1`. |
 | 502 Bad Gateway | Backend not on the shared network, wrong *container* port, Windows app bound to 127.0.0.1 only / firewall, LAN device unreachable. |
+| Any public hostname fails | **Check health** on the service (Services or Infrastructure Explorer) names the *first failing hop*: DNS, Access, tunnel route, Traefik router, service, Traefik to backend (a real request from Traefik's own network with the public Host header), application, public URL. A lock means a login page answered: reachable, sign-in not tested. |
+| HTTP 400 through Traefik, 200 on the local port | The app rejects the public hostname (allowed-hosts list). Homepage: add the hostname to `HOMEPAGE_ALLOWED_HOSTS` in its `.env`, then `docker compose up -d` in its folder. |
+| LAN target times out from Traefik, works from Windows | A Docker network uses the LAN's subnet and captures the traffic (`scripts\Get-NetworkAudit.ps1` lists it as CONFLICT). For an app on this PC, target `host.docker.internal` (type `host`) instead of the PC's LAN address. |
+| Gateway Timeout / no answer from `host.docker.internal` | Windows Firewall blocks the port from the Docker Desktop VM, or the app listens only on 127.0.0.1. |
 | `services.ps1 ... -Apply` says Traefik rejected the configuration | The error names the router/middleware; nothing was changed. |
 | 524 at Cloudflare | Backend took > 100 s. |
 | cloudflared restarting | Bad/rotated token: `.\install.ps1 -SetTunnelToken`; `docker logs <stack>-cloudflared`. |

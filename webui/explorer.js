@@ -180,7 +180,7 @@
   const TOOLS = ['docker', 'compose', 'socket-proxy', 'manager'];
   // Request-path health checks (POST /api/services/health) shown on the component they test.
   const HEALTH_NODE = { dns: 'dns', access: 'access', tunnel: 'tunnel', router: 'router', service: 'service', backend: 'network', http: 'app', public: 'edge' };
-  const HEALTH_STATUS = { ok: { tone: 'ok', label: 'Verified', icon: 'check-double' }, failed: { tone: 'err', label: 'Failed', icon: 'x' }, warning: { tone: 'warn', label: 'Warning', icon: 'alert' }, skipped: { tone: 'neutral', label: 'Not checked', icon: 'minus' } };
+  const HEALTH_STATUS = { ok: { tone: 'ok', label: 'Verified', icon: 'check-double' }, failed: { tone: 'err', label: 'Failed', icon: 'x' }, warning: { tone: 'warn', label: 'Warning', icon: 'alert' }, skipped: { tone: 'neutral', label: 'Not checked', icon: 'minus' }, auth: { tone: 'neutral', label: 'Login required', icon: 'lock' } };
   const healthFor = (health, id) => (health ? arr(health.checks).find((x) => HEALTH_NODE[x.id] === id) : null);
 
   // --- Helpers ---------------------------------------------------------------------------------------------------------
@@ -350,7 +350,7 @@
         evidence.length ? h('ul', { class: 'checks' }, evidence.map((e) => U.checkItem(e.ok === true ? 'ok' : e.ok === false ? 'err' : 'neutral', e.text, U.atLeast('advanced') ? e.dim : ''))) : null,
         h('p', { class: 'muted small' }, 'A file existing only makes a component "configured". "Verified" needs a real check against the running component or Cloudflare.')),
       flow && ['router', 'service', 'middleware', 'app', 'access', 'dns'].includes(id) ? sec(`For ${flow.displayName}`, flowFacts(flow, id)) : null,
-      flow && healthFor(view.health[flow.name], id) ? sec('Health check', h('ul', { class: 'checks' }, [healthFor(view.health[flow.name], id)].map((x) => U.checkItem(x.state === 'ok' ? 'ok' : x.state === 'failed' ? 'err' : x.state === 'warning' ? 'warn' : 'neutral', `${x.label}${x.performed ? '' : ' (not checked)'}`, x.message)))) : null,
+      flow && healthFor(view.health[flow.name], id) ? sec('Health check', h('ul', { class: 'checks' }, [healthFor(view.health[flow.name], id)].map((x) => U.checkItem(x.state === 'ok' ? 'ok' : x.state === 'failed' ? 'err' : x.state === 'warning' ? 'warn' : x.state === 'auth' ? 'auth' : 'neutral', `${x.label}${x.performed ? '' : ' (not checked)'}`, x.message)))) : null,
       arr(info.fails).length ? sec('How it can fail', h('ul', null, info.fails.map((x) => h('li', null, x)))) : null,
       gate('intermediate', arr(info.diagnose).length ? sec('How to diagnose', h('ul', null, info.diagnose.map((x) => h('li', null, x)))) : null),
       arr(info.docs).length ? sec('Documentation', h('ul', { class: 'xp-docs' }, info.docs.map(([t, url]) => h('li', null, h('a', { href: url, target: '_blank', rel: 'noopener noreferrer' }, t, ' ', icon('external')))))) : null,

@@ -309,9 +309,10 @@ details.more > summary { cursor: pointer; font-weight: 600; color: var(--text-2)
 .checks li { display: grid; grid-template-columns: 1.4rem minmax(0, 1fr); gap: .45rem; padding: .4rem 0; border-bottom: 1px solid var(--border); }
 .checks li:last-child { border-bottom: 0; }
 .checks .ci { display: grid; place-items: center; height: 1.4rem; }
-.checks .ci.ok { color: var(--ok); } .checks .ci.err { color: var(--err); } .checks .ci.warn { color: var(--warn); } .checks .ci.neutral { color: var(--muted); }
+.checks .ci.ok { color: var(--ok); } .checks .ci.err { color: var(--err); } .checks .ci.warn { color: var(--warn); } .checks .ci.neutral { color: var(--muted); } .checks .ci.auth { color: var(--accent); }
 .checks .why { display: block; font-size: .84rem; color: var(--muted); }
 .checks .msg { display: block; font-size: .88rem; color: var(--text-2); overflow-wrap: anywhere; }
+.callout p, .callout li { overflow-wrap: anywhere; }
 
 /* --- Topology ------------------------------------------------------------------------------------------------------------------ */
 .topology { display: flex; align-items: stretch; gap: 0; overflow-x: auto; padding: .4rem .1rem .8rem; }
@@ -341,6 +342,7 @@ details.more > summary { cursor: pointer; font-weight: 600; color: var(--text-2)
 /* --- Tables, code, diff ---------------------------------------------------------------------------------------------------------- */
 .table-wrap { overflow-x: auto; border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface); margin-bottom: 1rem; }
 .table { width: 100%; border-collapse: collapse; }
+.table td .mono { overflow-wrap: anywhere; }
 .table th, .table td { text-align: left; padding: .6rem .85rem; border-bottom: 1px solid var(--border); vertical-align: top; }
 .table th { font-size: .74rem; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); background: var(--surface-2); font-weight: 650; }
 .table tr:last-child td { border-bottom: 0; }

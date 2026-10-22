@@ -74,12 +74,12 @@
     return h('span', { class: `chip ${m.tone}` }, icon(m.icon), label || m.label);
   }
   function plainChip(text, tone = 'neutral') { return h('span', { class: `chip ${tone}` }, text); }
-  const TONE_OF = { ok: 'ok', failed: 'err', warning: 'warn', pending: 'neutral', info: 'neutral', skipped: 'neutral' };
-  const ICON_OF = { ok: 'check', err: 'x', warn: 'alert', neutral: 'minus' };
-  // One line of a check list: state ok | warn | err | neutral.
+  const TONE_OF = { ok: 'ok', failed: 'err', warning: 'warn', pending: 'neutral', info: 'neutral', skipped: 'neutral', auth: 'auth' };
+  const ICON_OF = { ok: 'check', err: 'x', warn: 'alert', neutral: 'minus', auth: 'lock' };
+  // One line of a check list: state ok | warn | err | neutral | auth (a login page answered: reachable, sign-in not tested).
   function checkItem(state, label, message, why) {
     const tone = TONE_OF[state] || state;
-    return h('li', null, h('span', { class: `ci ${tone}` }, icon(ICON_OF[tone] || 'minus'), h('span', { class: 'sr-only' }, ({ ok: 'Passed', err: 'Failed', warn: 'Warning', neutral: 'Not checked' })[tone] || '')),
+    return h('li', null, h('span', { class: `ci ${tone}` }, icon(ICON_OF[tone] || 'minus'), h('span', { class: 'sr-only' }, ({ ok: 'Passed', err: 'Failed', warn: 'Warning', neutral: 'Not checked', auth: 'Authentication required' })[tone] || '')),
       h('span', null, h('strong', null, label), message ? h('span', { class: 'msg' }, message) : null, why ? h('span', { class: 'why', 'data-min-level': 'beginner' }, why) : null));
   }
 
