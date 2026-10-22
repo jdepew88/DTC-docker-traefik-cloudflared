@@ -111,6 +111,31 @@ test('emails and sizes', () => {
   assert.strictEqual(L.formatBytes(1536), '1.5 KB');
 });
 
+test('discovery: application names from containers', () => {
+  assert.strictEqual(L.suggestAppName({ name: 'docker-compose-prowlarr-1', compose: { project: 'docker-compose', service: 'prowlarr' } }), 'prowlarr');
+  assert.strictEqual(L.suggestAppName({ name: 'media-sonarr-2', compose: { project: 'media', service: '' } }), 'sonarr');
+  assert.strictEqual(L.suggestAppName({ name: 'Uptime_Kuma', compose: {} }), 'uptime-kuma');
+  assert.strictEqual(L.suggestAppName({ name: '', compose: {}, image: 'ghcr.io/hotio/prowlarr:latest' }), 'prowlarr');
+  assert.strictEqual(L.displayNameFromLabel('uptime-kuma'), 'Uptime Kuma');
+});
+
+test('discovery: port preselection never picks UDP, blocked or database ports first', () => {
+  const ports = [{ port: 5432, proto: 'tcp', guess: 'not-http' }, { port: 3478, proto: 'udp', guess: 'not-http' }, { port: 2375, proto: 'tcp', guess: 'blocked' }, { port: 8191, proto: 'tcp', guess: 'unknown' }, { port: 8096, proto: 'tcp', guess: 'http' }];
+  assert.strictEqual(L.choosePort(ports).port, 8096);
+  assert.strictEqual(L.choosePort(ports.slice(0, 4)).port, 8191);
+  assert.strictEqual(L.choosePort(ports.slice(0, 3)), null);
+});
+
+test('discovery: reachability options', () => {
+  assert.deepStrictEqual(L.reachOptions({ onProxyNetwork: true, published: [] }, 80).options, ['network']);
+  const pub = { onProxyNetwork: false, published: [{ port: 8000, proto: 'tcp', hostPort: 8000, hostIp: '0.0.0.0' }] };
+  assert.strictEqual(L.reachOptions(pub, 8000).default, 'hostport');
+  assert.strictEqual(L.reachOptions(pub, 9000).default, 'attach');
+  const loop = { onProxyNetwork: false, published: [{ port: 8000, proto: 'tcp', hostPort: 8000, hostIp: '127.0.0.1' }] };
+  assert.strictEqual(L.reachOptions(loop, 8000).default, 'attach');
+  assert.ok(L.reachOptions(loop, 8000).loopbackOnly);
+});
+
 test('explorer: a component is never green from configuration alone', () => {
   const c = (dims, extra = {}) => ({ id: 'x', applicable: true, dims: { detected: null, configured: null, running: null, reachable: null, authenticated: null, verified: null, ...dims }, ...extra });
   assert.strictEqual(L.componentStatus(c({})).key, 'unknown');

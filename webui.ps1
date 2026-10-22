@@ -50,6 +50,8 @@ Import-Module (Join-Path $here 'lib\Dashboard.psm1') -Force
 Import-Module (Join-Path $here 'lib\ConfigBackup.psm1') -Force
 Import-Module (Join-Path $here 'lib\ProjectDiscovery.psm1') -Force
 Import-Module (Join-Path $here 'lib\Infrastructure.psm1') -Force
+Import-Module (Join-Path $here 'lib\DockerDiscovery.psm1') -Force
+Import-Module (Join-Path $here 'lib\ServiceHealth.psm1') -Force
 Import-Module (Join-Path $here 'lib\LocalHttp.psm1') -Force
 Set-CloudflareApiBase $CloudflareApiBase
 
@@ -114,6 +116,7 @@ $StaticFiles = @{
   '/projects.js' = @('projects.js', 'text/javascript; charset=utf-8')
   '/brands.js' = @('brands.js', 'text/javascript; charset=utf-8')
   '/explorer.js' = @('explorer.js', 'text/javascript; charset=utf-8')
+  '/discover.js' = @('discover.js', 'text/javascript; charset=utf-8')
   '/learn.json' = @('learn.json', 'application/json; charset=utf-8')
   '/app.css'    = @('app.css', 'text/css; charset=utf-8')
   '/icon.svg'   = @('icon.svg', 'image/svg+xml')
@@ -442,6 +445,18 @@ function Build-ChangePlan($Body) {
   } else {
     $cfg = Read-CloudflareConfig -Settings $settings
     $cf = [pscustomobject]@{ Connected = $false; Actions = @(); Notes = @('Cloudflare automation is off for this change; only Traefik is changed.'); Errors = @(); ManualSteps = @(Get-CloudflareManualSteps $new $cfg.tunnelId); Fingerprint = '' }
+  }
+  # One owner per hostname: a hostname another router in this Traefik (hand-written file, Docker labels) or a
+  # container's labels already claim blocks the change; the user resolves the other definition first.
+  if ($new -and $new.enabled) {
+    $claimRouters = Get-TraefikApi $settings '/api/http/routers'
+    $labelled = @(); try { $labelled = @(Get-DockerContainerInventory -ProxyNetwork $settings.ProxyNetwork | Where-Object { @($_.traefik.routers).Count }) } catch { }
+    foreach ($hn in @($new.hostnames)) {
+      foreach ($c in @(Find-HostnameClaims -Hostname $hn -Routers $claimRouters -Containers $labelled -OwnService $new.name)) {
+        if ($c.level -eq 'error') { $traefik.Issues = @($traefik.Issues) + (New-Issue 'Error' $new.name 'hostnames' "$hn is already routed elsewhere: $($c.detail) Remove or change that definition first, so one configuration owns the hostname.") }
+        else { $notes += "$hn`: $($c.detail) Make sure only one Traefik publishes it." }
+      }
+    }
   }
   $traefikKey = $traefik.RegistryJson + '|' + ((@($traefik.Changes | ForEach-Object { "$($_.File):$($_.Action):$($_.OldContent)" })) -join '|')
   return [pscustomobject]@{
@@ -1382,6 +1397,80 @@ function Set-ContactEmailRequest($Body) {
   return [ordered]@{ contactEmail = $email }
 }
 
+# --- Docker discovery and publishing ----------------------------------------------------------------------
+
+function Get-DockerContainersData {
+  Assert-Installed
+  $settings = Get-Settings
+  if (-not (Get-DockerStatus).EngineRunning) { Stop-Request 503 'The Docker engine is not reachable. Start Docker Desktop.' }
+  $registry = @((Read-ServiceRegistry -Settings $settings).services)
+  $own = @((Get-StackContainerNames $settings).Values) + @($settings.WhoamiContainer)
+  $list = @(Get-DockerContainerInventory -ProxyNetwork $settings.ProxyNetwork | ForEach-Object {
+      $name = $_.name
+      $_.ownInstance = $own -contains $name
+      $_.services = @($registry | Where-Object { $_.target.type -eq 'docker' -and $_.target.host -eq $name } | ForEach-Object { [ordered]@{ name = $_.name; hostnames = @($_.hostnames); port = $_.target.port } })
+      $_
+    })
+  return [ordered]@{ proxyNetwork = $settings.ProxyNetwork; containers = $list; checkedAt = (Get-Date -Format 's') }
+}
+
+function Find-InventoryContainer([string]$Name) {
+  if ($Name -notmatch '^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$') { Stop-Request 400 'Invalid container name.' }
+  $settings = Get-Settings
+  $c = @(Get-DockerContainerInventory -ProxyNetwork $settings.ProxyNetwork | Where-Object { $_.name -eq $Name })
+  if (-not $c.Count) { Stop-Request 404 "No container named '$Name'." }
+  return $c[0]
+}
+
+function Get-HostnameClaimsData([string]$Hostname, [string]$ServiceName) {
+  Assert-Installed
+  $h = $Hostname.Trim().ToLowerInvariant()
+  if ($h -notmatch '^(?=.{1,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$') { Stop-Request 400 'Enter a valid hostname.' }
+  $settings = Get-Settings
+  $containers = @(); try { $containers = @(Get-DockerContainerInventory -ProxyNetwork $settings.ProxyNetwork) } catch { }
+  $dash = Read-DashboardConfig -Settings $settings
+  $claims = Find-HostnameClaims -Hostname $h -Services @((Read-ServiceRegistry -Settings $settings).services) -Routers (Get-TraefikApi $settings '/api/http/routers') -Containers $containers -OwnService $ServiceName -DashboardHostname $(if ($dash.enabled) { $dash.hostname } else { '' })
+  return [ordered]@{ hostname = $h; claims = @($claims); free = -not @($claims | Where-Object { $_.level -eq 'error' }).Count }
+}
+
+# Probes one container port with a short-lived probe container (see Test-ContainerPort). Changes nothing.
+function Invoke-PortProbe($Body) {
+  Assert-Installed
+  $settings = Get-Settings
+  $c = Find-InventoryContainer ([string](Get-Field $Body 'container' ''))
+  $port = 0
+  if (-not [int]::TryParse([string](Get-Field $Body 'port' ''), [ref]$port) -or $port -lt 1 -or $port -gt 65535) { Stop-Request 400 'Enter a port from 1 to 65535.' }
+  if ($port -in 2375, 2376) { Stop-Request 400 'The Docker Engine API port is never probed or published.' }
+  $r = Test-ContainerPort -Container $c -Port $port -ProxyNetwork $settings.ProxyNetwork -Image $settings.TraefikImage -NamePrefix $settings.StackName
+  Write-Audit 'port-probe' "$($c.name):$port $($r.method) $($r.result)"
+  return $r
+}
+
+# Attaches a container to the shared network (docker network connect): a Docker change, so it needs confirm. The
+# attachment lasts until the container is recreated; the response carries the Compose lines that make it permanent.
+function Invoke-NetworkConnect($Body) {
+  Assert-Installed
+  Assert-Confirmed $Body
+  $settings = Get-Settings
+  $c = Find-InventoryContainer ([string](Get-Field $Body 'container' ''))
+  $own = @((Get-StackContainerNames $settings).Values)
+  if ($own -contains $c.name) { Stop-Request 400 'The containers of this deployment are managed by its compose.yaml.' }
+  if ($c.infrastructure) { Stop-Request 400 "$($c.name) looks like proxy or tunnel infrastructure; it is not attached automatically." }
+  $snippet = @("services:", "  $(if ($c.compose.service) { $c.compose.service } else { $c.name }):", '    networks:', "      - $($settings.ProxyNetwork)", 'networks:', "  $($settings.ProxyNetwork):", '    external: true')
+  if ($c.onProxyNetwork) { return [ordered]@{ connected = $true; changed = $false; message = "$($c.name) is already attached to '$($settings.ProxyNetwork)'."; composeSnippet = $snippet } }
+  $r = Invoke-Docker network connect $settings.ProxyNetwork $c.name
+  Write-Audit 'network-connect' "$($c.name) -> $($settings.ProxyNetwork) exit=$($r.ExitCode)"
+  if ($r.ExitCode -ne 0) { Stop-Request 500 "docker network connect failed: $((@($r.Output) -join ' ').Trim())" }
+  return [ordered]@{ connected = $true; changed = $true; message = "$($c.name) is now attached to '$($settings.ProxyNetwork)'. It stays attached until the container is recreated; add the lines below to its compose file to keep it."; composeSnippet = $snippet; workingDir = $c.compose.workingDir }
+}
+
+function Invoke-ServiceHealth($Body) {
+  Assert-Installed
+  $settings = Get-Settings
+  $svc = Find-RegistryService @((Read-ServiceRegistry -Settings $settings).services) ([string](Get-Field $Body 'name' ''))
+  return Get-ServiceHealth -Settings $settings -Service $svc -Public:([bool](Get-Field $Body 'public' $false))
+}
+
 # The recorded tunnel as Cloudflare reports it (one read-only GET), or $null without a readable token.
 function Get-TunnelInfo($Settings, $Status, $Cf) {
   if (-not ($Status.cloudflare.tokenStored -and $Status.cloudflare.tokenReadable -and $Cf.accountId -and $Cf.tunnelId)) { return $null }
@@ -1685,6 +1774,11 @@ function Invoke-ApiRoute($Request, $Body) {
     'POST /api/dashboard/settings' { return Save-DashboardSettingsRequest $Body }
     'GET /api/overview' { return Get-OverviewData }
     'GET /api/infrastructure' { return Get-InfrastructureData }
+    'GET /api/docker/containers' { return Get-DockerContainersData }
+    'GET /api/docker/claims' { return Get-HostnameClaimsData ([string]$Request.Query['hostname']) ([string]$Request.Query['service']) }
+    'POST /api/docker/probe' { return Invoke-PortProbe $Body }
+    'POST /api/docker/connect' { return Invoke-NetworkConnect $Body }
+    'POST /api/services/health' { return Invoke-ServiceHealth $Body }
     'GET /api/environment' { return Get-EnvironmentData }
     'GET /api/expert/config' { return Get-ExpertConfigData }
     'POST /api/setup/contact' { return Set-ContactEmailRequest $Body }

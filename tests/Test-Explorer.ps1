@@ -14,12 +14,17 @@
   default for a new browser profile), keyboard navigation between components, the details panel, following one
   request, pausing the animation, accessible names, and the Overview's small diagram and quick actions.
   Teardown removes the instance; every other container on the engine must be unchanged (same IDs, start times, states).
+  Part 4 (-LiveReadOnly): the Explorer model, discovery, hostname claims and the request-path health of every service
+  of a real installation, read-only; its files and all containers must be unchanged afterwards.
 
 .EXAMPLE
   powershell -ExecutionPolicy Bypass -File .\tests\Test-Explorer.ps1 -ScreenshotDir $env:TEMP\tpm-explorer-shots
 #>
 [CmdletBinding()]
-param([string]$ScreenshotDir, [switch]$SkipBrowser, [switch]$SkipInstance, [string]$TunnelSubnet = '172.31.247.0/28')
+param([string]$ScreenshotDir, [switch]$SkipBrowser, [switch]$SkipInstance, [string]$TunnelSubnet = '172.31.247.0/28',
+  # Read-only checks of a real installation (Docker inspect, Traefik's local API, Cloudflare GET requests with its own
+  # stored token, one GET through its Traefik). Asserts that no file and no container changed.
+  [switch]$LiveReadOnly, [string]$LivePath = (Join-Path $env:USERPROFILE '.docker\projects\traefik-proxy'))
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 2.0
@@ -51,6 +56,7 @@ function Get-EngineSnapshot([string]$ExcludePrefix) {
 }
 function Get-Component($Model, [string]$Id) { return @($Model.components | Where-Object { $_.id -eq $Id })[0] }
 function Get-Dim($Model, [string]$Id, [string]$Dim) { return (Get-Component $Model $Id).dims.$Dim }
+function Get-Check2($Health, [string]$Id) { return @($Health.checks | Where-Object { $_.id -eq $Id })[0] }
 
 # --- Part 1: model unit tests -------------------------------------------------------------------------------------------
 function New-Facts([hashtable]$Over = @{}) {
@@ -288,6 +294,61 @@ else {
     Test-Condition "other containers untouched ($($before.Count) checked: same IDs, start times, states)" ($changed.Count -eq 0 -and $added.Count -eq 0) ("changed: $($changed -join ', ') added: $($added -join ', ')")
     Get-ChildItem -LiteralPath $work -Recurse -File -ErrorAction SilentlyContinue | Where-Object { $_.IsReadOnly } | ForEach-Object { $_.IsReadOnly = $false }
     Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue
+  }
+}
+
+# --- Part 4: read-only checks of a real installation --------------------------------------------------------------------------
+if ($LiveReadOnly) {
+  if (-not (Test-Path -LiteralPath (Join-Path $LivePath '.env'))) { Add-Result 'SKIP' 'live read-only checks' "No installation at $LivePath" }
+  else {
+    Import-Module (Join-Path $repo 'lib\CloudflareApi.psm1') -Force
+    Import-Module (Join-Path $repo 'lib\Dashboard.psm1') -Force
+    Import-Module (Join-Path $repo 'lib\DockerDiscovery.psm1') -Force
+    Import-Module (Join-Path $repo 'lib\ServiceHealth.psm1') -Force
+    $snap = { Get-ChildItem -LiteralPath $LivePath -Recurse -File -Force -ErrorAction SilentlyContinue | Sort-Object FullName | ForEach-Object { "$($_.FullName)|$($_.Length)|$($_.LastWriteTimeUtc.Ticks)" } }
+    $filesBefore = (& $snap) -join "`n"
+    $engineBefore = Get-EngineSnapshot '~none~'
+    try {
+      $s = Get-StackSettings -InstallPath $LivePath
+      $docker = Get-DockerStatus; $stack = Get-StackStatus -Settings $s
+      $cfg = Read-CloudflareConfig -Settings $s; $tok = Get-CloudflareApiTokenInfo -Settings $s
+      $registry = @((Read-ServiceRegistry -Settings $s).services)
+      $tunnel = $null
+      if ($tok.Stored -and $tok.Readable -and $cfg.accountId -and $cfg.tunnelId) {
+        $t = Invoke-CloudflareApi -Settings $s -Path "/accounts/$($cfg.accountId)/cfd_tunnel/$($cfg.tunnelId)"
+        $tunnel = [ordered]@{ name = [string]$t.name; status = [string]$t.status; connections = @($(if ($t.PSObject.Properties['connections']) { $t.connections } else { @() })).Count; error = '' }
+      }
+      $dash = Read-DashboardConfig -Settings $s
+      $base = [ordered]@{ mode = $(if ($stack.TunnelTokenPresent) { 'tunnel' } else { 'local' }); installed = $true; stackName = $s.StackName; httpPort = $s.HttpPort; dashboardPort = $s.DashboardPort; proxyNetwork = $s.ProxyNetwork
+        cloudflaredIp = $s.CloudflaredIp; docker = $docker; stack = $stack; services = $registry; cloudflare = $cfg; token = $tok; tunnel = $tunnel; tunnelTokenPresent = $stack.TunnelTokenPresent
+        dashboard = [ordered]@{ enabled = [bool]$dash.enabled; hostname = [string]$dash.hostname; router = (Get-DashboardRouterName) } }
+      $lm = ConvertTo-InfrastructureModel -Facts (Get-InfrastructureFacts -Settings $s -Base $base)
+      Write-Host "  live: $($s.StackName), network $($s.ProxyNetwork), tunnel $($cfg.tunnelName), dashboard $($dash.hostname), services $(($registry | ForEach-Object { $_.name }) -join ',')" -ForegroundColor Cyan
+      Test-Condition 'live: tunnel mode; the tunnel is verified with Cloudflare (connected connector)' ($lm.mode -eq 'tunnel' -and (Get-Dim $lm 'tunnel' 'verified') -eq $true -and (Get-Dim $lm 'cloudflared' 'reachable') -eq $true) (((Get-Component $lm 'tunnel').evidence | ForEach-Object { $_.text }) -join ' | ')
+      Test-Condition 'live: Traefik running with a reachable API; its routers loaded; the shared network exists with Traefik attached' ((Get-Dim $lm 'traefik' 'verified') -eq $true -and (Get-Dim $lm 'router' 'running') -eq $true -and (Get-Dim $lm 'network' 'reachable') -eq $true) (((Get-Component $lm 'router').evidence | ForEach-Object { $_.text }) -join ' | ')
+      Test-Condition 'live: every saved service has a flow with its loaded router' (@($lm.flows).Count -eq $registry.Count -and -not @($lm.flows | Where-Object { $_.enabled -and (-not $_.router -or $_.router.status -ne 'enabled') }).Count) (($lm.flows | ForEach-Object { "$($_.name):$(if ($_.router) { $_.router.status } else { 'none' })" }) -join ', ')
+      Test-Condition 'live: no competing hostname definitions' (@($lm.conflicts).Count -eq 0) ($lm.conflicts | ConvertTo-Json -Compress -Depth 4)
+      Test-Condition 'live: configuration alone verified nothing (Access and applications await a per-service check)' ($null -eq (Get-Dim $lm 'app' 'verified') -and $null -eq (Get-Dim $lm 'access' 'verified')) ''
+      $inv = @(Get-DockerContainerInventory -ProxyNetwork $s.ProxyNetwork)
+      $mine = @($inv | Where-Object { $_.name -like "$($s.StackName)-*" })
+      Test-Condition 'live: discovery lists the deployment''s containers as infrastructure (never offered for publishing)' ($mine.Count -ge 3 -and -not @($mine | Where-Object { -not $_.infrastructure }).Count) (($mine | ForEach-Object { "$($_.name):$($_.infrastructure)" }) -join ', ')
+      $invJson = $inv | ConvertTo-Json -Depth 8 -Compress
+      Test-Condition 'live: the inventory contains no environment variables' ($invJson -notmatch '"Env"' -and $invJson -notmatch 'TUNNEL_TOKEN=') ''
+      foreach ($svc in $registry) {
+        $claims = @(Find-HostnameClaims -Hostname @($svc.hostnames)[0] -Services $registry -Routers (Get-TraefikApi $s '/api/http/routers') -Containers $inv -OwnService $svc.name -DashboardHostname $(if ($dash.enabled) { $dash.hostname } else { '' }))
+        Test-Condition "live: $($svc.name) is the only owner of $(@($svc.hostnames)[0])" ($claims.Count -eq 0) ($claims | ConvertTo-Json -Compress)
+        $hh = Get-ServiceHealth -Settings $s -Service $svc
+        $line = ($hh.checks | ForEach-Object { "$($_.id)=$($_.state)$(if (-not $_.performed) { '(not performed)' })" }) -join ' '
+        Write-Host "  live health $($svc.name): $line" -ForegroundColor Cyan
+        Test-Condition "live: $($svc.name) request path - DNS, Access, tunnel route, router and service verified with read-only requests" (@($hh.checks | Where-Object { $_.id -in 'dns', 'tunnel', 'router', 'service' -and $_.state -ne 'ok' }).Count -eq 0 -and ($svc.cloudflare.access -eq $false -or (Get-Check2 $hh 'access').state -eq 'ok')) $line
+        Test-Condition "live: $($svc.name) application check reports what it saw (performed, with an HTTP result)" ((Get-Check2 $hh 'http').performed -and (Get-Check2 $hh 'http').message -match 'HTTP|answer') (Get-Check2 $hh 'http').message
+      }
+    } catch { Add-Result 'FAIL' 'live read-only checks' ($_.Exception.Message + ' ' + $_.ScriptStackTrace) }
+    $filesAfter = (& $snap) -join "`n"
+    $engineAfter = Get-EngineSnapshot '~none~'
+    $changed = @($engineBefore.Keys | Where-Object { -not $engineAfter.ContainsKey($_) -or $engineAfter[$_] -ne $engineBefore[$_] })
+    Test-Condition 'live: the installation''s files are unchanged (names, sizes, write times)' ($filesBefore -eq $filesAfter) ''
+    Test-Condition "live: every container is unchanged ($($engineBefore.Count) checked)" ($changed.Count -eq 0 -and $engineAfter.Count -eq $engineBefore.Count) ($changed -join ', ')
   }
 }
 

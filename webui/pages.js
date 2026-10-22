@@ -57,8 +57,8 @@
         tile('Services', 'list', `${o.services.published} published`, `${o.services.enabled} enabled of ${o.services.total}`)),
       h('div', { class: 'quick-actions', role: 'group', 'aria-label': 'Quick actions' },
         h('a', { class: 'btn primary', href: '#explorer' }, icon('network'), 'View infrastructure'),
-        h('a', { class: 'btn', href: '#services/add' }, icon('plus'), 'Add application'),
-        h('a', { class: 'btn', href: '#services/add' }, icon('globe'), 'Publish service'),
+        h('a', { class: 'btn', href: '#catalog' }, icon('plus'), 'Add application'),
+        h('a', { class: 'btn', href: '#discover' }, icon('globe'), 'Publish service'),
         h('a', { class: 'btn', href: dash.localUrl, target: '_blank', rel: 'noopener noreferrer' }, icon('gauge'), 'Open Traefik dashboard'),
         managerHost,
         h('button', { type: 'button', class: 'btn', onclick: (e) => verify(e.currentTarget) }, icon('pulse'), 'Check health')),
@@ -106,22 +106,26 @@
         h('td', null, h('span', { class: 'mono' }, v.url), h('div', { class: 'sub' }, KINDS[sv.target.type] ? KINDS[sv.target.type][0] : sv.target.type)),
         h('td', null, exposure), h('td', null, router),
         h('td', { class: 'actions-cell' },
+          h('button', { type: 'button', class: 'btn small', 'aria-label': `Check health of ${sv.name}`, onclick: () => { const hh = $('#health-host'); if (hh && P.serviceHealth) { P.serviceHealth(hh, sv.name); hh.scrollIntoView({ block: 'nearest' }); } } }, icon('pulse'), 'Health'),
           h('button', { type: 'button', class: 'btn small', onclick: () => openForm(ctx, v), 'aria-label': `Edit ${sv.name}` }, 'Edit'),
           h('button', { type: 'button', class: 'btn small', 'aria-label': `${sv.enabled ? 'Disable' : 'Enable'} ${sv.name}`, onclick: (e) => ctx.startPlan({ op: sv.enabled ? 'disable' : 'enable', name: sv.name, cloudflare: { automate: cfReady(s.setup), cleanup: false } }, e.currentTarget) }, sv.enabled ? 'Disable' : 'Enable'),
           h('button', { type: 'button', class: 'btn small danger-outline', 'aria-label': `Remove ${sv.name}`, onclick: (e) => ctx.startPlan({ op: 'remove', name: sv.name, cloudflare: { automate: cfReady(s.setup), cleanup: true } }, e.currentTarget) }, 'Remove')));
     });
     fill(main,
-      head('Operate', 'Services', 'Each service maps a public hostname to an app: name → hostname → destination → publish. Every change is previewed first.',
-        h('button', { type: 'button', class: 'btn primary', onclick: () => openForm(ctx, null) }, icon('plus'), 'Add a service')),
+      head('Operate', 'Services', 'Each service maps a public hostname to an app: name → hostname → destination → publish. Every change is previewed first.'),
+      P.serviceEntryPoints ? P.serviceEntryPoints(ctx) : h('button', { type: 'button', class: 'btn primary', onclick: () => openForm(ctx, null) }, icon('plus'), 'Add a service'),
       !data.traefikUp ? h('div', { class: 'callout warn' }, h('p', null, 'Traefik is not answering, so route status is unknown. Changes are still validated and saved.')) : null,
       arr(data.drift).length ? h('div', { class: 'callout warn' }, h('p', null, `${arr(data.drift).length} generated route file(s) do not match the registry. Re-save a service or use services.ps1 apply.`)) : null,
       formHost,
+      h('section', { class: 'card health-host', id: 'health-host', 'aria-live': 'polite' }),
       h('div', { class: 'table-wrap' }, h('table', { class: 'table' }, h('caption', { class: 'sr-only' }, 'Services'),
         h('thead', null, h('tr', null, ['Service', 'Hostname', 'Destination', 'Who can reach it', 'Traefik', ''].map((t) => h('th', { scope: 'col' }, t || h('span', { class: 'sr-only' }, 'Actions'))))),
-        h('tbody', null, rows)), s.services.length ? null : h('p', { class: 'empty' }, 'No services yet. Use Add a service to publish your first app.')),
+        h('tbody', null, rows)), s.services.length ? null : h('p', { class: 'empty' }, 'No services yet. Choose one of the three ways above to publish your first app.')),
       h('p', { class: 'muted small', 'data-help-host': '' }, 'Seeing 404 or 502 in the browser? ', help('http-errors', 'HTTP errors')),
       gate('advanced', h('p', { class: 'muted small' }, 'This tool covers basic publishing. For middleware chains, certificates, load balancing or plugins use Traefik\'s own configuration (a hand-written .yml in traefik\\dynamic) or a dedicated Traefik manager as a separate product.')));
     if (ctx.state.sub === 'add') openForm(ctx, null);
+    const hm = /^health\/(.+)$/.exec(ctx.state.sub || '');
+    if (hm && P.serviceHealth) P.serviceHealth($('#health-host'), decodeURIComponent(hm[1]));
   };
 
   function openForm(ctx, view) {

@@ -288,7 +288,7 @@ try {
     Test-Condition 'navigation: after installation the operational menu replaces the setup steps' ([int](Js "document.querySelectorAll('#rail a[href=\'#overview\'], #rail a[href=\'#services\'], #rail a[href=\'#diagnostics\']').length") -eq 3) ''
     Shot 'overview-1366'
     Go 'services' "document.querySelector('main h1') && document.querySelector('main h1').textContent === 'Services'"; Prepare-Page
-    $null = Js "__t.click('Add a service'); true"
+    $null = Js "location.hash = '#services/add'; true"
     $null = Wait-PageCondition $cdp "document.querySelector('#svc-display')" 10; Prepare-Page
     $null = Js "__t.set('#svc-display', 'Notflix'); true"
     $s1 = [string](Js "document.querySelector('#svc-sub').value")

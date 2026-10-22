@@ -142,6 +142,31 @@
   const EMAIL_RE = /^[A-Za-z0-9._%+'-]{1,64}@[A-Za-z0-9.-]{1,253}\.[A-Za-z]{2,63}$/;
   function isEmail(v) { return EMAIL_RE.test(String(v || '')); }
 
+  // --- Docker discovery ------------------------------------------------------------------------------------------------
+  // An application name for a discovered container: its Compose service, else its name without the Compose project
+  // prefix and replica suffix ("media-prowlarr-1" -> "prowlarr"), else the image name.
+  function suggestAppName(c) {
+    const compose = (c && c.compose) || {};
+    let base = compose.service || (c && c.name) || '';
+    if (!compose.service && compose.project && base.startsWith(`${compose.project}-`)) base = base.slice(compose.project.length + 1);
+    base = base.replace(/[-_]\d+$/, '');
+    if (!base && c && c.image) base = String(c.image).split('@')[0].split('/').pop().split(':')[0];
+    return suggestLabel(base);
+  }
+  // "uptime-kuma" -> "Uptime Kuma".
+  function displayNameFromLabel(label) { return String(label || '').split('-').filter(Boolean).map((w) => w[0].toUpperCase() + w.slice(1)).join(' '); }
+  // The port to preselect: the best HTTP(S) candidate, else the first TCP port that is not blocked, else none.
+  function choosePort(ports) {
+    const list = (ports || []).filter((p) => p.proto === 'tcp' && p.guess !== 'blocked');
+    return list.find((p) => p.guess === 'http' || p.guess === 'https') || list.find((p) => p.guess === 'unknown') || null;
+  }
+  // How Traefik will reach a container: over the shared network, or through a port published on this PC.
+  function reachOptions(c, port) {
+    const pub = (c.published || []).find((p) => p.port === port && p.proto === 'tcp' && p.hostPort > 0);
+    if (c.onProxyNetwork) return { default: 'network', options: ['network'], hostPort: pub ? pub.hostPort : 0 };
+    return { default: pub && pub.hostIp !== '127.0.0.1' ? 'hostport' : 'attach', options: pub ? ['attach', 'hostport'] : ['attach'], hostPort: pub ? pub.hostPort : 0, loopbackOnly: !!(pub && pub.hostIp === '127.0.0.1') };
+  }
+
   // --- Infrastructure Explorer ---------------------------------------------------------------------------------------
   // A component carries six independent dimensions (true / false / null = not checked). The summary never turns
   // green from configuration alone: "verified" needs a verification, "running" a live observation.
@@ -177,7 +202,7 @@
 
   return {
     LEVELS, LEVEL_TITLES, DEFAULT_LEVEL, normalizeLevel, levelIndex, isVisibleAt,
-    DIMENSIONS, COMPONENT_STATUS, componentStatus, firstBlocked,
+    DIMENSIONS, COMPONENT_STATUS, componentStatus, firstBlocked, suggestAppName, displayNameFromLabel, choosePort, reachOptions,
     suggestLabel, suggestServiceName, autoName, autoNameFromSource, autoNameEdit, autoNameReset, isValidSubdomain, joinHostname, splitHostname,
     detectTarget, isPrivateIPv4,
     stableStringify, fingerprint, reviewState, markReviewed, reopenReview,

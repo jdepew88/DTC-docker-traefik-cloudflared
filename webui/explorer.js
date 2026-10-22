@@ -178,6 +178,10 @@
   ];
   const PATH = LANES.flatMap((l) => l[2]);
   const TOOLS = ['docker', 'compose', 'socket-proxy', 'manager'];
+  // Request-path health checks (POST /api/services/health) shown on the component they test.
+  const HEALTH_NODE = { dns: 'dns', access: 'access', tunnel: 'tunnel', router: 'router', service: 'service', backend: 'network', http: 'app', public: 'edge' };
+  const HEALTH_STATUS = { ok: { tone: 'ok', label: 'Verified', icon: 'check-double' }, failed: { tone: 'err', label: 'Failed', icon: 'x' }, warning: { tone: 'warn', label: 'Warning', icon: 'alert' }, skipped: { tone: 'neutral', label: 'Not checked', icon: 'minus' } };
+  const healthFor = (health, id) => (health ? arr(health.checks).find((x) => HEALTH_NODE[x.id] === id) : null);
 
   // --- Helpers ---------------------------------------------------------------------------------------------------------
   function brandMark(key, fallback, cls = '') {
@@ -248,7 +252,8 @@
   function diagram(m, opts = {}) {
     const byId = {}; arr(m.components).forEach((c) => { byId[c.id] = c; });
     const flow = opts.flow || null;
-    const blocked = L.firstBlocked(m.components, PATH);
+    const blockedHealth = opts.health ? PATH.findIndex((id) => { const x = healthFor(opts.health, id); return x && x.state === 'failed'; }) : -1;
+    const blocked = blockedHealth >= 0 ? blockedHealth : L.firstBlocked(m.components, PATH);
     const buttons = [];
     const wrap = h('div', { class: `xp-diagram${opts.compact ? ' compact' : ''}${opts.paused ? ' paused' : ''}`, role: 'group', 'aria-label': flow ? `Request path for ${flow.displayName}` : 'Request path from a browser to your applications' });
     let index = 0;
@@ -267,7 +272,8 @@
       const row = h('ol', { class: 'xp-row' });
       shown.forEach((id, i) => {
         const c = byId[id];
-        const st = L.componentStatus(c);
+        const hc = healthFor(opts.health, id);
+        const st = hc ? { ...HEALTH_STATUS[hc.state] } : L.componentStatus(c);
         const pos = PATH.indexOf(id);
         const after = blocked >= 0 && pos > blocked;
         const btn = h('button', { type: 'button', class: `xp-node ${st.tone}${opts.selected === id ? ' selected' : ''}${after ? ' downstream' : ''}`, 'data-id': id, 'aria-pressed': opts.selected === id ? 'true' : 'false',
@@ -344,6 +350,7 @@
         evidence.length ? h('ul', { class: 'checks' }, evidence.map((e) => U.checkItem(e.ok === true ? 'ok' : e.ok === false ? 'err' : 'neutral', e.text, U.atLeast('advanced') ? e.dim : ''))) : null,
         h('p', { class: 'muted small' }, 'A file existing only makes a component "configured". "Verified" needs a real check against the running component or Cloudflare.')),
       flow && ['router', 'service', 'middleware', 'app', 'access', 'dns'].includes(id) ? sec(`For ${flow.displayName}`, flowFacts(flow, id)) : null,
+      flow && healthFor(view.health[flow.name], id) ? sec('Health check', h('ul', { class: 'checks' }, [healthFor(view.health[flow.name], id)].map((x) => U.checkItem(x.state === 'ok' ? 'ok' : x.state === 'failed' ? 'err' : x.state === 'warning' ? 'warn' : 'neutral', `${x.label}${x.performed ? '' : ' (not checked)'}`, x.message)))) : null,
       arr(info.fails).length ? sec('How it can fail', h('ul', null, info.fails.map((x) => h('li', null, x)))) : null,
       gate('intermediate', arr(info.diagnose).length ? sec('How to diagnose', h('ul', null, info.diagnose.map((x) => h('li', null, x)))) : null),
       arr(info.docs).length ? sec('Documentation', h('ul', { class: 'xp-docs' }, info.docs.map(([t, url]) => h('li', null, h('a', { href: url, target: '_blank', rel: 'noopener noreferrer' }, t, ' ', icon('external')))))) : null,
@@ -395,7 +402,7 @@
   }
 
   // --- Page ------------------------------------------------------------------------------------------------------------
-  const view = { selected: '', flow: '', paused: false, stale: false, files: null };
+  const view = { selected: '', flow: '', paused: false, stale: false, files: null, health: {} };
   try { view.paused = U.store('tpm.xp.paused') === '1'; } catch (e) { /* storage unavailable */ }
   let current = null;
   let mainRef = null;
@@ -417,10 +424,13 @@
         h('p', null, isEasy() ? 'Follow a visit from a browser to your app. Select any box to learn what it does and how it is doing.' : 'Each component of the request path, what it does and what has actually been established about it.')),
       h('div', { class: 'actions' }, h('button', { type: 'button', class: 'btn', onclick: (e) => withBusy(e.currentTarget, () => load()) }, icon('refresh'), 'Refresh'))),
       summary,
-      h('div', { class: 'xp-toolbar', 'data-xp-ready': view.stale ? null : 'true' }, h('label', { for: 'xp-follow' }, 'Follow a request to'), follow, h('span', { class: 'grow' }), pause,
+      h('div', { class: 'xp-toolbar', 'data-xp-ready': view.stale ? null : 'true' }, h('label', { for: 'xp-follow' }, 'Follow a request to'), follow,
+        flow ? h('button', { type: 'button', class: 'btn small', onclick: (e) => withBusy(e.currentTarget, async () => { view.health[flow.name] = await api('POST', '/api/services/health', { name: flow.name }); render(); }) }, icon('pulse'), view.health[flow.name] ? 'Check again' : 'Check health') : null,
+        h('span', { class: 'grow' }), pause,
         h('span', { class: 'muted small' }, `Checked ${String(m.checkedAt || '').replace('T', ' ')}`)),
       h('div', { class: `xp-layout${view.selected ? '' : ' no-detail'}` },
-        h('div', { class: 'xp-main' }, diagram(m, { selected: view.selected, flow, paused: view.paused, onSelect }), U.atLeast('intermediate') ? toolsRow(m, { selected: view.selected, onSelect }) : null),
+        h('div', { class: 'xp-main' }, flow && view.health[flow.name] && P.healthList ? h('details', { class: 'more' }, h('summary', null, `Health of ${flow.displayName}: ${view.health[flow.name].performed} of ${view.health[flow.name].total} checks performed`), P.healthList(view.health[flow.name])) : null,
+          diagram(m, { selected: view.selected, flow, paused: view.paused, onSelect, health: flow ? view.health[flow.name] : null }), U.atLeast('intermediate') ? toolsRow(m, { selected: view.selected, onSelect }) : null),
         h('aside', { class: 'xp-detail card', id: 'xp-detail', 'aria-live': 'polite', 'aria-labelledby': view.selected ? 'xp-detail-title' : null, hidden: view.selected ? null : true }, detail(m, view.selected, flow))),
       routesTable(m), networkingCard(m), expertCard(),
       technical([JSON.stringify(m, null, 2)], 'Raw explorer data', 'expert'));
@@ -433,7 +443,7 @@
   async function load() {
     const next = await api('GET', '/api/infrastructure');
     // Another deployment was opened: forget what belonged to the previous one.
-    if (current && current.instance.installPath !== next.instance.installPath) { view.files = null; view.flow = ''; view.selected = ''; }
+    if (current && current.instance.installPath !== next.instance.installPath) { view.files = null; view.flow = ''; view.selected = ''; view.health = {}; }
     current = next; view.stale = false; render(); return current;
   }
 

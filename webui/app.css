@@ -344,8 +344,9 @@ details.more > summary { cursor: pointer; font-weight: 600; color: var(--text-2)
 .table th, .table td { text-align: left; padding: .6rem .85rem; border-bottom: 1px solid var(--border); vertical-align: top; }
 .table th { font-size: .74rem; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); background: var(--surface-2); font-weight: 650; }
 .table tr:last-child td { border-bottom: 0; }
-.table td.actions-cell { white-space: nowrap; text-align: right; }
-.table td.actions-cell .btn { margin-left: .25rem; }
+.table td.actions-cell { text-align: right; min-width: 11rem; }
+.table td.actions-cell .btn { margin: .15rem 0 .15rem .25rem; }
+.table td:first-child { min-width: 9rem; }
 .table .sub { font-size: .84rem; color: var(--muted); overflow-wrap: anywhere; }
 .empty { padding: 1rem 1.1rem; margin: 0; color: var(--muted); }
 .output { background: var(--code-bg); color: var(--code-text); border-radius: 8px; padding: .75rem .9rem; overflow: auto; max-height: 420px; font-size: .8rem; margin: .4rem 0 .8rem; white-space: pre-wrap; overflow-wrap: anywhere; }
@@ -469,6 +470,27 @@ dialog::backdrop { background: rgba(5, 8, 12, .65); }
 .dim-list li .v { color: var(--muted); font-size: .76rem; }
 .dim-list li.yes .icon { color: var(--ok); } .dim-list li.no .icon { color: var(--err); } .dim-list li.na .icon { color: var(--muted); }
 .xp-connects, .xp-docs { padding-left: 1.1rem; margin: .2rem 0; }
+.entry-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: .7rem; margin: .4rem 0 1rem; }
+.entry-card { display: flex; gap: .7rem; align-items: flex-start; padding: .85rem; border: 1px solid var(--border); border-radius: 12px; background: var(--surface-2); color: var(--text); text-decoration: none; }
+.entry-card:hover, .entry-card:focus-visible { border-color: var(--accent); }
+.entry-card strong { display: block; }
+.health-host:empty { display: none; }
+.health-path { counter-reset: hp; }
+.disc-toolbar { display: flex; flex-wrap: wrap; align-items: flex-end; gap: .4rem 1.2rem; margin: .6rem 0; }
+.disc-toolbar .field { margin: 0; min-width: min(100%, 18rem); }
+.disc-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 340px), 1fr)); gap: .8rem; }
+.disc-card h2 { font-size: 1rem; margin: 0; overflow-wrap: anywhere; }
+.disc-card .card-head { flex-wrap: wrap; gap: .4rem; }
+.disc-card .mono { overflow-wrap: anywhere; }
+.port-list, .port-choices { list-style: none; padding: 0; margin: .4rem 0; }
+.port-list li, .port-choice { padding: .2rem 0; }
+.port-choice { display: flex; flex-wrap: wrap; align-items: center; gap: .3rem .8rem; border-bottom: 1px solid var(--border); padding: .4rem 0; }
+.port-choice p { flex-basis: 100%; margin: 0; }
+.wizard .wiz-step { border-bottom: 1px solid var(--border); padding: .6rem 0 1rem; }
+.wizard .wiz-step:last-child { border-bottom: 0; }
+.wizard .wiz-step h2 { display: flex; align-items: center; gap: .5rem; font-size: 1rem; }
+.wizard .step-num { display: inline-grid; place-items: center; width: 1.6rem; height: 1.6rem; border-radius: 50%; background: var(--accent-soft); color: var(--accent); font-size: .8rem; }
+.hint.ok { color: var(--ok); }
 .quick-actions { display: flex; flex-wrap: wrap; gap: .5rem; margin: .6rem 0 1rem; }
 
 /* --- Responsive --------------------------------------------------------------------------------------------------------------- */

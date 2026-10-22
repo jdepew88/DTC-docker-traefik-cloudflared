@@ -1113,7 +1113,7 @@ function Get-StackLogs {
   return [pscustomobject]@{ Container = $names[$Role]; Ok = ($r.ExitCode -eq 0); Lines = @(ConvertTo-RedactedText $r.Output) }
 }
 
-Export-ModuleMember -Function Invoke-Docker, Read-DotEnv, Get-FileSha256, Get-TextSha256, Get-ManagerVersion, New-ReviewItem, Get-ComposeImages, Write-TextFileAtomic,
+Export-ModuleMember -Function Invoke-Docker, New-Issue, Read-DotEnv, Get-FileSha256, Get-TextSha256, Get-ManagerVersion, New-ReviewItem, Get-ComposeImages, Write-TextFileAtomic,
   Get-ServiceProperty, ConvertTo-StableJson, ConvertTo-IPv4Range, Test-CidrOverlap,
   Get-TunnelTokenPattern, ConvertFrom-TunnelToken, Find-ConnectorForTunnel, Set-SecretFileAcl, Save-TunnelTokenFile, Test-TunnelTokenFile,
   Start-ProxyStack, Start-TunnelConnector, Get-PortUser, ConvertTo-RedactedText, Get-DockerStatus, Get-StackContainerNames, Get-StackStatus, Get-StackLogs,
