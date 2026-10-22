@@ -284,7 +284,7 @@ try {
     Go 'overview' "document.querySelector('.tiles')"
     $null = Wait-PageCondition $cdp "!document.querySelector('main').innerText.includes('Loading')" 30; Prepare-Page
     $tov = [string](Js "document.querySelector('main').innerText")
-    Test-Condition 'overview: health tiles, request-flow topology, local dashboard link' ($tov -match 'Deployment' -and $tov -match '2 of 2 running' -and [bool](Js "!!document.querySelector('.topology')") -and $tov -match 'Local dashboard') ($tov.Substring(0, [Math]::Min(500, $tov.Length)))
+    Test-Condition 'overview: health tiles, request-flow topology, local dashboard link' ($tov -match 'Deployment' -and $tov -match '2 of 2 running' -and [bool](Js "!!document.querySelector('.topology, .xp-diagram')") -and $tov -match 'Local dashboard') ($tov.Substring(0, [Math]::Min(500, $tov.Length)))
     Test-Condition 'navigation: after installation the operational menu replaces the setup steps' ([int](Js "document.querySelectorAll('#rail a[href=\'#overview\'], #rail a[href=\'#services\'], #rail a[href=\'#diagnostics\']').length") -eq 3) ''
     Shot 'overview-1366'
     Go 'services' "document.querySelector('main h1') && document.querySelector('main h1').textContent === 'Services'"; Prepare-Page

@@ -42,6 +42,10 @@
     if (o.upgrade && o.upgrade.state === 'available') actions.push([`Newer application files are available (${o.upgrade.installedVersion} → ${o.upgrade.sourceVersion}): preview the upgrade`, 'upgrade']);
     if (!s.verify) actions.push(['Run the end-to-end verification', 'verify']);
     const verifyBox = h('div', { id: 'overview-verify' }, s.verify ? window.TPMPages.renderVerification(ctx, s.verify) : null);
+    // The diagram and the container-manager link load after the page: the overview never waits for them.
+    const miniHost = h('div', { class: 'xp-mini' }, U.topology(nodes, links));
+    const managerHost = h('span', { class: 'manager-link' });
+    if (P.explorerMini) P.explorerMini(miniHost, ctx).then((m) => { const cm = m && arr(m.containerManagers)[0]; if (cm && managerHost.isConnected) fill(managerHost, h('a', { class: 'btn', href: cm.url, target: '_blank', rel: 'noopener noreferrer' }, icon('box'), `Open ${cm.kind === 'portainer' ? 'Portainer' : cm.kind === 'arcane' ? 'Arcane' : cm.kind}`)); });
     fill(main,
       head('Operate', 'Overview', null, h('button', { type: 'button', class: 'btn', onclick: (e) => withBusy(e.currentTarget, () => P.overview(main, ctx)) }, icon('refresh'), 'Refresh')),
       h('div', { class: 'tiles' },
@@ -51,8 +55,15 @@
         tile('Authorized domains', 'globe', arr(o.domains).map((d) => d.name).join(', ') || 'None', o.mode === 'tunnel' ? 'Services publish only under these' : 'Not needed locally'),
         tile('Traefik dashboard', 'gauge', dash.enabled ? 'Public + local' : 'Local', dash.enabled ? dash.publicUrl : dash.localUrl, dash.enabled ? 'ok' : null),
         tile('Services', 'list', `${o.services.published} published`, `${o.services.enabled} enabled of ${o.services.total}`)),
+      h('div', { class: 'quick-actions', role: 'group', 'aria-label': 'Quick actions' },
+        h('a', { class: 'btn primary', href: '#explorer' }, icon('network'), 'View infrastructure'),
+        h('a', { class: 'btn', href: '#services/add' }, icon('plus'), 'Add application'),
+        h('a', { class: 'btn', href: '#services/add' }, icon('globe'), 'Publish service'),
+        h('a', { class: 'btn', href: dash.localUrl, target: '_blank', rel: 'noopener noreferrer' }, icon('gauge'), 'Open Traefik dashboard'),
+        managerHost,
+        h('button', { type: 'button', class: 'btn', onclick: (e) => verify(e.currentTarget) }, icon('pulse'), 'Check health')),
       h('section', { class: 'card' }, h('div', { class: 'card-head' }, h('h2', null, 'Request flow'), help('reverse-proxy', 'Reverse proxy'), h('span', { class: 'grow' }),
-        dash.enabled ? ext(dash.publicUrl, 'Public dashboard') : null, ext(dash.localUrl, 'Local dashboard')), U.topology(nodes, links)),
+        dash.enabled ? ext(dash.publicUrl, 'Public dashboard') : null, h('a', { href: '#explorer' }, 'Explore')), miniHost),
       o.warnings.length || actions.length ? h('section', { class: 'card' }, h('h2', null, 'Needs attention'),
         h('ul', { class: 'checks' }, o.warnings.map((w) => checkItem('warn', w)), actions.map(([text, target]) => h('li', null, h('span', { class: 'ci neutral' }, icon('chevron')),
           h('span', null, h('a', { href: target === 'verify' || target === 'upgrade' ? '#overview' : `#${target}`,

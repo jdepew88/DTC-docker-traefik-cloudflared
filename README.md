@@ -86,6 +86,7 @@ never changed.
 | Portable backups (.json / .zip export, import with preview, two-part restore, recovery points) | **Implemented and tested** against the mock (round trip, version compatibility, credential exclusion, idempotency) and live in an isolated instance (local restore). |
 | Traefik dashboard bootstrap (public `/dashboard/` behind Cloudflare Access, fail closed) | **Implemented**; routing **live-tested** in an isolated instance, Cloudflare steps mock-tested. Not yet run against a real Access application. |
 | Deployment review (prepared / validated / applied / verified / action required, technical output) | **Implemented** for the installation, restores and the dashboard. |
+| Infrastructure Explorer: the request path (browser → DNS → Cloudflare → Access → tunnel → cloudflared → Traefik router → middleware → service → Docker network → app) with six separate states per component (detected, configured, running, reachable, authenticated, verified), tools shown apart from the path, small diagram and quick actions on the Overview | **Implemented and tested** (model unit tests, a disposable running instance, browser at three widths and four levels). Read-only. |
 | One-click launcher (`START-HERE.cmd`) and existing-deployment discovery / attach | **Implemented and tested** (launcher, discovery, attach without changes, recent projects, upgrade preview/apply on test folders, browser); discovery and read-only Cloudflare verification also run against a real installation. |
 | Redesigned web UI: seven-step journey, four detail levels, review states, topology, operational pages, learning catalog | **Implemented and browser-tested** in headless Edge (desktop, tablet and phone widths, keyboard and accessible-name checks), including an installation of a disposable instance through the UI. The tunnel path through the UI has only run against the Cloudflare API mock. |
 
@@ -496,6 +497,7 @@ container on this PC already uses.
 .\tests\Test-UiBrowser.ps1 -ScreenshotDir .\screens   # the UI in headless Edge (DevTools protocol): journey,
                                         # detail levels, naming, reviews, approvals, a disposable local install,
                                         # responsive layout (390/820/1366 px), keyboard and accessible names
+.\tests\Test-Explorer.ps1               # Infrastructure Explorer: model (fixture facts), a disposable running instance, browser
 .\tests\Test-Projects.ps1               # launcher (single-use link, duplicate start, ports, stop, START-HERE.cmd), discovery,
                                         # attach without changes, recent projects, upgrade preview/apply, browser;
                                         # -LiveReadOnly also inspects %USERPROFILE%\.docker\projects\traefik-proxy read-only

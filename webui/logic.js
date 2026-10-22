@@ -10,7 +10,7 @@
   // Presentation only: a level decides what is shown, never what is allowed, validated or sent to the server.
   const LEVELS = ['beginner', 'intermediate', 'advanced', 'expert'];
   const LEVEL_TITLES = { beginner: 'Beginner', intermediate: 'Intermediate', advanced: 'Advanced', expert: 'Expert' };
-  const DEFAULT_LEVEL = 'beginner';
+  const DEFAULT_LEVEL = 'intermediate';
 
   function normalizeLevel(value) { return LEVELS.includes(value) ? value : DEFAULT_LEVEL; }
   function levelIndex(level) { return LEVELS.indexOf(normalizeLevel(level)); }
@@ -142,8 +142,42 @@
   const EMAIL_RE = /^[A-Za-z0-9._%+'-]{1,64}@[A-Za-z0-9.-]{1,253}\.[A-Za-z]{2,63}$/;
   function isEmail(v) { return EMAIL_RE.test(String(v || '')); }
 
+  // --- Infrastructure Explorer ---------------------------------------------------------------------------------------
+  // A component carries six independent dimensions (true / false / null = not checked). The summary never turns
+  // green from configuration alone: "verified" needs a verification, "running" a live observation.
+  const DIMENSIONS = [
+    ['detected', 'Detected'], ['configured', 'Configured'], ['running', 'Running'],
+    ['reachable', 'Reachable'], ['authenticated', 'Authenticated'], ['verified', 'Verified'],
+  ];
+  const COMPONENT_STATUS = {
+    off: { tone: 'off', label: 'Not used', icon: 'minus' },
+    failed: { tone: 'err', label: 'Problem', icon: 'x' },
+    verified: { tone: 'ok', label: 'Verified', icon: 'check-double' },
+    running: { tone: 'live', label: 'Running', icon: 'check' },
+    configured: { tone: 'neutral', label: 'Configured', icon: 'clock' },
+    detected: { tone: 'neutral', label: 'Detected', icon: 'eye' },
+    unknown: { tone: 'neutral', label: 'Not checked', icon: 'minus' },
+  };
+  function componentStatus(c) {
+    if (!c || c.applicable === false) return { key: 'off', ...COMPONENT_STATUS.off };
+    const d = c.dims || {};
+    const vals = DIMENSIONS.map(([k]) => d[k]);
+    if (vals.some((v) => v === false)) return { key: 'failed', ...COMPONENT_STATUS.failed };
+    const key = d.verified === true ? 'verified' : d.running === true || d.reachable === true ? 'running'
+      : d.configured === true ? 'configured' : d.detected === true ? 'detected' : 'unknown';
+    return { key, ...COMPONENT_STATUS[key] };
+  }
+  // Index (in path order) of the first component that blocks requests, or -1. Components that are not used are skipped.
+  function firstBlocked(components, order) {
+    const byId = {};
+    for (const c of components || []) byId[c.id] = c;
+    for (let i = 0; i < order.length; i += 1) { const c = byId[order[i]]; if (c && componentStatus(c).key === 'failed') return i; }
+    return -1;
+  }
+
   return {
     LEVELS, LEVEL_TITLES, DEFAULT_LEVEL, normalizeLevel, levelIndex, isVisibleAt,
+    DIMENSIONS, COMPONENT_STATUS, componentStatus, firstBlocked,
     suggestLabel, suggestServiceName, autoName, autoNameFromSource, autoNameEdit, autoNameReset, isValidSubdomain, joinHostname, splitHostname,
     detectTarget, isPrivateIPv4,
     stableStringify, fingerprint, reviewState, markReviewed, reopenReview,

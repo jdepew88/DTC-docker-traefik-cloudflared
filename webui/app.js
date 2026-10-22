@@ -18,7 +18,7 @@
 
   // --- Navigation ---------------------------------------------------------------------------------------------------------
   const OPS_NAV = [
-    ['overview', 'Overview', 'home'], ['services', 'Services', 'list'], ['cloudflare', 'Cloudflare', 'cloud'],
+    ['overview', 'Overview', 'home'], ['explorer', 'Infrastructure Explorer', 'network'], ['services', 'Services', 'list'], ['cloudflare', 'Cloudflare', 'cloud'],
     ['dashboard', 'Traefik Dashboard', 'gauge'], ['backups', 'Backups', 'archive'], ['diagnostics', 'Diagnostics', 'terminal'],
     ['settings', 'Settings', 'settings'], ['help', 'Help and Learning', 'book'],
   ];

@@ -12,7 +12,8 @@ function test(name, fn) {
 
 test('detail levels: order, normalization, visibility', () => {
   assert.deepStrictEqual(L.LEVELS, ['beginner', 'intermediate', 'advanced', 'expert']);
-  assert.strictEqual(L.normalizeLevel('nope'), 'beginner');
+  assert.strictEqual(L.DEFAULT_LEVEL, 'intermediate'); // new users start at Intermediate (a saved choice wins)
+  assert.strictEqual(L.normalizeLevel('nope'), 'intermediate');
   assert.ok(L.isVisibleAt('advanced', 'expert'));
   assert.ok(!L.isVisibleAt('advanced', 'intermediate'));
   assert.ok(L.isVisibleAt(undefined, 'beginner'));
@@ -108,6 +109,29 @@ test('emails and sizes', () => {
   assert.deepStrictEqual(L.splitEmails('a@b.co, c@d.org;\n e@f.net'), ['a@b.co', 'c@d.org', 'e@f.net']);
   assert.ok(L.isEmail('a.b+c@example.com') && !L.isEmail('nope@'));
   assert.strictEqual(L.formatBytes(1536), '1.5 KB');
+});
+
+test('explorer: a component is never green from configuration alone', () => {
+  const c = (dims, extra = {}) => ({ id: 'x', applicable: true, dims: { detected: null, configured: null, running: null, reachable: null, authenticated: null, verified: null, ...dims }, ...extra });
+  assert.strictEqual(L.componentStatus(c({})).key, 'unknown');
+  assert.strictEqual(L.componentStatus(c({ configured: true })).key, 'configured');
+  assert.strictEqual(L.componentStatus(c({ configured: true })).tone, 'neutral');
+  assert.strictEqual(L.componentStatus(c({ detected: true })).key, 'detected');
+  assert.strictEqual(L.componentStatus(c({ configured: true, running: true })).key, 'running');
+  assert.notStrictEqual(L.componentStatus(c({ configured: true, running: true })).tone, 'ok');
+  assert.strictEqual(L.componentStatus(c({ running: true, verified: true })).key, 'verified');
+  assert.strictEqual(L.componentStatus(c({ running: true, verified: true })).tone, 'ok');
+  assert.strictEqual(L.componentStatus(c({ configured: true, running: false })).key, 'failed');
+  assert.strictEqual(L.componentStatus(c({ verified: true, authenticated: false })).key, 'failed');
+  assert.strictEqual(L.componentStatus(c({ running: false }, { applicable: false })).key, 'off');
+  assert.strictEqual(L.DIMENSIONS.length, 6);
+});
+
+test('explorer: the first failing component in path order blocks the rest', () => {
+  const mk = (id, dims, applicable = true) => ({ id, applicable, dims });
+  const order = ['a', 'b', 'c', 'd'];
+  assert.strictEqual(L.firstBlocked([mk('a', { running: true }), mk('b', { configured: true }), mk('c', { running: true })], order), -1);
+  assert.strictEqual(L.firstBlocked([mk('a', { running: true }), mk('b', { running: false }, false), mk('c', { running: false }), mk('d', { running: false })], order), 2);
 });
 
 console.log(`\n${passed} passed, ${failures.length} failed`);

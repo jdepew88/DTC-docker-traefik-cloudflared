@@ -49,6 +49,7 @@ Import-Module (Join-Path $here 'lib\CloudflareApi.psm1') -Force
 Import-Module (Join-Path $here 'lib\Dashboard.psm1') -Force
 Import-Module (Join-Path $here 'lib\ConfigBackup.psm1') -Force
 Import-Module (Join-Path $here 'lib\ProjectDiscovery.psm1') -Force
+Import-Module (Join-Path $here 'lib\Infrastructure.psm1') -Force
 Import-Module (Join-Path $here 'lib\LocalHttp.psm1') -Force
 Set-CloudflareApiBase $CloudflareApiBase
 
@@ -111,6 +112,8 @@ $StaticFiles = @{
   '/setup.js'   = @('setup.js', 'text/javascript; charset=utf-8')
   '/pages.js'   = @('pages.js', 'text/javascript; charset=utf-8')
   '/projects.js' = @('projects.js', 'text/javascript; charset=utf-8')
+  '/brands.js' = @('brands.js', 'text/javascript; charset=utf-8')
+  '/explorer.js' = @('explorer.js', 'text/javascript; charset=utf-8')
   '/learn.json' = @('learn.json', 'application/json; charset=utf-8')
   '/app.css'    = @('app.css', 'text/css; charset=utf-8')
   '/icon.svg'   = @('icon.svg', 'image/svg+xml')
@@ -1379,6 +1382,41 @@ function Set-ContactEmailRequest($Body) {
   return [ordered]@{ contactEmail = $email }
 }
 
+# The recorded tunnel as Cloudflare reports it (one read-only GET), or $null without a readable token.
+function Get-TunnelInfo($Settings, $Status, $Cf) {
+  if (-not ($Status.cloudflare.tokenStored -and $Status.cloudflare.tokenReadable -and $Cf.accountId -and $Cf.tunnelId)) { return $null }
+  try {
+    $t = Invoke-CloudflareApi -Settings $Settings -Path "/accounts/$($Cf.accountId)/cfd_tunnel/$($Cf.tunnelId)"
+    return [ordered]@{ name = [string]$t.name; status = [string]$t.status; connections = @($(if ($t.PSObject.Properties['connections']) { $t.connections } else { @() })).Count; error = '' }
+  } catch { return [ordered]@{ name = $Cf.tunnelName; status = 'unknown'; connections = 0; error = $_.Exception.Message } }
+}
+
+# Infrastructure Explorer: every component of the request path with what has actually been established about it.
+# Read-only (Docker inspect, Traefik's local API, one Cloudflare GET for the tunnel).
+function Get-InfrastructureData {
+  $status = Get-StatusData
+  $settings = Get-Settings
+  $installed = Test-Installed
+  $cf = Read-CloudflareConfig -Settings $settings
+  $mode = (Read-SetupDraft).deployment.mode
+  if (-not $mode -and $installed) { $mode = $(if (Test-TunnelTokenFile $settings) { 'tunnel' } else { 'local' }) }
+  $services = @()
+  if ($installed) { try { $services = @((Read-ServiceRegistry -Settings $settings).services) } catch { } }
+  $dash = Read-DashboardConfig -Settings $settings
+  $base = [ordered]@{
+    mode = $mode; installed = $installed; stackName = $settings.StackName; httpPort = $settings.HttpPort; dashboardPort = $settings.DashboardPort
+    proxyNetwork = $settings.ProxyNetwork; cloudflaredIp = $settings.CloudflaredIp; docker = $status.docker; stack = $status.stack
+    services = $services; cloudflare = $cf; token = (Get-CloudflareApiTokenInfo -Settings $settings); tunnel = (Get-TunnelInfo $settings $status $cf)
+    tunnelTokenPresent = [bool]$status.stack.TunnelTokenPresent; dashboard = [ordered]@{ enabled = [bool]$dash.enabled; hostname = [string]$dash.hostname; router = (Get-DashboardRouterName) }
+  }
+  $facts = Get-InfrastructureFacts -Settings $settings -Base $base
+  $model = ConvertTo-InfrastructureModel -Facts $facts
+  $model.instance = [ordered]@{ stackName = $settings.StackName; installPath = $InstallPath; httpPort = $settings.HttpPort; dashboardPort = $settings.DashboardPort; proxyNetwork = $settings.ProxyNetwork; tunnelNetwork = $settings.TunnelNetwork }
+  $model.dashboard = [ordered]@{ localUrl = "http://127.0.0.1:$($settings.DashboardPort)/dashboard/"; publicUrl = $(if ($dash.enabled -and $dash.hostname) { "https://$($dash.hostname)/dashboard/" } else { '' }) }
+  $model.checkedAt = (Get-Date -Format 's')
+  return $model
+}
+
 function Get-OverviewData {
   $status = Get-StatusData
   $settings = Get-Settings
@@ -1389,13 +1427,7 @@ function Get-OverviewData {
   $cf = Read-CloudflareConfig -Settings $settings
   $mode = (Read-SetupDraft).deployment.mode
   if (-not $mode -and $installed) { $mode = $(if (Test-TunnelTokenFile $settings) { 'tunnel' } else { 'local' }) }
-  $tunnel = $null
-  if ($status.cloudflare.tokenStored -and $status.cloudflare.tokenReadable -and $cf.accountId -and $cf.tunnelId) {
-    try {
-      $t = Invoke-CloudflareApi -Settings $settings -Path "/accounts/$($cf.accountId)/cfd_tunnel/$($cf.tunnelId)"
-      $tunnel = [ordered]@{ name = [string]$t.name; status = [string]$t.status; connections = @($(if ($t.PSObject.Properties['connections']) { $t.connections } else { @() })).Count; error = '' }
-    } catch { $tunnel = [ordered]@{ name = $cf.tunnelName; status = 'unknown'; connections = 0; error = $_.Exception.Message } }
-  }
+  $tunnel = Get-TunnelInfo $settings $status $cf
   $warnings = @()
   $c = @{}; foreach ($x in @($status.stack.Containers)) { $c[$x.Role] = $x }
   if ($installed) {
@@ -1652,6 +1684,7 @@ function Invoke-ApiRoute($Request, $Body) {
     'GET /api/dashboard' { return Get-DashboardData }
     'POST /api/dashboard/settings' { return Save-DashboardSettingsRequest $Body }
     'GET /api/overview' { return Get-OverviewData }
+    'GET /api/infrastructure' { return Get-InfrastructureData }
     'GET /api/environment' { return Get-EnvironmentData }
     'GET /api/expert/config' { return Get-ExpertConfigData }
     'POST /api/setup/contact' { return Set-ContactEmailRequest $Body }

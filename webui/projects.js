@@ -25,7 +25,7 @@
     pathInput.addEventListener('input', () => { ctx.state.forms.newPath = pathInput.value; });
     const best = list.find((p) => p.summary.usable);
     fill(main, head(ctx),
-      h('div', { class: 'callout', 'data-only-level': 'beginner' }, h('p', null, best
+      h('div', { class: 'callout' }, h('p', null, best
         ? ['We found ', h('strong', null, best.summary.stackName || folderName(best.summary.path)), '. Select ', h('strong', null, 'Review and open'), ' to continue managing it: nothing is reinstalled or changed by opening it.']
         : 'No existing deployment was found in the usual places. Start a new one, or choose its folder if you installed it somewhere else.')),
       h('section', { class: 'card' },

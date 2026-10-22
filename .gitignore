@@ -28,3 +28,5 @@ zipped project start/
 *.log
 .DS_Store
 __pycache__/
+# Local-only notes that may hold credentials
+API key*
