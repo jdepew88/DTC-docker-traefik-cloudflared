@@ -212,6 +212,29 @@ else {
     Test-Condition 'diagnosis: 127.0.0.1 (Windows localhost) as a target is refused: inside a container it is the container itself' (-not $wlo.Data.canApply -and (@($wlo.Data.traefik.issues | ForEach-Object { $_.Message }) -join ' ') -match 'Loopback') ($wlo.Body)
     $wto = & $diagPlan @{ type = 'lan'; host = '192.0.2.10'; port = 80; protocol = 'http' }
     Test-Condition 'diagnosis: a backend that never answers is reported as a timeout' ((@($wto.Data.notes) -join ' ') -match 'No answer from 192\.0\.2\.10:80 within') ($wto.Body)
+    Test-Condition 'readiness: the preview carries the verdict (Timeout) and asks for an acknowledgment before saving a failing backend' ($wto.Data.backend.result -eq 'timeout' -and $wto.Data.needsBackendAck) ($wto.Body)
+
+    # Automatic backend selection (POST /api/services/backend), verified from Traefik's network.
+    $rb = Invoke-WebUi $ui POST '/api/services/backend' @{ location = 'docker'; address = $app1; hostname = 'pick.example.test'; test = $true }
+    Test-Condition 'resolver: a container on the shared network -> its name and internal port, verified from Traefik''s network' ($rb.Status -eq 200 -and $rb.Data.resolution.recommended.url -eq "http://${app1}:80" -and $rb.Data.verification.result -eq 'verified' -and $rb.Data.verification.state -eq 'ok' -and $rb.Data.traefikYaml -match [regex]::Escape("http://${app1}:80")) ($rb.Body)
+    Test-Condition 'resolver: Docker Desktop is recognised and host.docker.internal is verified inside this Traefik' ($rb.Data.environment.adapter.id -eq 'docker-desktop' -and $rb.Data.environment.hostGatewayVerified -eq $true -and @($rb.Data.environment.traefikNetworks) -contains $network) ($rb.Data.environment | ConvertTo-Json -Compress -Depth 4)
+    $rpub = Invoke-WebUi $ui POST '/api/services/backend' @{ location = 'this-computer'; address = "http://127.0.0.1:$pubPort/"; test = $true }
+    Test-Condition 'resolver: a Windows address whose port a container publishes -> that container by name, verified' ($rpub.Data.resolution.recommended.url -eq "http://${app1}:80" -and @($rpub.Data.resolution.guidance | Where-Object { $_.id -eq 'published-by-container' }).Count -eq 1 -and $rpub.Data.verification.result -eq 'verified') ($rpub.Body)
+    $freePort = Get-FreeTcpPort
+    $rwin = Invoke-WebUi $ui POST '/api/services/backend' @{ location = 'this-computer'; address = "127.0.0.1:$freePort"; test = $true }
+    Test-Condition 'resolver: a Windows-hosted app typed as 127.0.0.1 -> host.docker.internal with "Use the Docker host address instead"; nothing listening is not green' ($rwin.Data.resolution.suggested.url -eq "http://host.docker.internal:$freePort" -and @($rwin.Data.resolution.guidance | Where-Object { $_.title -eq 'Use the Docker host address instead' }).Count -eq 1 -and $rwin.Data.verification.state -eq 'failed' -and $rwin.Data.verification.result -in 'refused', 'timeout') ($rwin.Body)
+    $rlan = Invoke-WebUi $ui POST '/api/services/backend' @{ location = 'lan'; address = '192.0.2.44:32400' }
+    Test-Condition 'resolver: another LAN device is kept as typed, without a local-host warning' ($rlan.Data.resolution.recommended.url -eq 'http://192.0.2.44:32400' -and -not @($rlan.Data.resolution.guidance | Where-Object { $_.id -in 'loopback', 'own-lan-ip' }).Count) ($rlan.Body)
+    $roth = Invoke-WebUi $ui POST '/api/services/backend' @{ location = 'docker'; address = $app2 }
+    Test-Condition 'resolver: a container on another network gets the options (its compose attachment), not a silent pick' (@($roth.Data.resolution.candidates | Where-Object { $_.action -eq 'attach' }).Count -eq 1 -and @($roth.Data.resolution.guidance | Where-Object { $_.id -eq 'not-shared' }).Count -eq 1) ($roth.Body)
+
+    # Readiness: applying a route whose backend fails needs an explicit acknowledgment; the plan stays valid meanwhile.
+    $gp = Invoke-WebUi $ui POST '/api/services/plan' @{ op = 'add'; name = 'gate'; service = @{ name = 'gate'; hostnames = @('gate.example.test'); target = @{ type = 'lan'; host = '192.0.2.10'; port = 80; protocol = 'http' }; cloudflare = @{ publish = $false; access = $false } }; cloudflare = @{ automate = $false } }
+    $ga = Invoke-WebUi $ui POST '/api/services/apply' @{ planId = $gp.Data.planId; confirm = $true }
+    $gExists = Test-Path -LiteralPath (Join-Path $installPath 'traefik\dynamic\svc-gate.yml')
+    $gb = Invoke-WebUi $ui POST '/api/services/apply' @{ planId = $gp.Data.planId; confirm = $true; acceptUnverifiedBackend = $true }
+    Test-Condition 'readiness: a failing backend is not saved without acknowledgment (409, nothing written); with it, saved and reported as not ready' ($ga.Status -eq 409 -and $ga.Data.needsBackendAck -and -not $gExists -and $gb.Status -eq 200 -and @($gb.Data.steps | Where-Object { $_.name -eq 'Backend reachable from Traefik' -and $_.status -eq 'Warning' -and $_.message -match 'Timeout' }).Count -eq 1) "$($ga.Status) $($ga.Body) | $($gb.Body)"
+    $null = Invoke-WebUiChange $ui @{ op = 'remove'; name = 'gate'; cloudflare = @{ automate = $false } }
 
     # Recreating a container keeps its shared-network membership only when its compose file declares the network.
     $composeDir = Join-Path $work 'composed'; New-Item -ItemType Directory -Force -Path $composeDir | Out-Null

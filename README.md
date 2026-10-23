@@ -387,6 +387,34 @@ bodies are capped at 100 MB on Free/Pro. For Plex, prefer Plex's own Remote Acce
 (Cloudflare WARP / Cloudflare One, a VPN) for streaming, and use the tunnel at most for light web access behind
 Cloudflare Access. The remaining Cloudflare steps for the hostname are the same as for any service (below).
 
+### Backend addresses: "Where is your application running?"
+
+The Add Service and Edit Service forms start with one question: **in a Docker container**, **on this computer**, or
+**on another computer or device on my network**. The manager then proposes the address Traefik must use from
+*inside* its container (`lib\BackendResolver.psm1`, `POST /api/services/backend`) and tests it from Traefik's own
+network before anything is saved:
+
+| You run or type | Traefik uses | Why |
+| --- | --- | --- |
+| A container on the shared network (`uptime-kuma`) | `http://uptime-kuma:3001` | Docker DNS name and the port *inside* the container |
+| A Windows app, typed as `127.0.0.1:4119` or `localhost:4119` | `http://host.docker.internal:4119` | Inside Traefik, 127.0.0.1 is Traefik itself |
+| A Windows app, typed as this PC's LAN address (`10.10.0.11:4119`) | `http://host.docker.internal:4119` | Does not depend on Docker routing to the LAN (a Docker network on the same subnet would capture it) |
+| A Windows port that a container publishes (`127.0.0.1:3010`) | `http://homepage:3000` | The container is reached directly, by name and internal port |
+| Another device (`10.10.0.8:32800`, `nas.home.arpa`) | As typed | Never replaced by `host.docker.internal`; a Docker subnet that captures it is reported |
+| A container on another network | Options: its published port through the host gateway, or a Compose network attachment | Shown as choices, never picked silently; databases and caches are never offered |
+
+When the recommendation corrects what you typed, the form explains it and offers **Use recommended address**; a
+deliberate custom address (Advanced) is kept once it passes the test. Editing an existing service keeps its saved
+backend until you choose another one. On native Linux, Podman or Unraid, `host.docker.internal` is recommended only
+after it is verified to resolve inside Traefik (add `extra_hosts: ['host.docker.internal:host-gateway']` to the
+Traefik service otherwise).
+
+The connection test is the readiness check. It runs during the preview and again immediately before applying, and
+names the result: *Verified reachable*, *Reachable, authentication required*, *Application redirect*, *Wrong
+protocol*, *Wrong port*, *DNS resolution failure*, *Connection refused*, *Timeout*, *Hostname rejected*, *TLS
+verification failure*, *Application error* or *Not tested*. A route whose backend fails is saved only after an
+explicit "Save the route anyway", and is never shown as healthy.
+
 ### Target notes
 
 - **docker:** attach only the app's web-facing container to the shared network: `docker network connect proxy
@@ -508,6 +536,9 @@ container on this PC already uses.
 .\tests\Test-Routing.ps1                # request-path diagnosis rules (no Docker): first failing hop, container vs Windows
                                         # localhost, LAN subnets captured by Docker, wrong port/protocol, timeouts, tunnel
                                         # route mismatches, Access login ("authentication required", never "passed")
+.\tests\Test-BackendResolver.ps1        # backend address selection (no Docker): 127.0.0.1 / this PC's LAN IP -> host gateway,
+                                        # containers (shared, several, no shared network, private), LAN devices, overlapping
+                                        # subnets, native Linux / Podman / Unraid, overrides; connection-test classification
 .\tests\Test-Projects.ps1               # launcher (single-use link, duplicate start, ports, stop, START-HERE.cmd), discovery,
                                         # attach without changes, recent projects, upgrade preview/apply, browser;
                                         # -LiveReadOnly also inspects %USERPROFILE%\.docker\projects\traefik-proxy read-only

@@ -232,7 +232,7 @@
       : h('p', { class: 'small' }, 'No failing hop among the checks performed.'),
     h('p', { class: 'small muted' }, `${r.performed} of ${r.total} checks performed · ${String(r.checkedAt).replace('T', ' ')}. Grey checks were not performed; they are never counted as passed. A lock means a login page answered: reachable, but signing in was not tested.`),
     h('ol', { class: 'checks health-path' }, ORDER.map((id) => arr(r.checks).find((x) => x.id === id)).filter(Boolean).map((x) =>
-      checkItem(healthTone(x.state), `${x.label}${x.performed ? '' : ' (not checked)'}`, x.message))));
+      checkItem(healthTone(x.state), `${x.label}${x.resultLabel ? ` · ${x.resultLabel}` : ''}${x.performed ? '' : ' (not checked)'}`, x.message))));
   P.serviceHealth = async (host, name, opts = {}) => {
     fill(host, h('p', { class: 'muted' }, 'Checking the request path…'));
     try {

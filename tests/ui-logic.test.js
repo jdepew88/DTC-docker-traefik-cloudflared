@@ -159,5 +159,57 @@ test('explorer: the first failing component in path order blocks the rest', () =
   assert.strictEqual(L.firstBlocked([mk('a', { running: true }), mk('b', { running: false }, false), mk('c', { running: false }), mk('d', { running: false })], order), 2);
 });
 
+test('backend: where the app runs, from a saved target type', () => {
+  assert.deepStrictEqual(L.WHERE, ['docker', 'this-computer', 'lan']);
+  assert.strictEqual(L.whereFromTargetType('docker'), 'docker');
+  assert.strictEqual(L.whereFromTargetType('host'), 'this-computer');
+  assert.strictEqual(L.whereFromTargetType('lan'), 'lan');
+});
+
+test('backend: pasted addresses are parsed; loopback is recognised', () => {
+  assert.deepStrictEqual(L.parseBackendAddress('http://127.0.0.1:4119/'), { scheme: 'http', host: '127.0.0.1', port: 4119 });
+  assert.deepStrictEqual(L.parseBackendAddress('4119'), { scheme: '', host: '', port: 4119 });
+  assert.deepStrictEqual(L.parseBackendAddress('NAS.local'), { scheme: '', host: 'nas.local', port: 0 });
+  assert.ok(L.isLoopbackHost('localhost') && L.isLoopbackHost('127.0.0.1') && !L.isLoopbackHost('10.10.0.11'));
+});
+
+test('backend: a clear suggestion is filled in; a correction of what was typed waits for "Use recommended address"', () => {
+  const rec = { type: 'host', host: 'host.docker.internal', port: 4119, protocol: 'http' };
+  const auto = L.chooseBackend({}, { suggested: rec, recommended: rec, guidance: [], candidates: [rec] });
+  assert.strictEqual(auto.source, 'auto'); assert.ok(L.sameTarget(auto.target, rec));
+  const loop = L.chooseBackend({}, { suggested: rec, recommended: rec, guidance: [{ id: 'loopback', action: 'use-recommended' }], candidates: [rec] });
+  assert.strictEqual(loop.target, null); assert.ok(loop.needsChoice);
+});
+
+test('backend: ambiguous paths are offered, never picked silently', () => {
+  const a = { type: 'host', host: 'host.docker.internal', port: 8088 }; const b = { type: 'docker', host: 'isolated', port: 80 };
+  const r = L.chooseBackend({}, { suggested: a, recommended: a, ambiguous: true, guidance: [], candidates: [a, b] });
+  assert.strictEqual(r.target, null); assert.ok(r.needsChoice);
+});
+
+test('backend: an existing service keeps its saved backend; a chosen one and an override are kept', () => {
+  const saved = { type: 'lan', host: '10.10.0.11', port: 4119 };
+  const rec = { type: 'host', host: 'host.docker.internal', port: 4119 };
+  assert.ok(L.sameTarget(L.chooseBackend({ source: 'existing', target: saved }, { suggested: rec, recommended: rec, guidance: [] }).target, saved));
+  assert.ok(L.sameTarget(L.chooseBackend({ source: 'chosen', target: rec }, { suggested: saved, recommended: saved, guidance: [] }).target, rec));
+  const ov = { type: 'lan', host: '10.20.0.5', port: 8080 };
+  const r = L.chooseBackend({ override: true }, { override: true, recommended: ov, suggested: rec, guidance: [] });
+  assert.strictEqual(r.source, 'override'); assert.ok(L.sameTarget(r.target, ov));
+});
+
+test('backend: a dismissed notice stays hidden until its condition changes; errors always show', () => {
+  const g = [{ id: 'loopback', severity: 'warn', condition: 'loopback|127.0.0.1|4119' }, { id: 'subnet-overlap', severity: 'error', condition: 'x' }];
+  assert.strictEqual(L.visibleGuidance(g, { 'loopback|127.0.0.1|4119': true, x: true }).length, 1);
+  assert.strictEqual(L.visibleGuidance([{ id: 'loopback', severity: 'warn', condition: 'loopback|127.0.0.1|4120' }], { 'loopback|127.0.0.1|4119': true }).length, 1);
+});
+
+test('backend: status tones - green only for an application answer; a login is "auth"; untested is neutral', () => {
+  assert.strictEqual(L.backendStatus(null).label, 'Not tested');
+  assert.strictEqual(L.backendStatus({ state: 'ok', result: 'verified', label: 'Verified reachable' }).tone, 'ok');
+  assert.strictEqual(L.backendStatus({ state: 'auth', result: 'auth', label: 'x' }).tone, 'auth');
+  assert.strictEqual(L.backendStatus({ state: 'failed', result: 'host-rejected', label: 'Hostname rejected' }).tone, 'err');
+  assert.strictEqual(L.backendStatus({ state: 'warning', result: 'unavailable', label: 'x' }).tone, 'warn');
+});
+
 console.log(`\n${passed} passed, ${failures.length} failed`);
 process.exit(failures.length ? 1 : 0);

@@ -542,3 +542,16 @@ dialog::backdrop { background: rgba(5, 8, 12, .65); }
   .kv dd { margin-bottom: .35rem; }
   .dialog-foot .grow { flex-basis: 100%; }
 }
+
+/* Backend selection in the service form: where the app runs, the address Traefik uses, the connection test. */
+.chip.auth { color: var(--accent); background: var(--accent-soft); border-color: color-mix(in srgb, var(--accent) 35%, transparent); }
+.backend-box { border: 1px solid var(--border); border-radius: var(--radius-sm); padding: .75rem .9rem; margin: .2rem 0 1rem; min-width: 0; }
+.backend-box h3 { margin: 0 0 .4rem; font-size: 1rem; display: flex; align-items: center; gap: .4rem; }
+.backend-box h4 { margin: .8rem 0 .3rem; font-size: .92rem; }
+.backend-box .mono, .backend-box code { overflow-wrap: anywhere; }
+.backend-box .actions { display: flex; flex-wrap: wrap; gap: .45rem; margin-top: .4rem; }
+.backend-box .guidance .actions { margin-top: .5rem; }
+.backend-box .cand-list { border: 0; padding: 0; margin: .4rem 0 .6rem; display: grid; gap: .5rem; }
+.backend-box .cand-list legend { font-weight: 600; margin-bottom: .35rem; padding: 0; }
+.backend-box .diag { border-top: 1px dashed var(--border); margin-top: .7rem; padding-top: .3rem; }
+.plan-backend p { overflow-wrap: anywhere; }

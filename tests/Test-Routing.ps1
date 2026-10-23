@@ -49,9 +49,12 @@ Test-Condition 'routed: 502 / 504 / timeout fail at the backend' ((ConvertFrom-R
 Test-Condition 'routed: 401 through Traefik is "authentication required"' ((ConvertFrom-RoutedStatus 401 '' '' 'a')[0] -eq 'auth') ''
 Test-Condition 'routed: Homepage''s host validation through Traefik fails' ((ConvertFrom-RoutedStatus 400 '{"error":"Host validation failed. See logs for more details."}' '' 'home.example.com')[0] -eq 'failed') ''
 $int = ConvertFrom-RoutedStatus 302 '' '' 'app.example.com' 'http://homepage:3000/login'
-$ext = ConvertFrom-RoutedStatus 302 '' '' 'app.example.com' 'https://app.example.com/login'
-$rel = ConvertFrom-RoutedStatus 302 '' '' 'app.example.com' '/login?next=/'
+$ext = ConvertFrom-RoutedStatus 302 '' '' 'app.example.com' 'https://app.example.com/home'
+$rel = ConvertFrom-RoutedStatus 302 '' '' 'app.example.com' '/dashboard'
 Test-Condition 'routed: a redirect to an internal address (container name / port) is a warning; to the public host or a path it passes' ($int[0] -eq 'warning' -and $int[1] -match 'internal address' -and $ext[0] -eq 'ok' -and $rel[0] -eq 'ok') "$($int -join ' ') | $($ext -join ' ')"
+$lg = ConvertFrom-RoutedStatus 302 '' '' 'app.example.com' '/login?next=/'
+$lgx = ConvertFrom-RoutedStatus 302 '' '' 'app.example.com' 'https://app.example.com/login'
+Test-Condition 'routed: a redirect to the app''s own login page is "authentication required", not passed' ($lg[0] -eq 'auth' -and $lg[1] -match 'login page' -and $lgx[0] -eq 'auth') ($lg -join ' ')
 
 # --- Windows localhost, Docker Desktop host address, LAN subnet capture -----------------------------------------------------
 $lo = @(Get-LanTargetIssues '127.0.0.1')

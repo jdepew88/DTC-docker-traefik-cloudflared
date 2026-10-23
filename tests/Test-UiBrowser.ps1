@@ -295,13 +295,20 @@ try {
     $null = Js "__t.set('#svc-sub', 'movies'); __t.set('#svc-display', 'Notflix HD'); true"
     $s2 = [string](Js "document.querySelector('#svc-sub').value"); $disp = [string](Js "document.querySelector('#svc-display').value")
     Test-Condition 'services: subdomain suggested from the display name; a manual subdomain survives later name changes' ($s1 -eq 'notflix' -and $s2 -eq 'movies' -and $disp -eq 'Notflix HD') "$s1 $s2 $disp"
-    $null = Js "__t.set('#svc-sub', 'movies'); document.querySelector('[aria-label=Domain]').value='example.test'; document.querySelector('[aria-label=Domain]').dispatchEvent(new Event('input', {bubbles:true})); __t.set('#svc-host', '10.99.0.5'); __t.set('#svc-port', '4119'); document.querySelector('input[name=svc-kind][value=lan]').click(); true"
-    Start-Sleep -Milliseconds 300; Prepare-Page
-    $null = Js "__t.set('#svc-host', '10.99.0.5'); __t.set('#svc-port', '4119'); document.querySelector('#svc-display').closest('form').requestSubmit(); true"
-    $ok = Wait-PageCondition $cdp "document.querySelector('#plan-dialog').open && document.querySelector('#plan-title').textContent.includes('notflix')" 60; Prepare-Page
+    # Where is your application running? Another device: its address is kept as typed, without a local-host warning.
+    Test-Condition 'wizard: "Where is your application running?" offers a Docker container, this computer and another device' ([int](Js "document.querySelectorAll('input[name=svc-where]').length") -eq 3 -and [string](Js "document.querySelector('[role=radiogroup][aria-label=\'Where is your application running?\']') ? 'yes' : ''") -eq 'yes') ''
+    $null = Js "document.querySelector('input[name=svc-where][value=lan]').click(); true"
+    $null = Wait-PageCondition $cdp "document.querySelector('#svc-address')" 10; Prepare-Page
+    $null = Js "__t.set('#svc-sub', 'movies'); document.querySelector('[aria-label=Domain]').value='example.test'; document.querySelector('[aria-label=Domain]').dispatchEvent(new Event('input', {bubbles:true})); __t.set('#svc-address', '10.99.0.5'); __t.set('#svc-port', '4119'); true"
+    $ok = Wait-PageCondition $cdp "document.querySelector('#svc-backend').innerText.includes('http://10.99.0.5:4119')" 60; Prepare-Page
+    Test-Condition 'wizard: another device keeps its own address (10.99.0.5:4119) with no local-host warning' ($ok -and -not [bool](Js "!!document.querySelector('[data-guidance=loopback], [data-guidance=own-lan-ip]')")) ([string](Js "document.querySelector('#svc-backend').innerText"))
+    $null = Js "document.querySelector('#svc-display').closest('form').requestSubmit(); true"
+    $ok = Wait-PageCondition $cdp "document.querySelector('#plan-dialog').open && document.querySelector('#plan-title').textContent.includes('notflix')" 90; Prepare-Page
     Test-Condition 'services: Preview opens the change dialog (Traefik diff, nothing applied yet)' ($ok -and -not (Test-Path -LiteralPath (Join-Path $pathB 'traefik\dynamic\svc-notflix.yml'))) ([string](Js "document.querySelector('#plan-title').textContent"))
+    $planText = [string](Js "document.querySelector('#plan-content').innerText")
+    Test-Condition 'preview: the connection test from Traefik is shown; a backend that does not answer is not green and needs an explicit "Save the route anyway"' ($planText -match 'Connection test from Traefik' -and $planText -match 'Timeout' -and [bool](Js "!!document.querySelector('#plan-backend-ack')") -and [bool](Js "(() => { document.querySelector('#plan-reviewed').click(); const b = __t.btn('Apply changes', document.querySelector('#plan-dialog')); const d = b.disabled; document.querySelector('#plan-reviewed').click(); return d; })()")) $planText.Substring(0, [Math]::Min(600, $planText.Length))
     Shot 'services-preview-1366'
-    $null = Js "document.querySelector('#plan-reviewed').click(); __t.click('Apply changes', document.querySelector('#plan-dialog')); true"
+    $null = Js "document.querySelector('#plan-reviewed').click(); document.querySelector('#plan-backend-ack').click(); __t.click('Apply changes', document.querySelector('#plan-dialog')); true"
     $ok = Wait-PageCondition $cdp "document.querySelector('#plan-title').textContent.includes('Changes applied')" 120
     $null = Js "document.querySelector('#plan-dialog').close(); true"
     Go 'services' "document.querySelector('tbody tr')"; Prepare-Page
@@ -309,6 +316,67 @@ try {
     Test-Condition 'services: applied; the list shows the display name and the manual hostname' ($ok -and $row -match 'Notflix HD' -and $row -match 'movies\.example\.test') $row
     $reg = Get-Content -Raw (Join-Path $pathB 'config\services.json') | ConvertFrom-Json
     Test-Condition 'services: registry keeps id (from the name), display name and the manual hostname separately' ($reg.services[0].name -eq 'notflix-hd' -and $reg.services[0].displayName -eq 'Notflix HD' -and $reg.services[0].hostnames[0] -eq 'movies.example.test') ($reg | ConvertTo-Json -Depth 5 -Compress)
+
+    # Edit Service: the saved backend is kept and shown; the location question is preselected.
+    $null = Js "__t.click('Edit', document.querySelector('tbody tr')); true"
+    $ok = Wait-PageCondition $cdp "document.querySelector('#svc-backend') && document.querySelector('#svc-backend').innerText.includes('10.99.0.5')" 60; Prepare-Page
+    Test-Condition 'edit service: "another device" preselected, the saved backend 10.99.0.5:4119 kept' ($ok -and [bool](Js "document.querySelector('input[name=svc-where][value=lan]').checked") -and [string](Js "document.querySelector('#svc-address').value") -eq '10.99.0.5') ([string](Js "document.querySelector('#svc-backend').innerText"))
+    Shot 'services-edit-1366'
+
+    # A Windows app typed as 127.0.0.1: contextual guidance, "Use recommended address", a real connection test.
+    $winPort = Get-FreeTcpPort
+    Go 'services/add' "document.querySelector('#svc-backend')"
+    $null = Js "__t.set('#svc-display', 'Win App'); document.querySelector('input[name=svc-where][value=this-computer]').click(); true"
+    $null = Wait-PageCondition $cdp "document.querySelector('#svc-address')" 10; Prepare-Page
+    $null = Js "__t.set('#svc-address', '127.0.0.1:$winPort'); true"
+    $ok = Wait-PageCondition $cdp "document.querySelector('[data-guidance=loopback]')" 60; Prepare-Page
+    $gText = [string](Js "document.querySelector('[data-guidance=loopback]').innerText")
+    Test-Condition 'guidance: 127.0.0.1 shows "Use the Docker host address instead" and recommends host.docker.internal' ($ok -and $gText -match 'Use the Docker host address instead' -and $gText -match 'its own container' -and $gText -match "host\.docker\.internal:$winPort") $gText
+    Shot 'services-add-guidance-1366'
+    $null = Js "__t.click('Use recommended address', document.querySelector('[data-guidance=loopback]')); true"
+    $ok = Wait-PageCondition $cdp "!document.querySelector('[data-guidance=loopback]') && /Connection refused|Timeout/.test(document.querySelector('#svc-backend').innerText)" 60; Prepare-Page
+    $bText = [string](Js "document.querySelector('#svc-backend').innerText")
+    Test-Condition 'guidance: "Use recommended address" sets host.docker.internal, hides the settled notice and tests it from Traefik (nothing listens: not green)' ($ok -and $bText -match "http://host\.docker\.internal:$winPort" -and $bText -notmatch 'Verified reachable') $bText
+    Test-Condition 'wizard: Test connection and View diagnostic details are named buttons' ([bool](Js "!!__t.btn('Test connection', document.querySelector('#svc-backend')) && !!__t.btn('View diagnostic details', document.querySelector('#svc-backend'))")) ''
+    # Detail levels: Beginner gets a plain sentence; Advanced a custom address; Expert the exact configuration.
+    $null = Js "TPMUI.setLevel('beginner'); true"; Start-Sleep -Milliseconds 300
+    $begin = [string](Js "document.querySelector('#svc-backend').innerText")
+    Test-Condition 'beginner: the backend is explained in plain language; Docker networks and subnets are hidden' ($begin -match "through Docker's host address" -and $begin -notmatch 'Recommended backend' -and -not (Js "__t.visible('#svc-custom')")) $begin
+    $null = Js "TPMUI.setLevel('intermediate'); true"; Start-Sleep -Milliseconds 300
+    $mid = [string](Js "document.querySelector('#svc-backend').innerText")
+    Test-Condition 'intermediate: recommended backend, application port, connection type and status' ($mid -match 'Recommended backend' -and $mid -match 'Application port' -and $mid -match 'Connection type' -and $mid -match 'Connection status' -and -not (Js "__t.visible('#svc-custom')")) $mid
+    $null = Js "TPMUI.setLevel('advanced'); true"; Start-Sleep -Milliseconds 300
+    $null = Js "__t.click('View diagnostic details', document.querySelector('#svc-backend')); true"; Start-Sleep -Milliseconds 300
+    $adv = [string](Js "document.querySelector('#svc-backend').innerText")
+    Test-Condition 'advanced: protocol, custom backend address, host gateway and networks are shown' ((Js "__t.visible('#svc-custom')") -and (Js "__t.visible('#svc-protocol')") -and $adv -match 'Host gateway' -and $adv -match "Traefik's networks") $adv
+    $null = Js "TPMUI.setLevel('expert'); true"; Start-Sleep -Milliseconds 300
+    $exp = [string](Js "document.querySelector('#svc-backend').innerText")
+    Test-Condition 'expert: exact URL, network identities and subnets, generated Traefik service, redacted test output' ($exp -match 'Exact backend URL' -and $exp -match 'Docker subnets' -and $exp -match 'Network identities' -and $exp -match 'Generated Traefik service' -and $exp -match 'Connection test output') $exp.Substring(0, [Math]::Min(500, $exp.Length))
+    Shot 'services-add-expert-1366'
+    # A deliberate override (Advanced) survives other changes; protocol choices are not replaced by recommendations.
+    $null = Js "TPMUI.setLevel('advanced'); document.querySelector('#svc-custom').closest('.field').querySelector('input[type=checkbox]').click(); true"; Start-Sleep -Milliseconds 200
+    $null = Js "__t.set('#svc-custom', 'http://192.0.2.77:8080'); true"
+    $ok = Wait-PageCondition $cdp "document.querySelector('#svc-backend').innerText.includes('192.0.2.77:8080')" 60
+    $null = Js "__t.set('#svc-display', 'Win App 2'); true"; Start-Sleep -Milliseconds 1200
+    Test-Condition 'override: a custom backend address is kept as typed, also after other fields change' ($ok -and [string](Js "document.querySelector('#svc-backend').innerText") -match '192\.0\.2\.77:8080') ([string](Js "document.querySelector('#svc-backend').innerText"))
+    $null = Js "TPMUI.setLevel('intermediate'); true"
+    # A Docker container on the shared network: chosen from the list, verified as reachable.
+    $whoImage = ((Invoke-Docker ps --filter "name=$stackB" --format '{{.Image}}').Output | Where-Object { $_ -match 'whoami' } | Select-Object -First 1)
+    if ($whoImage) {
+      $null = Invoke-Docker run -d --name "$stackB-uiapp" --network "$stackB-proxy" --label 'org.traefik-proxy.test=1' $whoImage
+      Go 'services/add' "document.querySelector('#svc-backend')"
+      $null = Wait-PageCondition $cdp "[...document.querySelectorAll('#svc-container option')].some((o) => o.value === '$stackB-uiapp')" 60; Prepare-Page
+      $null = Js "__t.set('#svc-display', 'UI App'); __t.set('#svc-container', '$stackB-uiapp'); true"
+      $ok = Wait-PageCondition $cdp "document.querySelector('#svc-backend').innerText.includes('http://$stackB-uiapp:80')" 60
+      $null = Js "__t.click('Test connection', document.querySelector('#svc-backend')); true"
+      $ok2 = Wait-PageCondition $cdp "document.querySelector('#svc-backend').innerText.includes('Verified reachable')" 60
+      Test-Condition 'docker container: chosen from the list -> its DNS name and internal port, verified reachable from Traefik' ($ok -and $ok2) ([string](Js "document.querySelector('#svc-backend').innerText"))
+      Shot 'services-add-docker-1366'
+      Set-Viewport $cdp 390 844 -Mobile; Start-Sleep -Milliseconds 600; Shot 'services-add-docker-phone-390'
+      Set-Viewport $cdp 820 1000; Start-Sleep -Milliseconds 600; Shot 'services-add-docker-tablet-820'
+      Set-Viewport $cdp 1366 900
+    } else { Add-Result 'SKIP' 'docker container in the wizard' 'no whoami image in the disposable instance' }
+    Check-Layout 'services/add' "document.querySelector('#svc-backend') && document.querySelector('input[name=svc-where]')"
     Check-Layout 'overview' "document.querySelector('.tiles')"
     Check-Layout 'services' "document.querySelector('tbody tr')"
     Check-Layout 'cloudflare' "document.querySelector('main').innerText.includes('API token')"
@@ -333,6 +401,7 @@ try {
   Add-Result 'FAIL' 'browser test run' ($_.Exception.Message + ' ' + $_.ScriptStackTrace)
 } finally {
   Stop-EdgeSession $cdp
+  $null = Invoke-Docker rm -f "$stackB-uiapp"
   if ($installedB) {
     $null = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $repo 'install.ps1') -InstallPath $pathB -Stop 2>&1
     $null = Invoke-Docker network rm "$stackB-proxy"

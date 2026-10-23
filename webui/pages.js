@@ -133,14 +133,15 @@
     const sv = view ? view.service : null;
     const zones = s.zones.map((z) => z.name);
     const first = sv && arr(sv.hostnames).length ? L.splitHostname(sv.hostnames[0], zones) : { sub: '', domain: zones[0] || '' };
-    const kind = sv ? sv.target.type : 'docker';
     const f = s.forms.svc = {
       editing: sv ? sv.name : null, display: sv ? (sv.displayName || sv.name) : '', id: sv ? sv.name : '', sub: { value: first.sub, custom: !!sv },
-      domain: first.domain, kind, host: sv ? sv.target.host : '', port: sv ? String(sv.target.port) : '', protocol: sv ? sv.target.protocol : 'http',
+      domain: first.domain,
       exposure: sv ? (!sv.cloudflare.publish ? 'local' : sv.cloudflare.access ? 'access' : 'public') : (cfReady(s.setup) ? 'access' : 'local'),
       emails: s.setup.contactEmail || '', path: sv ? sv.pathPrefix : '', strip: sv ? !!sv.stripPrefix : false, extra: sv ? arr(sv.hostnames).slice(1).join(', ') : '',
       tls: sv ? !!sv.target.tlsSkipVerify : false, middlewares: sv ? arr(sv.middlewares) : ['default-headers@file'], enabled: sv ? !!sv.enabled : true, description: sv ? sv.description : '',
     };
+    P.initBackendState(f, sv);
+    f.hostname = sv ? arr(sv.hostnames)[0] : '';
     renderForm(ctx);
     const host = $('#service-form-host'); if (host) host.scrollIntoView({ block: 'start', behavior: 'smooth' });
   }
@@ -149,7 +150,6 @@
     const s = ctx.state; const f = s.forms.svc; const host = $('#service-form-host');
     if (!host || !f) return;
     const zones = s.zones.map((z) => z.name);
-    const net = s.status.instance.proxyNetwork;
     const display = h('input', { value: f.display, autocomplete: 'off', placeholder: 'Notflix', maxlength: '60' });
     const subTag = h('span', { class: 'auto-tag' }, f.sub.custom ? 'edited' : 'automatic');
     const sub = h('input', { value: f.sub.value, autocomplete: 'off', spellcheck: 'false', placeholder: 'notflix' });
@@ -157,7 +157,7 @@
     const domain = zones.length ? h('select', { 'aria-label': 'Domain' }, zones.map((z) => h('option', { value: z, selected: z === f.domain }, z)))
       : h('input', { value: f.domain, placeholder: 'example.com', 'aria-label': 'Domain', spellcheck: 'false' });
     const idInput = h('input', { value: f.id, autocomplete: 'off', spellcheck: 'false', disabled: !!f.editing });
-    const sync = () => { preview.textContent = `https://${L.joinHostname(f.sub.value, f.domain)}${f.path || ''}`; subTag.textContent = f.sub.custom ? 'edited' : 'automatic'; };
+    const sync = () => { f.hostname = L.joinHostname(f.sub.value, f.domain); preview.textContent = `https://${f.hostname}${f.path || ''}`; subTag.textContent = f.sub.custom ? 'edited' : 'automatic'; };
     display.addEventListener('input', () => {
       f.display = display.value;
       if (!f.editing) { f.sub = L.autoNameFromSource(f.sub, f.display); sub.value = f.sub.value; if (!f.idCustom) { f.id = L.suggestServiceName(f.display); idInput.value = f.id; } }
@@ -166,19 +166,10 @@
     sub.addEventListener('input', () => { f.sub = L.autoNameEdit(f.sub, sub.value, f.display); sync(); });
     domain.addEventListener(zones.length ? 'change' : 'input', () => { f.domain = domain.value.trim().toLowerCase(); sync(); });
     idInput.addEventListener('input', () => { f.id = idInput.value.trim().toLowerCase(); f.idCustom = true; });
-    const kinds = h('div', { class: 'choice-cards', role: 'radiogroup', 'aria-label': 'Where does it run?' }, Object.entries(KINDS).map(([k, [title, ic, text]]) =>
-      h('label', { class: 'choice', 'data-min-level': k === 'other' ? 'advanced' : null }, h('input', { type: 'radio', name: 'svc-kind', value: k, checked: f.kind === k, onchange: () => { f.kind = k; if (k === 'host') f.host = 'host.docker.internal'; renderForm(ctx); } }),
-        h('strong', null, icon(ic), ' ', title), h('span', { class: 'small muted' }, k === 'docker' ? `Attached to '${net}': reached by its container name.` : text))));
-    const hostInput = h('input', { value: f.kind === 'host' ? 'host.docker.internal' : f.host, disabled: f.kind === 'host', autocomplete: 'off', spellcheck: 'false', placeholder: f.kind === 'docker' ? 'uptime-kuma' : '10.10.0.11' });
-    hostInput.addEventListener('input', () => { f.host = hostInput.value.trim(); });
-    const port = h('input', { value: f.port, inputmode: 'numeric', placeholder: f.kind === 'docker' ? '3001' : '4119', autocomplete: 'off' });
-    port.addEventListener('input', () => { f.port = port.value.trim(); });
-    const protocol = h('select', null, [['http', 'http'], ['https', 'https'], ['h2c', 'h2c (gRPC, cleartext)']].map(([v, t]) => h('option', { value: v, selected: f.protocol === v }, t)));
-    protocol.addEventListener('change', () => { f.protocol = protocol.value; renderForm(ctx); });
-    const hostHint = { docker: `The container must be attached to the '${net}' network; use the port the app listens on inside the container (e.g. http://uptime-kuma:3001).`,
-      host: 'The app must listen on all interfaces (0.0.0.0), not only 127.0.0.1, and Windows Firewall must allow the port from Docker Desktop.',
-      lan: 'An IP address (e.g. 10.10.0.11) or DNS name that this PC can reach.',
-      other: 'An address Traefik can reach through routing. Attaching the container to the shared network is simpler and keeps working when its IP changes.' }[f.kind];
+    // Where the app runs and the backend Traefik uses (backend.js): resolved by the server, verified from Traefik's network.
+    const backend = P.backendSection(ctx, f, { onContainers: () => renderForm(ctx), onTarget: () => { tlsRow.hidden = f.protocol !== 'https'; } });
+    const backendInputs = P.backendInputs(ctx, f, backend, () => renderForm(ctx));
+    const hostHint = f.where === 'this-computer' ? h('p', { class: 'hint', 'data-min-level': 'intermediate' }, 'The app must listen on all interfaces (0.0.0.0), not only 127.0.0.1, and Windows Firewall must allow the port from Docker Desktop.') : null;
     const ready = cfReady(s.setup);
     const exposure = h('div', { class: 'choice-cards', role: 'radiogroup', 'aria-label': 'Who can reach it?' },
       [['access', 'Internet, Cloudflare Access login', 'Recommended: only the emails you allow can sign in.', !ready],
@@ -195,6 +186,8 @@
     const desc = h('input', { value: f.description, maxlength: '200' });
     desc.addEventListener('input', () => { f.description = desc.value; });
     const cb = (key, label) => { const b = h('input', { type: 'checkbox', checked: f[key] }); b.addEventListener('change', () => { f[key] = b.checked; }); return h('label', { class: 'check' }, b, h('span', null, label)); };
+    const tlsRow = cb('tls', 'Skip certificate verification to the app (self-signed devices on a trusted LAN only)');
+    tlsRow.hidden = f.protocol !== 'https';
     const mws = Array.from(new Set([...s.middlewares, ...f.middlewares])).map((m) => { const b = h('input', { type: 'checkbox', value: m, checked: f.middlewares.includes(m) }); b.addEventListener('change', () => { f.middlewares = b.checked ? [...new Set([...f.middlewares, m])] : f.middlewares.filter((x) => x !== m); }); return h('label', { class: 'check' }, b, h('span', { class: 'mono' }, m)); });
     const err = h('p', { class: 'form-error', role: 'alert' });
     const form = h('form', { class: 'card', novalidate: true, 'aria-labelledby': 'svc-form-title' },
@@ -206,11 +199,7 @@
         h('div', { class: 'hostname-row' }, Object.assign(sub, { id: 'svc-sub' }), h('span', { class: 'sep' }, '.'), domain),
         h('p', { class: 'hint' }, preview, ' ', f.sub.custom && !f.editing ? h('button', { type: 'button', class: 'btn small ghost', onclick: () => { f.sub = L.autoNameReset(f.display); renderForm(ctx); } }, 'Reset to automatic') : null),
         zones.length ? null : h('p', { class: 'hint' }, ready ? 'No allowed domain: choose one on Setup > Connect Cloudflare.' : 'Without Cloudflare, type any domain; the route then works on this PC only.')),
-      h('div', { class: 'field', 'data-help-host': '' }, h('span', { class: 'label' }, 'Where does it run? ', help('container-dns', 'Container names')), kinds),
-      h('div', { class: 'grid' },
-        field({ id: 'svc-host', label: f.kind === 'docker' ? 'Container name' : 'Address', control: hostInput, hint: hostHint, helpId: f.kind === 'docker' ? 'container-dns' : 'ipv4' }),
-        field({ id: 'svc-port', label: 'Port', control: port }),
-        field({ id: 'svc-protocol', label: 'Protocol to the app', control: protocol, minLevel: 'intermediate', helpId: 'ports-protocols', hint: 'HTTP(S) and WebSockets are published through Cloudflare. Raw TCP or UDP services are not supported.' })),
+      backendInputs, hostHint, backend.node,
       h('div', { class: 'field' }, h('span', { class: 'label' }, 'Who can reach it?'), exposure),
       f.exposure === 'access' ? field({ id: 'svc-emails', label: 'Allowed emails (Cloudflare Access)', control: emails, helpId: 'cf-access', hint: 'Used only when an Access application has to be created.' }) : null,
       f.exposure === 'public' ? h('div', { class: 'callout warn' }, h('p', null, 'Anyone on the Internet can reach this app. Only choose this when the app has its own secure login.')) : null,
@@ -220,10 +209,10 @@
           field({ id: 'svc-extra', label: 'Additional hostnames', control: extra }),
           field({ id: 'svc-desc', label: 'Description', control: desc })),
         f.path ? cb('strip', 'Strip the path prefix before forwarding') : null,
-        f.protocol === 'https' ? cb('tls', 'Skip certificate verification to the app (self-signed devices on a trusted LAN only)') : null,
+        tlsRow,
         h('fieldset', null, h('legend', null, 'Middlewares ', help('traefik-middlewares', 'Middlewares')), h('div', { class: 'chips' }, mws)),
         cb('enabled', 'Enabled'))),
-      gate('expert', h('p', { class: 'small muted' }, 'Generated rule: ', h('code', null, `Host(\`${L.joinHostname(f.sub.value, f.domain)}\`)${f.path ? ` && PathPrefix(\`${f.path}\`)` : ''}`), ' → ', h('code', null, `${f.protocol}://${f.kind === 'host' ? 'host.docker.internal' : f.host || '?'}:${f.port || '?'}`))),
+      gate('expert', h('p', { class: 'small muted' }, 'Generated rule: ', h('code', null, `Host(\`${L.joinHostname(f.sub.value, f.domain)}\`)${f.path ? ` && PathPrefix(\`${f.path}\`)` : ''}`), ' → ', h('code', null, f.target ? `${f.protocol}://${f.target.host}:${f.target.port}` : '(backend not chosen yet)'))),
       err,
       h('div', { class: 'actions' }, h('button', { type: 'submit', class: 'btn primary' }, 'Preview changes'), h('button', { type: 'button', class: 'btn', onclick: () => { s.forms.svc = null; clear(host); } }, 'Cancel')));
     form.addEventListener('submit', (e) => {
@@ -233,20 +222,19 @@
       const hostnames = [];
       if (f.domain) hostnames.push(L.joinHostname(f.sub.value, f.domain));
       for (const x of f.extra.split(/[\s,]+/)) if (x.trim()) hostnames.push(x.trim().toLowerCase());
-      const portN = parseInt(f.port, 10);
+      const portN = f.target ? Number(f.target.port) : 0;
       if (!/^[a-z0-9]([a-z0-9-]{0,38}[a-z0-9])?$/.test(id)) errors.push('Enter a service name (it becomes the id).');
       if (f.sub.value && !L.isValidSubdomain(f.sub.value)) errors.push('The subdomain may use letters, digits and dashes.');
       if (!f.domain) errors.push('Choose a domain.');
-      if (f.kind !== 'host' && !f.host) errors.push(f.kind === 'docker' ? 'Enter the container name.' : 'Enter the address.');
-      if (!(portN >= 1 && portN <= 65535)) errors.push('Enter a port from 1 to 65535.');
+      if (!f.target) errors.push(f.needsChoice ? 'Choose how Traefik reaches the app: use the recommended address or pick one of the options.' : f.where === 'docker' ? 'Choose the container and its port.' : 'Enter the address and port of the app.');
+      else if (!(portN >= 1 && portN <= 65535)) errors.push('Enter a port from 1 to 65535.');
       if (f.exposure === 'access' && L.splitEmails(f.emails).some((x) => !L.isEmail(x))) errors.push('Check the email addresses.');
       err.textContent = errors.join(' ');
       if (errors.length) return;
-      const type = f.kind === 'other' ? 'lan' : f.kind;
       const body = {
         op: f.editing ? 'update' : 'add', name: id,
         service: { name: id, displayName: f.display, description: f.description, enabled: f.enabled, hostnames, pathPrefix: f.path, stripPrefix: !!(f.path && f.strip), middlewares: f.middlewares,
-          target: { type, host: f.kind === 'host' ? 'host.docker.internal' : f.host, port: portN, protocol: f.protocol, tlsSkipVerify: f.protocol === 'https' && f.tls },
+          target: { type: f.target.type, host: f.target.host, port: portN, protocol: f.protocol, tlsSkipVerify: f.protocol === 'https' && f.tls },
           cloudflare: { publish: f.exposure !== 'local', access: f.exposure === 'access' } },
         cloudflare: { automate: f.exposure !== 'local' && ready, accessEmails: L.splitEmails(f.emails), cleanup: true },
       };

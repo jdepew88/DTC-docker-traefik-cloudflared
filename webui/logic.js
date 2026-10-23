@@ -67,6 +67,52 @@
   }
   function isPrivateIPv4(v) { return PRIVATE_RE.test(String(v || '')); }
 
+  // --- Backend selection ("Where is your application running?") ------------------------------------------------------
+  // The wizard's three locations and the registry's target types. "this-computer" is Windows itself (host.docker.internal).
+  const WHERE = ['docker', 'this-computer', 'lan'];
+  function whereFromTargetType(type) { return type === 'docker' ? 'docker' : type === 'host' ? 'this-computer' : 'lan'; }
+  function isLoopbackHost(v) { return /^(127\.\d+\.\d+\.\d+|localhost|::1|0\.0\.0\.0)$/.test(String(v || '').trim().toLowerCase()); }
+  // "http://127.0.0.1:4119/x" -> { scheme: 'http', host: '127.0.0.1', port: 4119 }; "4119" -> { host: '', port: 4119 }.
+  function parseBackendAddress(text) {
+    let v = String(text || '').trim();
+    let scheme = '';
+    const m = /^(https?|h2c):\/\//i.exec(v);
+    if (m) { scheme = m[1].toLowerCase(); v = v.slice(m[0].length); }
+    v = v.split(/[/?#]/)[0];
+    if (/^\d{1,5}$/.test(v)) return { scheme, host: '', port: Number(v) };
+    const hp = /^([^:]+):(\d{1,5})$/.exec(v);
+    if (hp) return { scheme, host: hp[1].toLowerCase(), port: Number(hp[2]) };
+    return { scheme, host: v.toLowerCase(), port: 0 };
+  }
+  function sameTarget(a, b) { return !!(a && b && a.type === b.type && a.host === b.host && Number(a.port) === Number(b.port)); }
+  // Which backend the form uses after the resolver answered. A deliberate override and an existing service's backend are
+  // kept (an existing backend changes only when the user chooses so); an unambiguous suggestion without a correction to
+  // explain is filled in automatically; a suggestion that corrects what the user typed waits for "Use recommended address".
+  function chooseBackend(state, resolution) {
+    const st = state || {};
+    const res = resolution || {};
+    const suggested = res.suggested || res.recommended || null;
+    if (st.override && res.override && res.recommended) return { target: res.recommended, source: 'override', needsChoice: false };
+    if (st.source === 'existing' || st.source === 'chosen') return { target: st.target || null, source: st.source, needsChoice: false };
+    if (!suggested) return { target: null, source: '', needsChoice: !!res.ambiguous };
+    const correction = (res.guidance || []).some((g) => g.action === 'use-recommended');
+    if (correction) return { target: null, source: '', needsChoice: true };
+    if (res.ambiguous && (res.candidates || []).filter((c) => !c.rejected).length > 1) return { target: null, source: '', needsChoice: true };
+    return { target: suggested, source: 'auto', needsChoice: false };
+  }
+  // Notices the user dismissed stay hidden until their condition (what they are about) changes; errors always show.
+  function visibleGuidance(list, dismissed) {
+    const d = dismissed || {};
+    return (list || []).filter((g) => g.severity === 'error' || !d[g.condition]);
+  }
+  // A verification result -> how it is shown. Green only for an application answer (verified, or a redirect to a page
+  // that answered); a login is "auth"; everything else is a warning or a failure; no test is neutral.
+  function backendStatus(v) {
+    if (!v) return { key: 'not-tested', label: 'Not tested', tone: 'neutral', icon: 'minus' };
+    const tone = v.state === 'ok' ? 'ok' : v.state === 'auth' ? 'auth' : v.state === 'warning' ? 'warn' : v.state === 'failed' ? 'err' : 'neutral';
+    return { key: v.result || 'not-tested', label: v.label || 'Not tested', tone, icon: { ok: 'check', auth: 'lock', warn: 'alert', err: 'x' }[tone] || 'minus' };
+  }
+
   // --- Review state -----------------------------------------------------------------------------------------------
   // A short, stable fingerprint of what the user reviewed. When the content changes, the review is invalidated.
   function stableStringify(value) {
@@ -205,6 +251,7 @@
     DIMENSIONS, COMPONENT_STATUS, componentStatus, firstBlocked, suggestAppName, displayNameFromLabel, choosePort, reachOptions,
     suggestLabel, suggestServiceName, autoName, autoNameFromSource, autoNameEdit, autoNameReset, isValidSubdomain, joinHostname, splitHostname,
     detectTarget, isPrivateIPv4,
+    WHERE, whereFromTargetType, isLoopbackHost, parseBackendAddress, sameTarget, chooseBackend, visibleGuidance, backendStatus,
     stableStringify, fingerprint, reviewState, markReviewed, reopenReview,
     STATUS, statusFromReview, worstStatus,
     formatBytes, splitEmails, isEmail,

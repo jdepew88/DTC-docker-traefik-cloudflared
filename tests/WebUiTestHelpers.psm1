@@ -175,11 +175,14 @@ function New-TestInstance {
 }
 
 # Plan + apply through the API, the way the browser does it.
+# Preview + apply. Many suites route to deliberately unreachable addresses (10.x, 192.0.2.x) to test configuration, so
+# the acknowledgment for a backend that fails its connection test is given by default; the readiness gate itself is
+# tested with -AcceptUnverifiedBackend:$false (Test-Discovery.ps1).
 function Invoke-WebUiChange {
-  param($Server, $Body, [string[]]$ConfirmOverwrites = @())
+  param($Server, $Body, [string[]]$ConfirmOverwrites = @(), [bool]$AcceptUnverifiedBackend = $true)
   $plan = Invoke-WebUi $Server POST '/api/services/plan' $Body
   if ($plan.Status -ne 200) { return [pscustomobject]@{ Plan = $plan; Apply = $null } }
-  $apply = Invoke-WebUi $Server POST '/api/services/apply' @{ planId = $plan.Data.planId; confirm = $true; confirmOverwrites = $ConfirmOverwrites }
+  $apply = Invoke-WebUi $Server POST '/api/services/apply' @{ planId = $plan.Data.planId; confirm = $true; confirmOverwrites = $ConfirmOverwrites; acceptUnverifiedBackend = $AcceptUnverifiedBackend }
   return [pscustomobject]@{ Plan = $plan; Apply = $apply }
 }
 

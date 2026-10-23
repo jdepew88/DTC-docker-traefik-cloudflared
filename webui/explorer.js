@@ -273,7 +273,8 @@
       shown.forEach((id, i) => {
         const c = byId[id];
         const hc = healthFor(opts.health, id);
-        const st = hc ? { ...HEALTH_STATUS[hc.state] } : L.componentStatus(c);
+        // A backend check names its result (Timeout, Hostname rejected, ...) instead of a bare Failed.
+        const st = hc ? { ...HEALTH_STATUS[hc.state], ...(hc.resultLabel && hc.state !== 'ok' ? { label: hc.resultLabel } : {}) } : L.componentStatus(c);
         const pos = PATH.indexOf(id);
         const after = blocked >= 0 && pos > blocked;
         const btn = h('button', { type: 'button', class: `xp-node ${st.tone}${opts.selected === id ? ' selected' : ''}${after ? ' downstream' : ''}`, 'data-id': id, 'aria-pressed': opts.selected === id ? 'true' : 'false',
@@ -350,7 +351,7 @@
         evidence.length ? h('ul', { class: 'checks' }, evidence.map((e) => U.checkItem(e.ok === true ? 'ok' : e.ok === false ? 'err' : 'neutral', e.text, U.atLeast('advanced') ? e.dim : ''))) : null,
         h('p', { class: 'muted small' }, 'A file existing only makes a component "configured". "Verified" needs a real check against the running component or Cloudflare.')),
       flow && ['router', 'service', 'middleware', 'app', 'access', 'dns'].includes(id) ? sec(`For ${flow.displayName}`, flowFacts(flow, id)) : null,
-      flow && healthFor(view.health[flow.name], id) ? sec('Health check', h('ul', { class: 'checks' }, [healthFor(view.health[flow.name], id)].map((x) => U.checkItem(x.state === 'ok' ? 'ok' : x.state === 'failed' ? 'err' : x.state === 'warning' ? 'warn' : x.state === 'auth' ? 'auth' : 'neutral', `${x.label}${x.performed ? '' : ' (not checked)'}`, x.message)))) : null,
+      flow && healthFor(view.health[flow.name], id) ? sec('Health check', h('ul', { class: 'checks' }, [healthFor(view.health[flow.name], id)].map((x) => U.checkItem(x.state === 'ok' ? 'ok' : x.state === 'failed' ? 'err' : x.state === 'warning' ? 'warn' : x.state === 'auth' ? 'auth' : 'neutral', `${x.label}${x.resultLabel ? ` · ${x.resultLabel}` : ''}${x.performed ? '' : ' (not checked)'}`, x.message)))) : null,
       arr(info.fails).length ? sec('How it can fail', h('ul', null, info.fails.map((x) => h('li', null, x)))) : null,
       gate('intermediate', arr(info.diagnose).length ? sec('How to diagnose', h('ul', null, info.diagnose.map((x) => h('li', null, x)))) : null),
       arr(info.docs).length ? sec('Documentation', h('ul', { class: 'xp-docs' }, info.docs.map(([t, url]) => h('li', null, h('a', { href: url, target: '_blank', rel: 'noopener noreferrer' }, t, ' ', icon('external')))))) : null,

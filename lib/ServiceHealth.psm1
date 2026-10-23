@@ -43,6 +43,9 @@ function ConvertFrom-RoutedStatus([int]$Status, [string]$Body, [string]$ErrorTex
   if ($Status -ge 300 -and $Status -lt 400 -and $Location -match '^https?://([^/:]+)(:\d+)?' -and $Matches[1] -ne $Hostname -and ($Matches[2] -or $Matches[1] -notmatch '\.')) {
     return @('warning', "The application redirects to $Location, an internal address a browser cannot reach. Set the app's public URL (base URL) to https://$Hostname.")
   }
+  if ($Status -ge 300 -and $Status -lt 400 -and $Location -match '(?i)(^|/)(login|signin|sign-in|sign_in|auth|sso|oauth2?|session/new)([/?#]|$)') {
+    return @('auth', "The application answered HTTP $Status through Traefik and redirects to its login page ($Location): the route works; signing in is not tested.")
+  }
   return ConvertFrom-AppStatus $Status $Body $Hostname ' through Traefik'
 }
 
@@ -79,10 +82,32 @@ function Get-LocalIPv4Addresses {
   try { return @(Get-NetIPAddress -AddressFamily IPv4 -ErrorAction Stop | Where-Object { $_.IPAddress -notmatch '^(127\.|169\.254\.)' } | ForEach-Object { $_.IPAddress }) } catch { return @() }
 }
 
+# A field of a probe try (an ordered dictionary or an object) that older or hand-made tries may lack.
+function Get-TryField($Try, [string]$Name, $Default = $null) {
+  if ($null -eq $Try) { return $Default }
+  if ($Try -is [System.Collections.IDictionary]) { if ($Try.Contains($Name) -and $null -ne $Try[$Name]) { return $Try[$Name] } return $Default }
+  $p = $Try.PSObject.Properties[$Name]
+  if ($p -and $null -ne $p.Value) { return $p.Value }
+  return $Default
+}
+
+# Pure: the probe lines worth showing as evidence: status lines, redirect targets, server, content type and the
+# wget / TLS error lines. Cookies and every other header are dropped; query values that look like secrets are masked.
+function Get-ProbeEvidence([string[]]$Lines) {
+  return @(@($Lines) | ForEach-Object { ([string]$_).Trim() } |
+      Where-Object { $_ -match '^(HTTP/\d|Location:|Server:|Content-Type:|WWW-Authenticate:|wget:|ssl_client:)' -or $_ -match 'certificate verify failed' } |
+      ForEach-Object {
+        if ($_ -match 'certificate verify failed') { 'TLS: certificate verify failed' }
+        elseif ($_ -match '^WWW-Authenticate:\s*(\S+)') { "WWW-Authenticate: $($Matches[1])" }
+        else { $_ -replace '(?i)([?&](token|key|code|state|sig|signature|password|secret)=)[^&\s]*', '$1<redacted>' }
+      } | Select-Object -First 12)
+}
+
 # Requests the backend the way Traefik does: a short-lived container in Traefik's network namespace (same networks,
 # same name resolution, same host.docker.internal) running Traefik's own image (never pulled), one GET with the public
-# Host header. When the configured scheme fails in a way that suggests the other one, the other scheme is tried too.
-# Certificates are not verified by this probe (busybox wget); it tests reachability and protocol only.
+# Host header. HTTPS is requested with certificate verification first; when that fails the request is repeated without
+# it, so a self-signed certificate is told apart from a dead port. When the configured scheme fails in a way that
+# suggests the other one, the other scheme is tried too. Redirects are followed; the first answer and the last are kept.
 function Test-BackendFromTraefik {
   param([Parameter(Mandatory = $true)]$Settings, [Parameter(Mandatory = $true)]$Service, [int]$TimeoutSeconds = 5)
   $t = $Service.target
@@ -90,44 +115,108 @@ function Test-BackendFromTraefik {
   $path = $(if ($Service.pathPrefix -and -not $Service.stripPrefix) { "$($Service.pathPrefix)/" } else { '/' })
   if (-not (Test-ContainerRunning $Settings.TraefikContainer)) { return [ordered]@{ performed = $false; tries = @(); detail = "Traefik ($($Settings.TraefikContainer)) is not running, so the backend cannot be requested from its network." } }
   $try = {
-    param([string]$Scheme)
+    param([string]$Scheme, [bool]$Verify)
     $url = "${Scheme}://$($t.host):$($t.port)$path"
     $a = @('run', '--rm', '--pull', 'never', '--network', "container:$($Settings.TraefikContainer)", '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges',
       '--memory', '32m', '--label', 'org.traefik-proxy.probe=1', '--entrypoint', 'wget', $Settings.TraefikImage, '-S', '-q', '-O', '/dev/null', '-T', "$TimeoutSeconds")
     if ($hostname) { $a += @('--header', "Host: $hostname") }
-    if ($Scheme -eq 'https') { $a += '--no-check-certificate' }
+    if ($Scheme -eq 'https' -and -not $Verify) { $a += '--no-check-certificate' }
     $r = Invoke-Docker @($a + $url)
-    $text = (@($r.Output) -join "`n")
-    $p = ConvertFrom-ProbeOutput $r.Output $r.ExitCode
-    if ($text -match 'SSL_connect|ssl_client|wrong version number') { $p = [ordered]@{ result = 'not-http'; status = 0; detail = 'TLS handshake failed.' } }
+    $lines = @($r.Output | ForEach-Object { [string]$_ })
+    $text = $lines -join "`n"
+    $p = ConvertFrom-ProbeOutput $lines $r.ExitCode
+    $tlsFailed = $text -match 'certificate verify failed'
+    if ($tlsFailed) { $p = [ordered]@{ result = 'tls'; status = 0; detail = 'The certificate could not be verified.' } }
+    elseif ($p.result -ne 'http' -and $text -match 'SSL_connect|ssl_client|wrong version number') { $p = [ordered]@{ result = 'not-http'; status = 0; detail = 'TLS handshake failed.' } }
     if ($text -match 'Unable to find image|No such image') { $p = [ordered]@{ result = 'error'; status = 0; detail = "The probe image $($Settings.TraefikImage) is not present locally." } }
-    return [ordered]@{ scheme = $Scheme; url = $url; result = $p.result; status = $p.status; detail = $p.detail }
+    $codes = @([regex]::Matches($text, 'HTTP/\d(?:\.\d)?\s+(\d{3})') | ForEach-Object { [int]$_.Groups[1].Value })
+    $loc = [regex]::Match($text, '(?im)^\s*Location:\s*(\S+)')
+    return [ordered]@{ scheme = $Scheme; url = $url; result = $p.result; status = $p.status; detail = $p.detail
+      finalStatus = $(if ($codes.Count) { $codes[-1] } else { 0 }); location = $(if ($loc.Success) { $loc.Groups[1].Value } else { '' })
+      verified = ($Scheme -eq 'https' -and $Verify -and -not $tlsFailed -and $p.result -eq 'http'); evidence = @(Get-ProbeEvidence $lines) }
   }
-  $first = & $try $t.protocol
+  $first = & $try $t.protocol ($t.protocol -eq 'https')
   $tries = @($first)
   $other = $(if ($t.protocol -eq 'https') { 'http' } else { 'https' })
-  if ($first.result -eq 'not-http' -or ($t.protocol -eq 'http' -and $first.result -eq 'http' -and $first.status -eq 400)) { $tries += & $try $other }
+  if ($first.result -eq 'tls') { $tries += & $try 'https' $false }
+  elseif ($first.result -eq 'not-http' -or ($t.protocol -eq 'http' -and $first.result -eq 'http' -and $first.status -eq 400)) { $tries += & $try $other $false }
   return [ordered]@{ performed = $true; tries = $tries; timeout = $TimeoutSeconds; hostname = $hostname }
 }
 
-# Pure: Test-BackendFromTraefik's result -> (state, message) for the "Traefik -> backend" hop.
-function ConvertFrom-BackendProbe($Probe, $Service, [string]$ProxyNetwork = 'the shared network') {
-  if (-not $Probe.performed) { return @('skipped', $Probe.detail) }
+# What each verification result is called. Only "verified" and "redirect" (to a page that answers) are a pass;
+# "auth" means reachable with a login in front; everything else is a failure or a warning, never green.
+$script:BackendResultLabels = [ordered]@{
+  verified = 'Verified reachable'; auth = 'Reachable, authentication required'; redirect = 'Application redirect'; 'wrong-protocol' = 'Wrong protocol'
+  'wrong-port' = 'Wrong port'; dns = 'DNS resolution failure'; refused = 'Connection refused'; timeout = 'Timeout'; 'host-rejected' = 'Hostname rejected'
+  tls = 'TLS verification failure'; unavailable = 'Application error'; 'http-error' = 'Unexpected HTTP answer'; error = 'Test failed'; 'not-tested' = 'Not tested'
+}
+
+# Pure: one HTTP answer of the backend -> (result, state, message). $Answer: a probe try (status, location, finalStatus).
+function Get-BackendAnswerVerdict($Answer, [string]$Hostname, [string]$From) {
+  $s = [int]$Answer.status
+  $loc = [string](Get-TryField $Answer 'location' '')
+  $final = [int](Get-TryField $Answer 'finalStatus' 0)
+  if ($s -ge 300 -and $s -lt 400) {
+    $locPath = $(if ($loc -match '^https?://[^/]+(/.*)?$') { [string]$Matches[1] } else { $loc })
+    if ($locPath -match '(?i)(^|/)(login|signin|sign-in|sign_in|auth|sso|oauth2?|session/new)([/?#]|$)') {
+      return @('auth', 'auth', "The application answered HTTP $s$From and redirects to its login page ($loc): reachable, signing in is not tested.")
+    }
+    if ($loc -match '^https?://([^/:]+)(:\d+)?' -and $Matches[1] -ne $Hostname -and ($Matches[2] -or $Matches[1] -notmatch '\.')) {
+      return @('redirect', 'warning', "The application redirects to $loc$From, an internal address a browser cannot reach. Set the app's public URL (base URL) to https://$Hostname.")
+    }
+    if ($final -ge 400) { return @('redirect', 'warning', "The application redirects to $loc$From, and that page answered HTTP $final.") }
+    return @('redirect', 'ok', "The application answered HTTP $s$From, redirecting to $(if ($loc) { $loc } else { 'another page' })$(if ($final -ge 200 -and $final -lt 300) { ", which answered HTTP $final" }).")
+  }
+  if ($s -in 401, 403) { return @('auth', 'auth', "The application answered HTTP $s$From`: it asks for a login. Reachable; signing in is not tested.") }
+  if ($s -in 400, 421) { return @('host-rejected', 'failed', "The application answered HTTP $s$From for Host: $Hostname. The network path works, but the app refuses the request; most often its allowed-hosts setting lacks $Hostname (Homepage: HOMEPAGE_ALLOWED_HOSTS, Django: ALLOWED_HOSTS, Vite: server.allowedHosts).") }
+  if ($s -ge 500) { return @('unavailable', 'warning', "The application answered HTTP $s$From (an error inside the app, or it is still starting).") }
+  if ($s -ge 400) { return @('http-error', 'warning', "The application answered HTTP $s$From`: something answers, but not with a page at this path. Check the port and the path prefix.") }
+  return @('verified', 'ok', "The application answered HTTP $s$From.")
+}
+
+# Pure: Test-BackendFromTraefik's result -> the verification verdict { result; state; label; message; url; evidence }.
+# $KnownPorts: the ports a Docker target declares; a refused connection on another port is a wrong port.
+function Get-BackendVerdict($Probe, $Service, [string]$ProxyNetwork = 'the shared network', [int[]]$KnownPorts = @()) {
+  $v = { param($Result, $State, $Message, $Try) [ordered]@{ result = $Result; state = $State; label = $script:BackendResultLabels[$Result]; message = $Message
+      url = $(if ($Try) { $Try.url } else { '' }); evidence = @(@($Probe.tries) | ForEach-Object { $ev = @(Get-TryField $_ 'evidence' @()); if ($ev.Count) { "$($_.url)"; @($ev | ForEach-Object { "  $_" }) } }) } }
+  if (-not $Probe.performed) { return & $v 'not-tested' 'skipped' $Probe.detail $null }
   $t = $Service.target
   $first = $Probe.tries[0]
   $alt = $(if (@($Probe.tries).Count -gt 1) { $Probe.tries[1] } else { $null })
   $where = "$($t.host):$($t.port)"
-  if ($alt -and $alt.result -eq 'http' -and $alt.status -ne 400) {
-    return @('failed', "The backend at $where speaks $($alt.scheme.ToUpper()), not $($first.scheme.ToUpper()): it answered HTTP $($alt.status) over $($alt.scheme). Set the target protocol to $($alt.scheme)$(if ($alt.scheme -eq 'https') { ' (with skip certificate verification for a self-signed certificate)' }).")
+  $answer = $first
+  $note = ''
+  if ($first.result -eq 'tls') {
+    if (-not ($alt -and $alt.result -eq 'http')) { return & $v 'tls' 'failed' "The TLS handshake with $where failed: its certificate cannot be verified, and nothing answers HTTPS without verification either." $first }
+    if (-not (Get-TryField $t 'tlsSkipVerify' $false)) {
+      return & $v 'tls' 'failed' "The backend at $where answers HTTPS (HTTP $($alt.status)), but its certificate cannot be verified (self-signed, or issued for another name). Prefer the app's plain-HTTP port inside Docker if it has one (Portainer: 9000): Cloudflare already encrypts the public side. Skip certificate verification only for a trusted private backend." $first
+    }
+    $answer = $alt; $note = ' The certificate is not verified (skip certificate verification is set for this service).'
   }
-  switch ($first.result) {
-    'http' { $v = ConvertFrom-AppStatus $first.status '' $Probe.hostname " from Traefik's network ($($first.url))"; return $v }
-    'https' { $v = ConvertFrom-AppStatus $first.status '' $Probe.hostname " from Traefik's network ($($first.url))"; return $v }
-    'closed' { return @('failed', "Connection refused at $where from Traefik's network: nothing listens on that port. Check the port (the one the app listens on inside its container, not a published Windows port) and that the app does not listen only on 127.0.0.1.") }
-    'timeout' { return @('failed', "No answer from $where within $($Probe.timeout) seconds from Traefik's network. For a LAN address: Docker Desktop cannot route there (a Docker network on the same subnet captures it, or the device is off). For host.docker.internal: Windows Firewall blocks the port, or the app listens only on 127.0.0.1.") }
-    'not-http' { return @('failed', "Something listens at $where, but it does not answer $($first.scheme.ToUpper()) ($($first.detail)).") }
-    default { if ($first.detail -match 'resolve') { return @('failed', "$($t.host) does not resolve from Traefik's network: the container is not attached to '$ProxyNetwork' or the name is wrong.") } return @('failed', "The backend request failed: $($first.detail)") }
+  if ($alt -and $alt.scheme -ne $first.scheme -and $alt.result -eq 'http' -and $alt.status -ne 400) {
+    return & $v 'wrong-protocol' 'failed' "The backend at $where speaks $($alt.scheme.ToUpper()), not $($first.scheme.ToUpper()): it answered HTTP $($alt.status) over $($alt.scheme). Set the target protocol to $($alt.scheme)$(if ($alt.scheme -eq 'https') { ' (with skip certificate verification for a self-signed certificate)' })." $alt
   }
+  switch ($answer.result) {
+    'http' { $r = Get-BackendAnswerVerdict $answer $Probe.hostname " from Traefik's network ($($answer.url))"; return & $v $r[0] $r[1] ($r[2] + $note) $answer }
+    'closed' {
+      if ($t.type -eq 'docker' -and @($KnownPorts).Count -and @($KnownPorts) -notcontains [int]$t.port) {
+        return & $v 'wrong-port' 'failed' "Connection refused at $where from Traefik's network: $($t.host) declares port(s) $((@($KnownPorts) | Sort-Object) -join ', '), not $($t.port). Use the port the app listens on inside its container, not a published Windows port." $answer
+      }
+      return & $v 'refused' 'failed' "Connection refused at $where from Traefik's network: nothing listens on that port. Check the port (the one the app listens on inside its container, not a published Windows port) and that the app does not listen only on 127.0.0.1." $answer
+    }
+    'timeout' { return & $v 'timeout' 'failed' "No answer from $where within $($Probe.timeout) seconds from Traefik's network. For a LAN address: Docker Desktop cannot route there (a Docker network on the same subnet captures it, or the device is off). For host.docker.internal: Windows Firewall blocks the port, or the app listens only on 127.0.0.1." $answer }
+    'not-http' { return & $v 'wrong-protocol' 'failed' "Something listens at $where, but it does not answer $($answer.scheme.ToUpper()) ($($answer.detail))." $answer }
+    default {
+      if ($answer.detail -match 'resolve') { return & $v 'dns' 'failed' "$($t.host) does not resolve from Traefik's network: the container is not attached to '$ProxyNetwork' or the name is wrong." $answer }
+      return & $v 'error' 'failed' "The backend request failed: $($answer.detail)" $answer
+    }
+  }
+}
+
+# Pure: Test-BackendFromTraefik's result -> (state, message) for the "Traefik -> backend" hop.
+function ConvertFrom-BackendProbe($Probe, $Service, [string]$ProxyNetwork = 'the shared network') {
+  $r = Get-BackendVerdict $Probe $Service $ProxyNetwork
+  return @($r.state, $r.message)
 }
 
 # Pure: the tunnel's ingress rules for one hostname -> (state, message). cloudflared runs in its own container, so
@@ -236,13 +325,15 @@ function Get-ServiceHealth {
 
   # Traefik -> backend: membership of the shared network (containers), what a LAN address means inside Docker, then one
   # real request from Traefik's own network namespace.
-  $backendIssue = $null; $backendNote = ''
+  $backendIssue = $null; $backendNote = ''; $knownPorts = @()
   if ($Service.target.type -eq 'docker') {
-    $i = Invoke-Docker inspect $Service.target.host --format '{{.State.Status}}|{{json .NetworkSettings.Networks}}'
+    $i = Invoke-Docker inspect $Service.target.host --format '{{.State.Status}}|{{json .Config.ExposedPorts}}|{{json .NetworkSettings.Networks}}'
     if ($i.ExitCode -ne 0) { $backendIssue = @('failed', "No container named $($Service.target.host).") }
     else {
-      $line = (@($i.Output) -join '').Trim(); $sep = $line.IndexOf('|')
-      $st = $line.Substring(0, $sep); $nets = $line.Substring($sep + 1) | ConvertFrom-Json
+      $parts = (@($i.Output) -join '').Trim().Split([char[]]'|', 3)
+      $st = $parts[0]; $nets = $parts[2] | ConvertFrom-Json
+      $ep = $parts[1] | ConvertFrom-Json
+      if ($ep) { $knownPorts = @($ep.PSObject.Properties | Where-Object { $_.Name -match '^\d+/tcp$' } | ForEach-Object { [int]$_.Name.Split('/')[0] }) }
       if ($st -ne 'running') { $backendIssue = @('failed', "$($Service.target.host) is $st.") }
       elseif (-not $nets.PSObject.Properties[$Settings.ProxyNetwork]) { $backendIssue = @('failed', "$($Service.target.host) is running but not attached to '$($Settings.ProxyNetwork)'.") }
     }
@@ -255,11 +346,13 @@ function Get-ServiceHealth {
   if ($backendIssue) { & $add (New-HealthCheck 'backend' 'Traefik to backend' $backendIssue[0] $backendIssue[1]) }
   elseif (-not $Service.enabled) { & $add (New-HealthCheck 'backend' 'Traefik to backend' 'skipped' 'The service is disabled.' $false) }
   else {
-    $bp = ConvertFrom-BackendProbe (Test-BackendFromTraefik -Settings $Settings -Service $Service) $Service $Settings.ProxyNetwork
-    $msg = $bp[1]
-    if ($Service.target.type -eq 'docker' -and $bp[0] -ne 'skipped') { $msg = "$($Service.target.host) is running on '$($Settings.ProxyNetwork)'. $msg" }
+    $bv = Get-BackendVerdict (Test-BackendFromTraefik -Settings $Settings -Service $Service) $Service $Settings.ProxyNetwork $knownPorts
+    $msg = $bv.message
+    if ($Service.target.type -eq 'docker' -and $bv.state -ne 'skipped') { $msg = "$($Service.target.host) is running on '$($Settings.ProxyNetwork)'. $msg" }
     if ($backendNote) { $msg += " Note: $backendNote" }
-    & $add (New-HealthCheck 'backend' 'Traefik to backend' $bp[0] $msg ($bp[0] -ne 'skipped'))
+    $c = New-HealthCheck 'backend' 'Traefik to backend' $bv.state $msg ($bv.state -ne 'skipped')
+    $c.result = $bv.result; $c.resultLabel = $bv.label; $c.evidence = @($bv.evidence)
+    & $add $c
   }
 
   # Application through Traefik (bypasses Cloudflare; proves router -> service -> backend).
@@ -284,4 +377,5 @@ function Get-ServiceHealth {
 }
 
 Export-ModuleMember -Function Get-ServiceHealth, ConvertFrom-RoutedStatus, ConvertFrom-PublicProbe, New-HealthCheck, ConvertFrom-AppStatus, Get-LanTargetIssues,
-  Get-DockerSubnets, Get-LocalIPv4Addresses, Test-BackendFromTraefik, ConvertFrom-BackendProbe, ConvertFrom-TunnelRoute, Get-FirstFailure
+  Get-DockerSubnets, Get-LocalIPv4Addresses, Test-BackendFromTraefik, ConvertFrom-BackendProbe, ConvertFrom-TunnelRoute, Get-FirstFailure,
+  Get-ProbeEvidence, Get-BackendAnswerVerdict, Get-BackendVerdict

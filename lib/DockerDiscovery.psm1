@@ -13,6 +13,10 @@ $script:HttpPorts = @{ 80 = 'HTTP'; 3000 = 'web app'; 3001 = 'web app'; 4000 = '
   8081 = 'HTTP (alt)'; 8096 = 'Jellyfin'; 8123 = 'Home Assistant'; 8181 = 'web app'; 8888 = 'web app'; 8989 = 'Sonarr'; 9000 = 'web app'; 9091 = 'Authelia / Transmission'; 9117 = 'Jackett'; 9696 = 'Prowlarr'
   32400 = 'Plex'; 3552 = 'Arcane'; 5678 = 'n8n'; 8384 = 'Syncthing' }
 $script:HttpsPorts = @{ 443 = 'HTTPS'; 8443 = 'HTTPS (alt)'; 9443 = 'HTTPS (Portainer)'; 8920 = 'Jellyfin HTTPS' }
+# Images whose ports mean something specific: port -> @(guess, score, reason). Applied before the generic hints.
+$script:ImagePorts = @(
+  @{ image = '(^|/)portainer/portainer(-ce|-ee)?(:|@|$)'; ports = @{ 9000 = @('http', 90, 'Portainer web UI, plain HTTP (preferred behind Traefik: no self-signed certificate)'); 9443 = @('https', 50, 'Portainer web UI, HTTPS with a self-signed certificate'); 8000 = @('not-http', -50, 'Portainer Edge agent tunnel, not a web page') } }
+)
 
 function Get-Prop($Object, [string]$Name, $Default = $null) {
   if ($null -eq $Object) { return $Default }
@@ -82,11 +86,16 @@ function ConvertFrom-DockerInspect($C) {
 
 # Pure: a container's ports ranked by how likely they serve HTTP. Nothing here is "validated": that needs a probe.
 function Get-PortCandidates($Container) {
+  $image = $(if ($Container -is [System.Collections.IDictionary]) { [string]$Container['image'] } else { [string](Get-Prop $Container 'image' '') })
   $list = @(foreach ($p in @($Container.exposed)) {
       $port = [int]$p.port; $score = 10; $guess = 'unknown'; $reason = 'No hint for this port.'
       if ($port -in 2375, 2376) { $guess = 'blocked'; $score = -200; $reason = 'Docker Engine API: publishing it would hand over control of this computer. Never publish it.' }
       elseif ($p.proto -ne 'tcp') { $guess = 'not-http'; $score = -100; $reason = "$($p.proto.ToUpperInvariant()) port: Traefik and Cloudflare Tunnel publish HTTP over TCP only." }
       elseif (@($Container.traefik.servicePorts) -contains $port) { $guess = 'http'; $score = 100; $reason = 'Named in the container''s own Traefik labels.' }
+      elseif (@($script:ImagePorts | Where-Object { $image -match $_.image -and $_.ports.ContainsKey($port) }).Count) {
+        $hint = @($script:ImagePorts | Where-Object { $image -match $_.image -and $_.ports.ContainsKey($port) })[0].ports[$port]
+        $guess = $hint[0]; $score = $hint[1]; $reason = $hint[2]
+      }
       elseif ($script:HttpsPorts.ContainsKey($port)) { $guess = 'https'; $score = 40; $reason = "Usually $($script:HttpsPorts[$port])." }
       elseif ($script:HttpPorts.ContainsKey($port)) { $guess = 'http'; $score = 60; $reason = "Usually $($script:HttpPorts[$port])." }
       elseif ($script:NotHttpPorts.ContainsKey($port)) { $guess = 'not-http'; $score = -50; $reason = "Usually $($script:NotHttpPorts[$port]), not a web page." }

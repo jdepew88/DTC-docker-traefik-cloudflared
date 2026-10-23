@@ -54,6 +54,7 @@ Import-Module (Join-Path $here 'lib\ProjectDiscovery.psm1') -Force
 Import-Module (Join-Path $here 'lib\Infrastructure.psm1') -Force
 Import-Module (Join-Path $here 'lib\DockerDiscovery.psm1') -Force
 Import-Module (Join-Path $here 'lib\ServiceHealth.psm1') -Force
+Import-Module (Join-Path $here 'lib\BackendResolver.psm1') -Force
 Import-Module (Join-Path $here 'lib\AppCatalog.psm1') -Force
 if (-not $CatalogDir) { $CatalogDir = Join-Path $here 'catalog' }
 Import-Module (Join-Path $here 'lib\LocalHttp.psm1') -Force
@@ -118,6 +119,7 @@ $StaticFiles = @{
   '/logic.js'   = @('logic.js', 'text/javascript; charset=utf-8')
   '/setup.js'   = @('setup.js', 'text/javascript; charset=utf-8')
   '/pages.js'   = @('pages.js', 'text/javascript; charset=utf-8')
+  '/backend.js' = @('backend.js', 'text/javascript; charset=utf-8')
   '/projects.js' = @('projects.js', 'text/javascript; charset=utf-8')
   '/brands.js' = @('brands.js', 'text/javascript; charset=utf-8')
   '/explorer.js' = @('explorer.js', 'text/javascript; charset=utf-8')
@@ -373,29 +375,74 @@ function Find-RegistryService($Services, [string]$Name) {
 }
 
 # Extra live checks of the target (read-only): container membership of the shared network, what a LAN address means
-# inside Docker, then one real request from Traefik's network namespace with the public Host header.
-function Get-TargetWarnings($Settings, $Service) {
+# inside Docker, then one real request from Traefik's network namespace with the public Host header. Returns the notes
+# for the preview and the verification verdict, which is the readiness check: an apply re-runs it right before writing.
+function Get-TargetCheck($Settings, $Service) {
   $warnings = @()
-  if ($null -eq $Service -or $Service.target.host -notmatch '^[A-Za-z0-9][A-Za-z0-9_.-]*$') { return $warnings }
+  $verdict = $null
+  if ($null -eq $Service -or $Service.target.host -notmatch '^[A-Za-z0-9][A-Za-z0-9_.-]*$') { return [pscustomobject]@{ Warnings = $warnings; Verdict = $verdict } }
   $probe = $Service.enabled
+  $knownPorts = @()
   if ($Service.target.type -eq 'docker') {
-    $r = Invoke-Docker inspect $Service.target.host --format '{{json .NetworkSettings.Networks}}'
+    $r = Invoke-Docker inspect $Service.target.host --format '{{json .Config.ExposedPorts}}|{{json .NetworkSettings.Networks}}'
     if ($r.ExitCode -ne 0) {
       $warnings += "No container named '$($Service.target.host)' exists right now. The route will answer 502 until it does."; $probe = $false
+      $verdict = [ordered]@{ result = 'dns'; state = 'failed'; label = 'DNS resolution failure'; message = "No container named '$($Service.target.host)' exists on this Docker engine."; url = ''; evidence = @() }
     } else {
-      $nets = ((@($r.Output) -join '') | ConvertFrom-Json)
+      $parts = (@($r.Output) -join '').Trim().Split([char[]]'|', 2)
+      $ep = $parts[0] | ConvertFrom-Json
+      if ($ep) { $knownPorts = @($ep.PSObject.Properties | Where-Object { $_.Name -match '^\d+/tcp$' } | ForEach-Object { [int]$_.Name.Split('/')[0] }) }
+      $nets = $parts[1] | ConvertFrom-Json
       if (-not $nets.PSObject.Properties[$Settings.ProxyNetwork]) {
         $warnings += "Container '$($Service.target.host)' is not attached to the '$($Settings.ProxyNetwork)' network, so Traefik cannot reach it. Add it in its compose file (networks: [$($Settings.ProxyNetwork)], external) or run: docker network connect $($Settings.ProxyNetwork) $($Service.target.host)"; $probe = $false
+        $verdict = [ordered]@{ result = 'dns'; state = 'failed'; label = 'DNS resolution failure'; message = "Container '$($Service.target.host)' is not attached to '$($Settings.ProxyNetwork)', so its name does not resolve from Traefik's network."; url = ''; evidence = @() }
       }
     }
   } elseif ($Service.target.type -eq 'lan') {
     $warnings += @(Get-LanTargetIssues $Service.target.host (Get-LocalIPv4Addresses) (Get-DockerSubnets) | ForEach-Object { $_.message })
   }
   if ($probe) {
-    $v = ConvertFrom-BackendProbe (Test-BackendFromTraefik -Settings $Settings -Service $Service) $Service $Settings.ProxyNetwork
-    if ($v[0] -in 'failed', 'warning') { $warnings += "Backend test from Traefik's network: $($v[1])" }
+    $verdict = Get-BackendVerdict (Test-BackendFromTraefik -Settings $Settings -Service $Service) $Service $Settings.ProxyNetwork $knownPorts
+    if ($verdict.state -in 'failed', 'warning') { $warnings += "Backend test from Traefik's network: $($verdict.message)" }
   }
-  return $warnings
+  return [pscustomobject]@{ Warnings = $warnings; Verdict = $verdict }
+}
+
+# Where an application runs and what the user typed -> the backend address Traefik should use, with the reasons, the
+# containers to choose from and, on request, one verification of a target from Traefik's network. Read-only.
+function Invoke-BackendResolve($Body) {
+  Assert-Installed
+  $settings = Get-Settings
+  $envr = Get-BackendEnvironment -Settings $settings -Fresh:([bool](Get-Field $Body 'fresh' $false))
+  $inv = @(); try { $inv = @(Get-DockerContainerInventory -ProxyNetwork $settings.ProxyNetwork) } catch { }
+  $own = @((Get-StackContainerNames $settings).Values) + @($settings.WhoamiContainer)
+  $port = 0; $null = [int]::TryParse([string](Get-Field $Body 'port' ''), [ref]$port)
+  $address = ([string](Get-Field $Body 'address' '')).Trim()
+  if ($address.Length -gt 300) { Stop-Request 400 'The address is too long.' }
+  $res = Resolve-BackendAddress -Location ([string](Get-Field $Body 'location' 'auto')) -Address $address -Port $port -Protocol ([string](Get-Field $Body 'protocol' '')) `
+    -Container ([string](Get-Field $Body 'container' '')) -Override:([bool](Get-Field $Body 'override' $false)) -Environment $envr -Containers @($inv | Where-Object { $own -notcontains $_.name })
+  $containers = @($inv | Where-Object { $_.state -eq 'running' -and -not $_.infrastructure -and $own -notcontains $_.name } | ForEach-Object {
+      [ordered]@{ name = $_.name; image = ($_.image -replace '@sha256:[0-9a-f]+', ''); project = $_.compose.project; private = [bool]$_.privateService
+        networks = @($_.networks | ForEach-Object { [ordered]@{ name = $_.name; ipv4 = $_.ipv4; aliases = @($_.aliases) } }); sharesTraefikNetwork = [bool](@($_.networks | Where-Object { @($envr.traefikNetworks) -contains $_.name }).Count)
+        ports = @($_.ports | ForEach-Object { [ordered]@{ port = $_.port; proto = $_.proto; guess = $_.guess; reason = $_.reason; hostPort = $_.hostPort; hostIp = $_.hostIp } }) } })
+  $hostname = ([string](Get-Field $Body 'hostname' '')).Trim().ToLowerInvariant()
+  if ($hostname -notmatch '^(?=.{1,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$') { $hostname = '' }
+  $verification = $null; $yaml = ''
+  $t = Get-Field $Body 'target' $null
+  $target = $null
+  if ($t) { $target = [ordered]@{ type = [string](Get-Field $t 'type' ''); host = [string](Get-Field $t 'host' ''); port = [int](Get-Field $t 'port' 0); protocol = [string](Get-Field $t 'protocol' 'http'); tlsSkipVerify = [bool](Get-Field $t 'tlsSkipVerify' $false) } }
+  elseif ($res.recommended) { $target = [ordered]@{ type = $res.recommended.type; host = $res.recommended.host; port = $res.recommended.port; protocol = $res.recommended.protocol; tlsSkipVerify = $false } }
+  if ($target -and $target.host -match '^[A-Za-z0-9][A-Za-z0-9_.-]{0,252}$' -and $target.port -ge 1 -and $target.port -le 65535 -and $target.protocol -in @('http', 'https', 'h2c') -and $target.type -in @('docker', 'host', 'lan')) {
+    $svc = [pscustomobject]@{ name = 'backend-test'; enabled = $true; hostnames = @($(if ($hostname) { $hostname } else { $target.host })); pathPrefix = ''; stripPrefix = $false; target = [pscustomobject]$target }
+    try { $yaml = ConvertTo-TraefikRouteYaml (ConvertTo-ServiceDefinition @{ name = 'preview'; hostnames = @($(if ($hostname) { $hostname } else { 'app.example.com' })); middlewares = @('default-headers@file'); target = @{ type = $target.type; host = $target.host; port = $target.port; protocol = $target.protocol; tlsSkipVerify = $target.tlsSkipVerify } }) } catch { $yaml = '' }
+    if ([bool](Get-Field $Body 'test' $false)) {
+      $known = @(); $tc = @($inv | Where-Object { $_.name -eq $target.host }); if ($tc.Count) { $known = @($tc[0].exposed | Where-Object { $_.proto -eq 'tcp' } | ForEach-Object { [int]$_.port }) }
+      $verification = Get-BackendVerdict (Test-BackendFromTraefik -Settings $settings -Service $svc) $svc $settings.ProxyNetwork $known
+      $verification.target = $target; $verification.testedAt = (Get-Date -Format 's')
+      Write-Audit 'backend-test' "$($target.protocol)://$($target.host):$($target.port) $($verification.result)"
+    }
+  }
+  return [ordered]@{ resolution = $res; environment = $envr; containers = $containers; verification = $verification; traefikYaml = $yaml }
 }
 
 # Builds the Traefik + Cloudflare plan for a change request. Pure read: nothing is written.
@@ -475,9 +522,10 @@ function Build-ChangePlan($Body) {
     }
   }
   $traefikKey = $traefik.RegistryJson + '|' + ((@($traefik.Changes | ForEach-Object { "$($_.File):$($_.Action):$($_.OldContent)" })) -join '|')
+  $check = Get-TargetCheck $settings $new
   return [pscustomobject]@{
     Op = $op; Summary = $summary; Settings = $settings; Traefik = $traefik; Cloudflare = $cf; New = $new; Previous = $previous
-    Notes = @($notes + @(Get-TargetWarnings $settings $new)); TraefikKey = $traefikKey
+    Notes = @($notes + @($check.Warnings)); Backend = $check.Verdict; TraefikKey = $traefikKey
   }
 }
 
@@ -496,6 +544,9 @@ function ConvertTo-PlanView($Plan, [string]$PlanId) {
     cloudflare = [ordered]@{ connected = $cf.Connected; actions = $cfActions; notes = @($cf.Notes); errors = @($cf.Errors); manualSteps = @($cf.ManualSteps) }
     canApply   = ($errors -eq 0 -and $hasWork)
     hasWork    = $hasWork
+    # The connection test from Traefik's network; when it failed, applying needs an explicit acknowledgment.
+    backend    = $Plan.Backend
+    needsBackendAck = [bool]($Plan.Backend -and $Plan.Backend.state -eq 'failed')
   }
 }
 
@@ -526,6 +577,11 @@ function Invoke-ApplyRequest($Body) {
   $needed = @($plan.Cloudflare.Actions | Where-Object { $_.Overwrite } | ForEach-Object { $_.Id })
   $missing = @($needed | Where-Object { $confirmed -notcontains $_ })
   if ($missing.Count -gt 0) { Stop-Request 400 ('Confirm each overwrite of an existing Cloudflare resource: ' + ($missing -join ', ')) }
+  # The backend was verified again just now (Build-ChangePlan). A route to a backend that fails is only saved on request.
+  if ($view.needsBackendAck -and -not [bool](Get-Field $Body 'acceptUnverifiedBackend' $false)) {
+    $State.Plans[$id] = $stored
+    Stop-Request 409 "The backend did not pass the connection test from Traefik's network: $($plan.Backend.message) Fix the backend, or confirm that you want to save the route anyway." @{ needsBackendAck = $true; backend = $plan.Backend }
+  }
 
   $settings = $plan.Settings
   $steps = New-Object System.Collections.ArrayList
@@ -556,10 +612,12 @@ function Invoke-ApplyRequest($Body) {
       $null = $steps.Add([ordered]@{ name = 'Traefik reload'; status = 'Warning'; message = 'Traefik is not running; routes load when it starts.' })
     }
   }
-  # The route is ready only when Traefik's network reaches the backend: one real request, reported as its own step.
-  if ($plan.New -and $plan.New.enabled) {
-    $v = ConvertFrom-BackendProbe (Test-BackendFromTraefik -Settings $settings -Service $plan.New) $plan.New $settings.ProxyNetwork
-    $null = $steps.Add([ordered]@{ name = 'Backend reachable from Traefik'; status = $(switch ($v[0]) { 'ok' { 'Done' } 'auth' { 'Done' } 'skipped' { 'Skipped' } default { 'Warning' } }); message = $v[1] })
+  # The route is ready only when Traefik's network reaches the backend: the verification made right before writing,
+  # reported as its own step (a failed one was saved only because the user confirmed it).
+  if ($plan.New -and $plan.New.enabled -and $plan.Backend) {
+    $b = $plan.Backend
+    $null = $steps.Add([ordered]@{ name = 'Backend reachable from Traefik'; status = $(switch ($b.state) { 'ok' { 'Done' } 'auth' { 'Done' } 'skipped' { 'Skipped' } default { 'Warning' } })
+        message = "$($b.label): $($b.message)$(if ($b.state -eq 'failed') { ' Saved anyway, as you confirmed: the route is not ready until the backend answers.' })" })
   }
   $serviceName = if ($plan.New) { $plan.New.name } else { $plan.Previous.name }
   foreach ($r in @(Invoke-CloudflareServicePlan -Settings $settings -Plan $plan.Cloudflare -ServiceName $serviceName -ConfirmedOverwrites $confirmed)) {
@@ -2449,6 +2507,7 @@ function Invoke-ApiRoute($Request, $Body) {
     'GET /api/docker/containers' { return Get-DockerContainersData }
     'GET /api/docker/claims' { return Get-HostnameClaimsData ([string]$Request.Query['hostname']) ([string]$Request.Query['service']) }
     'POST /api/docker/probe' { return Invoke-PortProbe $Body }
+    'POST /api/services/backend' { return Invoke-BackendResolve $Body }
     'POST /api/docker/connect' { return Invoke-NetworkConnect $Body }
     'POST /api/services/health' { return Invoke-ServiceHealth $Body }
     'GET /api/catalog' { return Get-CatalogData }

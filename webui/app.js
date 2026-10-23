@@ -163,6 +163,13 @@
     if (arr(plan.review).length) content.append(h('div', null, reviewList(plan.review)));
     const notes = arr(plan.notes);
     if (notes.length) content.append(h('div', { class: 'callout' }, notes.map((n) => h('p', null, n))));
+    // The connection test from Traefik's network, made for this preview and again right before applying.
+    if (plan.backend) {
+      const st = L.backendStatus(plan.backend);
+      content.append(h('section', { class: 'plan-backend' }, h('h3', null, icon('pulse'), ' Connection test from Traefik'),
+        h('p', null, plainChip(st.label, st.tone), ' ', plan.backend.message),
+        U.gate('expert', arr(plan.backend.evidence).length ? U.technical(arr(plan.backend.evidence), 'Connection test output (redacted)') : null)));
+    }
     const issues = arr(plan.traefik.issues);
     if (issues.length) {
       content.append(h('h3', null, 'Validation'), h('ul', { class: 'checks' }, issues.map((i) => U.checkItem(i.Level === 'Error' ? 'err' : 'warn', `${i.Service ? `${i.Service}: ` : ''}${i.Level}`, i.Message))));
@@ -202,8 +209,15 @@
     if (!plan.canApply) { foot.append(h('div', { class: 'grow' }, h('span', { class: 'muted' }, plan.hasWork ? 'Fix the problems above, then preview again.' : 'Nothing to change.')), cancel); return; }
     const reviewed = h('input', { type: 'checkbox', id: 'plan-reviewed' });
     const apply = h('button', { type: 'button', class: 'btn primary', disabled: true }, 'Apply changes');
-    const sync = () => { apply.disabled = !(reviewed.checked && $$('.overwrite-confirm', $('#plan-content')).every((b) => b.checked)); };
+    // A backend that failed its connection test is saved only when the user says so explicitly.
+    const ack = plan.needsBackendAck ? h('input', { type: 'checkbox', id: 'plan-backend-ack', class: 'backend-ack' }) : null;
+    if (ack) {
+      $('#plan-content').append(h('div', { class: 'callout warn' }, h('label', { class: 'check' }, ack,
+        h('span', null, h('strong', null, 'Save the route anyway. '), 'The backend did not answer correctly from Traefik\'s network, so the route will not work until the backend is fixed. It is not marked healthy.'))));
+    }
+    const sync = () => { apply.disabled = !(reviewed.checked && (!ack || ack.checked) && $$('.overwrite-confirm', $('#plan-content')).every((b) => b.checked)); };
     reviewed.addEventListener('change', sync);
+    if (ack) ack.addEventListener('change', sync);
     $$('.overwrite-confirm', $('#plan-content')).forEach((b) => b.addEventListener('change', sync));
     apply.addEventListener('click', () => applyPlan(apply));
     foot.append(h('label', { class: 'check grow' }, reviewed, h('span', null, 'I reviewed these changes')), cancel, apply);
@@ -223,7 +237,8 @@
     const path = state.planApplyPath;
     button.disabled = true; button.setAttribute('aria-busy', 'true');
     try {
-      const r = await api('POST', path, { planId: state.plan.planId, confirm: true, confirmOverwrites: overwrites });
+      const ackBox = $('#plan-backend-ack');
+      const r = await api('POST', path, { planId: state.plan.planId, confirm: true, confirmOverwrites: overwrites, acceptUnverifiedBackend: !!(ackBox && ackBox.checked) });
       renderResult(r);
       state.verify = null;
       if (state.afterApply) { state.afterApply(); state.afterApply = null; }
