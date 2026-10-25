@@ -555,6 +555,10 @@ function Build-ChangePlan($Body) {
   }
   $traefikKey = $traefik.RegistryJson + '|' + ((@($traefik.Changes | ForEach-Object { "$($_.File):$($_.Action):$($_.OldContent)" })) -join '|')
   $check = Get-TargetCheck $settings $new
+  # Generic "make sure it is reachable" reminders are dropped once a real request from Traefik's network succeeded.
+  if ($check.Verdict -and $check.Verdict.state -in 'ok', 'auth') {
+    $traefik.Issues = @($traefik.Issues | Where-Object { -not ($_.Level -eq 'Warning' -and $_.Field -eq 'target.host' -and $_.Message -match '^(The container .+ must be attached|The Windows app must listen)') })
+  }
   return [pscustomobject]@{
     Op = $op; Summary = $summary; Settings = $settings; Traefik = $traefik; Cloudflare = $cf; New = $new; Previous = $previous
     Notes = @($notes + @($check.Warnings)); Backend = $check.Verdict; TraefikKey = $traefikKey
@@ -2598,7 +2602,7 @@ function Get-IdentityContext([switch]$Deep) {
     if ($r.Status -in 301, 302) { $pub.state = 'failed' }
     $State.IdpChecks['__public'] = $pub
   }
-  $facts = [ordered]@{ provider = $cfg.provider; install = $install; health = $health; token = $token; overview = $overview; hostname = $cfg.authentik.hostname; publicUrl = $cfg.authentik.publicUrl; owner = $cfg.authentik.owner
+  $facts = [ordered]@{ provider = $cfg.provider; install = $install; health = $health; token = $token; overview = $overview; hostname = $cfg.authentik.hostname; publicUrl = $cfg.authentik.publicUrl; owner = $cfg.authentik.owner; authMode = $cfg.authMode
     route = $route; cloudflare = $cfFacts; publicCheck = $pub; google = $google; apps = $appFacts }
   return [pscustomobject]@{ Settings = $settings; Config = $cfg; Installs = $installs; Install = $install; BaseUrl = $baseUrl; Conn = $conn; Overview = $overview; OverviewError = $overviewError; Credential = $credential
     Facts = $facts; Services = $services; Cloudflare = $cf }
@@ -2817,7 +2821,7 @@ function Set-IdentityOwnerRequest($Body) {
   Assert-Installed
   $settings = Get-Settings
   $cfg = Read-IdentityConfig -Settings $settings
-  if ($cfg.authentik.owner.verifiedAt) { Stop-Request 409 "The initial owner ($($cfg.authentik.owner.email)) is already set up. Add more people, or change who owns what, in authentik." }
+  if ($cfg.authentik.owner.subject) { Stop-Request 409 "The initial owner ($($cfg.authentik.owner.email)) is already set up with Google. Add more people, or change who owns what, in authentik." }
   try { $email = ConvertTo-OwnerEmail ([string](Get-Field $Body 'email' '')) } catch { Stop-Request 400 $_.Exception.Message }
   $cfg.authentik.owner.email = $email
   $cfg.authentik.owner.makeAdmin = [bool](Get-Field $Body 'makeAdmin' $true)
@@ -2828,8 +2832,28 @@ function Set-IdentityOwnerRequest($Body) {
 }
 
 function Get-GoogleDesired($Body, $Cfg) {
-  return [pscustomobject]@{ Slug = $Cfg.authentik.google.slug; ClientId = ([string](Get-Field $Body 'clientId' $Cfg.authentik.google.clientId)).Trim(); ClientSecret = ([string](Get-Field $Body 'clientSecret' '')).Trim()
-    OwnerEmail = $Cfg.authentik.owner.email; OwnerVerified = [bool]$Cfg.authentik.owner.verifiedAt }
+  $id = ([string](Get-Field $Body 'clientId' $Cfg.authentik.google.clientId)).Trim(); $secret = ([string](Get-Field $Body 'clientSecret' '')).Trim()
+  $json = [string](Get-Field $Body 'clientJson' '')
+  if ($json) {
+    # Google's downloaded client file (preferred): validated here; the secret is used once and never stored.
+    $redir = "$($Cfg.authentik.publicUrl)/source/oauth/callback/$($Cfg.authentik.google.slug)/"
+    $g = ConvertFrom-GoogleClientJson -Json $json -ExpectedRedirectUri $redir
+    $json = $null
+    if (-not $g.Ok) { Stop-Request 400 ($g.Errors -join ' ') @{ jsonErrors = @($g.Errors) } }
+    $id = $g.ClientId; $secret = $g.ClientSecret
+  }
+  return [pscustomobject]@{ Slug = $Cfg.authentik.google.slug; ClientId = $id; ClientSecret = $secret
+    OwnerEmail = $Cfg.authentik.owner.email; OwnerVerified = [bool]$Cfg.authentik.owner.subject; Replace = [bool](Get-Field $Body 'replace' $false); Repair = [bool](Get-Field $Body 'repair' $false) }
+}
+
+# Checks a downloaded Google client file without using it: client type, ID, secret present, redirect URI, endpoints.
+function Invoke-IdentityGoogleInspect($Body) {
+  Assert-Installed
+  $cfg = Read-IdentityConfig -Settings (Get-Settings)
+  if (-not $cfg.authentik.publicUrl) { Stop-Request 409 'Set up the public sign-in address first: the file must contain its redirect URI.' }
+  $redir = "$($cfg.authentik.publicUrl)/source/oauth/callback/$($cfg.authentik.google.slug)/"
+  $g = ConvertFrom-GoogleClientJson -Json ([string](Get-Field $Body 'clientJson' '')) -ExpectedRedirectUri $redir
+  return [ordered]@{ ok = $g.Ok; clientId = $g.ClientId; projectId = $g.ProjectId; secretPresent = [bool]$g.ClientSecret; redirectUris = @($g.RedirectUris); expectedRedirectUri = $redir; errors = @($g.Errors); warnings = @($g.Warnings) }
 }
 
 # Saves the client ID (never the secret), so the wizard survives a refresh or a trip to Google Cloud.
@@ -2852,7 +2876,8 @@ function Invoke-IdentityGooglePlan($Body) {
   if (-not $ctx.Config.authentik.publicUrl) { Stop-Request 409 'Set up the public sign-in address first: Google needs the https redirect URI.' }
   if (-not $ctx.Config.authentik.owner.email) { Stop-Request 409 'Enter the initial owner''s Google account first.' }
   $d = Get-GoogleDesired $Body $ctx.Config
-  try { $r = Sync-AuthentikGoogleSource -Conn $ctx.Conn -Desired $d -WhatIf } catch { Stop-Request 400 $_.Exception.Message }
+  try { $r = Sync-AuthentikGoogleSource -Conn $ctx.Conn -Desired $d -WhatIf }
+  catch { if ($_.Exception.Data['NeedsReplace']) { Stop-Request 409 $_.Exception.Message @{ needsReplace = $true } } else { Stop-Request 400 $_.Exception.Message } }
   $id = New-IdpPlanId ([pscustomobject]@{ Kind = 'google'; Desired = $d; Fingerprint = (Get-AkFingerprint $r.Actions) })
   return [ordered]@{ planId = $id; actions = @(ConvertTo-AkActionView $r.Actions); canApply = $true; secretProvided = [bool]$d.ClientSecret; redirectUri = "$($ctx.Config.authentik.publicUrl)/source/oauth/callback/$($d.Slug)/"
     notes = @("Only $($d.OwnerEmail) can create an account with Google at first. Everyone else is added later in authentik (invitations, or by editing the enrollment policy there).",
@@ -2887,29 +2912,129 @@ function Invoke-IdentityGoogleApply($Body) {
   return [ordered]@{ ok = $true; actions = @(ConvertTo-AkActionView $result.Actions); redirect = $redir }
 }
 
-# Completes the one-time owner setup once the owner has signed in with Google: their account (connected to the Google
-# source, with the owner's address, which authentik's enrollment policy accepted only verified) joins "DTC owners" and,
-# if chosen, the authentik administrators. Afterwards the manager never changes users or groups again.
+# Owner verification (explicit setup action). Google path: the account connected to the Google source with the owner's
+# address (authentik's enrollment policy only let Google-verified addresses through); the Google subject seen first is
+# pinned. Local path: the administrator whose token the manager uses, signed in after the check was started. Both: the
+# account must be Internal, joins "DTC owners" (and the administrators if chosen). An External account is only changed
+# to Internal when the request says repair = true.
 function Invoke-IdentityOwnerVerify($Body) {
   Assert-Installed
   $ctx = Get-IdentityContext
   Assert-IdentityConnection $ctx
   $cfg = $ctx.Config; $o = $cfg.authentik.owner
-  if (-not $o.email) { Stop-Request 409 'Enter the initial owner''s Google account first.' }
-  $found = @(Find-AuthentikOwner -Conn $ctx.Conn -OwnerEmail $o.email -Slug $cfg.authentik.google.slug | Where-Object { $_.IsActive })
-  if (-not $found.Count) {
-    return [ordered]@{ ok = $false; verified = [bool]$o.verifiedAt; message = "No account has signed in with Google as $($o.email) yet. Open the sign-in page, choose ""Sign in with Google"" and use that account, then check again." }
+  $local = $cfg.authMode -eq 'local'
+  $repair = [bool](Get-Field $Body 'repair' $false)
+  $since = [datetime]::MinValue
+  if ($local) {
+    if (-not $o.localSince) { Stop-Request 409 'Start the local sign-in check first.' }
+    $since = [datetime]$o.localSince
+    $me = (Invoke-AuthentikApi $ctx.Conn GET '/core/users/me/').user
+    $owner = [pscustomobject]@{ Pk = [int]$me.pk; Username = [string]$me.username; Subject = '' }
+    $null = Sync-AuthentikOwnersGroup -Conn $ctx.Conn
+  } else {
+    if (-not $o.email) { Stop-Request 409 'Enter the initial owner''s Google account first.' }
+    $found = @(Find-AuthentikOwner -Conn $ctx.Conn -OwnerEmail $o.email -Slug $cfg.authentik.google.slug | Where-Object { $_.IsActive })
+    if (-not $found.Count) { return [ordered]@{ ok = $false; verified = $false; items = @(); message = "Nobody has signed in with Google as $($o.email) yet. Press ""Continue with Google"", choose that account, then ""I've signed in - check again""." } }
+    if ($found.Count -gt 1) { Stop-Request 409 "Several authentik accounts signed in with Google as $($o.email): $(@($found | ForEach-Object { $_.Username }) -join ', '). Resolve this in authentik first." }
+    $owner = $found[0]
+    if ($o.subject -and $owner.Subject -ne $o.subject) { Stop-Request 409 'A different Google identity signed in with the owner''s address than the one verified first. Nothing was changed; check the account in authentik.' }
   }
-  if ($found.Count -gt 1) { Stop-Request 409 "Several authentik accounts signed in with Google as $($o.email): $(@($found | ForEach-Object { $_.Username }) -join ', '). Resolve this in authentik first." }
-  $u = $found[0]
-  $actions = @(Complete-AuthentikOwner -Conn $ctx.Conn -UserPk $u.Pk -MakeAdmin:([bool]$o.makeAdmin))
-  if (-not $o.verifiedAt) { $o.verifiedAt = $(if ($u.LastLogin) { $u.LastLogin } else { Get-Date -Format 's' }) }
-  $o.username = $u.Username
-  if (-not $cfg.authentik.google.verifiedAt) { $cfg.authentik.google.verifiedAt = $o.verifiedAt; $cfg.authentik.google.verifiedBy = $u.Username }
-  Set-IdentityProgress $cfg 'owner' 'verified' $u.Username
-  Save-IdentityConfig -Settings $ctx.Settings -Config $cfg
-  Write-Audit 'identity-owner-verified' "user=$($u.Username) admin=$($o.makeAdmin)"
-  return [ordered]@{ ok = $true; verified = $true; username = $u.Username; actions = @(ConvertTo-AkActionView $actions); next = @((Get-IdentityModel -Facts (Get-IdentityContext).Facts).next)[0] }
+  $repaired = @()
+  $u = Invoke-AuthentikApi $ctx.Conn GET "/core/users/$($owner.Pk)/"
+  if ([string]$u.type -ne 'internal') {
+    if (-not $repair) {
+      $chk = Get-AuthentikOwnerCheck -Conn $ctx.Conn -Owner $owner -MakeAdmin:([bool]$o.makeAdmin -and -not $local) -ExpectSubject $o.subject -Since $since -Local:$local
+      return [ordered]@{ ok = $false; verified = $false; needsRepair = $true; items = @($chk.Items); username = $owner.Username; message = "'$($owner.Username)' is an External authentik account, so authentik's dashboard refuses it (""Interface can only be accessed by internal users""). Repair makes it Internal; nothing else changes." }
+    }
+    if (Set-AuthentikUserInternal -Conn $ctx.Conn -UserPk $owner.Pk) { $repaired += "made '$($owner.Username)' Internal" }
+  }
+  $null = Complete-AuthentikOwner -Conn $ctx.Conn -UserPk $owner.Pk -MakeAdmin:([bool]$o.makeAdmin -and -not $local)
+  $chk = Get-AuthentikOwnerCheck -Conn $ctx.Conn -Owner $owner -MakeAdmin:([bool]$o.makeAdmin -and -not $local) -ExpectSubject $o.subject -Since $since -Local:$local
+  if ($chk.Ok) {
+    if (-not $o.verifiedAt -or (-not $local -and -not $o.subject)) { $o.verifiedAt = $(if ($chk.LastLogin) { $chk.LastLogin } else { Get-Date -Format 's' }) }
+    $o.username = $owner.Username
+    if (-not $local) { $o.subject = $owner.Subject; if (-not $cfg.authentik.google.verifiedAt) { $cfg.authentik.google.verifiedAt = $o.verifiedAt; $cfg.authentik.google.verifiedBy = $owner.Username } }
+    Set-IdentityProgress $cfg 'owner' 'verified' $owner.Username
+    Save-IdentityConfig -Settings $ctx.Settings -Config $cfg
+  }
+  Write-Audit 'identity-owner-verify' "user=$($owner.Username) ok=$($chk.Ok) local=$local repaired=$($repaired -join ',')"
+  return [ordered]@{ ok = $chk.Ok; verified = $chk.Ok; items = @($chk.Items); username = $owner.Username; repaired = $repaired
+    message = $(if ($chk.Ok) { "Verified: $($owner.Username) is the owner." } else { 'Not verified yet: ' + ((@($chk.Items | Where-Object { -not $_.ok } | ForEach-Object { "$($_.label): $($_.message)" })) -join ' ') })
+    next = $(if ($chk.Ok) { @((Get-IdentityModel -Facts (Get-IdentityContext).Facts).next)[0] } else { '' }) }
+}
+
+# Local path: remember when the check started, so only a sign-in after it counts.
+function Start-IdentityLocalOwnerCheck {
+  Assert-Installed
+  $settings = Get-Settings
+  $cfg = Read-IdentityConfig -Settings $settings
+  if ($cfg.authentik.owner.verifiedAt -and $cfg.authMode -eq 'local') { Stop-Request 409 'The owner is already verified.' }
+  $cfg.authentik.owner.localSince = (Get-Date).AddSeconds(-5).ToString('s')
+  Save-IdentityConfig -Settings $settings -Config $cfg
+  return [ordered]@{ ok = $true; since = $cfg.authentik.owner.localSince }
+}
+
+function Set-IdentityModeRequest($Body) {
+  Assert-Installed
+  $m = [string](Get-Field $Body 'mode' '')
+  if ($m -notin 'local', 'google') { Stop-Request 400 'mode must be local or google.' }
+  $settings = Get-Settings
+  $cfg = Read-IdentityConfig -Settings $settings
+  if ($cfg.provider -ne 'authentik') { $cfg.provider = 'authentik' }
+  # Only the guided path changes: switching never touches authentik accounts, policies or application access.
+  $cfg.authMode = $m
+  Set-IdentityProgress $cfg 'mode' 'done' $m
+  Save-IdentityConfig -Settings $settings -Config $cfg
+  Write-Audit 'identity-mode' $m
+  return [ordered]@{ ok = $true; mode = $m }
+}
+
+function Set-IdentityWizardStepRequest($Body) {
+  Assert-Installed
+  $step = [string](Get-Field $Body 'step' '')
+  if ($step -notmatch '^[a-z-]{1,30}$') { Stop-Request 400 'Invalid step.' }
+  $settings = Get-Settings
+  $cfg = Read-IdentityConfig -Settings $settings
+  $cfg.wizardStep = $step
+  Save-IdentityConfig -Settings $settings -Config $cfg
+  return [ordered]@{ ok = $true }
+}
+
+# Google-first sign-in page: preview, apply (records the previous brand values), restore.
+function Invoke-IdentityLoginPage($Body, [string]$Action) {
+  Assert-Installed
+  $ctx = Get-IdentityContext
+  Assert-IdentityConnection $ctx
+  $cfg = $ctx.Config; $lp = $cfg.authentik.loginPage
+  $domain = $(if ($cfg.authentik.hostname -match '^[^.]+\.(.+)$') { $Matches[1] } else { $cfg.authentik.hostname })
+  $title = "Sign in to $domain"
+  switch ($Action) {
+    'plan' {
+      try { $r = Sync-AuthentikLoginPage -Conn $ctx.Conn -Title $title -Slug $cfg.authentik.google.slug -WhatIf } catch { Stop-Request 400 $_.Exception.Message }
+      $id = New-IdpPlanId ([pscustomobject]@{ Kind = 'loginpage'; Fingerprint = (Get-AkFingerprint $r.Actions) })
+      return [ordered]@{ planId = $id; actions = @(ConvertTo-AkActionView $r.Actions); title = $title; canApply = [bool]@($r.Actions | Where-Object { $_.Kind -ne 'none' }).Count
+        recoveryUrl = "$($ctx.BaseUrl)/if/flow/default-authentication-flow/" }
+    }
+    'apply' {
+      $p = Use-IdpPlan $Body 'loginpage'
+      if ((Get-AkFingerprint (Sync-AuthentikLoginPage -Conn $ctx.Conn -Title $title -Slug $cfg.authentik.google.slug -WhatIf).Actions) -ne $p.Fingerprint) { Stop-Request 409 'authentik changed since the preview. Preview again.' }
+      $r = Sync-AuthentikLoginPage -Conn $ctx.Conn -Title $title -Slug $cfg.authentik.google.slug
+      if (-not $lp.appliedAt) { $lp.brand = $r.Previous.brand; $lp.previousFlow = $r.Previous.flow; $lp.previousTitle = $r.Previous.title }
+      $lp.appliedAt = (Get-Date -Format 's')
+      Save-IdentityConfig -Settings $ctx.Settings -Config $cfg
+      Write-Audit 'identity-loginpage' 'applied'
+      return [ordered]@{ ok = $true; actions = @(ConvertTo-AkActionView $r.Actions) }
+    }
+    'restore' {
+      Assert-Confirmed $Body
+      if (-not $lp.appliedAt) { Stop-Request 409 'The Google-first sign-in page was not applied by the manager.' }
+      Restore-AuthentikLoginPage -Conn $ctx.Conn -Previous ([pscustomobject]@{ brand = $lp.brand; flow = $lp.previousFlow; title = $lp.previousTitle })
+      $lp.appliedAt = ''
+      Save-IdentityConfig -Settings $ctx.Settings -Config $cfg
+      Write-Audit 'identity-loginpage' 'restored'
+      return [ordered]@{ ok = $true }
+    }
+  }
 }
 
 # Protecting applications: one service at a time is turned into a change body for the normal Traefik/Cloudflare
@@ -3134,6 +3259,13 @@ function Invoke-ApiRoute($Request, $Body) {
     'POST /api/identity/outpost/apply' { return Invoke-IdentityOutpost $Body -Apply }
     'POST /api/identity/owner' { return Set-IdentityOwnerRequest $Body }
     'POST /api/identity/owner/verify' { return Invoke-IdentityOwnerVerify $Body }
+    'POST /api/identity/owner/local-start' { return Start-IdentityLocalOwnerCheck }
+    'POST /api/identity/mode' { return Set-IdentityModeRequest $Body }
+    'POST /api/identity/wizard' { return Set-IdentityWizardStepRequest $Body }
+    'POST /api/identity/google/inspect' { return Invoke-IdentityGoogleInspect $Body }
+    'POST /api/identity/loginpage/plan' { return Invoke-IdentityLoginPage $Body 'plan' }
+    'POST /api/identity/loginpage/apply' { return Invoke-IdentityLoginPage $Body 'apply' }
+    'POST /api/identity/loginpage/restore' { return Invoke-IdentityLoginPage $Body 'restore' }
     'POST /api/identity/google/save' { return Save-IdentityGoogleRequest $Body }
     'POST /api/identity/google/plan' { return Invoke-IdentityGooglePlan $Body }
     'POST /api/identity/google/apply' { return Invoke-IdentityGoogleApply $Body }

@@ -251,11 +251,13 @@ function Get-GoogleOAuthSettings {
   param([Parameter(Mandatory = $true)][string]$PublicUrl, [string]$Slug = 'google', [string]$Domain = '', [string]$AppName = '')
   $base = $PublicUrl.TrimEnd('/')
   $u = [Uri]$base
-  if (-not $AppName) { $AppName = "authentik - $(if ($Domain) { $Domain } else { $u.Host })" }
+  # One name for the Google app and its client, ASCII only (Google rejects some punctuation and the word "Google").
+  if (-not $AppName) { $AppName = "$(if ($Domain) { $Domain } else { $u.Host }) Sign-in" }
+  $AppName = ($AppName -replace '[^A-Za-z0-9 ._-]', '-').Trim()
   $parts = $u.Host.Split('.')
   $authorized = $(if ($parts.Count -ge 2) { ($parts[($parts.Count - 2)..($parts.Count - 1)]) -join '.' } else { $u.Host })
   return [pscustomobject]@{
-    AppName = $AppName; ClientType = 'Web application'; ClientName = "$AppName (sign-in)"; Slug = $Slug
+    AppName = $AppName; ClientType = 'Web application'; ClientName = $AppName; Slug = $Slug
     PublicUrl = $base; RedirectUri = "$base/source/oauth/callback/$Slug/"; JavascriptOrigins = @()
     AuthorizedDomain = $authorized
     Scopes = @('openid', 'https://www.googleapis.com/auth/userinfo.email', 'https://www.googleapis.com/auth/userinfo.profile')
@@ -265,6 +267,43 @@ function Get-GoogleOAuthSettings {
       audience = 'https://console.cloud.google.com/auth/audience'; dataAccess = 'https://console.cloud.google.com/auth/scopes'; clients = 'https://console.cloud.google.com/auth/clients'
     }
   }
+}
+
+# Google's downloaded OAuth client file ("Download JSON"): {"web": {"client_id", "client_secret", "redirect_uris", "auth_uri",
+# "token_uri", ...}}. Returns ClientId/ClientSecret (server side only), ProjectId, RedirectUris and Errors/Warnings with
+# instructions. Never throws with the secret in the message.
+function ConvertFrom-GoogleClientJson {
+  param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$Json, [string]$ExpectedRedirectUri = '')
+  $out = [pscustomobject][ordered]@{ Ok = $false; ClientId = ''; ClientSecret = ''; ProjectId = ''; RedirectUris = @(); Errors = @(); Warnings = @() }
+  if ($Json.Length -gt 20000) { $out.Errors = @('That file is too large to be a Google OAuth client file.'); return $out }
+  $doc = $null
+  try { $doc = $Json | ConvertFrom-Json } catch { $out.Errors = @('That is not a valid JSON file. Download it again from Google Cloud (Clients > your client > Download JSON).'); return $out }
+  if ($null -eq $doc -or -not ($doc -is [pscustomobject])) { $out.Errors = @('That is not a Google OAuth client file.'); return $out }
+  if ($doc.PSObject.Properties['installed']) { $out.Errors = @('This client is of type "Desktop app" (or another installed-app type). Create a client of type "Web application" instead.'); return $out }
+  $w = $doc.PSObject.Properties['web']
+  if (-not $w -or -not ($w.Value -is [pscustomobject])) { $out.Errors = @('The file has no "web" section: it is not the OAuth client file of a "Web application" client. In Google Cloud open Clients, choose your Web application client and use Download JSON.'); return $out }
+  $web = $w.Value
+  $get = { param($n) if ($web.PSObject.Properties[$n] -and $null -ne $web.$n) { $web.$n } else { $null } }
+  $errors = @(); $warnings = @()
+  $id = ([string](& $get 'client_id')).Trim(); $secret = ([string](& $get 'client_secret')).Trim()
+  if (-not $id) { $errors += 'The file contains no client_id.' } elseif (-not (Test-GoogleClientId $id)) { $errors += 'The client_id is not a Google OAuth client ID (it should end in .apps.googleusercontent.com).' }
+  if (-not $secret) { $errors += 'The file contains no client_secret. Google shows and downloads the secret only right after the client is created: add a new secret to the client (Clients > your client > Add secret), then download the JSON again.' }
+  elseif (-not (Test-GoogleClientSecret $secret)) { $errors += 'The client_secret has an unexpected format.' }
+  $auth = [string](& $get 'auth_uri'); $token = [string](& $get 'token_uri')
+  if ($auth -and $auth -notin 'https://accounts.google.com/o/oauth2/auth', 'https://accounts.google.com/o/oauth2/v2/auth') { $errors += "auth_uri is '$auth', not Google's sign-in endpoint: this file does not come from Google." }
+  if ($token -and $token -notin 'https://oauth2.googleapis.com/token', 'https://accounts.google.com/o/oauth2/token') { $errors += "token_uri is '$token', not Google's token endpoint: this file does not come from Google." }
+  $uris = @(@(& $get 'redirect_uris') | ForEach-Object { [string]$_ } | Where-Object { $_ })
+  $out.RedirectUris = $uris
+  if ($ExpectedRedirectUri) {
+    if (-not $uris.Count) { $errors += "The client has no authorized redirect URI. In Google Cloud open Clients > your client > Authorized redirect URIs > Add URI, enter $ExpectedRedirectUri exactly, Save, then download the JSON again." }
+    elseif ($uris -cnotcontains $ExpectedRedirectUri) {
+      $near = @($uris | Where-Object { $_.TrimEnd('/').ToLowerInvariant() -eq $ExpectedRedirectUri.TrimEnd('/').ToLowerInvariant() })
+      $errors += "The client's authorized redirect URIs ($($uris -join ', ')) do not include $ExpectedRedirectUri$(if ($near.Count) { ' exactly (Google compares them character by character, including the trailing slash)' }). In Google Cloud open Clients > your client > Authorized redirect URIs, add $ExpectedRedirectUri, Save, then download the JSON again."
+    }
+  }
+  if (& $get 'javascript_origins') { $warnings += 'JavaScript origins are set; authentik does not need them (harmless).' }
+  $out.ClientId = $id; $out.ClientSecret = $secret; $out.ProjectId = [string](& $get 'project_id'); $out.Errors = $errors; $out.Warnings = $warnings; $out.Ok = -not $errors.Count
+  return $out
 }
 
 function Test-GoogleClientId([string]$Value) { return ([string]$Value).Trim() -match $script:GoogleClientIdPattern }
@@ -381,7 +420,12 @@ function Get-AuthentikGroup($Conn, [string]$Name) {
 #     verified Google address; while the owner has not signed in yet, a changed owner address updates that policy;
 #   - the Google OAuth source (client ID/secret; identifier matching: never linked to an existing account by email) and
 #     its button on the login page.
-# Desired: Slug, ClientId, ClientSecret (optional when the source exists), OwnerEmail, OwnerVerified (bool).
+# Desired: Slug, ClientId, ClientSecret (optional when the source exists), OwnerEmail, OwnerVerified (bool), Replace
+# (bool: allow changing the client of an existing Google source), Repair (bool: fix a flow from an earlier version).
+#
+# Users created by the enrollment flow are Internal (a dedicated write stage): authentik's default source enrollment
+# stage creates External users, who are refused by authentik's own user interface ("Interface can only be accessed by
+# internal users"). Google Cloud's "External" audience is unrelated: it only means "any Google account".
 function Sync-AuthentikGoogleSource {
   param([Parameter(Mandatory = $true)]$Conn, [Parameter(Mandatory = $true)]$Desired, [switch]$WhatIf)
   $actions = New-AkActionList
@@ -397,6 +441,11 @@ function Sync-AuthentikGoogleSource {
   $existing = @(Get-AuthentikList $Conn "/sources/oauth/?slug=$slug")[0]
   if ($existing -and [string]$existing.provider_type -ne 'google') { throw "A source with the slug '$slug' already exists and is not a Google source. Choose another slug." }
   if (-not $existing -and -not $secret) { throw 'Enter the client secret.' }
+  $replace = [bool](Get-AkProp $Desired 'Replace' $false)
+  if ($existing -and -not $replace -and ($secret -or [string]$existing.consumer_key -ne ([string]$Desired.ClientId).Trim())) {
+    $err = New-Object System.Exception ("authentik already has a Google connection (client $($existing.consumer_key)). Choose 'Replace the Google client' to change it; until then it stays as it is.")
+    $err.Data['Status'] = 409; $err.Data['NeedsReplace'] = $true; throw $err
+  }
 
   # Owner group with the administrator as first member.
   $grp = Get-AuthentikGroup $Conn $script:OwnersGroup
@@ -419,15 +468,44 @@ function Sync-AuthentikGoogleSource {
     if (-not $WhatIf) { $flow = Invoke-AuthentikApi $Conn POST '/flows/instances/' @{ name = 'Google enrollment (Deployment Manager)'; slug = $fslug; title = 'Create your account'; designation = 'enrollment'; authentication = 'none'; denied_action = 'message'; policy_engine_mode = 'any' }; Set-AkActionDone $actions }
     else { $flow = [pscustomobject]@{ pk = '<new flow>'; policybindingmodel_ptr_id = '<new flow>'; planned = $true } }
   }
+  # The flow's stages: the default enrollment stages, except that users are written by our own stage as Internal users.
+  $repair = [bool](Get-AkProp $Desired 'Repair' $false)
+  $defWrite = $null
+  $defBindings = @(Get-AuthentikList $Conn "/flows/bindings/?target=$($ov.Flows['default-source-enrollment'].Pk)&ordering=order")
+  foreach ($b in $defBindings) { if ([string](Get-AkProp $b.stage_obj 'component' '') -like '*user-write*') { $defWrite = Invoke-AuthentikApi $Conn GET "/stages/user_write/$($b.stage)/" } }
+  $wname = "$($script:Prefix)$slug-owner-write"
+  $wstage = @(Get-AuthentikList $Conn "/stages/user_write/?name=$([Uri]::EscapeDataString($wname))" | Where-Object { [string]$_.name -eq $wname })[0]
+  if ($wstage) { Add-AkAction $actions 'none' 'stage' $wname "Write stage '$wname' exists" }
+  else {
+    Add-AkAction $actions 'create' 'stage' $wname "Create write stage '$wname': accounts created through Google are Internal users" 'Internal users can open their authentik dashboard; External users are refused by it. No group and no administrator right is given here.'
+    if (-not $WhatIf) {
+      $wstage = Invoke-AuthentikApi $Conn POST '/stages/user_write/' @{ name = $wname; user_type = 'internal'; create_users_as_inactive = $false
+        user_creation_mode = [string](Get-AkProp $defWrite 'user_creation_mode' 'create_when_required'); user_path_template = [string](Get-AkProp $defWrite 'user_path_template' 'goauthentik.io/sources/%(slug)s') }
+      Set-AkActionDone $actions
+    } else { $wstage = [pscustomobject]@{ pk = '<new stage>'; planned = $true } }
+  }
   if (-not $flow.PSObject.Properties['planned']) {
     $have = @(Get-AuthentikList $Conn "/flows/bindings/?target=$($flow.pk)&ordering=order")
     if (-not $have.Count) {
-      foreach ($b in @(Get-AuthentikList $Conn "/flows/bindings/?target=$($ov.Flows['default-source-enrollment'].Pk)&ordering=order")) {
-        Add-AkAction $actions 'create' 'flow stage' $b.stage_obj.name "Bind stage '$($b.stage_obj.name)' (order $($b.order))"
-        if (-not $WhatIf) { $null = Invoke-AuthentikApi $Conn POST '/flows/bindings/' @{ target = $flow.pk; stage = $b.stage; order = [int]$b.order; evaluate_on_plan = [bool]$b.evaluate_on_plan; re_evaluate_policies = [bool]$b.re_evaluate_policies }; Set-AkActionDone $actions }
+      foreach ($b in $defBindings) {
+        $isWrite = [string](Get-AkProp $b.stage_obj 'component' '') -like '*user-write*'
+        Add-AkAction $actions 'create' 'flow stage' $(if ($isWrite) { $wname } else { $b.stage_obj.name }) "Bind stage '$(if ($isWrite) { $wname } else { $b.stage_obj.name })' (order $($b.order))"
+        if (-not $WhatIf) { $null = Invoke-AuthentikApi $Conn POST '/flows/bindings/' @{ target = $flow.pk; stage = $(if ($isWrite) { $wstage.pk } else { $b.stage }); order = [int]$b.order; evaluate_on_plan = [bool]$b.evaluate_on_plan; re_evaluate_policies = [bool]$b.re_evaluate_policies }; Set-AkActionDone $actions }
       }
-    } else { Add-AkAction $actions 'none' 'flow stage' $fslug "The enrollment flow has its stages ($($have.Count))" }
-  } else { Add-AkAction $actions 'create' 'flow stage' $fslug 'Bind the default enrollment stages (prompt, write user, log in)' }
+    } else {
+      # A flow from an earlier version writes External users through the shared default stage: repaired only during setup
+      # (owner not verified yet) or on explicit request.
+      $wrong = @($have | Where-Object { [string](Get-AkProp $_.stage_obj 'component' '') -like '*user-write*' -and [string]$_.stage -ne [string](Get-AkProp $wstage 'pk' '') })
+      $wrongExternal = @(foreach ($b in $wrong) { $st = $null; try { $st = Invoke-AuthentikApi $Conn GET "/stages/user_write/$($b.stage)/" } catch { }; if (-not $st -or [string]$st.user_type -ne 'internal') { $b } })
+      if ($wrongExternal.Count -and (-not $ownerVerified -or $repair)) {
+        foreach ($b in $wrongExternal) {
+          Add-AkAction $actions 'update' 'flow stage' $fslug "Repair: let '$fslug' create Internal users (stage '$($b.stage_obj.name)' -> '$wname')" 'Fixes "Interface can only be accessed by internal users" for accounts created through Google.'
+          if (-not $WhatIf) { $null = Invoke-AuthentikApi $Conn PATCH "/flows/bindings/$($b.pk)/" @{ stage = $wstage.pk }; Set-AkActionDone $actions }
+        }
+      } elseif ($wrongExternal.Count) { Add-AkAction $actions 'none' 'flow stage' $fslug 'The enrollment flow creates External users; it belongs to authentik now (use "Repair" to fix it)' }
+      else { Add-AkAction $actions 'none' 'flow stage' $fslug "The enrollment flow has its stages ($($have.Count)) and creates Internal users" }
+    }
+  } else { Add-AkAction $actions 'create' 'flow stage' $fslug 'Bind the enrollment stages (prompt, write Internal user, log in)' }
   $pname = "$($script:Prefix)$slug-initial-owner"
   $pol = @(Get-AuthentikList $Conn "/policies/expression/?name=$([Uri]::EscapeDataString($pname))")[0]
   $expr = New-OwnerEnrollmentExpression $owner
@@ -482,6 +560,21 @@ function Sync-AuthentikGoogleSource {
   return [pscustomobject]@{ Actions = $actions.ToArray(); SourcePk = $srcPk; EnrollmentFlow = [string]$flow.pk; GroupPk = [string](Get-AkProp $grp 'pk' '') }
 }
 
+# The "DTC owners" group (owner-only access rule) with the API token's administrator as first member: created once, the
+# same way the Google setup does, for installations that sign in with local accounts only.
+function Sync-AuthentikOwnersGroup {
+  param([Parameter(Mandatory = $true)]$Conn, [switch]$WhatIf)
+  $actions = New-AkActionList
+  $grp = Get-AuthentikGroup $Conn $script:OwnersGroup
+  if ($grp) { Add-AkAction $actions 'none' 'group' $script:OwnersGroup "Group '$($script:OwnersGroup)' exists (members are managed in authentik)" }
+  else {
+    $me = Invoke-AuthentikApi $Conn GET '/core/users/me/'
+    Add-AkAction $actions 'create' 'group' $script:OwnersGroup "Create group '$($script:OwnersGroup)' with $($me.user.username) as first member" 'The initial owner-only access rule for protected applications. Add or remove people in authentik.'
+    if (-not $WhatIf) { $grp = Invoke-AuthentikApi $Conn POST '/core/groups/' @{ name = $script:OwnersGroup; is_superuser = $false; users = @([int]$me.user.pk); attributes = @{ 'created-by' = 'traefik-deployment-manager' } }; Set-AkActionDone $actions }
+  }
+  return [pscustomobject]@{ Actions = $actions.ToArray(); Group = $grp }
+}
+
 # The owner's account after their first Google sign-in: users connected to the Google source whose email is the
 # owner's address. (The enrollment policy already required Google to have verified that address.)
 function Find-AuthentikOwner {
@@ -492,11 +585,41 @@ function Find-AuthentikOwner {
     $u = $null; try { $u = Invoke-AuthentikApi $Conn GET "/core/users/$($c.user)/" } catch { continue }
     if (([string]$u.email).Trim().ToLowerInvariant() -eq $e) {
       $out += [pscustomobject]@{ Pk = [int]$u.pk; Username = [string]$u.username; Email = [string]$u.email; IsActive = [bool]$u.is_active; IsSuperuser = [bool]$u.is_superuser
+        Type = [string](Get-AkProp $u 'type' ''); Subject = [string]$c.identifier
         LastLogin = $(if ($u.last_login) { ([datetime]::Parse([string]$u.last_login, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind)).ToLocalTime().ToString('s') } else { '' })
         Groups = @(@(Get-AkProp $u 'groups_obj' @()) | ForEach-Object { [string]$_.name }) }
     }
   }
   return $out
+}
+
+# The owner's state, item by item, for the verification step (read only). $Owner: the user (Find-AuthentikOwner) or, for
+# local sign-in, the administrator account; $Since: the sign-in must be newer (local path); $ExpectSubject: the Google
+# subject recorded at the first verification (a different Google identity is refused).
+function Get-AuthentikOwnerCheck {
+  param([Parameter(Mandatory = $true)]$Conn, [Parameter(Mandatory = $true)]$Owner, [switch]$MakeAdmin, [string]$ExpectSubject = '', [datetime]$Since = [datetime]::MinValue, [switch]$Local)
+  $u = Invoke-AuthentikApi $Conn GET "/core/users/$($Owner.Pk)/"
+  $groups = @(@(Get-AkProp $u 'groups_obj' @()) | ForEach-Object { [string]$_.name })
+  $last = $null; if ($u.last_login) { $last = [datetime]::Parse([string]$u.last_login, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind) }
+  $items = @(
+    [ordered]@{ id = 'identity'; label = $(if ($Local) { 'Local administrator account' } else { 'Google identity' }); ok = $(if ($Local) { [bool]$u.is_active } else { -not $ExpectSubject -or $ExpectSubject -eq [string](Get-AkProp $Owner 'Subject' '') })
+      message = $(if ($Local) { "$($u.username) (local password sign-in)" } elseif ($ExpectSubject -and $ExpectSubject -ne [string](Get-AkProp $Owner 'Subject' '')) { 'A different Google identity than the one verified first signed in with this address.' } else { "$($u.email): verified by Google, signed in as '$($u.username)'" }) }
+    [ordered]@{ id = 'internal'; label = 'Internal authentik account'; ok = ([string](Get-AkProp $u 'type' '') -eq 'internal'); message = "Account type: $([string](Get-AkProp $u 'type' ''))$(if ([string](Get-AkProp $u 'type' '') -ne 'internal') { ' (External accounts cannot open their authentik dashboard)' })" }
+    [ordered]@{ id = 'owners'; label = "Member of '$($script:OwnersGroup)'"; ok = ($groups -contains $script:OwnersGroup); message = $(if ($groups -contains $script:OwnersGroup) { 'Can open protected applications.' } else { 'Not a member yet.' }) }
+  )
+  if ($MakeAdmin) { $items += [ordered]@{ id = 'admin'; label = 'authentik administrator'; ok = ([bool]$u.is_superuser -or $groups -contains $script:AdminsGroup); message = $(if ([bool]$u.is_superuser) { 'Has administrator rights.' } else { 'Not an administrator yet.' }) } }
+  $loginOk = [bool]($last -and $last.ToUniversalTime() -ge $Since.ToUniversalTime())
+  $items += [ordered]@{ id = 'login'; label = 'Sign-in completed'; ok = $loginOk; message = $(if ($last) { "Last sign-in $($last.ToLocalTime().ToString('s'))$(if (-not $loginOk) { ' (before this check started: sign in again)' })" } else { 'Has never signed in.' }) }
+  return [pscustomobject]@{ Ok = -not @($items | Where-Object { -not $_.ok }).Count; Items = $items; Username = [string]$u.username; Type = [string](Get-AkProp $u 'type' ''); LastLogin = $(if ($last) { $last.ToLocalTime().ToString('s') } else { '' }) }
+}
+
+# Explicit repair for an owner account created by an earlier version as an External user.
+function Set-AuthentikUserInternal {
+  param([Parameter(Mandatory = $true)]$Conn, [Parameter(Mandatory = $true)][int]$UserPk)
+  $u = Invoke-AuthentikApi $Conn GET "/core/users/$UserPk/"
+  if ([string]$u.type -eq 'internal') { return $false }
+  $null = Invoke-AuthentikApi $Conn PATCH "/core/users/$UserPk/" @{ type = 'internal' }
+  return $true
 }
 
 # Completes the one-time owner setup: adds the verified owner account to "DTC owners" and, if chosen, to the
@@ -513,6 +636,72 @@ function Complete-AuthentikOwner {
     if (-not $WhatIf) { $null = Invoke-AuthentikApi $Conn POST "/core/groups/$($g.pk)/add_user/" @{ pk = $UserPk }; Set-AkActionDone $actions }
   }
   return $actions.ToArray()
+}
+
+# --- Sign-in page (Google first) -------------------------------------------------------------------------------------------
+
+# A separate authentication flow dm-authentication, cloned from default-authentication-flow, whose identification stage
+# shows the Google button first ("promoted", with its label) above the email/password form; the brand uses it and gets
+# a title for the domain. The default flow is left exactly as it is: it stays the local recovery route
+# (/if/flow/default-authentication-flow/), and "Restore" points the brand back. Previous brand values are returned so
+# the caller can record them.
+function Sync-AuthentikLoginPage {
+  param([Parameter(Mandatory = $true)]$Conn, [Parameter(Mandatory = $true)][string]$Title, [string]$Slug = 'google', [switch]$WhatIf)
+  $actions = New-AkActionList
+  $ov = Get-AuthentikOverview $Conn
+  if (-not $ov.Flows.ContainsKey('default-authentication-flow')) { throw 'authentik has no default-authentication-flow to start from.' }
+  $src = @(Get-AuthentikList $Conn "/sources/oauth/?slug=$Slug")[0]
+  if (-not $src) { throw 'Turn on Google sign-in first.' }
+  $defPk = $ov.Flows['default-authentication-flow'].Pk
+  $defBindings = @(Get-AuthentikList $Conn "/flows/bindings/?target=$defPk&ordering=order")
+  $identBinding = @($defBindings | Where-Object { [string](Get-AkProp $_.stage_obj 'component' '') -eq 'ak-stage-identification-form' })[0]
+  if (-not $identBinding) { throw 'The default sign-in flow has no identification stage to start from.' }
+  $defIdent = Invoke-AuthentikApi $Conn GET "/stages/identification/$($identBinding.stage)/"
+  $iname = "$($script:Prefix)identification"
+  $ident = @(Get-AuthentikList $Conn "/stages/identification/?name=$([Uri]::EscapeDataString($iname))" | Where-Object { [string]$_.name -eq $iname })[0]
+  if ($ident) { Add-AkAction $actions 'none' 'stage' $iname "Identification stage '$iname' exists (managed in authentik)" }
+  else {
+    Add-AkAction $actions 'create' 'stage' $iname 'Create the sign-in form: "Google" first, email or username with password below'
+    if (-not $WhatIf) {
+      $ident = Invoke-AuthentikApi $Conn POST '/stages/identification/' @{ name = $iname; user_fields = @($defIdent.user_fields); password_stage = (Get-AkProp $defIdent 'password_stage' $null); captcha_stage = (Get-AkProp $defIdent 'captcha_stage' $null)
+        case_insensitive_matching = $true; show_matched_user = [bool](Get-AkProp $defIdent 'show_matched_user' $true); enrollment_flow = $null; recovery_flow = (Get-AkProp $defIdent 'recovery_flow' $null)
+        passwordless_flow = (Get-AkProp $defIdent 'passwordless_flow' $null); sources = @([string]$src.pk); show_source_labels = $true; pretend_user_exists = $true; enable_remember_me = [bool](Get-AkProp $defIdent 'enable_remember_me' $false) }
+      Set-AkActionDone $actions
+    } else { $ident = [pscustomobject]@{ pk = '<new stage>'; planned = $true } }
+  }
+  $fslug = "$($script:Prefix)authentication"
+  $flow = $(if ($ov.Flows.ContainsKey($fslug)) { Invoke-AuthentikApi $Conn GET "/flows/instances/$fslug/" } else { $null })
+  if ($flow) { Add-AkAction $actions 'none' 'flow' $fslug "Sign-in flow '$fslug' exists (managed in authentik)" }
+  else {
+    Add-AkAction $actions 'create' 'flow' $fslug "Create sign-in flow '$fslug' (a copy of the default flow with the Google-first form)"
+    if (-not $WhatIf) {
+      $def = Invoke-AuthentikApi $Conn GET "/flows/instances/default-authentication-flow/"
+      $flow = Invoke-AuthentikApi $Conn POST '/flows/instances/' @{ name = "Sign in ($Title)"; slug = $fslug; title = $Title; designation = 'authentication'; authentication = [string](Get-AkProp $def 'authentication' 'none'); denied_action = [string](Get-AkProp $def 'denied_action' 'message_continue'); policy_engine_mode = [string](Get-AkProp $def 'policy_engine_mode' 'any') }
+      foreach ($b in $defBindings) {
+        $isIdent = [string]$b.stage -eq [string]$identBinding.stage
+        $null = Invoke-AuthentikApi $Conn POST '/flows/bindings/' @{ target = $flow.pk; stage = $(if ($isIdent) { $ident.pk } else { $b.stage }); order = [int]$b.order; evaluate_on_plan = [bool]$b.evaluate_on_plan; re_evaluate_policies = [bool]$b.re_evaluate_policies; policy_engine_mode = [string](Get-AkProp $b 'policy_engine_mode' 'any'); invalid_response_action = [string](Get-AkProp $b 'invalid_response_action' 'retry') }
+      }
+      Set-AkActionDone $actions
+    } else { $flow = [pscustomobject]@{ pk = '<new flow>'; planned = $true } }
+  }
+  $brand = @(Get-AuthentikList $Conn '/core/brands/' | Where-Object { [bool]$_.default })[0]
+  if (-not $brand) { $brand = @(Get-AuthentikList $Conn '/core/brands/')[0] }
+  $prev = [ordered]@{ brand = [string]$brand.brand_uuid; flow = [string](Get-AkProp $brand 'flow_authentication' ''); title = [string](Get-AkProp $brand 'branding_title' '') }
+  $patch = @{}
+  if ([string](Get-AkProp $brand 'flow_authentication' '') -ne [string]$flow.pk) { $patch.flow_authentication = $flow.pk }
+  if ([string](Get-AkProp $brand 'branding_title' '') -ne $Title) { $patch.branding_title = $Title }
+  if ($patch.Count) {
+    Add-AkAction $actions 'update' 'brand' $brand.domain "Use the Google-first sign-in page$(if ($patch.ContainsKey('branding_title')) { " titled '$Title'" })" 'The default sign-in flow stays unchanged and reachable for local recovery.'
+    if (-not $WhatIf) { $null = Invoke-AuthentikApi $Conn PATCH "/core/brands/$($brand.brand_uuid)/" $patch; Set-AkActionDone $actions }
+  } else { Add-AkAction $actions 'none' 'brand' $brand.domain 'The sign-in page already uses the Google-first form' }
+  return [pscustomobject]@{ Actions = $actions.ToArray(); Previous = $prev; FlowSlug = $fslug }
+}
+
+# Points the brand back to its previous sign-in flow and title. The dm-authentication flow is kept (unused).
+function Restore-AuthentikLoginPage {
+  param([Parameter(Mandatory = $true)]$Conn, [Parameter(Mandatory = $true)]$Previous)
+  $patch = @{ flow_authentication = $(if ($Previous.flow) { $Previous.flow } else { $null }); branding_title = $(if ($Previous.title) { $Previous.title } else { 'authentik' }) }
+  $null = Invoke-AuthentikApi $Conn PATCH "/core/brands/$($Previous.brand)/" $patch
 }
 
 # --- Application protection (ForwardAuth, single application) -----------------------------------------------------------
@@ -718,6 +907,6 @@ function Test-ForwardAuthChallenge {
 }
 
 Export-ModuleMember -Function Invoke-AkHttp, Get-AuthentikHealth, New-AuthentikConnection, Invoke-AuthentikApi, Get-AuthentikList, Test-AuthentikToken, Test-AuthentikCredential, Get-AuthentikOverview,
-  Get-GoogleOAuthSettings, Test-GoogleClientId, Test-GoogleClientSecret, ConvertTo-OwnerEmail, New-OwnerEnrollmentExpression, Get-AuthentikOwnersGroupName, Get-AuthentikGroup,
-  Sync-AuthentikOutpost, Sync-AuthentikGoogleSource, Find-AuthentikOwner, Complete-AuthentikOwner, Sync-AuthentikAppProtection, Remove-AuthentikAppProtection, Test-AuthentikGoogleRedirect,
+  Get-GoogleOAuthSettings, ConvertFrom-GoogleClientJson, Test-GoogleClientId, Test-GoogleClientSecret, ConvertTo-OwnerEmail, New-OwnerEnrollmentExpression, Get-AuthentikOwnersGroupName, Get-AuthentikGroup, Sync-AuthentikOwnersGroup,
+  Sync-AuthentikOutpost, Sync-AuthentikGoogleSource, Find-AuthentikOwner, Get-AuthentikOwnerCheck, Set-AuthentikUserInternal, Complete-AuthentikOwner, Sync-AuthentikLoginPage, Restore-AuthentikLoginPage, Sync-AuthentikAppProtection, Remove-AuthentikAppProtection, Test-AuthentikGoogleRedirect,
   Get-AuthentikSourceLogins, Get-AuthentikAppAccessEvidence, Wait-AuthentikOutpost, Test-ForwardAuthChallenge

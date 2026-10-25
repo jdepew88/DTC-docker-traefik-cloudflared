@@ -78,28 +78,29 @@ grouped by Compose project), records the chosen one in `config\identity.json` an
 create. Requirements for adoption: the server publishes port 9000 on 127.0.0.1 (for the API) and is on the shared proxy
 network (for Traefik).
 
-## Identity & Access page (`#identity`)
+## Identity & Access wizard (`#identity`)
 
-Steps, each with its own state (`lib\IdentityProvider.psm1`, `Get-IdentityModel`):
+A linear wizard: a numbered step list on the left (steps that cannot be opened yet say which step comes first), one
+step at a time on the right with *why* the step exists, whether it succeeded, the instructions, and **Back** /
+**Continue** (Continue is available once the step is done, or as *Skip for now* for optional steps). A step is complete
+only from what the manager observed, never from a click. The position is kept in the address (`#identity/<step>`) and
+in `config\identity.json`, so a refresh, a restart or coming back from Google Cloud resumes at the same step; re-entering
+detects existing infrastructure and creates nothing twice.
 
-1. **Identity provider**: authentik, Authelia (listed, *install only* — no sign-in integration in this version) or
-   *Configure later*.
-2. **Installation**: adopt one found on this PC, or install from the App Catalog (it links back here).
-3. **Administrator and recovery**: detects first setup via authentik's `/setup` endpoint (pending = anyone could claim
-   it: shown as urgent). The manager never resets the akadmin password or the secret key.
-4. **Manager connection**: the installation's bootstrap token (one click) or a pasted API token; stored with DPAPI in
-   `secrets\authentik_api.dpapi`; must belong to an administrator.
-   See [Connection settings](#connection-settings-api-token) below: the token can be replaced at any time.
-5. **Initial owner** (asked once): the Google account of the person who owns this authentik, and whether it also becomes
-   an authentik administrator. It can be changed until the owner has signed in with Google.
-6. **Public sign-in address**: suggests `auth.<your domain>`, records it, then creates the route through the normal
-   service preview (hostname claims, Cloudflare DNS/tunnel route checks, validation, backup). Recommended exposure:
-   public (authentik is the login); Cloudflare Access in front is possible but means two logins and Google's callback
-   has to pass Access. The embedded outpost's `authentik_host` is then pointed at `https://auth.<domain>/`.
-7. **Google sign-in** (below), finished by the owner's first Google sign-in.
-8. **Protect applications** (below).
-9. **Health**: one row per component (server, worker, PostgreSQL, network, administrator setup, API, route, Cloudflare,
-   public address, outpost, Google source, OAuth callback, real Google sign-in, ForwardAuth per application).
+| # | Step | Complete when |
+| --- | --- | --- |
+| 1 | **Choose how people sign in**: A. local accounts (username and password) or B. Google sign-in. Authelia is listed as install-only; *Configure later* keeps Cloudflare Access only. | A path is chosen |
+| 2 | **Install or connect authentik**: adopt an installation found on this PC or install one from the App Catalog; administrator and recovery status. | authentik runs, its database is ready, the administrator exists |
+| 3 | **Connect the manager to authentik**: the [connection settings](#connection-settings-api-token) card. | The saved token works for an administrator |
+| 4 | **Public sign-in address**: `auth.<domain>` suggested, route through the normal preview, embedded outpost pointed at it. | Route loaded and outpost uses the public URL |
+| 5 | **Register with Google** (path B): owner's Google account, values to copy, the four Google Cloud steps, client JSON import, preview and *Turn on Google sign-in*. | The Google source exists |
+| 6 | **Sign-in page** (path B, optional): Google-first sign-in page. | Applied (or skipped) |
+| 7 | **Verify the owner**: real sign-in, checked item by item. | Verified by the manager |
+| 8 | **Protect applications** (optional): checkboxes, one action. | At least one application verified protected (or skipped) |
+| 9 | **Finished**: links to manage everything in authentik. | |
+
+Starting with A and adding Google later only adds steps 5-6 and a Google sign-in for the owner: local accounts, the
+`DTC owners` group, application rules and existing sessions are not touched. akadmin always keeps its password.
 
 States: *Not configured*, *Configured*, *Awaiting your action*, *Reachable*, *Authentication required*, *Verified*,
 *Failed*, *Skipped*. **Verified only from evidence**: Google and the owner = the owner's account, connected to the Google
@@ -148,34 +149,49 @@ Workforce Identity Federation, and the IAP OAuth Admin API (brands/identityAware
 2025-01-22 and shut down on 2026-03-19 (Google Cloud IAP docs). The manager therefore does not ask for Google
 credentials, uses no Google API and no browser automation: it guides the console steps and automates authentik.
 
-What the wizard shows (values computed from your hostname, copy buttons):
+What the wizard shows (values computed from your hostname, copy buttons, a **?** beside each unfamiliar setting):
 
 | Value | Example (auth.jrtechconsult.com) |
 | --- | --- |
-| App name | `authentik - jrtechconsult.com` |
+| App name (used for both the Google app and the client; ASCII only) | `jrtechconsult.com Sign-in` |
 | Application type | Web application |
 | Authorized redirect URI | `https://auth.jrtechconsult.com/source/oauth/callback/google/` (authentik's `/source/oauth/callback/<slug>/`, verified against 2026.8.5) |
 | Authorized domain | `jrtechconsult.com` |
 | Scopes | `openid`, `email`, `profile` (non-sensitive; authentik itself requests `email profile`) |
 
-Your part (about five minutes, Google Auth Platform): create/choose a project
-(`console.cloud.google.com/projectcreate`) → Branding (`/auth/branding`: app name, support email, authorized domain; no
-logo, a logo triggers brand verification) → Audience (`/auth/audience`: *Internal* only with a Google Workspace
-organization; *External* starts in *Testing*, limited to listed test users (max. 100), or *Publish app*) → optionally Data
-access (`/auth/scopes`) → Clients (`/auth/clients`: Create client, Web application, add the redirect URI exactly) → copy
-the client ID and the secret **immediately** (Google shows the secret only once). No Google API has to be enabled for
-sign-in; no JavaScript origins are needed.
+Your part (about five minutes, Google Auth Platform, direct links in the wizard):
+
+1. **Branding** (`/auth/branding`): app name, user support email, developer contact email, authorized domain. Logo, home
+   page, privacy policy and terms are **optional**: leave them empty (a logo starts Google's brand verification). No
+   homepage has to be created for this.
+2. **Audience** (`/auth/audience`): **External** for ordinary Gmail accounts. *Internal* is only for Google Workspace
+   organizations (sign-in limited to that organization). External starts in **Testing**: add the owner as a test user
+   (up to 100 test users), or press *Publish app*. Publishing only lets any Google account reach Google's sign-in screen;
+   it never lets anyone into your applications: authentik's enrollment rule and application rules still decide.
+3. **Client** (`/auth/clients`): Create client, *Web application*, the app name, and the redirect URI exactly.
+4. **Download JSON** in the dialog that follows (Google shows the secret only then; otherwise *Add secret* and download again).
+
+Then import the file (preferred) or type the client ID and secret. The file is read on this PC and checked before anything
+changes: a `web` client (a Desktop/`installed` client is refused), client ID and secret present, the expected redirect URI
+(a missing trailing slash or another host is explained with the exact URI to add in Google Cloud), Google's `auth_uri` and
+`token_uri`. The secret goes to authentik once; it is not stored by the manager, not logged and never returned. An existing
+Google connection is only changed with an explicit **Replace the Google client**.
 
 Then the manager configures authentik through its API (dry run first):
 
 - OAuth source `google` (type Google, client ID/secret, *promoted* login button, authentication flow
   `default-source-authentication`).
-- **Owner-only sign-up**: enrollment flow `dm-google-enrollment` (the default enrollment stages) with the expression policy
+- **Owner-only sign-up**: enrollment flow `dm-google-enrollment` (the default prompt and login stages, and its own write
+  stage `dm-google-owner-write` that creates **Internal** users) with the expression policy
   `dm-google-initial-owner`: only the owner's address, and only when Google reports it verified, may create an account.
   After setup this policy is authentik's: edit it there, or use invitations, to let other people in.
 - **Owner group**: `DTC owners`, created with akadmin (the local recovery account) as first member. When the owner has
   signed in with Google (*Check owner sign-in*), their account joins it and, if chosen, `authentik Admins`. The manager
   only ever adds these memberships during that one step.
+- **Why Internal**: authentik's default source enrollment stage creates *External* users, and authentik's own dashboard
+  refuses them ("Interface can only be accessed by internal users"). This is unrelated to Google's *External* audience.
+  A flow created by an earlier version is repaired during setup (shown in the preview); an owner account created External
+  is only changed to Internal with the explicit *Repair* in the verification step.
 - **Account matching**: `identifier` (never links an existing account by email, so nobody can take over akadmin by
   controlling an email address). Existing users link Google from their authentik user settings while signed in.
 - The login page shows the Google button. akadmin keeps its password (Google is never the only way in).
@@ -186,10 +202,33 @@ The client secret goes from the password field to the local server to authentik 
 the manager, not logged, not returned and not shown again. To rotate it: create a new secret in Google, run the wizard
 again with it (only the source changes), then delete the old secret in Google.
 
+## Sign-in page (Google first)
+
+*Use this sign-in page* creates the authentication flow `dm-authentication`, a copy of authentik's default flow whose
+identification stage `dm-identification` shows **Google** first (promoted, with its label) and email or username with
+password below it; the default brand uses it and gets the title *Sign in to <domain>*. Clicking Google goes straight to
+Google's own account chooser: nobody types an email into authentik first. The default flow is not changed and stays the
+local recovery route (`/if/flow/default-authentication-flow/` on the local address). *Restore the previous sign-in page*
+puts the brand's previous flow and title back. authentik's Google source type does not allow extra authorization
+parameters, so the manager cannot force Google's account chooser when only one Google account is signed in (Google then
+continues with that account).
+
+## Owner verification
+
+Path B: *Continue with Google* opens authentik's Google sign-in directly (`/source/oauth/login/google/`); after signing
+in, *I've signed in - check again* checks, item by item: the Google identity (the owner's verified address; the Google
+subject seen first is pinned, a different Google identity with the same address is refused), the account is **Internal**,
+it is in `DTC owners`, an administrator if chosen, and the sign-in completed. Path A: *Start the sign-in check*, sign in
+with akadmin's password, check again (only a sign-in after the check started counts). Nothing can be marked verified by
+hand, and these memberships are only added during this explicit step.
+
 ## Protecting applications
 
 *Protect applications* lists the services with a checkbox each (compatible: enabled, one hostname, not the sign-in page
-itself) and one action, **Protect selected with authentik**. Nothing about people is asked. For each selected application
+itself), **Select all**, **Clear all** and the selected count, and one action, **Protect selected with authentik**.
+Ticking never re-renders the page, so it does not jump. Already protected applications are labelled and cannot be ticked:
+leaving something unticked never removes protection. The result lists, per application, backend reachability, the route
+loaded by Traefik and ForwardAuth enforcement separately (sign-in verification follows from real use). Nothing about people is asked. For each selected application
 (preview first, then one after the other, each with its own Traefik backup):
 
 - proxy provider `dm-<service>` (mode `forward_single`, external host `https://<hostname>`) and application

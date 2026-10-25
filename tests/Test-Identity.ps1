@@ -85,6 +85,30 @@ try {
   Test-Condition 'google: client ID and secret shapes' ((Test-GoogleClientId '123456789012-abcdefgh12345678.apps.googleusercontent.com') -and -not (Test-GoogleClientId 'abc.apps.googleusercontent.com') -and -not (Test-GoogleClientId '1234567-x.apps.googleusercontent.com.evil.com') -and (Test-GoogleClientSecret 'GOCSPX-abcdefghijklmnop_1234') -and -not (Test-GoogleClientSecret 'bad secret with spaces')) ''
 
   # --- Allow-lists and policy expressions -------------------------------------------------------------------------------------
+  # --- Google client JSON import ---------------------------------------------------------------------------------------------
+  $redir = 'https://auth.example.com/source/oauth/callback/google/'
+  $web = [ordered]@{ client_id = '123456789012-abcdefgh12345678.apps.googleusercontent.com'; project_id = 'dtc-sign-in'; auth_uri = 'https://accounts.google.com/o/oauth2/auth'; token_uri = 'https://oauth2.googleapis.com/token'
+    auth_provider_x509_cert_url = 'https://www.googleapis.com/oauth2/v1/certs'; client_secret = 'GOCSPX-unitTestSecretValue_123'; redirect_uris = @($redir) }
+  $j = { param($w) ConvertTo-Json -Depth 5 -Compress -InputObject ([ordered]@{ web = $w }) }
+  $ok = ConvertFrom-GoogleClientJson -Json (& $j $web) -ExpectedRedirectUri $redir
+  Test-Condition 'json import: a Google "web" client file gives client ID and secret' ($ok.Ok -and $ok.ClientId -eq $web.client_id -and $ok.ClientSecret -eq $web.client_secret -and $ok.ProjectId -eq 'dtc-sign-in') (@($ok.Errors) -join ' | ')
+  $bad = ConvertFrom-GoogleClientJson -Json '{"web": {' -ExpectedRedirectUri $redir
+  Test-Condition 'json import: invalid JSON is refused with instructions' (-not $bad.Ok -and $bad.Errors[0] -match 'not a valid JSON' -and $bad.Errors[0] -match 'Download JSON') ''
+  $inst = ConvertFrom-GoogleClientJson -Json '{"installed": {"client_id": "1-x.apps.googleusercontent.com"}}' -ExpectedRedirectUri $redir
+  Test-Condition 'json import: a Desktop (installed) client is refused: a Web application client is needed' (-not $inst.Ok -and $inst.Errors[0] -match 'Web application') ''
+  $w2 = [ordered]@{} + $web; $w2.Remove('client_secret')
+  $nosec = ConvertFrom-GoogleClientJson -Json (& $j $w2) -ExpectedRedirectUri $redir
+  Test-Condition 'json import: a file without the secret explains how to get a new one' (-not $nosec.Ok -and (@($nosec.Errors) -join ' ') -match 'Add secret') ''
+  $w3 = [ordered]@{} + $web; $w3.redirect_uris = @('https://auth.example.com/source/oauth/callback/google')
+  $wrong = ConvertFrom-GoogleClientJson -Json (& $j $w3) -ExpectedRedirectUri $redir
+  Test-Condition 'json import: a wrong redirect URI (missing trailing slash) is refused with the exact fix' (-not $wrong.Ok -and (@($wrong.Errors) -join ' ') -match [regex]::Escape($redir) -and (@($wrong.Errors) -join ' ') -match 'trailing slash' -and (@($wrong.Errors) -join ' ') -match 'Authorized redirect URIs') (@($wrong.Errors) -join ' | ')
+  $w4 = [ordered]@{} + $web; $w4.token_uri = 'https://evil.example/token'
+  $ep = ConvertFrom-GoogleClientJson -Json (& $j $w4) -ExpectedRedirectUri $redir
+  Test-Condition 'json import: non-Google endpoints are refused' (-not $ep.Ok -and (@($ep.Errors) -join ' ') -match 'token endpoint') ''
+  Test-Condition 'json import: oversized input is refused; the secret is never part of an error message' (-not (ConvertFrom-GoogleClientJson -Json ('x' * 30000)).Ok -and -not (@($wrong.Errors + $nosec.Errors + $ep.Errors) -join ' ' -match 'unitTestSecretValue')) ''
+  $gvA = Get-GoogleOAuthSettings -PublicUrl 'https://auth.jrtechconsult.com' -Domain 'jrtechconsult.com'
+  Test-Condition 'google: one ASCII application name is used for the app and the client' ($gvA.AppName -eq 'jrtechconsult.com Sign-in' -and $gvA.ClientName -eq $gvA.AppName -and $gvA.AppName -match '^[A-Za-z0-9 ._-]+$') $gvA.AppName
+
   # --- Initial owner (no user lists in the manager) ---------------------------------------------------------------------------
   Test-Condition 'owner: the address is normalized; quotes and code are rejected (no injection into the policy)' ((ConvertTo-OwnerEmail ' Owner@Example.COM ') -eq 'owner@example.com' -and $(try { $null = ConvertTo-OwnerEmail 'x"; return True #@a.com'; $false } catch { $true }) -and $(try { $null = ConvertTo-OwnerEmail 'not-an-email'; $false } catch { $true })) ''
   $enr = New-OwnerEnrollmentExpression 'owner@example.com'
@@ -150,6 +174,10 @@ try {
   Test-Condition 'model: Google set up, owner has not signed in -> awaiting the owner''s Google sign-in' ((& $ownerStep @{ owner = @{ email = 'o@example.com' }; google = @{ source = $src } }) -eq 'awaiting-user') ''
   $mo = Get-IdentityModel -Facts ($base + @{ owner = @{ email = 'o@example.com'; verifiedAt = '2026-10-25T10:00:00'; username = 'owner' }; google = @{ source = $src; redirect = [pscustomobject]@{ ok = $true; message = 'ok' } } })
   Test-Condition 'model: the owner''s real Google sign-in verifies both the owner and Google sign-in' ((& $st $mo 'owner') -eq 'verified' -and (& $st $mo 'google') -eq 'verified' -and (& $co $mo 'google-login') -eq 'verified') ''
+  $ml = Get-IdentityModel -Facts ($base + @{ authMode = 'local'; owner = @{ email = '' } })
+  Test-Condition 'model (local path): Google is skipped, the owner is the local administrator signing in once' ((& $st $ml 'google') -eq 'skipped' -and (& $st $ml 'owner') -eq 'awaiting-user') ''
+  $mlv = Get-IdentityModel -Facts ($base + @{ authMode = 'local'; owner = @{ verifiedAt = '2026-10-25T10:00:00'; username = 'akadmin' } })
+  Test-Condition 'model (local path): a verified local owner does not mark Google sign-in as verified' ((& $st $mlv 'owner') -eq 'verified' -and (& $st $mlv 'google') -eq 'skipped') ''
   $stopped = $a1 | ConvertTo-Json -Depth 5 | ConvertFrom-Json; $stopped.server.state = 'exited'
   Test-Condition 'model: a stopped server fails the installation step and its component' ((& $st (Get-IdentityModel -Facts @{ provider = 'authentik'; install = $stopped; token = @{ stored = $false } }) 'install') -eq 'failed' -and (& $co (Get-IdentityModel -Facts @{ provider = 'authentik'; install = $stopped }) 'server') -eq 'failed') ''
 

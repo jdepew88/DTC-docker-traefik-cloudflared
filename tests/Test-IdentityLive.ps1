@@ -239,7 +239,39 @@ try {
   $conn = New-AuthentikConnection -BaseUrl "http://127.0.0.1:$akPort" -Token $bootToken
   Test-Condition 'outpost: embedded outpost previewed, then pointed at the public sign-in URL' ($op.Data.canApply -and $opA.Status -eq 200 -and (Get-AuthentikOverview $conn).Outpost.AuthentikHost -eq "https://$authHost/") ($opA.Body)
 
-  # --- Initial owner and Google (synthetic credentials) ----------------------------------------------------------------------
+  # --- Path A: local accounts only ----------------------------------------------------------------------------------------------
+  $md = Invoke-WebUi $ui POST '/api/identity/mode' @{ mode = 'local' }
+  Test-Condition 'local path: chosen without any Google step' ($md.Status -eq 200 -and (Get-Step (Invoke-WebUi $ui GET '/api/identity').Data 'google').state -eq 'skipped') ($md.Body)
+  $lv0 = Invoke-WebUi $ui POST '/api/identity/owner/verify' @{}
+  Test-Condition 'local path: verification needs a real sign-in started from the wizard (no manual completion)' ($lv0.Status -eq 409) ($lv0.Body)
+  $null = Invoke-WebUi $ui POST '/api/identity/owner/local-start' @{}
+  $lv1 = Invoke-WebUi $ui POST '/api/identity/owner/verify' @{}
+  Test-Condition 'local path: not verified until the administrator actually signs in' ($lv1.Status -eq 200 -and -not $lv1.Data.ok -and @($lv1.Data.items | Where-Object { $_.id -eq 'login' -and -not $_.ok }).Count -eq 1) ($lv1.Body)
+  $localSignIn = { param($user, $pw) $b = Join-Path $work 'ls.json'; $j = Join-Path $work 'ls.jar'
+    $ex = "http://127.0.0.1:$akPort/api/v3/flows/executor/default-authentication-flow/?query=next%3D%252F"
+    $null = & curl.exe -s -c $j -b $j -o NUL $ex
+    [IO.File]::WriteAllText($b, (ConvertTo-Json -Compress @{ component = 'ak-stage-identification'; uid_field = $user })); $null = & curl.exe -s -L -c $j -b $j $ex -H 'Content-Type: application/json' --data-binary "@$b"
+    [IO.File]::WriteAllText($b, (ConvertTo-Json -Compress @{ component = 'ak-stage-password'; password = $pw })); $r = (& curl.exe -s -L -c $j -b $j $ex -H 'Content-Type: application/json' --data-binary "@$b") -join ''
+    Remove-Item $b, $j -Force -ErrorAction SilentlyContinue; return [string]($r | ConvertFrom-Json).component }
+  Start-Sleep -Seconds 6
+  $null = & $localSignIn 'akadmin' $adminPass
+  $lv2 = Invoke-WebUi $ui POST '/api/identity/owner/verify' @{}
+  Test-Condition 'local path: after signing in, the administrator is verified (Internal, in DTC owners, signed in)' ($lv2.Data.ok -and @($lv2.Data.items | Where-Object { -not $_.ok }).Count -eq 0 -and (Get-AuthentikGroup $conn 'DTC owners')) ($lv2.Body)
+  $wz = Invoke-WebUi $ui POST '/api/identity/wizard' @{ step = 'apps' }
+  Stop-TestServer $ui
+  $ui = Start-WebUiServer -Script (Join-Path $installPath 'webui.ps1') -InstallPath $installPath -WorkDir $uiDir
+  $null = Connect-WebUi $ui
+  $gL = Invoke-WebUi $ui GET '/api/identity'
+  Test-Condition 'resume: after a manager restart the wizard position, path and verified owner are kept' ($wz.Status -eq 200 -and $gL.Data.config.wizardStep -eq 'apps' -and $gL.Data.config.authMode -eq 'local' -and (Get-Step $gL.Data 'owner').state -eq 'verified') ($gL.Data.config | ConvertTo-Json -Depth 4 -Compress)
+  $bindsLocal = @(Get-AuthentikList $conn '/policies/bindings/').Count; $usersLocal = @(Get-AuthentikList $conn '/core/users/').Count
+
+  # --- Path B added later: Google (synthetic client file) -----------------------------------------------------------------------
+  $null = Invoke-WebUi $ui POST '/api/identity/mode' @{ mode = 'google' }
+  $gG = Invoke-WebUi $ui GET '/api/identity'
+  Test-Condition 'add Google later: the local verification is kept; the owner still has to sign in with Google' ($gG.Data.config.authentik.owner.verifiedAt -and (Get-Step $gG.Data 'owner').state -ne 'verified' -and (Get-Step $gG.Data 'google').state -eq 'awaiting-user') (($gG.Data.model.steps | ForEach-Object { "$($_.id)=$($_.state)" }) -join ', ')
+  $redir = "https://$authHost/source/oauth/callback/google/"
+  $clientFile = { param($id, $secret, $uris) ConvertTo-Json -Depth 5 -Compress @{ web = [ordered]@{ client_id = $id; project_id = 'dtc-test'; auth_uri = 'https://accounts.google.com/o/oauth2/auth'; token_uri = 'https://oauth2.googleapis.com/token'; client_secret = $secret; redirect_uris = @($uris) } } }
+
   $ownerEmail = 'owner@idtest.example'
   $gp0 = Invoke-WebUi $ui POST '/api/identity/google/plan' @{ clientId = $googleId; clientSecret = $googleSecret }
   Test-Condition 'owner: Google sign-in is not set up before the initial owner is known' ($gp0.Status -eq 409 -and $gp0.Data.error -match 'owner') ($gp0.Body)
@@ -256,9 +288,15 @@ try {
   Test-Condition 'google: wizard values (redirect URI, Web application, minimal scopes)' ($g3.Data.googleValues.RedirectUri -eq "https://$authHost/source/oauth/callback/google/" -and $g3.Data.googleValues.ClientType -eq 'Web application' -and (@($g3.Data.googleValues.ScopeNames) -join ',') -eq 'openid,email,profile') ($g3.Data.googleValues | ConvertTo-Json -Compress)
   $badId = Invoke-WebUi $ui POST '/api/identity/google/plan' @{ clientId = 'not-a-client-id'; clientSecret = $googleSecret }
   Test-Condition 'google: an invalid client ID is refused before authentik is touched' ($badId.Status -eq 400) ($badId.Body)
-  $gp = Invoke-WebUi $ui POST '/api/identity/google/plan' @{ clientId = $googleId; clientSecret = $googleSecret }
+  $insp = Invoke-WebUi $ui POST '/api/identity/google/inspect' @{ clientJson = (& $clientFile $googleId $googleSecret "https://$authHost/source/oauth/callback/google") }
+  Test-Condition 'json import: a wrong redirect URI in the downloaded file is explained (exact URI to add in Google Cloud)' ($insp.Status -eq 200 -and -not $insp.Data.ok -and (@($insp.Data.errors) -join ' ') -match [regex]::Escape($redir) -and $insp.Data.secretPresent -and $insp.Body -notmatch [regex]::Escape($googleSecret)) ($insp.Body)
+  $badJson = Invoke-WebUi $ui POST '/api/identity/google/plan' @{ clientJson = '{ not json' }
+  Test-Condition 'json import: an invalid file is refused before authentik is touched' ($badJson.Status -eq 400 -and @(Get-AuthentikList $conn '/sources/oauth/?slug=google').Count -eq 0) ($badJson.Body)
+  $insp2 = Invoke-WebUi $ui POST '/api/identity/google/inspect' @{ clientJson = (& $clientFile $googleId $googleSecret $redir) }
+  Test-Condition 'json import: the correct file is accepted (client ID shown, secret never returned)' ($insp2.Data.ok -and $insp2.Data.clientId -eq $googleId -and $insp2.Body -notmatch [regex]::Escape($googleSecret)) ($insp2.Body)
+  $gp = Invoke-WebUi $ui POST '/api/identity/google/plan' @{ clientJson = (& $clientFile $googleId $googleSecret $redir) }
   $created = @($gp.Data.actions | Where-Object { $_.kind -eq 'create' } | ForEach-Object { $_.object })
-  Test-Condition 'google: preview lists owner group, owner-only enrollment, source and login button (nothing applied)' ($gp.Status -eq 200 -and $created -contains 'group' -and $created -contains 'flow' -and $created -contains 'policy' -and $created -contains 'Google source' -and @(Get-AuthentikList $conn '/sources/oauth/?slug=google').Count -eq 0) (($gp.Data.actions | ForEach-Object { "$($_.kind):$($_.object)" }) -join ', ')
+  Test-Condition 'google: preview lists owner-only enrollment (Internal write stage), source and login button; the owner group from the local path is reused' ($gp.Status -eq 200 -and $created -notcontains 'group' -and $created -contains 'stage' -and $created -contains 'flow' -and $created -contains 'policy' -and $created -contains 'Google source' -and @(Get-AuthentikList $conn '/sources/oauth/?slug=google').Count -eq 0) (($gp.Data.actions | ForEach-Object { "$($_.kind):$($_.object)" }) -join ', ')
   $ga = Invoke-WebUi $ui POST '/api/identity/google/apply' @{ planId = $gp.Data.planId; confirm = $true }
   $src = @(Get-AuthentikList $conn '/sources/oauth/?slug=google')[0]
   Test-Condition 'google: source created through the API (type google, client ID, identifier matching, owner-only enrollment flow)' ($ga.Status -eq 200 -and $ga.Data.ok -and $src -and $src.provider_type -eq 'google' -and $src.consumer_key -eq $googleId -and $src.user_matching_mode -eq 'identifier' -and $src.enrollment_flow) ($ga.Body)
@@ -266,29 +304,73 @@ try {
   $ov = Get-AuthentikOverview $conn
   Test-Condition 'google: the login page shows the Google button' ($ov.LoginStage.Sources -contains [string]$src.pk) ''
   $owners = Get-AuthentikGroup $conn 'DTC owners'
-  Test-Condition 'owner-only rule: group "DTC owners" exists with akadmin (local recovery account) as first member' ($owners -and @($owners.users | ForEach-Object { [int]$_ }) -contains $akadminPk) ''
+  $flowB = @(Get-AuthentikList $conn "/flows/bindings/?target=$((Invoke-AuthentikApi $conn GET '/flows/instances/dm-google-enrollment/').pk)&ordering=order")
+  $writeB = @($flowB | Where-Object { [string]$_.stage_obj.component -like '*user-write*' })[0]
+  $writeStage = Invoke-AuthentikApi $conn GET "/stages/user_write/$($writeB.stage)/"
+  Test-Condition 'internal owner: Google enrollment writes Internal users (fixes "Interface can only be accessed by internal users")' ($writeStage.name -eq 'dm-google-owner-write' -and $writeStage.user_type -eq 'internal' -and -not $writeStage.create_users_group) ($writeStage | ConvertTo-Json -Compress)
+  Test-Condition 'add Google later: no local account, binding or rule was changed' (@(Get-AuthentikList $conn '/policies/bindings/').Count -eq $bindsLocal + 1 -and @(Get-AuthentikList $conn '/core/users/').Count -eq $usersLocal) "bindings $bindsLocal -> $(@(Get-AuthentikList $conn '/policies/bindings/').Count)"
+  # Replacing an existing Google connection needs an explicit choice.
+  $otherId = '210987654321-tpxreplacementclient.apps.googleusercontent.com'
+  $rp1 = Invoke-WebUi $ui POST '/api/identity/google/plan' @{ clientJson = (& $clientFile $otherId $googleSecret $redir) }
+  $rp2 = Invoke-WebUi $ui POST '/api/identity/google/plan' @{ clientJson = (& $clientFile $otherId $googleSecret $redir); replace = $true }
+  Test-Condition 'replace guard: an existing Google client is not overwritten without "Replace"' ($rp1.Status -eq 409 -and $rp1.Data.needsReplace -and $rp2.Status -eq 200 -and @($rp2.Data.actions | Where-Object { $_.object -eq 'Google source' -and $_.kind -eq 'update' }).Count -eq 1 -and (@(Get-AuthentikList $conn '/sources/oauth/?slug=google')[0]).consumer_key -eq $googleId) ($rp1.Body)
+  # Repair of a flow made by an earlier version (shared default write stage = External users).
+  $defWriteB = @(Get-AuthentikList $conn "/flows/bindings/?target=$((Invoke-AuthentikApi $conn GET '/flows/instances/default-source-enrollment/').pk)" | Where-Object { [string]$_.stage_obj.component -like '*user-write*' })[0]
+  $null = Invoke-AuthentikApi $conn PATCH "/flows/bindings/$($writeB.pk)/" @{ stage = $defWriteB.stage }
+  $rpr = Invoke-WebUi $ui POST '/api/identity/google/plan' @{}
+  $rpa = Invoke-WebUi $ui POST '/api/identity/google/apply' @{ planId = $rpr.Data.planId; confirm = $true }
+  Test-Condition 'repair: a flow from an earlier version (External users) is repaired during setup' (@($rpr.Data.actions | Where-Object { $_.summary -match 'Repair' }).Count -eq 1 -and $rpa.Data.ok -and [string](Invoke-AuthentikApi $conn GET "/flows/bindings/$($writeB.pk)/").stage -eq [string]$writeStage.pk) (($rpr.Data.actions | ForEach-Object { "$($_.kind):$($_.summary)" }) -join '; ')
+  Test-Condition 'owner-only rule: group "DTC owners" exists with akadmin (local recovery account) as member' ($owners -and @($owners.users | ForEach-Object { [int]$_ }) -contains $akadminPk) ''
   # The enrollment policy, asked through authentik's own policy test with the context a Google sign-in provides.
   $pol = @(Get-AuthentikList $conn '/policies/expression/?name=dm-google-initial-owner')[0]
   $ptest = { param($email, $verified) [bool](Invoke-AuthentikApi $conn POST "/policies/all/$($pol.pk)/test/" @{ user = $akadminPk; context = @{ oauth_userinfo = @{ email = $email; verified_email = $verified } } }).passing }
   Test-Condition 'owner-only enrollment: authentik admits the owner''s verified Google address' (& $ptest 'Owner@idtest.example' $true) ''
   Test-Condition 'owner-only enrollment: another Google account, or the owner''s address unverified, is refused' (-not (& $ptest 'alice@idtest.example' $true) -and -not (& $ptest $ownerEmail $false)) ''
-  $gp2 = Invoke-WebUi $ui POST '/api/identity/google/plan' @{ clientId = $googleId }
+  $gp2 = Invoke-WebUi $ui POST '/api/identity/google/plan' @{}
   Test-Condition 'google: running the wizard again changes nothing (no duplicate source, group, flow or policy; secret kept)' (@($gp2.Data.actions | Where-Object { $_.kind -ne 'none' }).Count -eq 0 -and @(Get-AuthentikList $conn '/sources/oauth/').Count -eq 1) (($gp2.Data.actions | ForEach-Object { "$($_.kind):$($_.summary)" }) -join '; ')
   $g4 = Invoke-WebUi $ui GET '/api/identity'
   Test-Condition 'google: configured, NOT verified; the owner''s sign-in is awaited' ((Get-Step $g4.Data 'google').state -eq 'configured' -and -not $g4.Data.google.verifiedAt -and (Get-Step $g4.Data 'owner').state -eq 'awaiting-user') (($g4.Data.model.steps | ForEach-Object { "$($_.id)=$($_.state)" }) -join ', ')
   $ov0 = Invoke-WebUi $ui POST '/api/identity/owner/verify' @{}
-  Test-Condition 'owner: nothing is verified before the owner has signed in with Google' ($ov0.Status -eq 200 -and -not $ov0.Data.ok -and $ov0.Data.message -match 'No account') ($ov0.Body)
+  Test-Condition 'owner: nothing is verified before the owner has signed in with Google' ($ov0.Status -eq 200 -and -not $ov0.Data.ok -and $ov0.Data.message -match 'Nobody has signed in') ($ov0.Body)
   # SIMULATED owner sign-in: a real one needs Google. The account and its Google connection are created the way authentik's
   # callback would (ak shell, inside the disposable worker); nothing here talks to Google.
   $mk = { param($u, $e, $p) $x = Invoke-AuthentikApi $conn POST '/core/users/' @{ username = $u; name = $u; email = $e; is_active = $true; path = 'users' }; $null = Invoke-AuthentikApi $conn POST "/core/users/$($x.pk)/set_password/" @{ password = $p }; $x }
   $ownerUser = & $mk 'owner' $ownerEmail 'Owner-Live-Test-55q'
+  $null = Invoke-AuthentikApi $conn PATCH "/core/users/$($ownerUser.pk)/" @{ type = 'external' }
   $sim = Invoke-Docker exec "$akProject-worker" ak shell -c "from authentik.sources.oauth.models import OAuthSource, UserOAuthSourceConnection; from authentik.core.models import User; UserOAuthSourceConnection.objects.create(user=User.objects.get(username='owner'), source=OAuthSource.objects.get(slug='google'), identifier='109876543210')"
   Test-Condition 'owner (simulated Google sign-in): fixture created inside the disposable authentik' ($sim.ExitCode -eq 0) (($sim.Output | Select-Object -Last 3) -join ' ')
-  $ov1 = Invoke-WebUi $ui POST '/api/identity/owner/verify' @{}
+  Start-Sleep -Seconds 2
+  $null = & $localSignIn 'owner' 'Owner-Live-Test-55q'
+  $ovx = Invoke-WebUi $ui POST '/api/identity/owner/verify' @{}
+  Test-Condition 'internal owner: an External owner account is detected and NOT changed without an explicit repair' ($ovx.Status -eq 200 -and -not $ovx.Data.ok -and $ovx.Data.needsRepair -and @($ovx.Data.items | Where-Object { $_.id -eq 'internal' -and -not $_.ok }).Count -eq 1 -and (Invoke-AuthentikApi $conn GET "/core/users/$($ownerUser.pk)/").type -eq 'external') ($ovx.Body)
+  $ov1 = Invoke-WebUi $ui POST '/api/identity/owner/verify' @{ repair = $true }
   $ownerNow = Invoke-AuthentikApi $conn GET "/core/users/$($ownerUser.pk)/"
-  Test-Condition 'owner: verified; the owner joins "DTC owners" and the authentik administrators (as chosen)' ($ov1.Data.ok -and $ov1.Data.username -eq 'owner' -and @($ownerNow.groups_obj | ForEach-Object { $_.name }) -contains 'DTC owners' -and @($ownerNow.groups_obj | ForEach-Object { $_.name }) -contains 'authentik Admins') ($ov1.Body)
+  Test-Condition 'owner: repaired and verified: Internal, in "DTC owners" and the authentik administrators (as chosen), signed in' ($ov1.Data.ok -and $ov1.Data.username -eq 'owner' -and $ownerNow.type -eq 'internal' -and @($ownerNow.groups_obj | ForEach-Object { $_.name }) -contains 'DTC owners' -and @($ownerNow.groups_obj | ForEach-Object { $_.name }) -contains 'authentik Admins' -and @($ov1.Data.items | Where-Object { -not $_.ok }).Count -eq 0) ($ov1.Body)
+  Test-Condition 'recovery: akadmin keeps working with its password after Google was added' ((& $localSignIn 'akadmin' $adminPass) -eq 'xak-flow-redirect' -and (Invoke-AuthentikApi $conn GET "/core/users/$akadminPk/").is_active) ''
+  $null = Invoke-Docker exec "$akProject-worker" ak shell -c "from authentik.sources.oauth.models import UserOAuthSourceConnection; UserOAuthSourceConnection.objects.filter(identifier='109876543210').update(identifier='555000111222')"
+  $ovs = Invoke-WebUi $ui POST '/api/identity/owner/verify' @{}
+  Test-Condition 'subject pinning: a different Google identity with the owner''s address is refused' ($ovs.Status -eq 409 -and $ovs.Data.error -match 'different Google identity') ($ovs.Body)
+  $null = Invoke-Docker exec "$akProject-worker" ak shell -c "from authentik.sources.oauth.models import UserOAuthSourceConnection; UserOAuthSourceConnection.objects.filter(identifier='555000111222').update(identifier='109876543210')"
+
+  # --- Google-first sign-in page (separate flow; the default flow stays the recovery route) ------------------------------------
+  $defFlowBefore = @(Get-AuthentikList $conn "/flows/bindings/?target=$((Invoke-AuthentikApi $conn GET '/flows/instances/default-authentication-flow/').pk)" | ForEach-Object { "$($_.stage):$($_.order)" } | Sort-Object) -join ','
+  $brandBefore = @(Get-AuthentikList $conn '/core/brands/' | Where-Object { $_.default })[0]
+  $lpp = Invoke-WebUi $ui POST '/api/identity/loginpage/plan' @{}
+  $lpa = Invoke-WebUi $ui POST '/api/identity/loginpage/apply' @{ planId = $lpp.Data.planId; confirm = $true }
+  $brandNow = @(Get-AuthentikList $conn '/core/brands/' | Where-Object { $_.default })[0]
+  $dmFlow = Invoke-AuthentikApi $conn GET '/flows/instances/dm-authentication/'
+  $dmIdent = @(Get-AuthentikList $conn '/stages/identification/?name=dm-identification')[0]
+  Test-Condition 'sign-in page: Google first (promoted source with label), email/password below, domain title, used by the brand' ($lpa.Data.ok -and [string]$brandNow.flow_authentication -eq [string]$dmFlow.pk -and $brandNow.branding_title -eq 'Sign in to idtest.example' -and @($dmIdent.sources) -contains [string]$src.pk -and $dmIdent.show_source_labels -and @($dmIdent.user_fields).Count -ge 1) ($lpp.Body)
+  $defFlowAfter = @(Get-AuthentikList $conn "/flows/bindings/?target=$((Invoke-AuthentikApi $conn GET '/flows/instances/default-authentication-flow/').pk)" | ForEach-Object { "$($_.stage):$($_.order)" } | Sort-Object) -join ','
+  Test-Condition 'sign-in page: the default flow is untouched and still signs akadmin in (local recovery route)' ($defFlowAfter -eq $defFlowBefore -and (& $localSignIn 'akadmin' $adminPass) -eq 'xak-flow-redirect') "$defFlowBefore -> $defFlowAfter"
+  $lpr = Invoke-WebUi $ui POST '/api/identity/loginpage/restore' @{ confirm = $true }
+  $brandRest = @(Get-AuthentikList $conn '/core/brands/' | Where-Object { $_.default })[0]
+  Test-Condition 'sign-in page: Restore brings back the previous flow and title' ($lpr.Data.ok -and [string]$brandRest.flow_authentication -eq [string]$brandBefore.flow_authentication -and $brandRest.branding_title -eq $brandBefore.branding_title) ''
+  $lpp2 = Invoke-WebUi $ui POST '/api/identity/loginpage/plan' @{}
+  $null = Invoke-WebUi $ui POST '/api/identity/loginpage/apply' @{ planId = $lpp2.Data.planId; confirm = $true }
+  Test-Condition 'sign-in page: applying again reuses the flow and stage (no duplicates)' (@($lpp2.Data.actions | Where-Object { $_.kind -eq 'create' }).Count -eq 0 -and @(Get-AuthentikList $conn '/flows/instances/?slug=dm-authentication').Count -eq 1) ''
   $o2 = Invoke-WebUi $ui POST '/api/identity/owner' @{ email = 'someone@else.example' }
-  Test-Condition 'owner: cannot be changed in the manager once set up (people are managed in authentik)' ($o2.Status -eq 409) ($o2.Body)
+  Test-Condition 'owner: cannot be changed in the manager once verified with Google (people are managed in authentik)' ($o2.Status -eq 409) ($o2.Body)
   $g4b = Invoke-WebUi $ui GET '/api/identity'
   Test-Condition 'model: owner and Google verified from the owner''s sign-in; next step: protect applications' ((Get-Step $g4b.Data 'owner').state -eq 'verified' -and (Get-Step $g4b.Data 'google').state -eq 'verified' -and @($g4b.Data.model.next)[0] -eq 'apps') (($g4b.Data.model.steps | ForEach-Object { "$($_.id)=$($_.state)" }) -join ', ')
   Test-Condition 'manager keeps no user lists: identity.json has the owner address only' (([IO.File]::ReadAllText((Join-Path $installPath 'config\identity.json'))) -notmatch 'alice|emails|domains|groups') ''
@@ -323,12 +405,12 @@ try {
 
   # Sign-ins through the real outpost. The test reaches Traefik on a local port over http, so the provider and outpost
   # addresses are switched to that address for this part (production uses https://<host> without a port).
-  $prov = @(Get-AuthentikList $conn '/providers/proxy/?name=dm-echo')[0]; $prov2 = @(Get-AuthentikList $conn '/providers/proxy/?name=dm-echo2')[0]
+  $prov = @(Get-AuthentikList $conn '/providers/proxy/?name=dm-echo' | Where-Object { $_.name -eq 'dm-echo' })[0]; $prov2 = @(Get-AuthentikList $conn '/providers/proxy/?name=dm-echo2' | Where-Object { $_.name -eq 'dm-echo2' })[0]
   $null = Invoke-AuthentikApi $conn PATCH "/providers/proxy/$($prov.pk)/" @{ mode = 'forward_single'; external_host = "http://${appHost}:$httpPort" }
   $null = Invoke-AuthentikApi $conn PATCH "/providers/proxy/$($prov2.pk)/" @{ mode = 'forward_single'; external_host = "http://${appHost2}:$httpPort" }
   $null = Sync-AuthentikOutpost -Conn $conn -PublicUrl "http://${authHost}:$httpPort"
   # Wait until the outpost has reloaded the test addresses (it refreshes a few seconds after a change).
-  $null = Wait-Until { $x = Test-ForwardAuthChallenge -TraefikPort $httpPort -Hostname $appHost2 -HostPort $httpPort -AuthHostname $authHost; $x.State -eq 'auth' -and $x.Location -match "^http://${authHost}:$httpPort/" } 90 2000
+  $null = Wait-Until { @($appHost, $appHost2 | Where-Object { $x = Test-ForwardAuthChallenge -TraefikPort $httpPort -Hostname $_ -HostPort $httpPort -AuthHostname $authHost; $x.State -eq 'auth' -and $x.Location -match "^http://${authHost}:$httpPort/" }).Count -eq 2 } 90 2000
   $anon = Test-ForwardAuthChallenge -TraefikPort $httpPort -Hostname $appHost -HostPort $httpPort -AuthHostname $authHost
   Test-Condition 'forwardauth: anonymous visitors are sent to the authentik sign-in (no loop)' ($anon.State -eq 'auth' -and $anon.Location -match "^http://${authHost}:$httpPort/") ($anon | ConvertTo-Json -Compress)
   $so = Invoke-SignIn $httpPort $authHost $appHost 'owner' 'Owner-Live-Test-55q' $work
@@ -337,7 +419,9 @@ try {
   Test-Condition 'owner-only: any other signed-in user is refused and never reaches it' ($sa.Login -eq 'xak-flow-redirect' -and -not $sa.ReachedApp -and $sa.Body -match 'Permission denied') "$($sa.Status) $($sa.Url)"
   $sa2 = Invoke-SignIn $httpPort $authHost $appHost2 'alice' 'Alice-Live-Test-91x' $work
   $sm2 = Invoke-SignIn $httpPort $authHost $appHost2 'mallory' 'Mallory-Live-Test-77y' $work
-  Test-Condition 'existing authentik rule respected: alice reaches echo2 (her rule), mallory does not' ($sa2.ReachedApp -and -not $sm2.ReachedApp) "alice $($sa2.Status) $($sa2.Url) / mallory $($sm2.Status)"
+  $why = ([regex]::Match([string]$sa2.Body, '(?s)<title>[^<]*</title>|"error_message": *"[^"]*"|Permission denied[^<]{0,200}')).Value
+  $b2 = @(Get-AuthentikList $conn "/policies/bindings/?target=$((Invoke-AuthentikApi $conn GET '/core/applications/dm-echo2/').pbm_uuid)" | ForEach-Object { "user=$($_.user) group=$($_.group) policy=$($_.policy) enabled=$($_.enabled)" }) -join '; '
+  Test-Condition 'existing authentik rule respected: alice reaches echo2 (her rule), mallory does not' ($sa2.ReachedApp -and -not $sm2.ReachedApp) "alice $($sa2.Status) $why / bindings: $b2 / alice pk $($alice.pk) / mallory $($sm2.Status)"
   $sw = Invoke-SignIn $httpPort $authHost $appHost 'owner' 'wrong-password-123' $work
   Test-Condition 'authorization: a wrong password never reaches the application' (-not $sw.ReachedApp) "$($sw.Status) $($sw.Url)"
   # Access changes made in authentik work immediately, without the manager and without touching Traefik files.
@@ -396,16 +480,17 @@ try {
   $rs = Invoke-WebUi $ui POST '/api/backups/restore' @{ id = $protectBackup; confirm = $true }
   $echoYaml = [IO.File]::ReadAllText((Join-Path $installPath 'traefik\dynamic\svc-echo.yml'))
   Test-Condition 'rollback: restoring the backup made before protection restores the previous route (no ForwardAuth)' ($rs.Status -eq 200 -and $echoYaml -notmatch 'forwardAuth') ($rs.Body)
-  $pp2 = Invoke-WebUi $ui POST '/api/identity/protect/plan' @{ services = @('echo') }
-  Test-Condition 'rollback: protecting again reuses the authentik objects and their rules (only the route changes)' ($pp2.Status -eq 200 -and @($pp2.Data.items[0].authentik | Where-Object { $_.kind -ne 'none' }).Count -eq 0 -and @($pp2.Data.items[0].traefik.traefik.changes).Count -eq 1) (($pp2.Data.items[0].authentik | ForEach-Object { "$($_.kind):$($_.object)" }) -join ', ')
+  # The backup holds the whole registry from before the batch: echo2 lost its protection too, so both are protected again.
+  $pp2 = Invoke-WebUi $ui POST '/api/identity/protect/plan' @{ services = @('echo', 'echo2') }
+  Test-Condition 'rollback: protecting again reuses the authentik objects and their rules (only the routes change)' ($pp2.Status -eq 200 -and @($pp2.Data.items | ForEach-Object { $_.authentik } | Where-Object { $_.kind -ne 'none' }).Count -eq 0 -and @($pp2.Data.items | Where-Object { @($_.traefik.traefik.changes).Count -eq 1 }).Count -eq 2) (($pp2.Data.items | ForEach-Object { $_.authentik } | ForEach-Object { "$($_.kind):$($_.object)" }) -join ', ')
   $pa2 = Invoke-WebUi $ui POST '/api/identity/protect/apply' @{ planId = $pp2.Data.planId; confirm = $true }
-  Test-Condition 'rollback: protection re-applied and verified' ($pa2.Data.ok -and $pa2.Data.challenge.State -eq 'auth') ($pa2.Body)
+  Test-Condition 'rollback: protection re-applied and verified for both' ($pa2.Data.ok -and @($pa2.Data.results | Where-Object { $_.ok -and $_.challenge.State -eq 'auth' }).Count -eq 2) ($pa2.Body)
 
   # --- Remove protection ----------------------------------------------------------------------------------------------------
   $up = Invoke-WebUi $ui POST '/api/identity/unprotect/plan' @{ service = 'echo' }
   Test-Condition 'unprotect: preview warns what stays in front of the application and that authentik keeps its rules' ($up.Status -eq 200 -and (@($up.Data.notes) -join ' ') -match 'without sign-in' -and (@($up.Data.notes) -join ' ') -match 'stay in authentik') ($up.Body)
   $ua = Invoke-WebUi $ui POST '/api/identity/unprotect/apply' @{ planId = $up.Data.planId; confirm = $true }
-  $provNow = @(Get-AuthentikList $conn '/providers/proxy/?name=dm-echo')[0]
+  $provNow = @(Get-AuthentikList $conn '/providers/proxy/?name=dm-echo' | Where-Object { $_.name -eq 'dm-echo' })[0]
   $bindsKept = @(Get-AuthentikList $conn "/policies/bindings/?target=$($echoApp.pbm_uuid)" | ForEach-Object { [string]$_.pk } | Sort-Object) -join ','
   Test-Condition 'unprotect: route without ForwardAuth; outpost no longer serves it; authentik application and its rules kept' ($ua.Data.ok -and [IO.File]::ReadAllText((Join-Path $installPath 'traefik\dynamic\svc-echo.yml')) -notmatch 'forwardAuth' -and (Get-AuthentikOverview $conn).Outpost.Providers -notcontains [int]$provNow.pk -and @(Get-AuthentikList $conn '/core/applications/?slug=dm-echo').Count -eq 1 -and $bindsKept -eq $bindsBefore) ($ua.Body)
   $pp3 = Invoke-WebUi $ui POST '/api/identity/protect/plan' @{ services = @('echo') }
@@ -444,25 +529,81 @@ try {
     Set-Viewport $cdp 1366 900
     Open-Page $cdp $ui.LaunchUrl
     $null = Wait-PageCondition $cdp "document.readyState === 'complete' && window.TPMApp && document.querySelector('main h1')" 30
+    # Seven more applications; with echo (unprotected again above) that makes eight selectable ones.
+    $batch = @(1..7 | ForEach-Object { "b$_" })
+    foreach ($n in $batch) {
+      $null = Invoke-Docker run -d --name "$stack-$n" --network $network --pull missing $whoami
+      $null = Invoke-WebUiChange $ui @{ op = 'add'; service = @{ name = $n; displayName = "Batch $n"; hostnames = @("$n.idtest.example"); target = @{ type = 'docker'; host = "$stack-$n"; port = 80 }; cloudflare = @{ publish = $false; access = $false } }; cloudflare = @{ automate = $false } }
+    }
     foreach ($lv in @('beginner', 'expert')) {
       Open-Page $cdp "$base/#identity?level=$lv"
-      $ok = Wait-PageCondition $cdp "!!document.querySelector('#identity-google') && !!document.querySelector('.id-steps')" 60
+      $ok = Wait-PageCondition $cdp "!!document.querySelector('.wizard-steps') && !!document.querySelector('#wizard-panel h2')" 60
       $text = [string](Invoke-PageScript $cdp 'document.body.innerText')
-      Test-Condition "browser ($lv): Identity & Access page with progress, Google wizard, owner and protect section" ($ok -and $text -match 'Setup progress' -and $text -match [regex]::Escape("https://$authHost/source/oauth/callback/google/") -and $text -match 'Protect applications' -and $text -match 'Initial owner' -and $text -match 'managed in authentik') ''
-      $noPeople = [bool](Invoke-PageScript $cdp "!document.querySelector('#id-p-list') && ![...document.querySelectorAll('#identity-apps input')].some((i) => i.type === 'email' || i.type === 'text') && document.querySelectorAll('#identity-apps tbody input[type=checkbox]').length >= 1 && [...document.querySelectorAll('#identity-apps a, #identity-managed a')].some((a) => a.textContent.includes('Open in authentik'))")
-      Test-Condition "browser ($lv): the protect section has application checkboxes, no email/group fields, and Open in authentik links" $noPeople ''
+      Test-Condition "browser ($lv): a numbered wizard with Back/Continue opens at the saved step" ($ok -and $text -match 'Step \d+ of 9' -and $text -match 'Choose how people sign in' -and $text -match 'Verify the owner with Google' -and $text -match 'Protect applications' -and $text -match 'Back') ''
       Test-Condition "browser ($lv): no secret is shown" ($text -notmatch [regex]::Escape($googleSecret) -and $text -notmatch [regex]::Escape($bootToken) -and $text -notmatch [regex]::Escape($adminPass)) ''
-      if ($ScreenshotDir) { Save-PageScreenshot $cdp (Join-Path $ScreenshotDir "identity-$lv-1366.png") }
     }
+    # Screenshots are deliverables, not checks: a capture that times out is retried once as a viewport image and noted.
+    $shot = { param($name) if (-not $ScreenshotDir) { return }
+      try { Save-PageScreenshot $cdp (Join-Path $ScreenshotDir $name) }
+      catch {
+        try { $img = Invoke-Cdp $cdp 'Page.captureScreenshot' @{ format = 'png' } 60000; [IO.File]::WriteAllBytes((Join-Path $ScreenshotDir $name), [Convert]::FromBase64String($img.data)); Write-Host "screenshot ${name}: viewport only ($($_.Exception.Message))" -ForegroundColor DarkYellow }
+        catch { Write-Host "screenshot ${name} not saved: $($_.Exception.Message)" -ForegroundColor DarkYellow }
+      } }
+    Open-Page $cdp "$base/#identity/mode?level=beginner"; $null = Wait-PageCondition $cdp "!!document.querySelector('#identity-mode')" 60; & $shot 'wizard-1-mode.png'
+    Open-Page $cdp "$base/#identity/google?level=beginner"; $okG = Wait-PageCondition $cdp "!!document.querySelector('#identity-google')" 60
+    $gtext = [string](Invoke-PageScript $cdp "document.querySelector('#wizard-panel').innerText")
+    Test-Condition 'browser google: four guided Google Cloud steps, External for Gmail, JSON import, exact redirect URI, one app name' ($okG -and $gtext -match 'Branding' -and $gtext -match 'Audience' -and $gtext -match 'External' -and $gtext -match 'Download JSON' -and $gtext -match [regex]::Escape($redir) -and ([regex]::Matches($gtext, [regex]::Escape('idtest.example Sign-in'))).Count -ge 2 -and $gtext -match 'optional') ''
+    $helpCount = [int](Invoke-PageScript $cdp "document.querySelectorAll('#wizard-panel .help-btn').length")
+    Test-Condition 'browser google: question-mark help beside the unfamiliar settings' ($helpCount -ge 5) "help buttons: $helpCount"
+    & $shot 'wizard-5-google.png'
+    Open-Page $cdp "$base/#identity/signin?level=beginner"; $null = Wait-PageCondition $cdp "!!document.querySelector('.login-preview')" 60; & $shot 'wizard-6-signin.png'
+    Open-Page $cdp "$base/#identity/owner?level=beginner"; $okO = Wait-PageCondition $cdp "!!document.querySelector('.verified-banner')" 60
+    Test-Condition 'browser owner: the owner step shows an obvious verified state' ($okO -and [string](Invoke-PageScript $cdp "document.querySelector('.verified-banner').innerText") -match 'Owner verified') ''
+    & $shot 'wizard-7-owner-verified.png'
+    # Application selection: select all, deselect one, the page never jumps.
+    Open-Page $cdp "$base/#identity/apps?level=beginner"
+    $okA = Wait-PageCondition $cdp "!!document.querySelector('#id-sel-all') && document.querySelectorAll('.protect-table tbody input[type=checkbox]').length >= 8" 60
+    $null = Invoke-PageScript $cdp "document.querySelector('.protect-table').scrollIntoView({ block: 'center' }); true"
+    $y0 = [int](Invoke-PageScript $cdp 'Math.round(window.scrollY)')
+    $null = Invoke-PageScript $cdp "document.querySelector('#id-sel-all').click(); true"
+    $cnt = [string](Invoke-PageScript $cdp "document.querySelector('.sel-count').textContent")
+    $null = Invoke-PageScript $cdp "document.querySelector('#sel-b3').click(); true"
+    $null = Invoke-PageScript $cdp "document.querySelector('#sel-b5').click(); document.querySelector('#sel-b5').click(); true"
+    $y1 = [int](Invoke-PageScript $cdp 'Math.round(window.scrollY)')
+    $states = [string](Invoke-PageScript $cdp "[...document.querySelectorAll('.protect-table tbody input[type=checkbox]')].map((b) => b.dataset.name + '=' + b.checked).join(',')")
+    $cnt2 = [string](Invoke-PageScript $cdp "document.querySelector('.sel-count').textContent")
+    Test-Condition 'browser apps: Select all selects the 8 new applications; already protected ones are labelled, not selectable' ($okA -and $cnt -match '^8 of 8' -and [string](Invoke-PageScript $cdp "document.querySelector('.protect-table').innerText") -match 'Already protected') "$cnt"
+    Test-Condition 'browser apps: ticking and unticking never moves the page; selections stay as set' ($y1 -eq $y0 -and $cnt2 -match '^7 of 8' -and $states -match 'b3=false' -and $states -match 'b5=true' -and $states -match 'b1=true') "y $y0 -> $y1; $cnt2; $states"
+    & $shot 'wizard-8-apps-selection.png'
+    $null = Invoke-PageScript $cdp "document.querySelector('#id-protect-btn').click(); true"
+    $okP = Wait-PageCondition $cdp "!!document.querySelector('#id-protect-review') && [...document.querySelectorAll('#id-protect-review button')].some((b) => b.textContent.includes('Protect 7'))" 240
+    $null = Invoke-PageScript $cdp "(() => { document.querySelector('#id-protect-review input[type=checkbox]').click(); [...document.querySelectorAll('#id-protect-review button')].find((b) => b.textContent.includes('Protect 7')).click(); return true; })()"
+    $okR = Wait-PageCondition $cdp "!!document.querySelector('#id-protect-result')" 900
+    $resText = [string](Invoke-PageScript $cdp "(document.querySelector('#id-protect-result') || {}).innerText || ''")
+    $prot = @(@('echo') + $batch | Where-Object { [IO.File]::ReadAllText((Join-Path $installPath "traefik\dynamic\svc-$_.yml")) -match "svc-$_-authentik" })
+    Test-Condition 'browser apps: the batch of 7 is protected, each route verified; the unticked one is untouched' ($okP -and $okR -and $prot.Count -eq 7 -and $prot -notcontains 'b3' -and ([regex]::Matches($resText, 'ForwardAuth enforced')).Count -eq 7) "$($prot -join ',') / $($resText.Substring(0, [Math]::Min(300, $resText.Length)))"
+    $stillEcho2 = [IO.File]::ReadAllText((Join-Path $installPath 'traefik\dynamic\svc-echo2.yml')) -match 'svc-echo2-authentik'
+    Test-Condition 'bulk protection keeps every earlier protection (echo2 still protected; nothing removed by deselecting)' ($stillEcho2 -and @($batch | Where-Object { (Test-ForwardAuthChallenge -TraefikPort $httpPort -Hostname "$_.idtest.example").State -eq 'auth' }).Count -eq 6) ''
+    & $shot 'wizard-8-apps-result.png'
+    # Authentik's real sign-in page, through Traefik (Edge maps the test hostnames to this PC).
+    $cdp2 = Start-EdgeSession -WorkDir $work -ExtraArgs @("--host-resolver-rules=MAP *.idtest.example 127.0.0.1")
+    try {
+      Set-Viewport $cdp2 1366 900
+      Open-Page $cdp2 "http://${authHost}:$httpPort/"
+      $okL = Wait-PageCondition $cdp2 "(() => { const deep = (n) => { let t = ''; if (n.shadowRoot) t += deep(n.shadowRoot); for (const c of n.childNodes) t += c.nodeType === 3 ? c.textContent : deep(c); return t; }; return /Google/.test(deep(document.body)); })()" 90
+      Start-Sleep -Seconds 2
+      if ($ScreenshotDir) { Save-PageScreenshot $cdp2 (Join-Path $ScreenshotDir 'authentik-signin-page.png') }
+      Test-Condition 'login page: authentik''s sign-in page renders with the Google button (screenshot)' $okL ''
+    } finally { Stop-EdgeSession $cdp2 }
     # Token management in the browser: an unusable token opens the replacement form; replacing works from the page.
     Save-ProtectedSecret -Settings (Get-StackSettings -InstallPath $installPath) -Name 'authentik_api' -Value $outpostKey -Label 'old version'
     $null = Invoke-WebUi $ui POST '/api/identity/token/test' @{}
-    Open-Page $cdp "$base/#identity?level=beginner"
+    Open-Page $cdp "$base/#identity/connect?level=beginner"
     $ok1 = Wait-PageCondition $cdp "!!document.querySelector('#cred-card-authentik-api') && !!document.querySelector('#cred-authentik-api')" 60
     $cardText = [string](Invoke-PageScript $cdp "document.querySelector('#cred-card-authentik-api').innerText")
     Test-Condition 'browser token: a failed token shows the reason, Replace API token and the replacement field right away' ($ok1 -and $cardText -match 'Replace API token' -and $cardText -match 'outpost' -and $cardText -match 'Try a different token' -and $cardText -match 'Test connection') $cardText
     if ($ScreenshotDir) { Save-PageScreenshot $cdp (Join-Path $ScreenshotDir 'identity-token-failed-1366.png') }
-    Open-Page $cdp "$base/#identity?level=beginner"
+    Open-Page $cdp "$base/#identity/connect?level=beginner"
     $ok2 = Wait-PageCondition $cdp "!!document.querySelector('#cred-authentik-api')" 60
     Test-Condition 'browser token: after a page refresh the replacement form is still offered' $ok2 ''
     $null = Invoke-PageScript $cdp "(() => { const i = document.querySelector('#cred-authentik-api'); i.value = 'wrongwrongwrongwrongwrongwrong0123456789'; [...document.querySelectorAll('#cred-card-authentik-api button')].find((b) => b.textContent.includes('Validate and save')).click(); return true; })()"
@@ -474,15 +615,15 @@ try {
     Test-Condition 'browser token: replacing from the page connects; Replace API token stays available on a healthy connection' ($ok4 -and $card2 -match 'akadmin' -and $card2 -match 'Replace API token' -and $card2 -notmatch [regex]::Escape($bootToken)) $card2
     if ($ScreenshotDir) { Save-PageScreenshot $cdp (Join-Path $ScreenshotDir 'identity-token-connected-1366.png') }
     Open-Page $cdp "$base/#identity?level=expert"
-    $null = Wait-PageCondition $cdp "!!document.querySelector('#identity-google') && !!document.querySelector('.id-steps')" 60
+    $null = Wait-PageCondition $cdp "!!document.querySelector('.wizard-steps')" 60
     $raw = [string](Invoke-PageScript $cdp "(document.querySelector('details.tech pre') || {}).textContent || ''")
     Test-Condition 'browser (expert): raw state is shown without secrets' ($raw -match 'clientId' -and $raw -notmatch [regex]::Escape($googleSecret)) ''
     Set-Viewport $cdp 390 844 -Mobile
     Open-Page $cdp "$base/#identity?level=beginner"
-    $null = Wait-PageCondition $cdp "!!document.querySelector('#identity-google')" 60
+    $null = Wait-PageCondition $cdp "!!document.querySelector('.wizard-steps')" 60
     $overflow = [bool](Invoke-PageScript $cdp 'document.documentElement.scrollWidth > window.innerWidth + 1')
     Test-Condition 'browser (390 px): no horizontal scrolling' (-not $overflow) ''
-    if ($ScreenshotDir) { Save-PageScreenshot $cdp (Join-Path $ScreenshotDir 'identity-beginner-390.png') }
+    if ($ScreenshotDir) { Save-PageScreenshot $cdp (Join-Path $ScreenshotDir 'wizard-390.png') }
     $errs = @($cdp.Errors | Where-Object { $_ -notmatch 'favicon' })
     Test-Condition 'browser: no script errors' ($errs.Count -eq 0) ($errs -join ' | ')
   }
@@ -496,6 +637,7 @@ try {
     Write-Host "Kept for inspection: $work (stack $stack). Remove with: docker compose -p $akProject down -v; install.ps1 -Stop" -ForegroundColor Yellow
   } else {
     $null = Invoke-Docker rm -f $app "$stack-echo2"
+    foreach ($n in 1..7) { $null = Invoke-Docker rm -f "$stack-b$n" }
     if (Test-Path -LiteralPath (Join-Path $akFolder 'compose.yaml')) { $null = Invoke-Docker compose --project-directory $akFolder -f (Join-Path $akFolder 'compose.yaml') down -v --remove-orphans }
     $null = Invoke-Docker volume rm "${akProject}_database"
     if ($installed) { $null = Invoke-Ps (Join-Path $installPath 'install.ps1') @('-InstallPath', $installPath, '-Stop'); $null = Invoke-Docker rm -f "$stack-whoami" }

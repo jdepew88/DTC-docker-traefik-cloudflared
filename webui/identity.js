@@ -1,12 +1,15 @@
 'use strict';
-// Identity & Access (GET /api/identity): choose an identity provider, install or adopt authentik, connect the manager
-// to its API, publish the sign-in page, connect Google sign-in (guided: Google offers no API for OAuth clients), protect
-// applications with Traefik ForwardAuth and verify each part. Every change is previewed and confirmed; secrets are typed
-// into password fields, sent once to the local server and never stored in the browser.
+// Identity & Access (GET /api/identity) as a linear, resumable wizard: choose local or Google sign-in, install or adopt
+// authentik, connect the manager, publish the sign-in address, register with Google (guided; Google offers no API for
+// OAuth clients; the downloaded client JSON is the preferred import), the Google-first sign-in page, verify the owner,
+// protect applications. A step counts as complete only from what the server observed (TPMLogic.identityWizard); the
+// position is kept in the URL (#identity/<step>) and on the server, so a refresh or restart resumes in place. Secrets are
+// typed or uploaded once, sent to the local server and never stored in the browser. After setup, users and access are
+// managed in authentik.
 (() => {
   const L = window.TPMLogic;
   const U = window.TPMUI;
-  const { $, arr, h, fill, icon, plainChip, toast, api, withBusy, field, gate, kv, technical, checkItem } = U;
+  const { $, arr, h, fill, icon, plainChip, toast, api, withBusy, field, gate, kv, technical, checkItem, help } = U;
   const P = (window.TPMPages = window.TPMPages || {});
   const head = (eyebrow, title, text, ...actions) => h('div', { class: 'page-head' },
     h('div', null, h('div', { class: 'eyebrow' }, eyebrow), h('h1', null, title), text ? h('p', null, text) : null),
@@ -14,16 +17,29 @@
   const stateChip = (state) => { const s = L.identityState(state); return h('span', { class: `chip ${s.tone}` }, icon(s.icon), s.label); };
   const stateTone = (state) => ({ ok: 'ok', err: 'err', warn: 'warn', auth: 'auth', info: 'neutral', neutral: 'neutral' })[L.identityState(state).tone];
   const ext = (href, text) => h('a', { href, target: '_blank', rel: 'noopener noreferrer' }, text, ' ', icon('external'));
-  function copyRow(label, value, id) {
+  function copyRow(label, value, id, helpId) {
     const btn = h('button', { type: 'button', class: 'btn small', 'aria-label': `Copy ${label}`, onclick: async () => { try { await navigator.clipboard.writeText(value); toast(`Copied: ${label}`); } catch (e) { toast('Copy failed; select the text instead.', true); } } }, 'Copy');
-    return h('div', { class: 'copy-row' }, h('span', { class: 'copy-label', id }, label), h('code', { 'aria-labelledby': id }, value), btn);
+    return h('div', { class: 'copy-row', 'data-help-host': '' }, h('span', { class: 'copy-label', id }, label, helpId ? help(helpId, label) : null), h('code', { 'aria-labelledby': id }, value), btn);
   }
   const actionList = (actions) => h('ul', { class: 'checks' }, arr(actions).map((a) => checkItem(
     a.kind === 'none' ? 'neutral' : a.status === 'Failed' ? 'err' : a.status === 'Done' ? 'ok' : a.kind === 'delete' ? 'warn' : 'auth',
     `${({ create: 'Create', update: 'Change', delete: 'Remove', none: 'No change' })[a.kind] || a.kind}: ${a.summary}`, a.detail || a.message || '')));
 
   async function load(ctx, deep) { ctx.state.identity = await api('GET', `/api/identity${deep ? '?deep=1' : ''}`); return ctx.state.identity; }
-  const form = (ctx) => ctx.state.forms.identity || (ctx.state.forms.identity = { google: null, protect: null, plans: {}, secret: '' });
+  const form = (ctx) => ctx.state.forms.identity || (ctx.state.forms.identity = { google: null, protect: null, plans: {}, secret: '', owner: null, verify: null, loginPlan: null, json: null });
+
+  // Why each step exists, in plain words (shown at the top of the step).
+  const WHY = {
+    mode: 'Decide how people will sign in to your protected applications. You can start with local accounts and add Google later; nothing you set up now is lost.',
+    authentik: 'authentik is the sign-in service. It runs as its own Docker project on this PC, next to Traefik.',
+    connect: 'The manager configures authentik for you through authentik\'s API. It needs an administrator API token, stored encrypted on this PC.',
+    address: 'People (and Google) reach the sign-in page at its own address. It goes through your existing Traefik and Cloudflare Tunnel.',
+    google: 'Google only lets you create the sign-in client in its Cloud Console. Follow the four short steps there, then import the file Google gives you; the manager configures authentik.',
+    signin: 'Optional: a sign-in page that offers "Google" first, with email and password below it for local accounts.',
+    owner: 'Proves that the owner can actually sign in, and gives that account access to the applications you protect next.',
+    apps: 'Choose which applications require signing in. From then on, who may open them is decided in authentik.',
+    done: 'Setup is complete. From now on, users and access are managed in authentik.',
+  };
 
   P.identity = async (main, ctx, sub) => {
     if (!ctx.state.setup) await ctx.refresh();
@@ -33,52 +49,82 @@
     }
     fill(main, head('Access', 'Identity & Access', 'Loading…'));
     const d = await load(ctx, sub === 'check');
-    render(main, ctx, d);
+    render(main, ctx, d, sub && sub !== 'check' ? sub : '', false);
   };
 
-  function render(main, ctx, d) {
+  function render(main, ctx, d, wanted, keepScroll) {
+    const y = window.scrollY;
     const f = form(ctx);
-    const rerender = () => render(main, ctx, ctx.state.identity);
-    const reload = async (deep) => { await load(ctx, deep); rerender(); };
-    const steps = arr(d.model && d.model.steps);
-    const next = L.identityNextStep(steps);
-    const progress = h('section', { class: 'card', 'aria-labelledby': 'id-progress' },
-      h('div', { class: 'card-head' }, h('h2', { id: 'id-progress' }, 'Setup progress'), h('span', { class: 'grow' }),
-        h('button', { type: 'button', class: 'btn small', onclick: (e) => withBusy(e.currentTarget, () => reload(true)) }, icon('refresh'), 'Run checks')),
-      h('ol', { class: 'id-steps' }, steps.map((s) => h('li', { class: next && next.id === s.id ? 'current' : '' },
-        h('a', { href: `#identity-${s.id}` }, h('strong', null, s.label)), ' ', stateChip(s.state), s.optional ? h('span', { class: 'muted small' }, ' (optional)') : null,
-        h('p', { class: 'small muted' }, s.message)))),
-      d.progress && d.progress.step ? gate('advanced', h('p', { class: 'small muted' }, `Last step worked on: ${d.progress.step} (${d.progress.status}) at ${d.progress.at}.`)) : null,
-      next ? h('p', null, h('strong', null, 'Next: '), next.label, ' — ', next.message) : steps.length ? h('p', { class: 'muted' }, 'Nothing is waiting for you.') : null);
-
-    const sections = [providerSection(ctx, d, reload)];
-    if (d.provider === 'authentik') {
-      sections.push(managedSection(d), installSection(ctx, d, reload), adminSection(d), apiSection(ctx, d, reload), ownerSection(ctx, d, f, reload, rerender), hostnameSection(ctx, d, reload),
-        googleSection(ctx, d, f, reload, rerender), protectSection(ctx, d, f, reload, rerender), healthSection(d));
-    }
+    const wiz = L.identityWizard(d);
+    const byId = Object.fromEntries(wiz.steps.map((s) => [s.id, s]));
+    let id = wanted && byId[wanted] ? wanted : wiz.current;
+    if (!byId[id].available) id = wiz.firstOpen;
+    const step = byId[id];
+    const rerender = (keep = true) => render(main, ctx, ctx.state.identity, id, keep);
+    const reload = async (deep) => { await load(ctx, deep); rerender(true); };
+    const go = (to) => {
+      api('POST', '/api/identity/wizard', { step: to }).catch(() => {});
+      if (location.hash !== `#identity/${to}`) history.replaceState(null, '', `#identity/${to}`);
+      render(main, ctx, ctx.state.identity, to, false);
+      const p = document.getElementById('wizard-panel'); if (p) p.scrollIntoView({ block: 'start' });
+    };
+    const nb = L.wizardNeighbours(wiz, id);
+    const nav = h('nav', { class: 'wizard-steps', 'aria-label': 'Setup steps' }, h('ol', null, wiz.steps.map((s) => h('li', { class: `${s.id === id ? 'current' : ''} ${s.done ? 'done' : ''} ${!s.available ? 'locked' : ''}` },
+      s.available ? h('button', { type: 'button', class: 'step-link', 'aria-current': s.id === id ? 'step' : null, onclick: () => go(s.id) },
+        h('span', { class: 'step-num', 'aria-hidden': 'true' }, s.done ? '✓' : String(s.number)), h('span', null, s.title, s.optional ? h('span', { class: 'small muted' }, ' (optional)') : null),
+        h('span', { class: 'sr-only' }, s.done ? ', complete' : s.id === id ? ', current step' : ''))
+        : h('span', { class: 'step-link', title: `First: ${s.blockedBy}` }, h('span', { class: 'step-num', 'aria-hidden': 'true' }, String(s.number)), h('span', null, s.title), h('span', { class: 'sr-only' }, `, available after: ${s.blockedBy}`))))));
+    const status = step.final ? null : step.done ? h('p', { class: 'step-status ok', role: 'status' }, icon('check'), ' Done. ', step.optional ? 'You can change it here at any time.' : 'Continue to the next step.')
+      : h('p', { class: 'step-status todo', role: 'status' }, icon('alert'), step.optional ? ' Optional: do it now or skip it.' : ' Not done yet: follow the instructions below.');
+    const bodyFor = {
+      mode: () => modeStep(ctx, d, reload, go),
+      authentik: () => [installSection(ctx, d, reload), adminSection(d)],
+      connect: () => apiSection(ctx, d, reload),
+      address: () => hostnameSection(ctx, d, reload),
+      google: () => googleStep(ctx, d, f, reload, rerender),
+      signin: () => signinStep(ctx, d, f, reload, rerender),
+      owner: () => ownerStep(ctx, d, f, reload, rerender, go),
+      apps: () => protectStep(ctx, d, f, reload, rerender),
+      done: () => doneStep(d),
+    };
+    const continueLabel = nb.next ? (step.done || !step.optional ? `Continue: ${nb.next.title}` : `Skip for now: ${nb.next.title}`) : '';
+    const footer = h('div', { class: 'wizard-foot' },
+      nb.prev ? h('button', { type: 'button', class: 'btn', onclick: () => go(nb.prev.id) }, '← Back') : h('span'),
+      h('span', { class: 'grow' }),
+      nb.next ? h('button', { type: 'button', class: `btn ${step.done ? 'primary' : ''}`, disabled: !(step.done || step.optional), title: step.done || step.optional ? '' : 'Finish this step first', onclick: () => go(nb.next.id) }, continueLabel, ' →') : null);
+    const panel = h('section', { class: 'card wizard-panel', id: 'wizard-panel', 'aria-labelledby': 'wizard-title' },
+      h('div', { class: 'eyebrow' }, `Step ${step.number} of ${wiz.steps.length}`),
+      h('h2', { id: 'wizard-title', tabindex: '-1' }, step.title),
+      h('p', { class: 'why' }, WHY[id] || ''), status,
+      h('div', { class: 'wizard-body', id: `identity-${id}` }, bodyFor[id]()),
+      footer);
     fill(main,
-      head('Access', 'Identity & Access', 'Optional, one-time setup: authentik with Google sign-in, then pick the applications to protect. Afterwards users, groups, invitations and who may open what are managed in authentik only. Basic setup and Cloudflare Access work without it.',
-        h('a', { class: 'btn', href: '#explorer' }, icon('network'), 'Infrastructure Explorer')),
-      progress, sections,
-      gate('expert', technical([JSON.stringify({ config: d.config, overview: d.overview, model: d.model }, null, 2)], 'Raw identity state (no secrets)')));
+      head('Access', 'Identity & Access', 'A one-time guided setup of sign-in (authentik, optionally with Google) for the applications you choose. Afterwards users and access are managed in authentik. Basic setup and Cloudflare Access work without it.',
+        h('button', { type: 'button', class: 'btn small', onclick: (e) => withBusy(e.currentTarget, () => reload(true)) }, icon('refresh'), 'Check again')),
+      h('div', { class: 'wizard' }, nav, panel),
+      gate('advanced', healthSection(d)),
+      gate('expert', technical([JSON.stringify({ config: d.config, overview: d.overview, model: d.model, wizard: wiz }, null, 2)], 'Raw identity state (no secrets)')));
+    if (keepScroll) window.scrollTo(0, y);
   }
 
-  // --- Provider ----------------------------------------------------------------------------------------------------------
-  function providerSection(ctx, d, reload) {
-    const choose = (id) => (e) => withBusy(e.currentTarget, async () => { await api('POST', '/api/identity/provider', { provider: id }); toast('Saved.'); await reload(false); });
-    return h('section', { class: 'card', id: 'identity-provider', 'aria-labelledby': 'id-prov-h' }, h('h2', { id: 'id-prov-h' }, 'Identity provider'),
-      h('div', { class: 'choice-cards', role: 'list' }, arr(d.providers).map((p) => {
-        const current = d.provider === p.id;
-        const disabled = p.status !== 'integrated';
-        return h('div', { class: `choice ${current ? 'selected' : ''} ${disabled ? 'disabled' : ''}`, role: 'listitem' },
-          h('strong', null, p.name), current ? plainChip('Selected', 'ok') : disabled ? plainChip('Install only', 'warn') : null,
-          h('p', { class: 'small' }, p.summary),
-          disabled ? h('a', { class: 'btn small', href: `#install/${p.catalogId}` }, 'App Catalog') : current ? null : h('button', { type: 'button', class: 'btn small primary', onclick: choose(p.id) }, `Choose ${p.name}`));
-      })),
-      d.provider === 'authentik' ? h('p', { class: 'small muted' }, 'Only one identity provider is set up at a time; nothing is installed automatically.') : null);
+  // --- 1. Sign-in path -----------------------------------------------------------------------------------------------------
+  function modeStep(ctx, d, reload, go) {
+    const mode = d.config.authMode;
+    const pick = (m) => (e) => withBusy(e.currentTarget, async () => { await api('POST', '/api/identity/mode', { mode: m }); await load(ctx, false); go('authentik'); });
+    const card = (m, title, text, extra) => h('div', { class: `choice ${mode === m ? 'selected' : ''}`, role: 'listitem' },
+      h('strong', null, title), mode === m ? plainChip('Chosen', 'ok') : null, h('p', { class: 'small' }, text), extra || null,
+      h('button', { type: 'button', class: `btn small ${mode === m ? '' : 'primary'}`, onclick: pick(m) }, mode === m ? 'Keep this' : 'Choose'));
+    return [h('div', { class: 'choice-cards', role: 'list' },
+      card('local', 'A. Local accounts (username and password)', 'authentik accounts with passwords. Simplest start: no Google Cloud steps. You can add Google later in this wizard without losing accounts, rules or access.'),
+      card('google', 'B. Google sign-in (recommended for Gmail users)', 'People sign in with their Google account. Needs a short visit to Google Cloud (about five minutes, guided). A local administrator password always remains as a recovery path.')),
+      mode === 'local' && d.google && d.google.source ? h('p', { class: 'small' }, 'Google sign-in is already configured in authentik; choosing local accounts here only changes this wizard, nothing in authentik.') : null,
+      h('details', { class: 'more' }, h('summary', null, 'Other choices'),
+        h('p', { class: 'small' }, 'Authelia can be installed from the App Catalog, but its sign-in integration is not implemented in this version. ',
+          h('button', { type: 'button', class: 'btn small ghost', onclick: (e) => withBusy(e.currentTarget, async () => { await api('POST', '/api/identity/provider', { provider: 'none' }); toast('Saved: configure later. Cloudflare Access keeps working.'); await reload(false); }) }, 'Configure later'))),
+      d.provider === 'none' ? h('p', { class: 'small muted' }, 'Currently: configure later (no self-hosted sign-in). Choose A or B to start.') : null];
   }
 
-  // --- Installation ------------------------------------------------------------------------------------------------------
+  // --- 2. Installation -----------------------------------------------------------------------------------------------------
   function installSection(ctx, d, reload) {
     const inst = d.install;
     const adopt = (p) => (e) => withBusy(e.currentTarget, async () => {
@@ -144,10 +190,9 @@
       catch (x) { toast(x.message, true); }
     });
     async function afterChange(r) {
-      await reload(false);
+      await load(ctx, false);
       // Resume where the setup stands now: the next step that needs attention.
-      const next = r && r.next ? document.getElementById(`identity-${r.next}`) : null;
-      if (next) next.scrollIntoView({ block: 'start' });
+      if (r && r.next) location.hash = `#identity/${r.next}`; else await reload(false);
     }
     const explain = h('details', { class: 'more', open: v.status === 'insufficient' || !v.stored ? true : null }, h('summary', null, 'How to create an API token in authentik'),
       h('ol', { class: 'small' },
@@ -229,188 +274,274 @@
       h('p', { class: 'small muted' }, 'The manager handles the rest: deploying applications, routing, connecting them to authentik (ForwardAuth), connection health and removing protection.'));
   }
 
-  // --- Initial owner ---------------------------------------------------------------------------------------------------
-  function ownerSection(ctx, d, f, reload, rerender) {
-    const o = (d.config.authentik && d.config.authentik.owner) || {};
-    const g = d.google || {};
-    const pub = d.config.authentik.publicUrl;
-    if (!f.owner) f.owner = { email: o.email || d.contactEmail || '', makeAdmin: o.makeAdmin !== false };
-    const of = f.owner;
-    if (o.verifiedAt) {
-      return h('section', { class: 'card', id: 'identity-owner', 'aria-labelledby': 'id-own-h' }, h('h2', { id: 'id-own-h' }, 'Initial owner ', stateChip('verified')),
-        h('p', null, `${o.email} signed in with Google as authentik user '${o.username}' (${o.verifiedAt}) and is in the group "DTC owners"${o.makeAdmin ? ' and the authentik administrators' : ''}. Everyone else is added in authentik.`));
-    }
-    const email = h('input', { id: 'id-owner', type: 'email', value: of.email, autocomplete: 'off', spellcheck: 'false', placeholder: 'you@gmail.com' });
-    email.addEventListener('input', () => { of.email = email.value.trim(); });
-    const admin = h('input', { type: 'checkbox', checked: of.makeAdmin }); admin.addEventListener('change', () => { of.makeAdmin = admin.checked; });
-    const save = (e) => withBusy(e.currentTarget, async () => { if (!L.isEmail(of.email)) { toast('Enter a valid email address.', true); return; } await api('POST', '/api/identity/owner', { email: of.email, makeAdmin: of.makeAdmin }); toast('Saved.'); await reload(false); });
-    const check = (e) => withBusy(e.currentTarget, async () => {
-      const r = await api('POST', '/api/identity/owner/verify', {});
-      if (!r.ok) { toast(r.message, true); return; }
-      toast(`Owner set up: ${r.username}.`); await reload(false);
-      const n = r.next ? document.getElementById(`identity-${r.next}`) : null; if (n) n.scrollIntoView({ block: 'start' });
-    });
-    const waiting = o.email && g.source;
-    return h('section', { class: 'card', id: 'identity-owner', 'aria-labelledby': 'id-own-h' }, h('h2', { id: 'id-own-h' }, 'Initial owner ', stateChip(waiting ? 'awaiting-user' : o.email ? 'configured' : 'awaiting-user')),
-      h('p', null, 'The Google account of the person who owns this authentik. Asked once: it becomes the only Google account that can create an authentik account at first, and the first member of the owner group that protected applications admit. Authentik checks that Google has verified the address.'),
-      field({ id: 'id-owner', label: 'Owner\'s Google account', control: email, hint: 'Can be changed until the owner has signed in with Google.' }),
-      h('label', { class: 'check' }, admin, h('span', null, 'Also make this account an authentik administrator (so you can manage authentik with Google sign-in; akadmin keeps its password either way)')),
-      h('div', { class: 'actions' }, h('button', { type: 'button', class: o.email ? 'btn' : 'btn primary', onclick: save }, o.email ? 'Change owner' : 'Save')),
-      waiting ? h('div', { class: 'callout', role: 'status' }, h('p', null, h('strong', null, 'Last setup step: '), `open the sign-in page, choose "Sign in with Google" and use ${o.email}. Then press "Check owner sign-in".`),
-        h('div', { class: 'actions' }, pub ? h('a', { class: 'btn', href: `${pub}/`, target: '_blank', rel: 'noopener noreferrer' }, 'Open the sign-in page ', icon('external')) : null,
-          h('button', { type: 'button', class: 'btn primary', onclick: check }, icon('refresh'), 'Check owner sign-in'))) : null);
-  }
-
-  // --- Google ----------------------------------------------------------------------------------------------------------
-  function googleSection(ctx, d, f, reload, rerender) {
+  // --- 5. Register with Google ---------------------------------------------------------------------------------------------
+  function googleStep(ctx, d, f, reload, rerender) {
     const cfg = d.config.authentik;
     const g = d.google || {};
     const v = d.googleValues;
-    const connected = d.token && d.token.ok;
     const owner = cfg.owner || {};
-    if (!f.google) f.google = { clientId: cfg.google.clientId || '' };
-    const gf = f.google;
-    if (!v) {
-      return h('section', { class: 'card', id: 'identity-google', 'aria-labelledby': 'id-g-h' }, h('h2', { id: 'id-g-h' }, 'Google sign-in'),
-        h('p', { class: 'muted' }, 'Set up the public sign-in address first: Google only accepts https redirect addresses.'));
-    }
-    const step = (n, title, ...body) => h('section', { class: 'wiz-step', 'aria-labelledby': `gs-${n}` }, h('h3', { id: `gs-${n}` }, h('span', { class: 'step-num' }, String(n)), title), body);
+    if (!v) return h('p', { class: 'muted' }, 'Set up the public sign-in address first: Google only accepts https addresses.');
+    if (!f.owner) f.owner = { email: owner.email || d.contactEmail || '', makeAdmin: owner.makeAdmin !== false };
+    if (!f.google) f.google = { clientId: cfg.google.clientId || '', manual: false, replace: false };
+    const gf = f.google; const of = f.owner;
+    const sub = (n, title, ...body) => h('section', { class: 'wiz-step', 'aria-labelledby': `gs-${n}` }, h('h3', { id: `gs-${n}` }, h('span', { class: 'step-num' }, n), title), body);
+    // a. The owner (asked once).
+    const ownerEmail = h('input', { id: 'id-owner', type: 'email', value: of.email, autocomplete: 'off', spellcheck: 'false', placeholder: 'you@gmail.com', disabled: !!owner.subject });
+    ownerEmail.addEventListener('input', () => { of.email = ownerEmail.value.trim(); });
+    const adminBox = h('input', { type: 'checkbox', checked: of.makeAdmin, disabled: !!owner.subject }); adminBox.addEventListener('change', () => { of.makeAdmin = adminBox.checked; });
+    const saveOwner = (e) => withBusy(e.currentTarget, async () => { if (!L.isEmail(of.email)) { toast('Enter a valid email address.', true); return; } await api('POST', '/api/identity/owner', { email: of.email, makeAdmin: of.makeAdmin }); toast('Saved.'); await reload(false); });
+    // e. Import the client JSON (preferred) or type the values.
+    const jsonState = f.json;
+    const fileInput = h('input', { type: 'file', id: 'id-g-json', accept: 'application/json,.json' });
+    fileInput.addEventListener('change', () => {
+      const file = fileInput.files && fileInput.files[0]; if (!file) return;
+      if (file.size > 20000) { f.json = { error: 'That file is too large to be a Google OAuth client file.' }; rerender(); return; }
+      const reader = new FileReader();
+      reader.onload = async () => {
+        const text = String(reader.result || '');
+        try { const r = await api('POST', '/api/identity/google/inspect', { clientJson: text }); f.json = r.ok ? { ...r, text } : { ...r, text: '' }; }
+        catch (x) { f.json = { error: x.message }; }
+        f.plans.google = null; rerender();
+      };
+      reader.readAsText(file);
+    });
     const cid = h('input', { id: 'id-g-cid', value: gf.clientId, autocomplete: 'off', spellcheck: 'false', placeholder: '1234567890-abc….apps.googleusercontent.com' });
-    cid.addEventListener('input', () => { gf.clientId = cid.value.trim(); });
-    const sec = h('input', { id: 'id-g-sec', type: 'password', autocomplete: 'off', spellcheck: 'false', placeholder: g.source ? 'Leave empty to keep the secret authentik already has' : 'GOCSPX-…' });
-    sec.value = f.secret || '';
-    sec.addEventListener('input', () => { f.secret = sec.value; });
+    cid.addEventListener('input', () => { gf.clientId = cid.value.trim(); f.plans.google = null; });
+    const sec = h('input', { id: 'id-g-sec', type: 'password', autocomplete: 'off', spellcheck: 'false', placeholder: g.source ? 'Only to replace it' : 'GOCSPX-…' });
+    sec.value = f.secret || ''; sec.addEventListener('input', () => { f.secret = sec.value; f.plans.google = null; });
     const err = h('p', { class: 'form-error', role: 'alert' });
-    const validate = () => {
-      if (!owner.email) return 'Enter the initial owner\'s Google account first (above).';
-      if (!L.isGoogleClientId(gf.clientId)) return 'The client ID ends in .apps.googleusercontent.com — copy it from Google Cloud.';
-      if (!g.source && !f.secret) return 'Paste the client secret (Google shows it only right after you create the client).';
-      return '';
-    };
-    const saveDraft = (e) => withBusy(e.currentTarget, async () => { await api('POST', '/api/identity/google/save', { clientId: gf.clientId }); toast('Saved. You can leave for Google Cloud and continue later; the secret is never saved.'); });
+    const replaceBox = h('input', { type: 'checkbox', checked: gf.replace }); replaceBox.addEventListener('change', () => { gf.replace = replaceBox.checked; f.plans.google = null; });
+    const body = () => (jsonState && jsonState.ok && jsonState.text && !gf.manual ? { clientJson: jsonState.text, replace: gf.replace } : { clientId: gf.clientId, clientSecret: f.secret || '', replace: gf.replace });
     const plan = f.plans.google;
-    const previewBtn = h('button', { type: 'button', class: 'btn primary', disabled: !connected }, icon('eye'), 'Preview the authentik changes');
+    const previewBtn = h('button', { type: 'button', class: 'btn primary' }, icon('eye'), 'Check and preview the authentik changes');
     previewBtn.addEventListener('click', () => withBusy(previewBtn, async () => {
-      err.textContent = validate(); if (err.textContent) return;
-      f.plans.google = await api('POST', '/api/identity/google/plan', { clientId: gf.clientId, clientSecret: f.secret || '' }); rerender();
+      err.textContent = '';
+      if (!owner.email) { err.textContent = 'Save the owner\'s Google account first (a).'; return; }
+      const b = body();
+      if (!b.clientJson && (!L.isGoogleClientId(b.clientId) || (!g.source && !b.clientSecret))) { err.textContent = 'Import the downloaded JSON file, or enter the client ID and secret.'; return; }
+      try { f.plans.google = await api('POST', '/api/identity/google/plan', b); rerender(); }
+      catch (x) { err.textContent = x.message; if (x.data && x.data.needsReplace) { gf.replaceOffered = true; rerender(); } }
     }));
-    const applyBtn = h('button', { type: 'button', class: 'btn primary', disabled: true }, 'Apply in authentik');
+    const applyBtn = h('button', { type: 'button', class: 'btn primary', disabled: true }, 'Turn on Google sign-in');
     const reviewed = h('input', { type: 'checkbox' }); reviewed.addEventListener('change', () => { applyBtn.disabled = !reviewed.checked; });
     applyBtn.addEventListener('click', () => withBusy(applyBtn, async () => {
       const r = await api('POST', '/api/identity/google/apply', { planId: plan.planId, confirm: true });
-      f.plans.google = null; if (r.ok) { f.secret = ''; f.googleResult = r; } else toast(r.message, true);
+      f.plans.google = null; if (r.ok) { f.secret = ''; f.json = null; f.googleResult = r; toast('Google sign-in is on.'); } else toast(r.message, true);
       await reload(false);
     }));
     const res = f.googleResult;
-    const redirect = g.redirect;
-    return h('section', { class: 'card wizard', id: 'identity-google', 'aria-labelledby': 'id-g-h' }, h('h2', { id: 'id-g-h' }, 'Google sign-in ', g.verifiedAt ? stateChip('verified') : g.source ? stateChip('configured') : stateChip('awaiting-user')),
-      h('p', null, 'Google offers no API to create the sign-in client, so steps 1–4 are a short visit to Google Cloud (about five minutes). The rest — the Google source, the login button, the owner-only sign-up — the manager configures in authentik.'),
-      h('ul', { class: 'legend small' }, h('li', null, plainChip('You', 'warn'), ' steps in Google Cloud'), h('li', null, plainChip('Automatic', 'ok'), ' done by the manager'), h('li', null, plainChip('Verified', 'ok'), ' only after the owner\'s real Google sign-in')),
-      step(1, 'Values to use (copy them)', copyRow('App name', v.AppName, 'gv-app'), copyRow('Application type', v.ClientType, 'gv-type'), copyRow('Authorized redirect URI', v.RedirectUri, 'gv-redir'),
-        copyRow('Authorized domain', v.AuthorizedDomain, 'gv-dom'), copyRow('Scopes', v.ScopeNames.join(', '), 'gv-scopes'),
-        gate('advanced', h('p', { class: 'small muted' }, 'Scopes in full: ', v.Scopes.join(' '), '. authentik asks Google for "email profile"; openid, email and profile are the basic, non-sensitive scopes, so Google does not require app verification for them. No JavaScript origins are needed.'))),
-      step(2, 'Create or choose a Google Cloud project', plainChip('You', 'warn'),
-        h('p', null, 'Use a project just for sign-in. ', ext(v.ConsoleUrls.projects, 'Create a project'), ' (or pick one at the top of the console). No Google API has to be enabled for sign-in.')),
-      step(3, 'Branding and audience', plainChip('You', 'warn'),
-        h('ol', null,
-          h('li', null, ext(v.ConsoleUrls.branding, 'Google Auth Platform > Branding'), ': App name ', h('code', null, v.AppName), ', your support email, developer contact email; authorized domain ', h('code', null, v.AuthorizedDomain), '. Skip the logo (it triggers Google\'s brand verification).'),
-          h('li', null, ext(v.ConsoleUrls.audience, 'Audience'), ': ', h('strong', null, 'Internal'), ' if everyone is in your Google Workspace organization, otherwise ', h('strong', null, 'External'), '. External starts in "Testing" (only listed test users, up to 100 — add ', h('code', null, owner.email || 'the owner'), ') or press "Publish app"; authentik still decides who may enroll.'))),
-      step(4, 'Create the OAuth client', plainChip('You', 'warn'),
-        h('ol', null, h('li', null, ext(v.ConsoleUrls.clients, 'Clients'), ' > Create client > Application type ', h('strong', null, 'Web application'), '.'),
-          h('li', null, 'Authorized redirect URIs > Add URI: ', h('code', null, v.RedirectUri), ' (exactly, including the trailing slash).'),
-          h('li', null, 'Create, then copy the Client ID and Client secret right away: Google shows the secret only once.'))),
-      step(5, 'Paste the client details', plainChip('You', 'warn'),
-        field({ id: 'id-g-cid', label: 'Client ID', control: cid }),
-        field({ id: 'id-g-sec', label: g.source ? 'Client secret (only to replace it)' : 'Client secret', control: sec, hint: 'Sent once to this PC\'s manager and straight into authentik. Never saved by the manager, never shown again, never logged.' }),
-        h('p', { class: 'small' }, owner.email ? `Only ${owner.email} will be able to create an account with Google at first.` : 'Enter the initial owner (above) first.'),
-        h('div', { class: 'actions' }, h('button', { type: 'button', class: 'btn', onclick: saveDraft }, 'Save progress'), previewBtn), err,
-        !connected ? h('p', { class: 'hint' }, 'Connect the manager to authentik first (above).') : null),
-      step(6, 'Configure authentik', plainChip('Automatic', 'ok'),
-        plan ? [actionList(plan.actions), h('ul', null, arr(plan.notes).map((n) => h('li', { class: 'small' }, n))),
-          h('div', { class: 'actions' }, h('label', { class: 'check grow' }, reviewed, h('span', null, 'I reviewed these changes')), applyBtn)]
-          : res ? [actionList(res.actions)] : h('p', { class: 'muted' }, 'Preview first: nothing in authentik changes until you apply.')),
-      step(7, 'Verify', plainChip('Verified', 'ok'),
-        h('ul', { class: 'checks' },
-          checkItem(g.source ? 'ok' : 'neutral', 'Google source in authentik', g.source ? `Slug ${g.source.Slug}, client ${g.source.ConsumerKey}` : 'Not created yet.'),
-          checkItem(redirect ? (redirect.ok ? 'ok' : 'err') : 'neutral', 'Redirect to Google', redirect ? redirect.message : 'Checked once the source exists.'),
-          checkItem(g.verifiedAt ? 'ok' : g.source ? 'warn' : 'neutral', 'Owner\'s Google sign-in', g.verifiedAt ? `Succeeded for ${g.verifiedBy} at ${g.verifiedAt}.` : g.source ? 'Waiting for the owner (see "Initial owner").' : '')),
-        h('p', { class: 'hint' }, 'Saved configuration never counts as verified: only the owner\'s real Google sign-in does.')));
+    return [
+      sub('a', 'Who owns this sign-in?',
+        h('p', null, 'The Google account of the person who owns this authentik. Only this account can create an authentik account with Google at first; everyone else is added later in authentik. It becomes an Internal authentik account and the first member of ', h('strong', null, 'DTC owners'), '.'),
+        field({ id: 'id-owner', label: 'Owner\'s Google account', control: ownerEmail, helpId: 'authentik-user-type', hint: owner.subject ? 'Verified with Google; change people in authentik from now on.' : 'Can be changed until the owner has signed in with Google.' }),
+        h('label', { class: 'check' }, adminBox, h('span', null, 'Also make this account an authentik administrator (akadmin keeps its password either way)')),
+        owner.subject ? null : h('div', { class: 'actions' }, h('button', { type: 'button', class: owner.email ? 'btn' : 'btn primary', onclick: saveOwner }, owner.email ? 'Save changes' : 'Save'))),
+      sub('b', 'Values you will need (copy them)',
+        copyRow('App name', v.AppName, 'gv-app'), copyRow('Support email', of.email || owner.email || '(your email)', 'gv-mail'), copyRow('Authorized domain', v.AuthorizedDomain, 'gv-dom', 'google-branding'),
+        copyRow('Application type', v.ClientType, 'gv-type'), copyRow('Authorized redirect URI', v.RedirectUri, 'gv-redir', 'redirect-uri'),
+        gate('advanced', h('p', { class: 'small muted' }, 'Scopes: ', v.ScopeNames.join(', '), ' (basic, non-sensitive; Google does not require verification for them). No JavaScript origins and no Google API are needed.'))),
+      sub('c', 'In Google Cloud (about five minutes)',
+        h('ol', { class: 'gsteps' },
+          h('li', null, h('strong', null, 'Project. '), ext(v.ConsoleUrls.projects, 'Create a project'), ' (any name), or pick an existing one at the top of the console.'),
+          h('li', { 'data-help-host': '' }, h('strong', null, 'Branding. '), ext(v.ConsoleUrls.branding, 'Google Auth Platform > Branding'), ' (or "Get started"): App name ', h('code', null, v.AppName), ', User support email, Developer contact email. Leave logo, home page, privacy policy and terms empty: they are optional. Under Authorized domains add ', h('code', null, v.AuthorizedDomain), '.', help('google-branding', 'Branding')),
+          h('li', { 'data-help-host': '' }, h('strong', null, 'Audience. '), ext(v.ConsoleUrls.audience, 'Audience'), ': choose ', h('strong', null, 'External'), ' for ordinary Gmail accounts (Internal is only for Google Workspace organizations). In ', h('strong', null, 'Testing'), ', add ', h('code', null, of.email || owner.email || 'the owner\'s address'), ' under Test users, or press Publish app. Publishing does not let anyone into your applications: authentik still decides.', help('google-audience', 'Audience'), help('google-testing', 'Testing')),
+          h('li', { 'data-help-host': '' }, h('strong', null, 'Client. '), ext(v.ConsoleUrls.clients, 'Clients'), ' > Create client > Application type ', h('strong', null, 'Web application'), ', name ', h('code', null, v.AppName), '. Under Authorized redirect URIs press Add URI and paste ', h('code', null, v.RedirectUri), ' exactly. Create.', help('redirect-uri', 'Redirect URI')),
+          h('li', { 'data-help-host': '' }, h('strong', null, 'Download. '), 'In the dialog that appears, press ', h('strong', null, 'Download JSON'), ' (Google shows the secret only now; if you closed it, open the client, Add secret, then download).', help('oauth-json', 'Client JSON')))),
+      sub('d', 'Import the downloaded file',
+        g.source && !gf.replace ? h('div', { class: 'callout', role: 'status' }, h('p', null, stateChip('configured'), ` Google sign-in is already connected (client ${g.source.ConsumerKey}). It is only changed if you choose to replace it.`),
+          h('label', { class: 'check' }, replaceBox, h('span', null, 'Replace the Google client (for example after creating a new one in Google Cloud)'))) : null,
+        !g.source || gf.replace ? [
+          gf.manual ? null : field({ id: 'id-g-json', label: 'Google client file (.json)', control: fileInput, helpId: 'oauth-json', hint: 'Read on this PC and checked: Web application client, client ID and secret present, the redirect URI above, Google endpoints. The secret is passed to authentik once and never stored by the manager.' }),
+          !gf.manual && jsonState ? (jsonState.ok ? h('ul', { class: 'checks' }, checkItem('ok', 'Web application client', jsonState.clientId), checkItem('ok', 'Client secret', 'present (not shown)'), checkItem('ok', 'Redirect URI', jsonState.expectedRedirectUri), ...arr(jsonState.warnings).map((w) => checkItem('warn', 'Note', w)))
+            : h('div', { class: 'callout err', role: 'alert' }, arr(jsonState.errors).length ? arr(jsonState.errors).map((x) => h('p', null, x)) : h('p', null, jsonState.error || 'The file could not be read.'))) : null,
+          h('p', { class: 'small' }, h('button', { type: 'button', class: 'link-btn', onclick: () => { gf.manual = !gf.manual; f.plans.google = null; rerender(); } }, gf.manual ? 'Use the JSON file instead' : 'No file? Enter the client ID and secret instead')),
+          gf.manual ? [field({ id: 'id-g-cid', label: 'Client ID', control: cid }), field({ id: 'id-g-sec', label: 'Client secret', control: sec, hint: 'Sent once to this PC\'s manager and straight into authentik; never stored, shown or logged.' })] : null,
+          h('div', { class: 'actions' }, previewBtn), err] : null),
+      plan ? sub('e', 'Turn on Google sign-in', actionList(plan.actions), h('ul', null, arr(plan.notes).map((n) => h('li', { class: 'small' }, n))),
+        h('div', { class: 'actions' }, h('label', { class: 'check grow' }, reviewed, h('span', null, 'I reviewed these changes')), applyBtn)) : null,
+      res ? sub('e', 'Done in authentik', actionList(res.actions)) : null,
+      g.source ? h('ul', { class: 'checks' },
+        checkItem('ok', 'Google source in authentik', `client ${g.source.ConsumerKey}`),
+        checkItem(g.redirect ? (g.redirect.ok ? 'ok' : 'err') : 'neutral', 'Redirect to Google', g.redirect ? g.redirect.message : 'Checked when the page loads.')) : null,
+    ];
   }
 
-  // --- Protected applications ------------------------------------------------------------------------------------------
-  // Select applications, one action. Access starts owner-only and is then managed in authentik; nothing about people is
-  // asked here.
-  function protectSection(ctx, d, f, reload, rerender) {
+  // --- 6. Sign-in page -------------------------------------------------------------------------------------------------------
+  function signinStep(ctx, d, f, reload, rerender) {
+    const lp = d.config.authentik.loginPage || {};
+    const pub = d.config.authentik.publicUrl;
+    const local = d.install && d.install.localUrl;
+    const plan = f.loginPlan;
+    const preview = (e) => withBusy(e.currentTarget, async () => { f.loginPlan = await api('POST', '/api/identity/loginpage/plan', {}); rerender(); });
+    const apply = (e) => withBusy(e.currentTarget, async () => { await api('POST', '/api/identity/loginpage/apply', { planId: plan.planId, confirm: true }); f.loginPlan = null; toast('The sign-in page shows Google first.'); await reload(false); });
+    const restore = (e) => withBusy(e.currentTarget, async () => {
+      if (!await U.confirmDialog({ title: 'Restore the previous sign-in page', okText: 'Restore', body: ['authentik shows its previous sign-in flow and title again. Google sign-in and all accounts stay as they are.'] })) return;
+      await api('POST', '/api/identity/loginpage/restore', { confirm: true }); await reload(false);
+    });
+    return [
+      h('div', { class: 'login-preview', 'aria-hidden': 'true' }, h('div', { class: 'lp-card' }, h('strong', null, `Sign in to ${(d.config.authentik.hostname || '').replace(/^[^.]+\./, '')}`),
+        h('div', { class: 'lp-google' }, 'Continue with Google'), h('div', { class: 'lp-or' }, 'or'), h('div', { class: 'lp-field' }, 'Email or username'), h('div', { class: 'lp-field' }, 'Password'), h('div', { class: 'lp-btn' }, 'Log in'))),
+      h('ul', null,
+        h('li', null, 'Google comes first: one click opens Google\'s own account chooser; nobody types an email into authentik first.'),
+        h('li', null, 'Email or username with password stays below it, for local accounts.'),
+        h('li', null, 'A separate copy of authentik\'s sign-in flow is used; the original flow stays untouched as the recovery route', local ? [': ', ext(`${local}/if/flow/default-authentication-flow/`, 'local recovery sign-in')] : '', '.', help('local-recovery', 'Recovery'))),
+      lp.appliedAt ? [h('p', null, stateChip('configured'), ` Applied ${lp.appliedAt}. `, pub ? ext(`${pub}/`, 'Open the sign-in page') : null),
+        h('div', { class: 'actions' }, h('button', { type: 'button', class: 'btn ghost', onclick: restore }, 'Restore the previous sign-in page'))]
+        : plan ? [actionList(plan.actions), h('div', { class: 'actions' }, h('button', { type: 'button', class: 'btn primary', onclick: apply, disabled: !plan.canApply }, 'Use this sign-in page'))]
+          : h('div', { class: 'actions' }, h('button', { type: 'button', class: 'btn primary', onclick: preview }, icon('eye'), 'Preview')),
+    ];
+  }
+
+  // --- 7. Verify the owner ---------------------------------------------------------------------------------------------------
+  function ownerStep(ctx, d, f, reload, rerender, go) {
+    const cfg = d.config.authentik;
+    const o = cfg.owner || {};
+    const local = d.config.authMode === 'local';
+    const pub = cfg.publicUrl;
+    const v = f.verify;
+    const check = (repair) => (e) => withBusy(e.currentTarget, async () => {
+      try { f.verify = await api('POST', '/api/identity/owner/verify', { repair: !!repair }); }
+      catch (x) { f.verify = { ok: false, message: x.message, items: [] }; }
+      if (f.verify.ok) { await load(ctx, false); toast('Owner verified.'); }
+      rerender();
+    });
+    const startLocal = (e) => withBusy(e.currentTarget, async () => { await api('POST', '/api/identity/owner/local-start', {}); await reload(false); });
+    const items = v && arr(v.items).length ? h('ul', { class: 'checks owner-checks' }, arr(v.items).map((x) => checkItem(x.ok ? 'ok' : 'err', x.label, x.message))) : null;
+    if (o.verifiedAt && (local || o.subject)) {
+      return [h('div', { class: 'verified-banner', role: 'status' }, icon('check'), h('div', null, h('strong', null, 'Owner verified'), h('p', null, `${local || !o.email ? 'Local administrator' : o.email} signed in as '${o.username}' (${o.verifiedAt}). The account is Internal and in DTC owners${o.makeAdmin && !local ? ', with administrator rights' : ''}.`))),
+        items, h('p', { class: 'small muted' }, 'From now on users and access are managed in authentik.')];
+    }
+    if (local) {
+      return [h('p', null, 'Prove that the local administrator can sign in: start the check, sign in on the sign-in page with your administrator account (akadmin and its password), then come back here.'),
+        !o.localSince ? h('div', { class: 'actions' }, h('button', { type: 'button', class: 'btn primary', onclick: startLocal }, 'Start the sign-in check'))
+          : [h('div', { class: 'actions' }, pub ? h('a', { class: 'btn primary', href: `${pub}/`, target: '_blank', rel: 'noopener noreferrer' }, 'Sign in now ', icon('external')) : null,
+            h('button', { type: 'button', class: 'btn', onclick: check(false) }, icon('refresh'), "I've signed in - check again"))],
+        v && !v.ok ? h('div', { class: 'callout warn', role: 'status' }, h('p', null, v.message), v.needsRepair ? h('button', { type: 'button', class: 'btn small', onclick: check(true) }, 'Repair: make the account Internal') : null) : null, items];
+    }
+    return [
+      o.email ? h('p', null, 'Sign in once as the owner (', h('strong', null, o.email), ') with Google. It opens Google\'s own account chooser directly; pick that account. Come back to this tab afterwards.') : h('p', { class: 'callout warn' }, 'Enter the owner\'s Google account in the previous step first.'),
+      pub && o.email ? h('div', { class: 'actions big' }, h('a', { class: 'btn primary google-btn', href: `${pub}/source/oauth/login/${cfg.google.slug}/`, target: '_blank', rel: 'noopener noreferrer' }, 'Continue with Google ', icon('external')),
+        h('button', { type: 'button', class: 'btn', onclick: check(false) }, icon('refresh'), "I've signed in - check again")) : null,
+      v && !v.ok ? h('div', { class: 'callout warn', role: 'status' }, h('p', null, v.message), v.needsRepair ? h('button', { type: 'button', class: 'btn small', onclick: check(true) }, 'Repair: make the account Internal') : null) : null,
+      items,
+      h('details', { class: 'more' }, h('summary', null, 'What is checked?'), h('ul', { class: 'small' },
+        h('li', null, 'The Google account with the owner\'s address (Google verified it) signed in and is the same Google identity as the first time.'),
+        h('li', null, 'The authentik account is Internal (it can open its authentik dashboard).', help('authentik-user-type', 'Internal account')),
+        h('li', null, 'It is in DTC owners', help('dtc-owners', 'DTC owners'), ' and, if you chose it, an authentik administrator.'),
+        h('li', null, 'The sign-in completed. Nothing can be marked verified by hand.'))),
+    ];
+  }
+
+  // --- 8. Protect applications -----------------------------------------------------------------------------------------------
+  // Selecting never re-renders the page (no jumping): the count and the button update in place.
+  function protectStep(ctx, d, f, reload, rerender) {
     const connected = d.token && d.token.ok;
-    const ownerReady = !!(d.config.authentik.owner && d.config.authentik.owner.verifiedAt) || !!(d.google && d.google.source);
     const services = arr(d.services).filter((s) => !s.isIdentity);
     const byName = Object.fromEntries(arr(d.apps).map((a) => [a.service, a]));
-    if (!f.protect) f.protect = { selected: {}, access: 'keep', plan: null, result: null, remove: null };
+    if (!f.protect) f.protect = { selected: {}, access: 'keep', plan: null, result: null };
     const pf = f.protect;
     const compatible = (s) => s.enabled && arr(s.hostnames).length === 1 && s.auth !== 'authentik';
     const why = (s) => (!s.enabled ? 'disabled' : arr(s.hostnames).length !== 1 ? 'several hostnames' : '');
     const link = d.adminLinks;
+    const candidates = services.filter(compatible);
+    Object.keys(pf.selected).forEach((k) => { if (!candidates.some((s) => s.name === k)) delete pf.selected[k]; });
+    const count = h('span', { class: 'sel-count', 'aria-live': 'polite' });
+    const protectBtn = h('button', { type: 'button', class: 'btn primary', id: 'id-protect-btn' }, icon('lock'), 'Protect selected with authentik…');
+    const boxes = [];
+    const sync = () => {
+      const n = Object.keys(pf.selected).filter((k) => pf.selected[k]).length;
+      count.textContent = `${n} of ${candidates.length} selected`;
+      protectBtn.disabled = !n || !connected;
+      protectBtn.lastChild.textContent = `Protect ${n || ''} selected with authentik…`.replace('  ', ' ');
+      boxes.forEach((b) => { b.checked = !!pf.selected[b.dataset.name]; });
+    };
     const rows = services.map((s) => {
       const a = byName[s.name];
       const prot = s.auth === 'authentik';
       const state = a ? (a.verifiedAt ? 'verified' : !a.authentik ? 'failed' : a.challenge ? ({ auth: 'auth-required', open: 'failed', loop: 'failed', failed: 'failed' })[a.challenge.State] : 'configured') : 'not-configured';
-      const box = h('input', { type: 'checkbox', 'aria-label': `Select ${s.displayName || s.name}`, checked: !!pf.selected[s.name], disabled: !compatible(s) || !connected });
-      box.addEventListener('change', () => { pf.selected[s.name] = box.checked; pf.plan = null; rerender(); });
+      let cell;
+      if (prot) cell = h('span', { title: 'Already protected (not affected by this selection)' }, icon('lock'), h('span', { class: 'sr-only' }, 'Already protected'));
+      else {
+        const box = h('input', { type: 'checkbox', 'data-name': s.name, id: `sel-${s.name}`, 'aria-label': `Select ${s.displayName || s.name}`, checked: !!pf.selected[s.name], disabled: !compatible(s) || !connected });
+        box.addEventListener('change', () => { pf.selected[s.name] = box.checked; pf.plan = null; sync(); });
+        boxes.push(box); cell = box;
+      }
       const access = prot && a ? (a.rules === null || a.rules === undefined ? '' : a.ownerOnly ? 'owner only (DTC owners)' : a.rules ? `${a.rules} rule(s) in authentik` : 'no rule (everyone signed in)') : '';
-      return h('tr', null,
-        h('td', null, prot ? icon('lock') : box),
-        h('td', null, s.displayName || s.name, why(s) && !prot ? h('span', { class: 'small muted' }, ` (${why(s)})`) : null),
+      return h('tr', { class: prot ? 'protected' : '' },
+        h('td', null, cell),
+        h('td', null, h('label', { for: prot ? null : `sel-${s.name}` }, s.displayName || s.name), why(s) && !prot ? h('span', { class: 'small muted' }, ` (${why(s)})`) : null),
         h('td', null, arr(s.hostnames).join(', ')),
-        h('td', null, prot ? [stateChip(state), access ? h('div', { class: 'small muted' }, access) : null] : s.publish && s.access ? plainChip('Cloudflare Access', 'info') : !s.publish ? plainChip('Local only') : plainChip('Public', 'warn')),
+        h('td', null, prot ? [h('span', { class: 'small' }, 'Already protected '), stateChip(state), access ? h('div', { class: 'small muted' }, access) : null] : s.publish && s.access ? plainChip('Cloudflare Access', 'info') : !s.publish ? plainChip('Local only') : plainChip('Public', 'warn')),
         h('td', null, prot ? [link ? h('a', { class: 'btn small', href: `${link.base}/if/admin/#/core/applications/${a ? a.slug : `dm-${s.name}`}`, target: '_blank', rel: 'noopener noreferrer' }, 'Open in authentik ', icon('external')) : null,
           h('button', { type: 'button', class: 'btn small ghost', onclick: (e) => withBusy(e.currentTarget, async () => { pf.plan = await api('POST', '/api/identity/unprotect/plan', { service: s.name }); pf.plan.remove = true; pf.result = null; rerender(); }) }, 'Remove protection…')] : null));
     });
-    const table = services.length ? h('table', { class: 'table' }, h('thead', null, h('tr', null, h('th', null, ''), h('th', null, 'Application'), h('th', null, 'Address'), h('th', null, 'Sign-in'), h('th', null, ''))), h('tbody', null, rows))
+    const selAll = h('button', { type: 'button', class: 'btn small', id: 'id-sel-all', disabled: !candidates.length || !connected, onclick: () => { candidates.forEach((s) => { pf.selected[s.name] = true; }); pf.plan = null; sync(); } }, 'Select all');
+    const clrAll = h('button', { type: 'button', class: 'btn small ghost', id: 'id-sel-none', onclick: () => { pf.selected = {}; pf.plan = null; sync(); } }, 'Clear all');
+    const table = services.length ? h('table', { class: 'table protect-table' }, h('thead', null, h('tr', null, h('th', null, h('span', { class: 'sr-only' }, 'Select')), h('th', null, 'Application'), h('th', null, 'Address'), h('th', null, 'Sign-in'), h('th', null, ''))), h('tbody', null, rows))
       : h('p', { class: 'muted' }, 'No services yet. Publish an application on the Services page first.');
-    const chosen = Object.keys(pf.selected).filter((k) => pf.selected[k]);
     const accessSel = h('select', { id: 'id-p-access' }, h('option', { value: 'keep', selected: pf.access === 'keep' }, 'Keep Cloudflare Access as it is (default)'), h('option', { value: 'remove', selected: pf.access === 'remove' }, 'Remove Cloudflare Access from the selected applications (authentik becomes the only login)'));
     accessSel.addEventListener('change', () => { pf.access = accessSel.value; pf.plan = null; });
-    const protectBtn = h('button', { type: 'button', class: 'btn primary', disabled: !chosen.length || !connected || !ownerReady }, icon('lock'), `Protect selected with authentik${chosen.length ? ` (${chosen.length})` : ''}…`);
-    protectBtn.addEventListener('click', () => withBusy(protectBtn, async () => { pf.plan = await api('POST', '/api/identity/protect/plan', { services: chosen, cloudflareAccess: pf.access }); pf.plan.remove = false; pf.result = null; rerender(); }));
+    protectBtn.addEventListener('click', () => withBusy(protectBtn, async () => {
+      const chosen = Object.keys(pf.selected).filter((k) => pf.selected[k]);
+      pf.plan = await api('POST', '/api/identity/protect/plan', { services: chosen, cloudflareAccess: pf.access }); pf.plan.remove = false; pf.result = null; rerender();
+      const r = document.getElementById('id-protect-review'); if (r) r.scrollIntoView({ block: 'start' });
+    }));
     let review = null;
     const plan = pf.plan;
     if (plan) {
-      const items = arr(plan.items);
+      const its = arr(plan.items);
       const reviewed = h('input', { type: 'checkbox' });
-      const overwrites = items.flatMap((it) => arr(it.traefik.cloudflare.actions).filter((x) => x.overwrite).map((x) => { const b = h('input', { type: 'checkbox', 'data-id': x.id }); return h('label', { class: 'check' }, b, h('span', null, `Overwrite: ${x.summary}`)); }));
-      const apply = h('button', { type: 'button', class: `btn ${plan.remove ? 'danger' : 'primary'}`, disabled: true }, plan.remove ? 'Remove protection' : `Protect ${items.length} application(s)`);
-      const sync = () => { apply.disabled = !(reviewed.checked && plan.canApply && overwrites.every((o) => o.querySelector('input').checked)); };
-      reviewed.addEventListener('change', sync); overwrites.forEach((o) => o.querySelector('input').addEventListener('change', sync));
+      const overwrites = its.flatMap((it) => arr(it.traefik.cloudflare.actions).filter((x) => x.overwrite).map((x) => { const b = h('input', { type: 'checkbox', 'data-id': x.id }); return h('label', { class: 'check' }, b, h('span', null, `Overwrite: ${x.summary}`)); }));
+      const apply = h('button', { type: 'button', class: `btn ${plan.remove ? 'danger' : 'primary'}`, disabled: true }, plan.remove ? 'Remove protection' : `Protect ${its.length} application(s)`);
+      const syncApply = () => { apply.disabled = !(reviewed.checked && plan.canApply && overwrites.every((o) => o.querySelector('input').checked)); };
+      reviewed.addEventListener('change', syncApply); overwrites.forEach((o) => o.querySelector('input').addEventListener('change', syncApply));
       apply.addEventListener('click', () => withBusy(apply, async () => {
         const ids = overwrites.map((o) => o.querySelector('input')).filter((b) => b.checked).map((b) => b.dataset.id);
+        const progress = document.getElementById('id-protect-progress'); if (progress) progress.textContent = `Working on ${its.length} application(s), one after the other…`;
         pf.result = await api('POST', `/api/identity/${plan.remove ? 'unprotect' : 'protect'}/apply`, { planId: plan.planId, confirm: true, confirmOverwrites: ids });
         pf.plan = null; pf.selected = {}; await reload(false);
+        const r = document.getElementById('id-protect-result'); if (r) r.scrollIntoView({ block: 'start' });
       }));
-      review = h('div', { class: 'card inset', id: 'id-protect-review' }, h('h3', null, plan.remove ? 'Preview: remove protection' : 'Preview: protect with authentik'),
-        items.map((it) => h('details', { class: 'more', open: items.length === 1 ? true : null }, h('summary', null, `${it.displayName} (${it.hostname})${it.errors ? ' — has problems' : ''}`),
+      review = h('div', { class: 'card inset', id: 'id-protect-review' }, h('h3', null, plan.remove ? 'Preview: remove protection' : `Preview: protect ${its.length} application(s)`),
+        its.map((it) => h('details', { class: 'more', open: its.length === 1 ? true : null }, h('summary', null, `${it.displayName} (${it.hostname})${it.errors ? ' — has problems' : ''}`),
           arr(it.notes).map((n) => h('div', { class: 'callout' }, h('p', null, n))),
           h('h4', null, 'authentik'), actionList(it.authentik),
           h('h4', null, 'Traefik'), arr(it.traefik.traefik.changes).length ? arr(it.traefik.traefik.changes).map((c) => h('details', { class: 'tech' }, h('summary', null, `${c.action}: ${c.file}`), U.diffBlock(c.diff))) : h('p', { class: 'muted' }, 'No route change.'),
-          arr(it.traefik.traefik.issues).length ? h('ul', { class: 'checks' }, arr(it.traefik.traefik.issues).map((i) => checkItem(i.Level === 'Error' ? 'err' : 'warn', i.Field, i.Message))) : null,
-          arr(it.traefik.cloudflare.actions).filter((x) => x.kind !== 'none').length ? [h('h4', null, 'Cloudflare'), h('ul', { class: 'checks' }, arr(it.traefik.cloudflare.actions).filter((x) => x.kind !== 'none').map((x) => checkItem('auth', x.summary, x.detail)))] : null,
-          arr(it.traefik.cloudflare.errors).length ? h('div', { class: 'callout err' }, arr(it.traefik.cloudflare.errors).map((x) => h('p', null, x))) : null)),
+          arr(it.traefik.traefik.issues).filter((i) => i.Level === 'Error').length ? h('ul', { class: 'checks' }, arr(it.traefik.traefik.issues).filter((i) => i.Level === 'Error').map((i) => checkItem('err', i.Field, i.Message))) : null,
+          arr(it.traefik.cloudflare.actions).filter((x) => x.kind !== 'none').length ? [h('h4', null, 'Cloudflare'), h('ul', { class: 'checks' }, arr(it.traefik.cloudflare.actions).filter((x) => x.kind !== 'none').map((x) => checkItem('auth', x.summary, x.detail)))] : null)),
         overwrites, plan.canApply ? h('div', { class: 'actions' }, h('label', { class: 'check grow' }, reviewed, h('span', null, 'I reviewed these changes')), apply, h('button', { type: 'button', class: 'btn ghost', onclick: () => { pf.plan = null; rerender(); } }, 'Cancel'))
-          : h('p', { class: 'muted' }, 'The preview has problems (see above); nothing can be applied.'));
+          : h('p', { class: 'muted' }, 'The preview has problems (see above); nothing can be applied.'),
+        h('p', { class: 'small muted', id: 'id-protect-progress', role: 'status', 'aria-live': 'polite' }));
     }
     const res = pf.result;
+    const stepState = (x, name) => { const st = arr(x.traefik && x.traefik.steps).find((s) => s.name === name); return st ? (st.status === 'Done' ? 'ok' : st.status === 'Failed' ? 'err' : 'warn') : 'neutral'; };
     const result = res ? h('div', { class: `callout ${res.ok ? '' : 'err'}`, role: 'status', id: 'id-protect-result' }, h('p', null, h('strong', null, res.ok ? 'Done. ' : 'Not everything completed. '), res.message || ''),
-      h('ul', { class: 'checks' }, arr(res.results).map((x) => checkItem(x.ok ? (x.challenge && x.challenge.State === 'auth' ? 'auth' : 'ok') : 'err', x.service, x.message || '')))) : null;
-    return h('section', { class: 'card', id: 'identity-apps', 'aria-labelledby': 'id-apps-h' }, h('h2', { id: 'id-apps-h' }, 'Protect applications'),
-      h('p', null, 'Select applications and protect them in one step. Each gets its own authentik application, a ForwardAuth middleware in its Traefik route and, if it has no access rule in authentik yet, the owner-only rule (group "DTC owners"). Who else may open it is then decided in authentik — nothing about people is asked here.'),
-      !ownerReady ? h('p', { class: 'hint' }, 'Set up Google sign-in first: it creates the owner-only rule new applications start with.') : null,
+      arr(res.results).map((x) => h('div', { class: 'protect-res' }, h('strong', null, x.service, ' '), x.ok ? plainChip('Protected', 'ok') : plainChip('Not protected', 'err'),
+        h('ul', { class: 'checks' },
+          checkItem(stepState(x, 'Backend reachable from Traefik'), 'Backend reachable', (arr(x.traefik && x.traefik.steps).find((s) => s.name === 'Backend reachable from Traefik') || {}).message || 'Not checked.'),
+          checkItem(stepState(x, 'Traefik reload'), 'Route loaded by Traefik', (arr(x.traefik && x.traefik.steps).find((s) => s.name === 'Traefik reload') || {}).message || ''),
+          checkItem(x.challenge ? (x.challenge.State === 'auth' ? 'ok' : 'err') : 'neutral', 'ForwardAuth enforced', x.challenge ? x.challenge.Message : (x.message || 'Not checked.')),
+          checkItem('neutral', 'Sign-in verified', 'Shown as Verified after someone opened it through authentik.'))))) : null;
+    const out = [
+      h('p', null, 'Tick the applications that should require signing in. New ones start owner-only (group DTC owners); applications that already have rules in authentik keep them. Already protected applications are not affected by what you tick.', help('forwardauth', 'ForwardAuth'), help('dtc-owners', 'DTC owners')),
+      !connected ? h('p', { class: 'hint' }, 'Connect the manager to authentik first.') : null,
+      h('div', { class: 'sel-bar' }, selAll, clrAll, count),
       table,
       h('div', { class: 'protect-bar' }, field({ id: 'id-p-access', label: 'Cloudflare Access', control: accessSel }), h('div', { class: 'actions' }, protectBtn)),
       review, result,
-      h('details', { class: 'more' }, h('summary', null, 'ForwardAuth or the application\'s own OpenID Connect?'),
-        h('p', { class: 'small' }, 'ForwardAuth (used here) puts authentik in front of any web application without changing it; the application sees the user in X-authentik-* headers and keeps its own login, if it has one. Applications that support OpenID Connect themselves can instead sign users in natively through an authentik OAuth2 provider — configure that in authentik and the application.')));
+    ];
+    sync();
+    return out;
   }
 
-  // --- Health ------------------------------------------------------------------------------------------------------------
+  // --- 9. Finished -------------------------------------------------------------------------------------------------------------
+  function doneStep(d) {
+    const prot = arr(d.apps).filter((a) => a.protected);
+    return [h('div', { class: 'verified-banner', role: 'status' }, icon('check'), h('div', null, h('strong', null, 'Sign-in is set up'),
+      h('p', null, `${prot.length} protected application(s). Manage people, groups, invitations and who may open what in authentik.`))), managedSection(d)];
+  }
+
+  // --- Health (advanced) -----------------------------------------------------------------------------------------------------
   function healthSection(d) {
     const comps = arr(d.model && d.model.components);
     return h('section', { class: 'card', id: 'identity-health', 'aria-labelledby': 'id-health-h' }, h('h2', { id: 'id-health-h' }, 'Health'),

@@ -9,13 +9,13 @@ function Get-EdgePath {
 }
 
 function Start-EdgeSession {
-  param([string]$WorkDir = [IO.Path]::GetTempPath())
+  param([string]$WorkDir = [IO.Path]::GetTempPath(), [string[]]$ExtraArgs = @())
   $edge = Get-EdgePath
   if (-not $edge) { throw 'Microsoft Edge was not found.' }
   $l = New-Object System.Net.Sockets.TcpListener([System.Net.IPAddress]::Loopback, 0); $l.Start(); $port = $l.LocalEndpoint.Port; $l.Stop()
   $profileDir = Join-Path $WorkDir ('edge-cdp-' + [Guid]::NewGuid().ToString('N').Substring(0, 8))
-  $p = Start-Process -FilePath $edge -PassThru -WindowStyle Hidden -ArgumentList @('--headless=new', '--disable-gpu', '--no-first-run', '--no-default-browser-check', '--hide-scrollbars',
-    "--remote-debugging-port=$port", "--user-data-dir=`"$profileDir`"", '--window-size=1366,900', 'about:blank')
+  $p = Start-Process -FilePath $edge -PassThru -WindowStyle Hidden -ArgumentList (@('--headless=new', '--disable-gpu', '--no-first-run', '--no-default-browser-check', '--hide-scrollbars',
+    "--remote-debugging-port=$port", "--user-data-dir=`"$profileDir`"", '--window-size=1366,900') + @($ExtraArgs) + @('about:blank'))
   $deadline = (Get-Date).AddSeconds(30); $target = $null
   while (-not $target -and (Get-Date) -lt $deadline) {
     try { $list = Invoke-RestMethod -Uri "http://127.0.0.1:$port/json/list" -TimeoutSec 2; $target = @($list | Where-Object { $_.type -eq 'page' })[0] } catch { Start-Sleep -Milliseconds 300 }

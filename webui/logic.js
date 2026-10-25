@@ -333,6 +333,53 @@
   }
   const GOOGLE_CLIENT_ID = /^[0-9]{6,20}-[a-z0-9]{8,64}\.apps\.googleusercontent\.com$/;
   function isGoogleClientId(v) { return GOOGLE_CLIENT_ID.test(String(v || '').trim()); }
+  // The Identity & Access wizard: which steps apply to the chosen sign-in path, which are complete (from what the
+  // server observed, never from clicks), which can be opened (all earlier required steps complete) and where to resume.
+  // d: GET /api/identity.
+  function identityWizard(d) {
+    const data = d || {};
+    const cfg = data.config || {};
+    const a = cfg.authentik || {};
+    const mode = cfg.authMode || '';
+    const google = mode === 'google';
+    const inst = data.install;
+    const health = data.health || {};
+    const running = !!(inst && inst.server && inst.server.state === 'running');
+    const tokenOk = !!(data.credential ? data.credential.ok : data.token && data.token.ok);
+    const route = data.route;
+    const outpost = data.overview && data.overview.outpost;
+    const pub = String(a.publicUrl || '').replace(/\/+$/, '');
+    const outpostOk = !!(outpost && pub && String(outpost.authentikHost || '').replace(/\/+$/, '') === pub);
+    const owner = a.owner || {};
+    const protectedOk = (Array.isArray(data.apps) ? data.apps : []).filter((x) => x.protected && x.challenge && x.challenge.State === 'auth').length;
+    const steps = [
+      { id: 'mode', title: 'Choose how people sign in', done: !!mode && cfg.provider === 'authentik' },
+      { id: 'authentik', title: 'Install or connect authentik', done: running && !!health.Ready && health.Setup === 'done' },
+      { id: 'connect', title: 'Connect the manager to authentik', done: tokenOk },
+      { id: 'address', title: 'Public sign-in address', done: !!(route && route.exists && route.router === 'enabled' && outpostOk) },
+      google ? { id: 'google', title: 'Register with Google', done: !!(data.google && data.google.source) } : null,
+      google ? { id: 'signin', title: 'Sign-in page', done: !!(a.loginPage && a.loginPage.appliedAt), optional: true } : null,
+      { id: 'owner', title: google ? 'Verify the owner with Google' : 'Verify the owner', done: google ? !!(owner.verifiedAt && owner.subject) : !!owner.verifiedAt },
+      { id: 'apps', title: 'Protect applications', done: protectedOk > 0, optional: true },
+      { id: 'done', title: 'Finished', done: false, final: true },
+    ].filter(Boolean);
+    let blockedBy = null;
+    steps.forEach((s, i) => {
+      s.number = i + 1;
+      s.available = !blockedBy;
+      s.blockedBy = blockedBy ? blockedBy.title : '';
+      if (!s.done && !s.optional && !s.final && !blockedBy) blockedBy = s;
+    });
+    const byId = Object.fromEntries(steps.map((s) => [s.id, s]));
+    const saved = cfg.wizardStep && byId[cfg.wizardStep] && byId[cfg.wizardStep].available ? cfg.wizardStep : '';
+    const firstOpen = (steps.find((s) => s.available && !s.done && !s.final) || steps[steps.length - 1]).id;
+    return { steps, mode, current: saved || firstOpen, firstOpen };
+  }
+  function wizardNeighbours(wiz, id) {
+    const i = wiz.steps.findIndex((s) => s.id === id);
+    return { prev: i > 0 ? wiz.steps[i - 1] : null, next: i >= 0 && i < wiz.steps.length - 1 ? wiz.steps[i + 1] : null, index: i };
+  }
+
   // Status of a managed API credential (lib\CredentialManager.psm1). "unreachable" is about the server, not the token.
   const CREDENTIAL_STATUS = {
     valid: { label: 'Connected', tone: 'ok', icon: 'check' },
@@ -354,7 +401,7 @@
   }
 
   return {
-    IDENTITY_STATES, identityState, googleRedirectUri, isGoogleClientId, identityNextStep, CREDENTIAL_STATUS, credentialStatus,
+    IDENTITY_STATES, identityState, googleRedirectUri, isGoogleClientId, identityNextStep, identityWizard, wizardNeighbours, CREDENTIAL_STATUS, credentialStatus,
     LEVELS, LEVEL_TITLES, DEFAULT_LEVEL, normalizeLevel, levelIndex, isVisibleAt,
     DIMENSIONS, COMPONENT_STATUS, componentStatus, firstBlocked, suggestAppName, displayNameFromLabel, choosePort, reachOptions,
     suggestLabel, suggestServiceName, autoName, autoNameFromSource, autoNameEdit, autoNameReset, isValidSubdomain, joinHostname, splitHostname,

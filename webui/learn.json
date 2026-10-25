@@ -10,7 +10,8 @@
     { "id": "dns", "title": "DNS" },
     { "id": "cloudflare", "title": "Cloudflare" },
     { "id": "traefik", "title": "Traefik" },
-    { "id": "this-tool", "title": "This tool" }
+    { "id": "this-tool", "title": "This tool" },
+    { "id": "identity", "title": "Identity and sign-in" }
   ],
   "topics": [
     { "id": "powershell", "category": "windows", "title": "PowerShell", "levels": ["beginner", "intermediate"], "destination": { "type": "internal" },
@@ -212,6 +213,33 @@
       "links": [], "placements": ["ingress", "help"] },
     { "id": "third-party-managers", "category": "this-tool", "title": "Other Traefik management tools", "levels": ["advanced", "expert"], "destination": { "type": "internal" },
       "summary": "This tool deliberately covers deployment, basic service publishing, backups and troubleshooting. For middleware chains, certificates, load balancing or plugins, use Traefik's own configuration or a dedicated third-party manager as a separate product.",
-      "links": [ { "title": "Traefik documentation", "url": "https://doc.traefik.io/traefik/" } ], "placements": ["help"] }
+      "links": [ { "title": "Traefik documentation", "url": "https://doc.traefik.io/traefik/" } ], "placements": ["help"] },
+    { "id": "google-audience", "category": "identity", "title": "Google audience: External or Internal", "levels": ["beginner", "intermediate"], "destination": { "type": "internal" },
+      "summary": "External lets any Google account (including ordinary @gmail.com accounts) sign in to your app; choose it unless everyone belongs to your own Google Workspace organization. Internal is only offered to Workspace (or Cloud Identity) organizations and limits sign-in to that organization. Either way, authentik still decides who may create an account and what they may open.",
+      "links": [ { "title": "Manage app audience (Google)", "url": "https://support.google.com/cloud/answer/15549945" } ], "placements": ["help", "identity"] },
+    { "id": "google-testing", "category": "identity", "title": "Testing or In production", "levels": ["beginner", "intermediate"], "destination": { "type": "internal" },
+      "summary": "A new External app starts in Testing: only the test users you list (up to 100) can sign in, so add your own Google account as a test user. Publish app (In production) lets any Google account reach the Google sign-in screen. Publishing does not give anyone access to your applications: authentik's rules still decide that. Apps that only ask for openid, email and profile need no Google verification.",
+      "links": [ { "title": "Manage app audience (Google)", "url": "https://support.google.com/cloud/answer/15549945" } ], "placements": ["help", "identity"] },
+    { "id": "google-branding", "category": "identity", "title": "Google branding", "levels": ["beginner", "intermediate"], "destination": { "type": "internal" },
+      "summary": "The app name and a support email are required; they appear on Google's consent screen. A logo, home page, privacy policy and terms links are optional: leave them empty (a logo starts Google's brand verification). The authorized domain is the domain of your sign-in address.",
+      "links": [ { "title": "Manage OAuth app branding (Google)", "url": "https://support.google.com/cloud/answer/15549049" } ], "placements": ["help", "identity"] },
+    { "id": "redirect-uri", "category": "identity", "title": "Authorized redirect URI", "levels": ["beginner", "intermediate"], "destination": { "type": "internal" },
+      "summary": "The exact address Google sends people back to after they signed in: authentik's callback for the Google source. Google compares it character by character, including https, the host name and the trailing slash.",
+      "links": [ { "title": "Google OAuth 2.0 for web server apps", "url": "https://developers.google.com/identity/protocols/oauth2/web-server" } ], "placements": ["help", "identity"] },
+    { "id": "oauth-json", "category": "identity", "title": "Client JSON file", "levels": ["beginner", "intermediate"], "destination": { "type": "internal" },
+      "summary": "After creating a Web application client, Google offers Download JSON. The file holds the client ID, the client secret and the redirect URIs. Import it here: the manager checks it and passes the secret to authentik once; it is not stored by the manager. Google shows and downloads the secret only right after the client (or a new secret) is created.",
+      "links": [ { "title": "Manage OAuth clients (Google)", "url": "https://support.google.com/cloud/answer/15549257" } ], "placements": ["help", "identity"] },
+    { "id": "authentik-user-type", "category": "identity", "title": "Internal or External authentik account", "levels": ["beginner", "intermediate"], "destination": { "type": "internal" },
+      "summary": "authentik users are Internal (they can open authentik's own dashboard and application list) or External (only the applications, not the dashboard). The owner is created as an Internal user. This has nothing to do with Google's External audience.",
+      "links": [ { "title": "authentik users", "url": "https://docs.goauthentik.io/users-sources/user/" } ], "placements": ["help", "identity"] },
+    { "id": "dtc-owners", "category": "identity", "title": "The DTC owners group", "levels": ["beginner", "intermediate"], "destination": { "type": "internal" },
+      "summary": "The initial access rule: protected applications that have no rule of their own in authentik admit the members of this group. The owner and akadmin are in it. Add people, or give applications other rules, in authentik.",
+      "links": [ { "title": "authentik applications and bindings", "url": "https://docs.goauthentik.io/add-secure-apps/applications/manage_apps/" } ], "placements": ["help", "identity"] },
+    { "id": "local-recovery", "category": "identity", "title": "Local recovery sign-in", "levels": ["beginner", "intermediate"], "destination": { "type": "internal" },
+      "summary": "akadmin keeps its password and can always sign in on this PC at authentik's local address, even if Google or Cloudflare are unavailable. The original sign-in flow stays reachable at /if/flow/default-authentication-flow/.",
+      "links": [ { "title": "authentik documentation", "url": "https://docs.goauthentik.io/" } ], "placements": ["help", "identity"] },
+    { "id": "forwardauth", "category": "identity", "title": "ForwardAuth", "levels": ["beginner", "intermediate"], "destination": { "type": "internal" },
+      "summary": "Traefik asks authentik, for every request to a protected application, whether the visitor is signed in and allowed. Unknown visitors are sent to the sign-in page; if authentik does not answer, Traefik refuses the request.",
+      "links": [ { "title": "authentik forward auth with Traefik", "url": "https://docs.goauthentik.io/add-secure-apps/providers/proxy/server_traefik/" } ], "placements": ["help", "identity"] }
   ]
 }

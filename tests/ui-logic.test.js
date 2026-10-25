@@ -314,5 +314,59 @@ test('credentials: status labels; an unreachable server is a warning, not a toke
   assert.strictEqual(L.credentialStatus({ status: 'whatever' }).label, 'Not checked yet');
 });
 
+const wizData = (over = {}) => {
+  const base = {
+    provider: 'authentik',
+    config: { provider: 'authentik', authMode: 'local', wizardStep: '', authentik: { publicUrl: 'https://auth.example.com', owner: {}, loginPage: {} } },
+    install: { server: { state: 'running' } }, health: { Ready: true, Setup: 'done' }, credential: { ok: true },
+    route: { exists: true, router: 'enabled' }, overview: { outpost: { authentikHost: 'https://auth.example.com/' } }, google: { source: null }, apps: [],
+  };
+  return JSON.parse(JSON.stringify({ ...base, ...over, config: { ...base.config, ...(over.config || {}), authentik: { ...base.config.authentik, ...((over.config || {}).authentik || {}) } } }));
+};
+
+test('wizard: the local path has no Google steps; the owner step is next after the address', () => {
+  const w = L.identityWizard(wizData());
+  assert.deepStrictEqual(w.steps.map((s) => s.id), ['mode', 'authentik', 'connect', 'address', 'owner', 'apps', 'done']);
+  assert.strictEqual(w.current, 'owner');
+  assert.ok(!w.steps.find((s) => s.id === 'apps').available, 'protecting waits for the owner');
+});
+
+test('wizard: the Google path adds Register with Google and the optional sign-in page', () => {
+  const w = L.identityWizard(wizData({ config: { authMode: 'google' } }));
+  assert.deepStrictEqual(w.steps.map((s) => s.id), ['mode', 'authentik', 'connect', 'address', 'google', 'signin', 'owner', 'apps', 'done']);
+  assert.strictEqual(w.current, 'google');
+  assert.ok(!w.steps.find((s) => s.id === 'owner').available);
+  const w2 = L.identityWizard(wizData({ config: { authMode: 'google' }, google: { source: { Slug: 'google' } } }));
+  assert.ok(w2.steps.find((s) => s.id === 'owner').available, 'the optional sign-in page does not block the owner step');
+  assert.strictEqual(w2.current, 'signin');
+});
+
+test('wizard: steps complete only from observed state; earlier gaps lock later steps', () => {
+  const w = L.identityWizard(wizData({ credential: { ok: false }, config: { authMode: 'google' } }));
+  assert.strictEqual(w.current, 'connect');
+  assert.ok(!w.steps.find((s) => s.id === 'address').available);
+  assert.strictEqual(w.steps.find((s) => s.id === 'address').blockedBy, 'Connect the manager to authentik');
+  const outpostWrong = L.identityWizard(wizData({ overview: { outpost: { authentikHost: '' } } }));
+  assert.strictEqual(outpostWrong.current, 'address', 'the address step needs the outpost pointed at the public URL too');
+});
+
+test('wizard: resumes at the saved step if it is reachable, else at the first open step', () => {
+  assert.strictEqual(L.identityWizard(wizData({ config: { wizardStep: 'address' } })).current, 'address');
+  assert.strictEqual(L.identityWizard(wizData({ config: { wizardStep: 'apps' } })).current, 'owner', 'a locked saved step is not reopened');
+  const done = wizData({ config: { authentik: { owner: { verifiedAt: '2026-10-25T10:00:00' } } }, apps: [{ protected: true, challenge: { State: 'auth' } }] });
+  assert.strictEqual(L.identityWizard(done).current, 'done');
+});
+
+test('wizard: adding Google later only adds steps; the owner then also has to sign in with Google', () => {
+  const local = wizData({ config: { authentik: { owner: { verifiedAt: '2026-10-25T10:00:00' } } } });
+  const g = L.identityWizard({ ...local, config: { ...local.config, authMode: 'google' } });
+  assert.ok(!g.steps.find((s) => s.id === 'owner').done, 'a local verification does not count as a Google sign-in');
+  const gv = L.identityWizard({ ...local, config: { ...local.config, authMode: 'google', authentik: { ...local.config.authentik, owner: { verifiedAt: 'x', subject: '1098' } } } });
+  assert.ok(gv.steps.find((s) => s.id === 'owner').done);
+  assert.strictEqual(g.current, 'google');
+  const nb = L.wizardNeighbours(g, 'google');
+  assert.strictEqual(nb.prev.id, 'address'); assert.strictEqual(nb.next.id, 'signin');
+});
+
 console.log(`\n${passed} passed, ${failures.length} failed`);
 process.exit(failures.length ? 1 : 0);
