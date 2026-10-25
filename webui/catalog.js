@@ -176,7 +176,8 @@
           gate('expert', res.output ? technical(res.output.split('\n'), 'docker compose output') : null)] : h('p', { class: 'muted' }, 'Checked right after deploying.')),
         step(11, 'Publish (optional)', res && res.ok ? [
           exposureWarn ? h('div', { class: 'callout warn' }, h('p', null, exposureWarn)) : null,
-          h('div', { class: 'actions' }, h('a', { class: 'btn primary', href: `#publish/${encodeURIComponent(res.container)}` }, icon('globe'), 'Publish through Traefik…'), h('a', { class: 'btn', href: '#apps' }, 'Installed apps'))] : h('p', { class: 'muted' }, 'After deploying: publish it with a hostname, behind Cloudflare Access by default, or keep it private.'))));
+          a.id === 'authentik' ? h('div', { class: 'actions' }, h('a', { class: 'btn primary', href: '#identity' }, icon('lock'), 'Continue in Identity & Access…'), h('a', { class: 'btn', href: '#apps' }, 'Installed apps'))
+            : h('div', { class: 'actions' }, h('a', { class: 'btn primary', href: `#publish/${encodeURIComponent(res.container)}` }, icon('globe'), 'Publish through Traefik…'), h('a', { class: 'btn', href: '#apps' }, 'Installed apps'))] : h('p', { class: 'muted' }, 'After deploying: publish it with a hostname, behind Cloudflare Access by default, or keep it private.'))));
   }
 
   // --- Installed apps ------------------------------------------------------------------------------------------------------

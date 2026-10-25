@@ -87,7 +87,7 @@ function New-Facts([hashtable]$Over = @{}) {
 }
 
 $m = ConvertTo-InfrastructureModel -Facts (New-Facts)
-Test-Condition 'model: every path component and tool is present, in order' ((@($m.components | ForEach-Object { $_.id }) -join ',') -eq 'browser,dns,edge,access,tunnel,cloudflared,traefik,router,middleware,service,network,app,docker,compose,socket-proxy,manager') (@($m.components | ForEach-Object { $_.id }) -join ',')
+Test-Condition 'model: every path component and tool is present, in order' ((@($m.components | ForEach-Object { $_.id }) -join ',') -eq 'browser,dns,edge,access,tunnel,cloudflared,traefik,router,middleware,identity,service,network,app,docker,compose,socket-proxy,manager') (@($m.components | ForEach-Object { $_.id }) -join ',')
 Test-Condition 'model: a healthy tunnel is verified with Cloudflare (connections), cloudflared is reachable' ((Get-Dim $m 'tunnel' 'verified') -eq $true -and (Get-Dim $m 'cloudflared' 'reachable') -eq $true) ''
 Test-Condition 'model: Traefik is running, its API reachable and its web entry point verified' ((Get-Dim $m 'traefik' 'running') -eq $true -and (Get-Dim $m 'traefik' 'reachable') -eq $true -and (Get-Dim $m 'traefik' 'verified') -eq $true) ''
 Test-Condition 'model: a loaded router is running but NOT verified until a request is tested' ((Get-Dim $m 'router' 'running') -eq $true -and $null -eq (Get-Dim $m 'router' 'verified')) ''
@@ -118,7 +118,7 @@ $m5 = ConvertTo-InfrastructureModel -Facts $net
 Test-Condition 'model: an application container that is not on the shared network is unreachable' ((Get-Dim $m5 'app' 'reachable') -eq $false) ''
 $m6 = ConvertTo-InfrastructureModel -Facts (New-Facts @{ mode = 'local'; tunnel = $null })
 $offIds = @($m6.components | Where-Object { -not $_.applicable } | ForEach-Object { $_.id })
-Test-Condition 'model: local only marks DNS, edge, Access, tunnel and cloudflared as not used' (($offIds -join ',') -eq 'dns,edge,access,tunnel,cloudflared') ($offIds -join ',')
+Test-Condition 'model: local only marks DNS, edge, Access, tunnel and cloudflared as not used (and sign-in, when no app is protected)' (($offIds -join ',') -eq 'dns,edge,access,tunnel,cloudflared,identity') ($offIds -join ',')
 $bad = New-Facts
 $bad.traefikApi.routers = @($bad.traefikApi.routers[0], [ordered]@{ name = 'svc-x@file'; status = 'disabled'; rule = 'Host(`x.example.com`)'; service = 'svc-x'; provider = 'file'; entryPoints = @('web'); middlewares = @('missing@file') })
 $bad.services = @($bad.services[0], [pscustomobject]@{ name = 'x'; enabled = $true; hostnames = @('x.example.com'); middlewares = @(); target = [pscustomobject]@{ type = 'lan'; host = '10.0.0.5'; port = 80; protocol = 'http' }; cloudflare = [pscustomobject]@{ publish = $false; access = $false } })
@@ -169,7 +169,7 @@ else {
     $deadline = (Get-Date).AddSeconds(25)
     do { $r = Invoke-WebUi $ui GET '/api/infrastructure'; if ((Get-Dim $r.Data 'router' 'running') -eq $true) { break }; Start-Sleep -Milliseconds 800 } while ((Get-Date) -lt $deadline)
     $x = $r.Data
-    Test-Condition 'api: /api/infrastructure answers with components, flows and instance data' ($r.Status -eq 200 -and @($x.components).Count -eq 16 -and $x.instance.stackName -eq $stack) "HTTP $($r.Status)"
+    Test-Condition 'api: /api/infrastructure answers with components, flows and instance data' ($r.Status -eq 200 -and @($x.components).Count -eq 17 -and $x.instance.stackName -eq $stack) "HTTP $($r.Status)"
     Test-Condition 'api: local-only instance marks the Cloudflare components as not used' (-not (Get-Component $x 'tunnel').applicable -and -not (Get-Component $x 'dns').applicable) ''
     Test-Condition 'api: Traefik running, API reachable, web entry point verified (live)' ((Get-Dim $x 'traefik' 'running') -eq $true -and (Get-Dim $x 'traefik' 'reachable') -eq $true -and (Get-Dim $x 'traefik' 'verified') -eq $true) (((Get-Component $x 'traefik').evidence | ForEach-Object { $_.text }) -join ' | ')
     Test-Condition 'api: the router of the new service is loaded (running) and not claimed as verified' ((Get-Dim $x 'router' 'running') -eq $true -and $null -eq (Get-Dim $x 'router' 'verified')) (((Get-Component $x 'router').evidence | ForEach-Object { $_.text }) -join ' | ')
@@ -194,7 +194,7 @@ else {
       $nodes = [int](Invoke-PageScript $cdp "document.querySelectorAll('.xp-diagram .xp-node').length")
       $offNodes = [int](Invoke-PageScript $cdp "document.querySelectorAll('.xp-diagram .xp-node.off').length")
       $collapsed = [string](Invoke-PageScript $cdp "document.querySelector('.xp-lane.cloudflare.collapsed') ? document.querySelector('.xp-lane.cloudflare.collapsed').innerText : ''")
-      Test-Condition 'explorer: local only collapses the Cloudflare lane; the other cards render, unused ones marked' ($ok -and $nodes -eq 9 -and $offNodes -eq 2 -and $collapsed -match 'not used by this deployment') "nodes $nodes off $offNodes"
+      Test-Condition 'explorer: local only collapses the Cloudflare lane; the other cards render, unused ones marked' ($ok -and $nodes -eq 10 -and $offNodes -eq 3 -and $collapsed -match 'not used by this deployment') "nodes $nodes off $offNodes"
       $tools = [string](Invoke-PageScript $cdp "document.querySelector('.xp-tools') ? document.querySelector('.xp-tools').innerText : ''")
       Test-Condition 'explorer: Docker Desktop, Compose, socket proxy and the manager are shown apart from the path' ($tools -match 'Docker Desktop' -and $tools -match 'Docker Compose' -and $tools -match 'No request passes through them') ''
       $verifiedNodes = @(Invoke-PageScript $cdp "[...document.querySelectorAll('.xp-diagram .xp-node.ok')].map((b) => b.dataset.id)")
@@ -216,7 +216,7 @@ else {
       Test-Condition 'details: live evidence of the running instance is shown' ($d -match "$stack-traefik" -and $d -match 'API answers') ''
       $null = Invoke-PageScript $cdp "(() => { const s = document.querySelector('#xp-follow'); s.value = 'echo'; s.dispatchEvent(new Event('change')); })(); true"
       $null = Wait-PageCondition $cdp "document.querySelector('.xp-node[data-id=router] .xp-sub') && document.querySelector('.xp-node[data-id=router] .xp-sub').textContent.includes('svc-echo')" 10
-      Test-Condition 'follow: a followed service shows every hop, with the Cloudflare ones not used (local only)' ([int](Invoke-PageScript $cdp "document.querySelectorAll('.xp-diagram .xp-node').length") -eq 12) ''
+      Test-Condition 'follow: a followed service shows every hop, with the Cloudflare ones not used (local only)' ([int](Invoke-PageScript $cdp "document.querySelectorAll('.xp-diagram .xp-node').length") -eq 13) ''
       if ($ScreenshotDir) { Save-PageScreenshot $cdp (Join-Path $ScreenshotDir 'explorer-follow-service-1366.png') }
       $sub = [string](Invoke-PageScript $cdp "document.querySelector('.xp-node[data-id=app] .xp-sub').textContent")
       Test-Condition 'follow: choosing a service shows its router and backend on the path' ($sub -match "$stack-whoami:80") $sub

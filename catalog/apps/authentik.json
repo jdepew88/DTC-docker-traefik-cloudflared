@@ -23,6 +23,14 @@
     {
       "title": "Google social login",
       "url": "https://docs.goauthentik.io/users-sources/sources/social-logins/google/"
+    },
+    {
+      "title": "Automated install (bootstrap variables)",
+      "url": "https://docs.goauthentik.io/install-config/automated-install/"
+    },
+    {
+      "title": "Forward auth with Traefik",
+      "url": "https://docs.goauthentik.io/add-secure-apps/providers/proxy/server_traefik/"
     }
   ],
   "platforms": {
@@ -54,7 +62,10 @@
         "AUTHENTIK_POSTGRESQL__NAME": "authentik",
         "AUTHENTIK_POSTGRESQL__USER": "authentik",
         "AUTHENTIK_POSTGRESQL__PASSWORD": "{{input:pgPass}}",
-        "AUTHENTIK_SECRET_KEY": "{{input:secretKey}}"
+        "AUTHENTIK_SECRET_KEY": "{{input:secretKey}}",
+        "AUTHENTIK_BOOTSTRAP_PASSWORD": "{{input:adminPassword}}",
+        "AUTHENTIK_BOOTSTRAP_TOKEN": "{{input:apiToken}}",
+        "AUTHENTIK_BOOTSTRAP_EMAIL": "{{input:adminEmail}}"
       },
       "volumes": [
         {
@@ -95,7 +106,10 @@
         "AUTHENTIK_POSTGRESQL__NAME": "authentik",
         "AUTHENTIK_POSTGRESQL__USER": "authentik",
         "AUTHENTIK_POSTGRESQL__PASSWORD": "{{input:pgPass}}",
-        "AUTHENTIK_SECRET_KEY": "{{input:secretKey}}"
+        "AUTHENTIK_SECRET_KEY": "{{input:secretKey}}",
+        "AUTHENTIK_BOOTSTRAP_PASSWORD": "{{input:adminPassword}}",
+        "AUTHENTIK_BOOTSTRAP_TOKEN": "{{input:apiToken}}",
+        "AUTHENTIK_BOOTSTRAP_EMAIL": "{{input:adminEmail}}"
       },
       "volumes": [
         {
@@ -173,6 +187,27 @@
       "type": "generated",
       "bytes": 48,
       "label": "Secret key"
+    },
+    {
+      "id": "adminEmail",
+      "type": "text",
+      "label": "Administrator email",
+      "required": true,
+      "pattern": "^[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9.-]+\\.[A-Za-z]{2,63}$",
+      "help": "Email address of the built-in administrator account akadmin."
+    },
+    {
+      "id": "adminPassword",
+      "type": "password",
+      "label": "Administrator (akadmin) password",
+      "help": "Leave empty to generate one; it is saved to credentials.txt. Used only on the first start (authentik ignores it afterwards)."
+    },
+    {
+      "id": "apiToken",
+      "type": "generated",
+      "bytes": 32,
+      "label": "Deployment Manager API token",
+      "help": "Created for akadmin on the first start so the manager can configure Google sign-in and protected apps. Stored only in .env and, encrypted, in the deployment."
     }
   ],
   "privileges": [],
@@ -180,9 +215,10 @@
     "PostgreSQL 16 (in this project)"
   ],
   "security": [
-    "Open http://127.0.0.1:<port>/if/flow/initial-setup/ right after the first start and set the akadmin password: until then anyone who can reach it can claim the instance.",
-    "The Docker socket mount from the official file is left out (outposts are then deployed by hand); the worker still runs as root like upstream for its file permissions.",
-    "LDAP is not required. Google sign-in is configured in authentik's admin interface (OAuth source); a Google OAuth client must be created in Google Cloud by hand."
+    "The administrator account (akadmin) is created on the first start with the generated password (credentials.txt) and email you enter, so the initial setup page is never left open for anyone to claim (AUTHENTIK_BOOTSTRAP_PASSWORD / _EMAIL, read only on the first start).",
+    "An API token for akadmin (AUTHENTIK_BOOTSTRAP_TOKEN, also read only on the first start) lets the Deployment Manager configure Google sign-in, applications and the embedded outpost. Revoke it in authentik (Directory > Tokens) to cut the manager off.",
+    "The Docker socket mount from the official file is left out: the embedded outpost (part of the server) handles Traefik ForwardAuth, so no outpost container has to be deployed. The worker still runs as root like upstream for its file permissions.",
+    "PostgreSQL stays on the app's private network; only the server joins the shared proxy network. Google sign-in is configured from Identity & Access; the Google OAuth client itself must be created in Google Cloud by hand (Google offers no API for it)."
   ],
   "update": {
     "strategy": "pinned-digest",
@@ -194,7 +230,8 @@
     "localPort": 9000
   },
   "exposure": {
-    "default": "access"
+    "default": "public",
+    "warning": "authentik is the sign-in page itself: publish it without Cloudflare Access (otherwise visitors log in twice and Google's callback has to pass Access first). Its own login, MFA and brute-force protection apply."
   },
   "resources": {
     "memoryMB": 1550,

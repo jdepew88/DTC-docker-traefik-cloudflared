@@ -98,7 +98,9 @@
     const rows = s.services.map((v) => {
       const sv = v.service;
       const hosts = arr(sv.hostnames).map((hn) => h('div', null, sv.cloudflare.publish ? ext(`https://${hn}${sv.pathPrefix || ''}`, hn + (sv.pathPrefix || '')) : hn + (sv.pathPrefix || '')));
-      const exposure = v.exposure === 'access' ? plainChip('Access login', 'ok') : v.exposure === 'public' ? plainChip('Public', 'warn') : plainChip('Local only');
+      const signedIn = sv.auth && sv.auth.provider === 'authentik';
+      const exposure = [v.exposure === 'access' ? plainChip('Access login', 'ok') : v.exposure === 'public' ? plainChip('Public', signedIn ? 'neutral' : 'warn') : plainChip('Local only'),
+        signedIn ? h('a', { href: '#identity', class: 'chip-link', title: 'Protected by authentik sign-in (Identity & Access)' }, plainChip('authentik sign-in', 'ok')) : null];
       const router = !sv.enabled ? plainChip('Disabled') : v.router === 'enabled' ? chip('healthy', 'Routed') : v.router === 'unknown' ? plainChip('Unknown') : plainChip(v.router, 'err');
       return h('tr', null,
         h('td', null, h('strong', null, sv.displayName || sv.name), U.gateSpan('intermediate', h('div', { class: 'sub mono' }, sv.name)), sv.description ? h('div', { class: 'sub' }, sv.description) : null),

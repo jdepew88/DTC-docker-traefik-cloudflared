@@ -763,7 +763,10 @@
       v.ready ? h('div', { class: 'ready-banner', role: 'status' }, icon('check'), h('div', null, h('h2', null, 'Your reverse proxy is ready.'),
         h('p', null, v.dashEnabled ? ['Open ', h('a', { href: v.publicUrl, target: '_blank', rel: 'noopener noreferrer' }, v.publicUrl), ' and sign in with Cloudflare Access to see Traefik.'] : 'Traefik is running. Add your first service next.'),
         h('div', { class: 'actions' }, onSetup ? h('button', { type: 'button', class: 'btn primary', onclick: () => C.navigate('overview') }, 'Go to the Overview') : null,
-          h('button', { type: 'button', class: onSetup ? 'btn' : 'btn primary', onclick: () => C.navigate('services', 'add') }, 'Add a service'))))
+          h('button', { type: 'button', class: onSetup ? 'btn' : 'btn primary', onclick: () => C.navigate('services', 'add') }, 'Add a service')),
+        onSetup ? h('div', { class: 'callout', id: 'setup-identity' }, h('p', null, h('strong', null, 'Optional: Identity & Access. '),
+          'Add a self-hosted sign-in (authentik) with Google accounts in front of the applications you choose. Not needed for anything else: you can do it now or later.'),
+          h('div', { class: 'actions' }, h('button', { type: 'button', class: 'btn small', onclick: () => C.navigate('identity') }, 'Set up Identity & Access…'))) : null))
         : h('div', { class: 'callout warn' }, h('p', null, h('strong', null, 'Not everything is healthy yet. '), 'Each component is checked on its own below; a running container alone does not mean the deployment works.'),
           h('div', { class: 'actions' }, h('button', { type: 'button', class: 'btn small', onclick: (e) => withBusy(e.currentTarget, () => runVerify()) }, 'Verify again'),
             h('button', { type: 'button', class: 'btn small', onclick: () => C.navigate('diagnostics') }, 'Open Diagnostics'),

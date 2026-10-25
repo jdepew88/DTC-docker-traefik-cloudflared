@@ -566,3 +566,18 @@ dialog::backdrop { background: rgba(5, 8, 12, .65); }
 .backend-box .test-result.err { border-color: var(--err); }
 .backend-box .test-result p { margin: .2rem 0; overflow-wrap: anywhere; }
 .plan-backend p { overflow-wrap: anywhere; }
+
+/* --- Identity & Access ----------------------------------------------------------------------------------------------- */
+.chip.auth { color: var(--accent); background: color-mix(in srgb, var(--accent) 14%, transparent); border-color: color-mix(in srgb, var(--accent) 35%, transparent); }
+.id-steps { list-style: none; margin: .4rem 0; padding: 0; display: grid; gap: .45rem; }
+.id-steps li { border: 1px solid var(--border); border-radius: 10px; padding: .5rem .7rem; }
+.id-steps li.current { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent) inset; }
+.id-steps li p { margin: .2rem 0 0; }
+.copy-row { display: grid; grid-template-columns: minmax(9rem, 13rem) minmax(0, 1fr) auto; gap: .5rem; align-items: center; margin: .3rem 0; }
+.copy-row code { overflow-wrap: anywhere; padding: .3rem .45rem; border: 1px solid var(--border); border-radius: 6px; }
+.copy-label { font-weight: 600; font-size: .9rem; }
+.card.inset { margin-top: .8rem; background: var(--neutral-soft); }
+.legend { list-style: none; padding: 0; display: flex; flex-wrap: wrap; gap: .4rem 1rem; }
+.choice.selected { border-color: var(--accent); }
+.wizard .wiz-step h3 { display: flex; align-items: center; gap: .5rem; font-size: 1rem; }
+@media (max-width: 640px) { .copy-row { grid-template-columns: 1fr auto; } .copy-row .copy-label { grid-column: 1 / -1; } }

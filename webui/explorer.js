@@ -134,6 +134,16 @@
       diagnose: ['Check health shows the HTTP status the app returns through Traefik.', 'docker logs <container>.'],
       docs: [],
     },
+    identity: {
+      title: 'Identity provider (authentik)', easy: 'Sign-in check', icon: 'lock', zone: 'host',
+      what: 'For applications protected on Identity & Access, Traefik asks authentik (its embedded outpost, through a ForwardAuth middleware) whether the visitor is signed in and allowed before the request reaches the application. Unknown visitors are sent to the authentik sign-in page (local accounts or Google).',
+      easyWhat: 'Before a protected app opens, authentik checks who you are and whether you may open it.',
+      why: 'Optional: only applications you protected use it. Others are not affected.',
+      connects: ['middleware', 'service'],
+      fails: ['authentik stopped or not on the shared network: protected apps refuse requests (fail closed).', 'The application or provider is missing in authentik: 404 from the outpost.', 'The sign-in hostname itself protected: endless redirects.'],
+      diagnose: ['Identity & Access > Run checks (sign-in redirect, loop detection, real sign-in evidence).', 'docker logs <authentik server>.'],
+      docs: [['authentik forward auth (Traefik)', 'https://docs.goauthentik.io/add-secure-apps/providers/proxy/server_traefik/'], ['Traefik ForwardAuth', `${TR}/middlewares/http/forwardauth/`]],
+    },
     docker: {
       title: 'Docker Desktop', easy: 'Docker Desktop', icon: 'monitor', brand: 'docker',
       what: 'Runs the Docker Engine (in WSL 2) that hosts every container and network here. It is not a proxy and forwards no requests itself.',
@@ -174,7 +184,7 @@
   const LANES = [
     ['internet', 'Internet', ['browser', 'dns']],
     ['cloudflare', 'Cloudflare', ['edge', 'access', 'tunnel']],
-    ['host', 'This PC · Docker Desktop', ['cloudflared', 'traefik', 'router', 'middleware', 'service', 'network', 'app']],
+    ['host', 'This PC · Docker Desktop', ['cloudflared', 'traefik', 'router', 'middleware', 'identity', 'service', 'network', 'app']],
   ];
   const PATH = LANES.flatMap((l) => l[2]);
   const TOOLS = ['docker', 'compose', 'socket-proxy', 'manager'];
@@ -222,6 +232,7 @@
         case 'tunnel': case 'cloudflared': return flow.exposure === 'local' ? 'not used: local only' : (f.tunnelName || f.container || '');
         case 'router': return flow.router ? `${flow.router.name}: ${flow.router.status}` : 'not loaded';
         case 'middleware': return arr(flow.middlewares).join(', ') || 'none';
+        case 'identity': return flow.auth === 'authentik' ? 'authentik sign-in required' : 'not used by this app';
         case 'service': return flow.service ? arr(flow.service.servers).join(', ') : 'not loaded';
         case 'network': return flow.target.type === 'docker' ? m.instance.proxyNetwork : flow.target.type === 'host' ? 'host.docker.internal' : 'LAN routing';
         case 'app': return `${flow.target.host}:${flow.target.port}`;

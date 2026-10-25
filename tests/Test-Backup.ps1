@@ -129,7 +129,7 @@ try {
     $h.Count -eq 1 -and $h[0].dnsRecordId -and $h[0].accessAppId -and @($h[0].accessEmails) -contains 'owner@example.com' -and
     @($m.services).Count -eq 2 -and @($m.routes | Where-Object { $_.rule -eq 'Host(`web1.example.test`)' }).Count -eq 1 -and
     @($m.middlewares.available) -contains 'my-mw@file' -and @($m.middlewares.customFiles) -contains 'custom-mw.yml') $jsonText
-  Test-Condition 'export .json: credentials listed as not included' (@($m.credentials).Count -eq 2 -and @($m.credentials | Where-Object { $_.included }).Count -eq 0 -and
+  Test-Condition 'export .json: credentials listed as not included' (@($m.credentials).Count -eq 3 -and @($m.credentials | Where-Object { $_.id -eq 'authentik-api-token' -and -not $_.present }).Count -eq 1 -and @($m.credentials | Where-Object { $_.included }).Count -eq 0 -and
     @($m.credentials | Where-Object { $_.id -eq 'tunnel-connector-token' -and $_.present }).Count -eq 1) ($m.credentials | ConvertTo-Json -Compress)
   $leaks = @($apiToken, $fakeTunnelToken, 'eyJ', 'sk_live_', 'EXTRA_API_KEY=', '"data"') | Where-Object { $jsonText.Contains($_) }
   Test-Condition 'export .json: no API token, tunnel token, unknown .env values or DPAPI data (left-out keys named only)' (@($leaks).Count -eq 0 -and @($m.omittedEnvKeys) -contains 'EXTRA_API_KEY') ($leaks -join ', ')
@@ -195,7 +195,7 @@ try {
   $writesBefore = @(Get-Writes).Count
   $p = Import-Preview $uiB $z.Bytes 'backup.zip'
   Test-Condition 'restore preview without a token: local part ready, Cloudflare not verified, credentials to reconnect' ($p.Status -eq 200 -and $p.Data.local.canApply -and -not $p.Data.cloudflare.connected -and
-    $p.Data.cloudflare.message -match 'Connect Cloudflare' -and @($p.Data.credentials | Where-Object { -not $_.present }).Count -eq 2 -and
+    $p.Data.cloudflare.message -match 'Connect Cloudflare' -and @($p.Data.credentials | Where-Object { -not $_.present }).Count -eq 3 -and
     @($p.Data.actions | Where-Object { $_ -match 'not adopted' }).Count -eq 1 -and -not (Test-Path -LiteralPath $pathB)) (Short $p)
   $tok = Invoke-WebUi $uiB POST '/api/cloudflare/token' @{ token = $apiToken }
   $p = Import-Preview $uiB $z.Bytes 'backup.zip'

@@ -311,7 +311,46 @@
     return -1;
   }
 
+  // --- Identity & Access ------------------------------------------------------------------------------------------
+  // States of identity setup steps and components (lib\IdentityProvider.psm1). "Verified" only ever comes from evidence
+  // of a real sign-in; "Authentication required" means a login page answered, nobody signed in yet.
+  const IDENTITY_STATES = {
+    'not-configured': { label: 'Not configured', tone: 'neutral', icon: 'minus' },
+    configured: { label: 'Configured', tone: 'info', icon: 'settings' },
+    'awaiting-user': { label: 'Awaiting your action', tone: 'warn', icon: 'user' },
+    reachable: { label: 'Reachable', tone: 'ok', icon: 'pulse' },
+    'auth-required': { label: 'Authentication required', tone: 'auth', icon: 'lock' },
+    verified: { label: 'Verified', tone: 'ok', icon: 'check' },
+    failed: { label: 'Failed', tone: 'err', icon: 'x' },
+    skipped: { label: 'Skipped', tone: 'neutral', icon: 'minus' },
+  };
+  function identityState(state) { return IDENTITY_STATES[state] || IDENTITY_STATES['not-configured']; }
+  // Google's "Authorized redirect URI" for an authentik OAuth source (authentik: /source/oauth/callback/<slug>/).
+  function googleRedirectUri(publicUrl, slug = 'google') {
+    const base = String(publicUrl || '').trim().replace(/\/+$/, '');
+    if (!/^https:\/\/[a-z0-9.-]+(:\d+)?$/i.test(base) || !/^[a-z0-9][a-z0-9_-]*$/i.test(slug)) return '';
+    return `${base.toLowerCase()}/source/oauth/callback/${slug}/`;
+  }
+  const GOOGLE_CLIENT_ID = /^[0-9]{6,20}-[a-z0-9]{8,64}\.apps\.googleusercontent\.com$/;
+  function isGoogleClientId(v) { return GOOGLE_CLIENT_ID.test(String(v || '').trim()); }
+  // Emails and domains typed into one box: "alice@example.com, example.org" -> { emails, domains, invalid }.
+  function splitAccessList(text) {
+    const out = { emails: [], domains: [], invalid: [] };
+    for (const raw of String(text || '').split(/[\s,;]+/)) {
+      const v = raw.trim().toLowerCase().replace(/^@/, '');
+      if (!v) continue;
+      if (isEmail(v)) { if (!out.emails.includes(v)) out.emails.push(v); } else if (/^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/.test(v)) { if (!out.domains.includes(v)) out.domains.push(v); } else out.invalid.push(raw.trim());
+    }
+    return out;
+  }
+  // The first step that needs the user (or failed), else the first unfinished one.
+  function identityNextStep(steps) {
+    const list = Array.isArray(steps) ? steps : [];
+    return list.find((s) => s.state === 'failed') || list.find((s) => s.state === 'awaiting-user') || null;
+  }
+
   return {
+    IDENTITY_STATES, identityState, googleRedirectUri, isGoogleClientId, splitAccessList, identityNextStep,
     LEVELS, LEVEL_TITLES, DEFAULT_LEVEL, normalizeLevel, levelIndex, isVisibleAt,
     DIMENSIONS, COMPONENT_STATUS, componentStatus, firstBlocked, suggestAppName, displayNameFromLabel, choosePort, reachOptions,
     suggestLabel, suggestServiceName, autoName, autoNameFromSource, autoNameEdit, autoNameReset, isValidSubdomain, joinHostname, splitHostname,

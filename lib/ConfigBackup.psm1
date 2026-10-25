@@ -33,7 +33,7 @@ $script:MaxArchiveBytes = 8MB
 $script:MaxArchiveEntries = 200
 # traefik\dynamic files that come from the manager package (never restored from a backup) or are generated.
 $script:PackageDynamicFiles = @('security.yml', 'dashboard.yml')
-$script:ConfigFiles = @('config\services.json', 'config\cloudflare.json', 'config\setup.json', 'config\dashboard.json')
+$script:ConfigFiles = @('config\services.json', 'config\cloudflare.json', 'config\setup.json', 'config\dashboard.json', 'config\identity.json')
 $script:CustomFilePattern = '^[A-Za-z0-9][A-Za-z0-9._-]{0,80}\.ya?ml$'
 $script:EmailPattern = '^[A-Za-z0-9._%+''-]{1,64}@[A-Za-z0-9.-]{1,253}\.[A-Za-z]{2,63}$'
 $script:HostnamePattern = '^(?=.{1,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$'
@@ -103,6 +103,10 @@ function Get-CredentialInventory($Settings) {
       id = 'tunnel-connector-token'; label = 'Tunnel connector token'; file = 'secrets\cloudflare_tunnel_token'; present = [bool](Test-TunnelTokenFile $Settings); included = $false
       recover = 'Not exported. It is downloaded again from Cloudflare for the same tunnel during installation (Setup > Review and install) or on the Cloudflare page, using the API token. Without automation: Zero Trust > Networks > Tunnels > (tunnel) > Configure, then install.ps1 -SetTunnelToken.'
     }
+    [ordered]@{
+      id = 'authentik-api-token'; label = 'authentik API token'; file = 'secrets\authentik_api.dpapi'; present = (Test-Path -LiteralPath (Join-Path $Settings.InstallPath 'secrets\authentik_api.dpapi')); included = $false
+      recover = 'Not exported (encrypted for one Windows account). Reconnect it on Identity & Access: "Use the token created at installation", or paste an API token created in authentik (Directory > Tokens). The Google client secret is never stored by the manager; it lives only in authentik (and in authentik''s own database backup).'
+    }
   )
 }
 
@@ -171,6 +175,41 @@ function Get-ConfigManifest {
       accessEmails = @($dash.accessEmails); localUrl = "http://127.0.0.1:$($Settings.DashboardPort)/dashboard/"
     }
     credentials    = @(Get-CredentialInventory $Settings)
+    identity       = (Get-IdentityBackupSection $Settings)
+  }
+}
+
+# Identity & Access settings for a backup: config\identity.json without evidence of past sign-ins (a restore must not
+# claim anything is verified) and without anything secret (it holds none).
+function Get-IdentityBackupSection($Settings) {
+  $path = Join-Path $Settings.InstallPath 'config\identity.json'
+  if (-not (Test-Path -LiteralPath $path)) { return $null }
+  try { $raw = [IO.File]::ReadAllText($path) | ConvertFrom-Json } catch { return $null }
+  return ConvertTo-IdentitySection $raw
+}
+
+function ConvertTo-IdentitySection($Raw) {
+  if ($null -eq $Raw) { return $null }
+  $provider = [string](Get-Prop $Raw 'provider' '')
+  if ($provider -notin '', 'authentik', 'none') { return $null }
+  $a = Get-Prop $Raw 'authentik' $null
+  $g = Get-Prop $a 'google' $null
+  $hostname = ([string](Get-Prop $a 'hostname' '')).ToLowerInvariant()
+  if ($hostname -and $hostname -notmatch $script:HostnamePattern) { $hostname = '' }
+  $clientId = [string](Get-Prop $g 'clientId' '')
+  if ($clientId -notmatch '^[0-9]{6,20}-[a-z0-9]{8,64}\.apps\.googleusercontent\.com$') { $clientId = '' }
+  $apps = [ordered]@{}
+  $rawApps = Get-Prop $a 'apps' $null
+  if ($rawApps) { foreach ($p in $rawApps.PSObject.Properties) { if ($p.Name -match '^[a-z0-9]([a-z0-9-]{0,38}[a-z0-9])?$') { $apps[$p.Name] = [ordered]@{ emails = @(Get-ManifestStrings $p.Value 'emails' | Where-Object { $_ -match $script:EmailPattern }); domains = @(Get-ManifestStrings $p.Value 'domains' | Where-Object { $_ -match $script:HostnamePattern }); groups = @(Get-ManifestStrings $p.Value 'groups' | Where-Object { $_.Length -le 80 }) } } } }
+  return [ordered]@{
+    version = 1; provider = $provider
+    authentik = [ordered]@{
+      project = [string](Get-Prop $a 'project' ''); serverContainer = [string](Get-Prop $a 'serverContainer' ''); hostname = $hostname; service = [string](Get-Prop $a 'service' ''); publicUrl = $(if ($hostname) { "https://$hostname" } else { '' })
+      google = [ordered]@{ slug = $(if ([string](Get-Prop $g 'slug' 'google') -match '^[a-z0-9][a-z0-9_-]{0,48}$') { [string](Get-Prop $g 'slug' 'google') } else { 'google' }); clientId = $clientId
+        signup = $(if ([string](Get-Prop $g 'signup' '') -in 'allowlist', 'open', 'existing') { [string]$g.signup } else { 'allowlist' }); emails = @(Get-ManifestStrings $g 'emails' | Where-Object { $_ -match $script:EmailPattern }); domains = @(Get-ManifestStrings $g 'domains' | Where-Object { $_ -match $script:HostnamePattern })
+        matching = $(if ([string](Get-Prop $g 'matching' '') -eq 'email_deny') { 'email_deny' } else { 'identifier' }); showOnLogin = [bool](Get-Prop $g 'showOnLogin' $true) }
+      apps = $apps
+    }
   }
 }
 
@@ -217,6 +256,7 @@ function New-ConfigBackupArchive {
       'config\cloudflare.json' { 'Cloudflare selections and the ids of resources this tool created' }
       'config\setup.json' { 'Setup wizard choices' }
       'config\dashboard.json' { 'Public dashboard settings' }
+      'config\identity.json' { 'Identity & Access choices (no secrets)' }
       'traefik\dynamic\svc-*' { 'Generated route (regenerated from the service registry on restore)' }
       'traefik\dynamic\admin-dashboard.yml' { 'Generated public dashboard route (written again only after Access is confirmed)' }
       'traefik\dynamic\security.yml' { 'Package file (comes from the installed manager on restore)' }
@@ -324,6 +364,7 @@ function ConvertTo-NormalizedManifest($Raw, [System.Collections.ArrayList]$Error
     createdAt = [string](Get-Prop $Raw 'createdAt' ''); sourceStackName = [string](Get-Prop (Get-Prop $Raw 'source' $null) 'stackName' ([string](Get-Prop $rawInstance 'STACK_NAME' '')))
     instance = $instance; deployment = [ordered]@{ mode = $mode }; cloudflare = $cf; services = $services; dashboard = $dash
     customFiles = @(Get-ManifestStrings (Get-Prop $Raw 'middlewares' $null) 'customFiles')
+    identity = (ConvertTo-IdentitySection (Get-Prop $Raw 'identity' $null))
   }
 }
 
@@ -579,6 +620,16 @@ function Get-RestorePlan {
       $newDash = [pscustomobject][ordered]@{ version = 1; enabled = $false; subdomain = $md.subdomain; subdomainCustom = $true; zoneId = $md.zoneId; zoneName = $md.zoneName; hostname = $md.hostname; accessEmails = @($md.accessEmails); publish = $true; enabledAt = '' }
       $writes['config\dashboard.json'] = $newDash
       $null = $items.Add((New-RestoreItem 'dashboard' 'create' "Public dashboard settings: $($md.hostname)" 'Saved as settings only. The dashboard is published in the Cloudflare part of the restore (or on the Setup page) after Cloudflare Access is confirmed.'))
+    }
+  }
+
+  # 5b. Identity & Access settings (no secrets, no sign-in evidence). An existing identity.json is never replaced.
+  if ($m.PSObject.Properties['identity'] -and $m.identity -and $m.identity.provider) {
+    $idPath = Join-Path $root 'config\identity.json'
+    if (Test-Path -LiteralPath $idPath) { $null = $items.Add((New-RestoreItem 'identity' 'keep' "Identity & Access settings already exist here; kept" 'Compare them on the Identity & Access page; protected applications come back with the service registry.')) }
+    else {
+      $writes['config\identity.json'] = (ConvertTo-StableJson $m.identity) + "`n"
+      $null = $items.Add((New-RestoreItem 'identity' 'create' "Identity & Access settings: $($m.identity.provider)$(if ($m.identity.authentik.hostname) { ", sign-in at $($m.identity.authentik.hostname)" })" 'Choices only: authentik itself, its database and the Google client secret are restored with authentik''s own backup. Reconnect the API token afterwards; nothing is marked verified until it is checked again.'))
     }
   }
 

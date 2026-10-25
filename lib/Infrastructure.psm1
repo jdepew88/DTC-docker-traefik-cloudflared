@@ -149,7 +149,7 @@ function Get-RouterHosts([string]$Rule) {
 function Get-RouterOwner([string]$Name) {
   $n = ($Name -replace '@[^@]+$', '')
   if ($n -match '^(public-dashboard)') { return 'public-dashboard' }
-  return ($n -replace '-(root|redirect|strip|secure|insecure)$', '')
+  return ($n -replace '-(root|redirect|strip|secure|insecure|outpost)$', '')
 }
 
 # Pure: facts -> components (request path + tools) and one flow per service.
@@ -281,6 +281,27 @@ function ConvertTo-InfrastructureModel {
   }
   $c.facts.middlewares = @(Get-FactValue $api 'middlewares' @())
 
+  # Sign-in in front of applications (authentik ForwardAuth): a hop only for services that use it.
+  $c = & $addC (New-ComponentRecord 'identity' 'hop' $true)
+  $idf = Get-FactValue $Facts 'identity' $null
+  $protected = @($enabled | Where-Object { $_.PSObject.Properties['auth'] -and $_.auth.provider -eq 'authentik' })
+  if (-not $protected.Count) {
+    $c.applicable = $false
+    if ($idf -and [string](Get-FactValue $idf 'provider' '')) { Add-Evidence $c 'configured' $null "Identity provider: $(Get-FactValue $idf 'provider' ''); no application uses it yet." }
+  } else {
+    Add-Evidence $c 'configured' $true "$($protected.Count) application(s) sign in through authentik: $(($protected | ForEach-Object { $_.name }) -join ', ')."
+    $srv = Get-FactValue $idf 'server' $null
+    if ($srv) {
+      Add-Evidence $c 'running' ([string](Get-FactValue $srv 'state' '') -eq 'running' -and [string](Get-FactValue $srv 'health' '') -ne 'unhealthy') "authentik server $(Get-FactValue $srv 'name' ''): $(Get-FactValue $srv 'state' '')$(if (Get-FactValue $srv 'health' '') { " ($(Get-FactValue $srv 'health' ''))" })."
+      Add-Evidence $c 'reachable' ([bool](Get-FactValue $srv 'onProxyNetwork' $false)) $(if (Get-FactValue $srv 'onProxyNetwork' $false) { 'On the shared network: Traefik asks it about every request (fails closed if it does not answer).' } else { 'Not on the shared network: Traefik cannot ask it, so protected applications refuse every request.' })
+    } else { Add-Evidence $c 'running' $false 'No authentik server container is recorded on Identity & Access.' }
+    $verified = @(Get-FactValue $idf 'verified' @())
+    Add-Evidence $c 'authenticated' $null 'Sign-in redirects are checked on Identity & Access (Run checks).'
+    Add-Evidence $c 'verified' $(if ($verified.Count) { $true } else { $null }) $(if ($verified.Count) { "Real sign-ins recorded by authentik for: $($verified -join ', ')." } else { 'Verified only after a real sign-in (Identity & Access).' })
+  }
+  $c.facts.protected = @($protected | ForEach-Object { [ordered]@{ name = $_.name; hostnames = @($_.hostnames); endpoint = $_.auth.endpoint } })
+  $c.facts.identity = $idf
+
   $c = & $addC (New-ComponentRecord 'service' 'hop')
   $expectedSvc = @($enabled | ForEach-Object { "svc-$($_.name)@file" })
   Add-Evidence $c 'configured' ($expectedSvc.Count -gt 0) $(if ($expectedSvc.Count) { "$($expectedSvc.Count) backend service definition(s)." } else { 'No service is enabled yet.' })
@@ -358,6 +379,7 @@ function ConvertTo-InfrastructureModel {
         router = $(if ($r.Count) { [ordered]@{ name = $r[0].name; status = $r[0].status; rule = $r[0].rule; middlewares = @($r[0].middlewares) } } else { $null })
         service = $(if ($ts.Count) { [ordered]@{ name = $ts[0].name; status = $ts[0].status; servers = @($ts[0].servers) } } else { $null })
         middlewares = @($s.middlewares)
+        auth = $(if ($s.PSObject.Properties['auth']) { [string]$s.auth.provider } else { '' })
       }
     })
   # Hostnames claimed by routers of more than one owner (a service, the dashboard pair, a hand-written file, a

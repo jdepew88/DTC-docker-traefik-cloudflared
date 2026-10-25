@@ -91,6 +91,7 @@ never changed.
 | Infrastructure Explorer: the request path (browser → DNS → Cloudflare → Access → tunnel → cloudflared → Traefik router → middleware → service → Docker network → app) with six separate states per component (detected, configured, running, reachable, authenticated, verified), tools shown apart from the path, small diagram and quick actions on the Overview | **Implemented and tested** (model unit tests, a disposable running instance, browser at three widths and four levels). Read-only. |
 | One-click launcher (`START-HERE.cmd`) and existing-deployment discovery / attach | **Implemented and tested** (launcher, discovery, attach without changes, recent projects, upgrade preview/apply on test folders, browser); discovery and read-only Cloudflare verification also run against a real installation. |
 | Redesigned web UI: seven-step journey, four detail levels, review states, topology, operational pages, learning catalog | **Implemented and browser-tested** in headless Edge (desktop, tablet and phone widths, keyboard and accessible-name checks), including an installation of a disposable instance through the UI. The tunnel path through the UI has only run against the Cloudflare API mock. |
+| Identity & Access (optional): authentik installed from the catalog with a bootstrap administrator and API token, or an existing installation adopted; its sign-in hostname routed through the existing Traefik and tunnel; guided Google sign-in (Google offers no API for OAuth clients) with automatic authentik configuration (Google source, restricted sign-up, login button); per-application ForwardAuth (embedded outpost) with email/domain/group rules; resumable setup, health states that are only "verified" from real sign-in evidence; Explorer hop. See [docs/identity.md](docs/identity.md) | **Implemented and tested** against a disposable authentik 2026.8.5 (catalog install, API configuration, sign-ins with local test users through the real outpost and Traefik, fail closed, rollback, browser) with **synthetic** Google credentials. A real Google sign-in and the real Cloudflare publication of the sign-in hostname have **not** been run (they need your accounts). |
 
 ## Requirements
 
@@ -566,6 +567,11 @@ container on this PC already uses.
 .\tests\Test-Projects.ps1               # launcher (single-use link, duplicate start, ports, stop, START-HERE.cmd), discovery,
                                         # attach without changes, recent projects, upgrade preview/apply, browser;
                                         # -LiveReadOnly also inspects %USERPROFILE%\.docker\projects\traefik-proxy read-only
+.\tests\Test-Identity.ps1              # Identity & Access without authentik: ForwardAuth routes (accepted by a throwaway Traefik),
+                                        # guards, Google values, allow-lists, discovery, model states, resume, secret store
+.\tests\Test-IdentityLive.ps1 -ScreenshotDir .\screens   # disposable instance + authentik from the catalog: adopt, token,
+                                        # sign-in route, outpost, Google source (synthetic credentials), protect/unprotect,
+                                        # allowed/denied sign-ins through the real outpost, fail closed, rollback, browser
 node .\tests\ui-logic.test.js           # developer-only unit tests of webui\logic.js (Node is not needed to run the tool)
 .\tests\Invoke-UiPreview.ps1            # developer tool: quick screenshots of pages at chosen levels and widths
 .\tests\Invoke-IsolatedTest.ps1         # (repository only) disposable second instance: install, live tests,
@@ -656,6 +662,10 @@ routes from the old `traefik\dynamic\` folder can be copied over as-is, or re-cr
   API; in particular, Access applications are created with an inline email policy, which should be checked on
   first real use. The console wizard and `services.ps1` remain guided (manual Cloudflare steps).
 - The tunnel path (cloudflared, public test) has not been validated end to end from this repository.
+- Identity & Access: Google sign-in has only been exercised with synthetic credentials (the redirect to Google is
+  checked, a real login is not); creating the Google OAuth client is manual (no Google API exists for it); Authelia
+  is install-only; native OpenID Connect for applications is not configured by the manager; the manager uses an
+  administrator's API token (a service account with a narrower RBAC role is possible in authentik but not set up yet).
 - The web UI handles one request at a time; long operations (installer, deep validation) block it briefly.
   Service snapshots and rollback cover Traefik only; a backup restore re-creates missing Cloudflare resources but
   never deletes Cloudflare resources that are not in the backup.

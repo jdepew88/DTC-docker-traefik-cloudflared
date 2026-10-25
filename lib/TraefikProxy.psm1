@@ -10,7 +10,7 @@ Set-StrictMode -Version 2.0
 
 $script:TraefikImage = 'traefik:v3.7.15'   # keep in sync with compose.yaml
 # Version of this manager (scripts + web UI). Recorded in configuration backups; bump it when the package changes.
-$script:ManagerVersion = '1.2.0'
+$script:ManagerVersion = '1.3.0'
 $script:RegistryVersion = 1
 $script:ManagedPrefix = 'svc-'
 $script:HostnamePattern = '^(?=.{1,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$'
@@ -23,6 +23,15 @@ $script:TargetTypes = @('docker', 'host', 'lan')
 $script:Protocols = @('http', 'https', 'h2c')
 $script:WindowsHost = 'host.docker.internal'
 $script:DefaultMiddlewares = @('default-headers@file')
+# Sign-in providers a service route can use (ForwardAuth rendered into its own svc-<name>.yml).
+$script:AuthProviders = @('authentik')
+$script:AuthEndpointPattern = '^http://[A-Za-z0-9][A-Za-z0-9_.-]{0,127}:\d{1,5}$'
+$script:AuthMiddlewareHint = '(?i)authelia|authentik|forward-?auth|oauth2?-proxy|sso'
+# authentik's embedded outpost: ForwardAuth endpoint for Traefik, the path prefix its own pages and callbacks use on
+# every protected hostname, and the headers it returns to the application (docs.goauthentik.io, proxy provider, Traefik).
+$script:AuthentikOutpostPrefix = '/outpost.goauthentik.io/'
+$script:AuthentikResponseHeaders = @('X-authentik-username', 'X-authentik-groups', 'X-authentik-entitlements', 'X-authentik-email', 'X-authentik-name', 'X-authentik-uid',
+  'X-authentik-jwt', 'X-authentik-meta-jwks', 'X-authentik-meta-outpost', 'X-authentik-meta-provider', 'X-authentik-meta-app', 'X-authentik-meta-version')
 # Names, hostnames or ports that suggest a media server (Cloudflare restricts video delivery).
 $script:MediaHints = '(?i)plex|jellyfin|emby|video|stream|media|movie|tv'
 $script:MediaPorts = @(32400, 8096, 8920)
@@ -393,6 +402,18 @@ function ConvertTo-ServiceDefinition($InputObject) {
   # written by earlier versions are unchanged.
   $displayName = ([string](Get-ServiceProperty $InputObject 'displayName' '')).Trim()
   if ($displayName) { $definition.Insert(1, 'displayName', $displayName) }
+  # Optional sign-in in front of the application (identity provider ForwardAuth). Only stored when set, like
+  # displayName, so registries without it are unchanged. The endpoint is the provider's internal address on the
+  # shared network (Docker DNS name and container port), never an IP address.
+  $auth = Get-ServiceProperty $InputObject 'auth' $null
+  if ($auth -is [hashtable]) { $auth = [pscustomobject]$auth }
+  $authProvider = ([string](Get-ServiceProperty $auth 'provider' '')).Trim().ToLowerInvariant()
+  if ($authProvider -and $authProvider -ne 'none') {
+    $definition['auth'] = [pscustomobject][ordered]@{
+      provider = $authProvider
+      endpoint = ([string](Get-ServiceProperty $auth 'endpoint' '')).Trim().TrimEnd('/')
+    }
+  }
   return [pscustomobject]$definition
 }
 
@@ -555,6 +576,20 @@ function Test-ServiceDefinition {
       & $err 'middlewares' "Middleware '$base' is not defined in traefik\dynamic (available: $($AvailableMiddlewares -join ', '))."
     }
   }
+  if ($s.PSObject.Properties['auth']) {
+    $a = $s.auth
+    if ($script:AuthProviders -notcontains $a.provider) { & $err 'auth.provider' "Sign-in provider '$($a.provider)' is not supported here (supported: $($script:AuthProviders -join ', '))." }
+    if ($a.endpoint -notmatch $script:AuthEndpointPattern) { & $err 'auth.endpoint' "The sign-in service address must be an internal http://<container>:<port> address on the shared network (got '$($a.endpoint)')." }
+    elseif ($t.type -eq 'docker' -and ($a.endpoint -replace '^http://([^:/]+):\d+$', '$1') -ieq $t.host) {
+      & $err 'auth' 'The sign-in service cannot protect itself: its own login pages would require a login (an endless redirect loop).'
+    }
+    foreach ($m in $s.middlewares) {
+      if (($m -split '@')[0] -match $script:AuthMiddlewareHint) { & $err 'middlewares' "Middleware '$m' looks like another sign-in (ForwardAuth) middleware. Only one sign-in provider may protect a route; remove it or choose 'No additional sign-in'." }
+    }
+    if ($s.cloudflare.publish -and $s.cloudflare.access) {
+      & $warn 'auth' 'Cloudflare Access and authentik both ask for a login: visitors sign in twice (first Cloudflare, then authentik). Keep both only if you want two separate gates.'
+    }
+  }
   if ($s.middlewares -notcontains 'default-headers@file' -and $s.middlewares -notcontains 'default-headers') {
     & $warn 'middlewares' 'default-headers is not applied: browsers will not get the standard security headers.'
   }
@@ -584,6 +619,11 @@ function Test-ServiceRegistry {
   for ($i = 0; $i -lt $list.Count; $i++) {
     $others = @(for ($j = 0; $j -lt $list.Count; $j++) { if ($j -ne $i) { $list[$j] } })
     $issues += Test-ServiceDefinition -Service $list[$i] -OtherServices $others -AvailableMiddlewares $available
+    # A protected service adds the router svc-<name>-outpost; no other service may own that router name.
+    $si = ConvertTo-ServiceDefinition $list[$i]
+    if ($si.PSObject.Properties['auth'] -and @($others | Where-Object { ([string]$_.name).ToLowerInvariant() -eq "$($si.name)-outpost" }).Count) {
+      $issues += New-Issue 'Error' $si.name 'name' "A service named '$($si.name)-outpost' exists; its route would collide with the sign-in route of '$($si.name)'. Rename one of them."
+    }
   }
   return $issues
 }
@@ -610,11 +650,15 @@ function ConvertTo-TraefikRouteYaml($Service) {
   $s = ConvertTo-ServiceDefinition $Service
   $id = "$($script:ManagedPrefix)$($s.name)"
   $middlewares = @($s.middlewares)
+  $auth = $(if ($s.PSObject.Properties['auth']) { $s.auth } else { $null })
+  # Sign-in runs first: an unauthenticated request never reaches the application or its other middlewares.
+  if ($auth) { $middlewares = @("$id-authentik") + $middlewares }
   if ($s.stripPrefix) { $middlewares = @("$id-strip") + $middlewares }
   $lines = New-Object System.Collections.Generic.List[string]
   $lines.Add("# Generated from config/services.json (service '$($s.name)'). Do not edit by hand:")
   $lines.Add('# changes here are overwritten. Use services.ps1 or the web UI instead.')
   if ($s.description) { $lines.Add('# ' + ($s.description -replace '[\r\n]+', ' ')) }
+  if ($auth) { $lines.Add("# Sign-in: authentik ForwardAuth (embedded outpost at $($auth.endpoint)). If authentik is unreachable, Traefik refuses the request.") }
   $lines.Add('http:')
   $lines.Add('  routers:')
   $lines.Add("    ${id}:")
@@ -622,8 +666,30 @@ function ConvertTo-TraefikRouteYaml($Service) {
   $lines.Add('      entryPoints: [web]')
   if ($middlewares.Count -gt 0) { $lines.Add('      middlewares: [' + ($middlewares -join ', ') + ']') }
   $lines.Add("      service: $id")
+  if ($auth) {
+    # The outpost's own pages (sign-in start, callback, sign-out) on the application's hostname go to authentik
+    # without ForwardAuth; the longer rule gives this router priority over the application router.
+    $hostRule = (@($s.hostnames) | ForEach-Object { 'Host(`' + $_ + '`)' }) -join ' || '
+    if (@($s.hostnames).Count -gt 1) { $hostRule = "($hostRule)" }
+    $outpostMiddlewares = @($s.middlewares | Where-Object { $_ -match '^default-headers(@file)?$' })
+    $lines.Add("    ${id}-outpost:")
+    $lines.Add("      rule: '" + $hostRule + ' && PathPrefix(`' + $script:AuthentikOutpostPrefix + '`)' + "'")
+    $lines.Add('      entryPoints: [web]')
+    if ($outpostMiddlewares.Count -gt 0) { $lines.Add('      middlewares: [' + ($outpostMiddlewares -join ', ') + ']') }
+    $lines.Add("      service: $id-outpost")
+  }
+  if ($s.stripPrefix -or $auth) { $lines.Add('  middlewares:') }
+  if ($auth) {
+    $lines.Add("    ${id}-authentik:")
+    $lines.Add('      forwardAuth:')
+    $lines.Add("        address: $($auth.endpoint)$($script:AuthentikOutpostPrefix)auth/traefik")
+    # Safe: the web entry point already replaces X-Forwarded-* from everyone except cloudflared.
+    $lines.Add('        trustForwardHeader: true')
+    $lines.Add('        maxResponseBodySize: 4194304')
+    $lines.Add('        authResponseHeaders:')
+    foreach ($hn in $script:AuthentikResponseHeaders) { $lines.Add("          - $hn") }
+  }
   if ($s.stripPrefix) {
-    $lines.Add('  middlewares:')
     $lines.Add("    ${id}-strip:")
     $lines.Add('      stripPrefix:')
     $lines.Add("        prefixes: ['$($s.pathPrefix)']")
@@ -635,6 +701,14 @@ function ConvertTo-TraefikRouteYaml($Service) {
   if ($s.target.tlsSkipVerify) { $lines.Add("        serversTransport: $id-transport") }
   $lines.Add('        servers:')
   $lines.Add('          - url: ' + (Get-ServiceUrl $s))
+  if ($auth) {
+    $lines.Add("    ${id}-outpost:")
+    $lines.Add('      loadBalancer:')
+    # The outpost finds the application's provider by the Host header.
+    $lines.Add('        passHostHeader: true')
+    $lines.Add('        servers:')
+    $lines.Add("          - url: $($auth.endpoint)")
+  }
   if ($s.target.tlsSkipVerify) {
     $lines.Add('  serversTransports:')
     $lines.Add("    ${id}-transport:")

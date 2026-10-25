@@ -275,5 +275,42 @@ test('backend: status tones - green only for an application answer; a login is "
   assert.strictEqual(L.backendStatus({ state: 'warning', result: 'unavailable', label: 'x' }).tone, 'warn');
 });
 
+test('identity: state vocabulary; verified and authentication required are distinct', () => {
+  assert.strictEqual(L.identityState('verified').label, 'Verified');
+  assert.strictEqual(L.identityState('auth-required').label, 'Authentication required');
+  assert.strictEqual(L.identityState('auth-required').tone, 'auth');
+  assert.strictEqual(L.identityState('awaiting-user').tone, 'warn');
+  assert.strictEqual(L.identityState('nonsense').label, 'Not configured');
+  for (const s of ['not-configured', 'configured', 'awaiting-user', 'reachable', 'auth-required', 'verified', 'failed', 'skipped']) assert.ok(L.IDENTITY_STATES[s]);
+});
+
+test('identity: Google redirect URI from the public URL and source slug (https only, no hard-coded domain)', () => {
+  assert.strictEqual(L.googleRedirectUri('https://auth.jrtechconsult.com'), 'https://auth.jrtechconsult.com/source/oauth/callback/google/');
+  assert.strictEqual(L.googleRedirectUri('https://Login.Example.org/', 'gws'), 'https://login.example.org/source/oauth/callback/gws/');
+  assert.strictEqual(L.googleRedirectUri('http://auth.example.com'), '');
+  assert.strictEqual(L.googleRedirectUri('https://auth.example.com/path'), '');
+  assert.strictEqual(L.googleRedirectUri('https://auth.example.com', '../x'), '');
+});
+
+test('identity: Google client ID shape', () => {
+  assert.ok(L.isGoogleClientId('123456789012-abcdefgh12345678.apps.googleusercontent.com'));
+  assert.ok(!L.isGoogleClientId('GOCSPX-secret'));
+  assert.ok(!L.isGoogleClientId('1234567-x.apps.googleusercontent.com.evil.com'));
+});
+
+test('identity: allow-list box splits emails and domains, rejects junk', () => {
+  const r = L.splitAccessList('Alice@Example.com, example.org; @partner.example\n alice@example.com bad"value');
+  assert.deepStrictEqual(r.emails, ['alice@example.com']);
+  assert.deepStrictEqual(r.domains, ['example.org', 'partner.example']);
+  assert.deepStrictEqual(r.invalid, ['bad"value']);
+});
+
+test('identity: next step is the first failure, else the first step waiting for the user', () => {
+  const steps = [{ id: 'install', state: 'reachable' }, { id: 'google', state: 'awaiting-user' }, { id: 'apps', state: 'failed' }];
+  assert.strictEqual(L.identityNextStep(steps).id, 'apps');
+  assert.strictEqual(L.identityNextStep(steps.slice(0, 2)).id, 'google');
+  assert.strictEqual(L.identityNextStep([{ id: 'x', state: 'verified' }]), null);
+});
+
 console.log(`\n${passed} passed, ${failures.length} failed`);
 process.exit(failures.length ? 1 : 0);

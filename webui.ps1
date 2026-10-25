@@ -56,6 +56,9 @@ Import-Module (Join-Path $here 'lib\DockerDiscovery.psm1') -Force
 Import-Module (Join-Path $here 'lib\ServiceHealth.psm1') -Force
 Import-Module (Join-Path $here 'lib\BackendResolver.psm1') -Force
 Import-Module (Join-Path $here 'lib\AppCatalog.psm1') -Force
+Import-Module (Join-Path $here 'lib\SecretStore.psm1') -Force
+Import-Module (Join-Path $here 'lib\Authentik.psm1') -Force
+Import-Module (Join-Path $here 'lib\IdentityProvider.psm1') -Force
 if (-not $CatalogDir) { $CatalogDir = Join-Path $here 'catalog' }
 Import-Module (Join-Path $here 'lib\LocalHttp.psm1') -Force
 Set-CloudflareApiBase $CloudflareApiBase
@@ -96,6 +99,8 @@ $State = @{
   Chosen    = $ProjectChosen
   Upgrades  = @{}
   AppPlans  = @{}
+  IdpPlans  = @{}
+  IdpChecks = @{}
   Cookie    = "tpx_session_$Port"
   Origins   = @("http://127.0.0.1:$Port", "http://localhost:$Port")
   Hosts     = @("127.0.0.1:$Port", "localhost:$Port")
@@ -125,6 +130,7 @@ $StaticFiles = @{
   '/explorer.js' = @('explorer.js', 'text/javascript; charset=utf-8')
   '/discover.js' = @('discover.js', 'text/javascript; charset=utf-8')
   '/catalog.js' = @('catalog.js', 'text/javascript; charset=utf-8')
+  '/identity.js' = @('identity.js', 'text/javascript; charset=utf-8')
   '/learn.json' = @('learn.json', 'application/json; charset=utf-8')
   '/app.css'    = @('app.css', 'text/css; charset=utf-8')
   '/icon.svg'   = @('icon.svg', 'image/svg+xml')
@@ -358,14 +364,19 @@ function Get-ServiceFromBody($Body) {
   $hostnames = @(Get-Field $svc 'hostnames' @())
   if ($hostnames.Count -gt 20) { Stop-Request 400 'At most 20 hostnames per service.' }
   $displayName = ([string](Get-Field $svc 'displayName' '')).Trim()
-  $definition = ConvertTo-ServiceDefinition @{
+  $def = @{
     name = Get-Field $svc 'name' ''; displayName = $displayName.Substring(0, [Math]::Min(80, $displayName.Length)); description = ([string](Get-Field $svc 'description' '')).Substring(0, [Math]::Min(200, ([string](Get-Field $svc 'description' '')).Length))
     enabled = [bool](Get-Field $svc 'enabled' $true); hostnames = $hostnames; pathPrefix = Get-Field $svc 'pathPrefix' ''
     stripPrefix = [bool](Get-Field $svc 'stripPrefix' $false); middlewares = @(Get-Field $svc 'middlewares' @('default-headers@file'))
     target = @{ type = $resolved.Type; host = $resolved.Host; port = (Get-Field $target 'port' 0); protocol = (Get-Field $target 'protocol' 'http'); tlsSkipVerify = [bool](Get-Field $target 'tlsSkipVerify' $false) }
     cloudflare = @{ publish = [bool](Get-Field (Get-Field $svc 'cloudflare' $null) 'publish' $true); access = [bool](Get-Field (Get-Field $svc 'cloudflare' $null) 'access' $true) }
   }
-  return [pscustomobject]@{ Service = $definition; Note = $resolved.Note }
+  # Sign-in (ForwardAuth): only when the request names it. A form that does not send 'auth' keeps whatever the
+  # service had (Build-ChangePlan), so editing a protected service never silently removes its protection.
+  $hasAuth = [bool]($svc.PSObject.Properties['auth'])
+  if ($hasAuth -and $null -ne $svc.auth) { $def.auth = @{ provider = [string](Get-Field $svc.auth 'provider' ''); endpoint = [string](Get-Field $svc.auth 'endpoint' '') } }
+  $definition = ConvertTo-ServiceDefinition $def
+  return [pscustomobject]@{ Service = $definition; Note = $resolved.Note; HasAuth = $hasAuth }
 }
 
 function Find-RegistryService($Services, [string]$Name) {
@@ -487,6 +498,7 @@ function Build-ChangePlan($Body) {
       $new = $parsed.Service
       if ($parsed.Note) { $notes += $parsed.Note }
       if ($new.name -ne $previous.name) { Stop-Request 400 'A service cannot be renamed; remove it and add it again.' }
+      if (-not $parsed.HasAuth -and $previous.PSObject.Properties['auth']) { $new | Add-Member -NotePropertyName auth -NotePropertyValue $previous.auth -Force }
       $list = @($services | ForEach-Object { if ($_.name -eq $previous.name) { $new } else { $_ } })
       $summary = "Update service '$($new.name)'"
     }
@@ -602,7 +614,12 @@ function Invoke-ApplyRequest($Body) {
     $State.Plans[$id] = $stored
     Stop-Request 409 "The backend did not pass the connection test from Traefik's network: $($plan.Backend.message) Fix the backend, or confirm that you want to save the route anyway." @{ needsBackendAck = $true; backend = $plan.Backend }
   }
+  return Invoke-ChangePlanSteps $plan $confirmed
+}
 
+# Executes a verified change plan: recovery point, Traefik validation in a throwaway container, backup + write + reload,
+# backend readiness step, then the approved Cloudflare actions. Shared by service changes and identity protection.
+function Invoke-ChangePlanSteps($plan, [string[]]$confirmed) {
   $settings = $plan.Settings
   $steps = New-Object System.Collections.ArrayList
   $result = [ordered]@{ ok = $true; steps = $null; backup = ''; recoveryPoint = ''; warnings = @() }
@@ -2247,6 +2264,7 @@ function Get-InfrastructureData {
     proxyNetwork = $settings.ProxyNetwork; cloudflaredIp = $settings.CloudflaredIp; docker = $status.docker; stack = $status.stack
     services = $services; cloudflare = $cf; token = (Get-CloudflareApiTokenInfo -Settings $settings); tunnel = (Get-TunnelInfo $settings $status $cf)
     tunnelTokenPresent = [bool]$status.stack.TunnelTokenPresent; dashboard = [ordered]@{ enabled = [bool]$dash.enabled; hostname = [string]$dash.hostname; router = (Get-DashboardRouterName) }
+    identity = (Get-IdentityExplorerFacts $settings)
   }
   $facts = Get-InfrastructureFacts -Settings $settings -Base $base
   $model = ConvertTo-InfrastructureModel -Facts $facts
@@ -2254,6 +2272,23 @@ function Get-InfrastructureData {
   $model.dashboard = [ordered]@{ localUrl = "http://127.0.0.1:$($settings.DashboardPort)/dashboard/"; publicUrl = $(if ($dash.enabled -and $dash.hostname) { "https://$($dash.hostname)/dashboard/" } else { '' }) }
   $model.checkedAt = (Get-Date -Format 's')
   return $model
+}
+
+# Identity facts for the Explorer: local only (identity.json and one docker inspect), no authentik API call.
+function Get-IdentityExplorerFacts($Settings) {
+  if (-not (Test-Installed)) { return $null }
+  try { $cfg = Read-IdentityConfig -Settings $Settings } catch { return $null }
+  $srv = $null
+  if ($cfg.authentik.serverContainer) {
+    $r = Invoke-Docker inspect $cfg.authentik.serverContainer --format '{{.State.Status}}|{{if .State.Health}}{{.State.Health.Status}}{{end}}|{{json .NetworkSettings.Networks}}'
+    if ($r.ExitCode -eq 0) {
+      $parts = (@($r.Output) -join '').Split([char[]]'|', 3)
+      $nets = $parts[2] | ConvertFrom-Json
+      $srv = [ordered]@{ name = $cfg.authentik.serverContainer; state = $parts[0]; health = $parts[1]; onProxyNetwork = [bool]$nets.PSObject.Properties[$Settings.ProxyNetwork] }
+    }
+  }
+  $verified = @($cfg.authentik.apps.PSObject.Properties | Where-Object { $_.Value.PSObject.Properties['verifiedAt'] -and $_.Value.verifiedAt } | ForEach-Object { $_.Name })
+  return [ordered]@{ provider = $cfg.provider; hostname = $cfg.authentik.hostname; server = $srv; verified = $verified; googleVerified = [bool]$cfg.authentik.google.verifiedAt }
 }
 
 function Get-OverviewData {
@@ -2463,6 +2498,461 @@ function Invoke-ManagerStop($Body) {
   return [ordered]@{ stopping = $true }
 }
 
+# --- Identity & Access (authentik) ---------------------------------------------------------------------------------
+# Thin request handlers over lib\IdentityProvider.psm1 (state, model) and lib\Authentik.psm1 (API, sync). Every change
+# in authentik is previewed first (the sync functions' dry run), applied once after confirmation, and recomputed right
+# before applying; the Traefik side goes through the same plan/validate/backup/apply path as every service change.
+
+function Get-IdentityContext([switch]$Deep) {
+  $settings = Get-Settings
+  $cfg = Read-IdentityConfig -Settings $settings
+  $inv = @(); try { $inv = @(Get-DockerContainerInventory -ProxyNetwork $settings.ProxyNetwork) } catch { }
+  $apps = @(); if (Test-Installed) { $apps = @(Read-AppsRegistry $settings) }
+  $installs = @(Find-AuthentikInstallations -Containers $inv -Apps $apps -ProxyNetwork $settings.ProxyNetwork)
+  $install = $null
+  if ($cfg.authentik.project) { $install = @($installs | Where-Object { $_.project -eq $cfg.authentik.project })[0] }
+  elseif ($cfg.authentik.serverContainer) { $install = @($installs | Where-Object { $_.serverContainer -eq $cfg.authentik.serverContainer })[0] }
+  $baseUrl = $(if ($install -and $install.localUrl) { $install.localUrl } else { $cfg.authentik.localUrl })
+  $running = [bool]($install -and $install.server -and $install.server.state -eq 'running')
+  $health = $null; if ($running -and $baseUrl) { $health = Get-AuthentikHealth -BaseUrl $baseUrl }
+  $tokInfo = Get-ProtectedSecretInfo -Settings $settings -Name (Get-IdentityTokenSecretName)
+  $token = [ordered]@{ stored = $tokInfo.Stored; readable = $tokInfo.Readable; savedAt = $tokInfo.SavedAt; user = $tokInfo.User; ok = $false; username = ''; superuser = $false; message = '' }
+  $conn = $null; $overview = $null; $overviewError = ''
+  if ($tokInfo.Stored -and $tokInfo.Readable -and $health -and $health.Live) {
+    $plain = Read-ProtectedSecret -Settings $settings -Name (Get-IdentityTokenSecretName)
+    $t = Test-AuthentikToken -BaseUrl $baseUrl -Token $plain
+    $token.ok = $t.Ok; $token.username = $t.Username; $token.superuser = $t.IsSuperuser; $token.message = $t.Message
+    if ($t.Ok) {
+      $conn = New-AuthentikConnection -BaseUrl $baseUrl -Token $plain
+      try { $overview = Get-AuthentikOverview $conn } catch { $overviewError = $_.Exception.Message }
+    }
+    $plain = $null
+  } elseif ($tokInfo.Stored -and -not ($health -and $health.Live)) { $token.message = 'authentik is not reachable, so the token was not checked.' }
+  $services = @(); if (Test-Installed) { try { $services = @((Read-ServiceRegistry -Settings $settings).services) } catch { } }
+  $routers = $null; if (Test-Installed) { $routers = Get-TraefikApi $settings '/api/http/routers' }
+  $route = $null
+  $svc = $(if ($cfg.authentik.service) { @($services | Where-Object { $_.name -eq $cfg.authentik.service })[0] } else { $null })
+  if ($svc) {
+    $rt = @($routers | Where-Object { $null -ne $_ -and $_.name -eq "svc-$($svc.name)@file" })
+    $route = [ordered]@{ exists = $true; enabled = [bool]$svc.enabled; service = $svc.name; publish = [bool]$svc.cloudflare.publish; access = [bool]$svc.cloudflare.access
+      router = $(if ($rt.Count) { [string]$rt[0].status } elseif ($null -eq $routers) { 'unknown' } else { 'not loaded' }); target = (Get-ServiceUrl $svc) }
+  }
+  $cf = Read-CloudflareConfig -Settings $settings
+  $cfFacts = $null
+  if ($cfg.authentik.hostname) { $dnsId = Get-ManagedResource $cf $cfg.authentik.hostname 'dnsRecordId'; $cfFacts = [ordered]@{ connected = [bool]$cf.tunnelId; dns = [bool]$dnsId; tunnel = [bool]($dnsId -and $cf.tunnelId); access = [bool](Get-ManagedResource $cf $cfg.authentik.hostname 'accessAppId') } }
+  $google = [ordered]@{ clientId = $cfg.authentik.google.clientId; source = $null; redirect = $null; logins = @(); verifiedAt = $cfg.authentik.google.verifiedAt; verifiedBy = $cfg.authentik.google.verifiedBy }
+  $changed = $false
+  if ($overview) {
+    $google.source = @($overview.OAuthSources | Where-Object { $_.Slug -eq $cfg.authentik.google.slug })[0]
+    if ($google.source -and $cfg.authentik.hostname) { $google.redirect = Test-AuthentikGoogleRedirect -BaseUrl $baseUrl -PublicHost $cfg.authentik.hostname -Slug $cfg.authentik.google.slug -ExpectClientId $google.source.ConsumerKey }
+    if ($google.source -and -not $cfg.authentik.google.verifiedAt) {
+      $since = $(if ($cfg.authentik.google.configuredAt) { [datetime]$cfg.authentik.google.configuredAt } else { [datetime]::MinValue })
+      try { $google.logins = @(Get-AuthentikSourceLogins -Conn $conn -Slug $cfg.authentik.google.slug -Since $since) } catch { }
+      if ($google.logins.Count) {
+        # Evidence of a real Google sign-in: a user connected to the Google source signed in after it was configured.
+        $cfg.authentik.google.verifiedAt = $google.logins[0].LastLogin; $cfg.authentik.google.verifiedBy = $google.logins[0].Username
+        $google.verifiedAt = $cfg.authentik.google.verifiedAt; $google.verifiedBy = $cfg.authentik.google.verifiedBy; $changed = $true
+      }
+    }
+  }
+  $appFacts = @()
+  foreach ($s in @($services | Where-Object { $_.PSObject.Properties['auth'] -and $_.auth.provider -eq 'authentik' })) {
+    $known = Get-IdentityApp $cfg $s.name
+    $exists = $false; $appPk = ''
+    if ($conn) { try { $a = Invoke-AuthentikApi $conn GET "/core/applications/dm-$($s.name)/"; $exists = [bool]$a.provider; $appPk = [string]$a.pk } catch { } }
+    $verifiedAt = [string](Get-IdProp2 $known 'verifiedAt' '')
+    if ($conn -and $appPk -and -not $verifiedAt) {
+      $since = $(if ($known -and (Get-IdProp2 $known 'protectedAt' '')) { [datetime](Get-IdProp2 $known 'protectedAt' '') } else { [datetime]::MinValue })
+      try { $ev = Get-AuthentikAppAccessEvidence -Conn $conn -ApplicationPk $appPk -Since $since; if ($ev) { $verifiedAt = $ev.At; Set-IdentityApp $cfg $s.name (Merge-IdentityApp $known @{ verifiedAt = $ev.At; verifiedBy = $ev.Username }); $changed = $true } } catch { }
+    }
+    $check = $(if ($State.IdpChecks.ContainsKey($s.name)) { $State.IdpChecks[$s.name] } else { $null })
+    if ($Deep -and $s.enabled) { $check = Test-ForwardAuthChallenge -TraefikPort $settings.HttpPort -Hostname @($s.hostnames)[0] -AuthHostname $cfg.authentik.hostname; $State.IdpChecks[$s.name] = $check }
+    $appFacts += [ordered]@{ service = $s.name; displayName = $(if ($s.PSObject.Properties['displayName']) { $s.displayName } else { $s.name }); hostname = @($s.hostnames)[0]; protected = $true; authentik = $exists; challenge = $check; verifiedAt = $verifiedAt
+      verifiedBy = [string](Get-IdProp2 (Get-IdentityApp $cfg $s.name) 'verifiedBy' ''); emails = @(Get-IdProp2 $known 'emails' @()); domains = @(Get-IdProp2 $known 'domains' @()); groups = @(Get-IdProp2 $known 'groups' @()); access = [bool]$s.cloudflare.access; publish = [bool]$s.cloudflare.publish }
+  }
+  if ($changed) { Save-IdentityConfig -Settings $settings -Config $cfg }
+  $pub = $(if ($State.IdpChecks.ContainsKey('__public')) { $State.IdpChecks['__public'] } else { $null })
+  if ($Deep -and $cfg.authentik.hostname -and $route -and $route.publish) {
+    $r = Invoke-ProbeRequest "https://$($cfg.authentik.hostname)/-/health/live/"
+    $pub = [ordered]@{ state = $(if ($r.Status -eq 200) { 'ok' } else { 'failed' }); message = $(if ($r.Status -eq 200) { "https://$($cfg.authentik.hostname) answers through Cloudflare (authentik is live)." } elseif ($r.Status -in 301, 302 -and $r.Location -match 'cloudflareaccess\.com') { 'Cloudflare Access asks for a login before the sign-in page: visitors would log in twice.' } elseif ($r.Status) { "https://$($cfg.authentik.hostname) answered HTTP $($r.Status) (DNS may still be propagating)." } else { "Not reachable yet: $($r.Error) (DNS may still be propagating)." }); checkedAt = (Get-Date -Format 's') }
+    if ($r.Status -in 301, 302) { $pub.state = 'failed' }
+    $State.IdpChecks['__public'] = $pub
+  }
+  $facts = [ordered]@{ provider = $cfg.provider; install = $install; health = $health; token = $token; overview = $overview; hostname = $cfg.authentik.hostname; publicUrl = $cfg.authentik.publicUrl
+    route = $route; cloudflare = $cfFacts; publicCheck = $pub; google = $google; apps = $appFacts }
+  return [pscustomobject]@{ Settings = $settings; Config = $cfg; Installs = $installs; Install = $install; BaseUrl = $baseUrl; Conn = $conn; Overview = $overview; OverviewError = $overviewError
+    Facts = $facts; Services = $services; Cloudflare = $cf }
+}
+
+function Get-IdProp2($Object, [string]$Name, $Default = $null) {
+  if ($null -eq $Object) { return $Default }
+  $p = $Object.PSObject.Properties[$Name]
+  if ($p -and $null -ne $p.Value) { return $p.Value }
+  return $Default
+}
+
+function Merge-IdentityApp($Known, [hashtable]$Values) {
+  $o = [ordered]@{}
+  if ($Known) { foreach ($p in $Known.PSObject.Properties) { $o[$p.Name] = $p.Value } }
+  foreach ($k in $Values.Keys) { $o[$k] = $Values[$k] }
+  return [pscustomobject]$o
+}
+
+function Assert-IdentityConnection($Ctx) {
+  if ($Ctx.Config.provider -ne 'authentik') { Stop-Request 409 'Choose authentik as the identity provider first.' }
+  if (-not $Ctx.Install) { Stop-Request 409 'No authentik installation is recorded. Install or adopt one first.' }
+  if (-not $Ctx.Conn) { Stop-Request 409 $(if ($Ctx.Facts.token.message) { $Ctx.Facts.token.message } else { 'Connect the manager to authentik first (API token).' }) }
+  if (-not $Ctx.Facts.token.superuser) { Stop-Request 409 "The saved token belongs to '$($Ctx.Facts.token.username)', who is not an authentik administrator." }
+}
+
+function ConvertTo-AkActionView($Actions) {
+  return @(@($Actions) | ForEach-Object { [ordered]@{ kind = $_.Kind; object = $_.Object; name = $_.Name; summary = $_.Summary; detail = $_.Detail; status = $_.Status; message = $_.Message } })
+}
+
+function Get-AkFingerprint($Actions) { return (Get-TextSha256 ((@(@($Actions) | ForEach-Object { "$($_.Kind)|$($_.Object)|$($_.Name)|$($_.Detail)" })) -join "`n")) }
+
+function New-IdpPlanId($Data) {
+  foreach ($k in @($State.IdpPlans.Keys)) { if (((Get-Date) - $State.IdpPlans[$k].Created).TotalMinutes -gt 15) { $State.IdpPlans.Remove($k) } }
+  $id = New-RandomKey 12
+  $Data | Add-Member -NotePropertyName Created -NotePropertyValue (Get-Date) -Force
+  $State.IdpPlans[$id] = $Data
+  return $id
+}
+
+function Use-IdpPlan($Body, [string]$Kind) {
+  Assert-Confirmed $Body
+  $id = [string](Get-Field $Body 'planId' '')
+  if (-not $id -or -not $State.IdpPlans.ContainsKey($id) -or $State.IdpPlans[$id].Kind -ne $Kind) { Stop-Request 409 'This preview has expired or was already applied. Preview again.' }
+  $p = $State.IdpPlans[$id]; $State.IdpPlans.Remove($id)
+  if (((Get-Date) - $p.Created).TotalMinutes -gt 15) { Stop-Request 409 'This preview has expired. Preview again.' }
+  return $p
+}
+
+# Everything the Identity & Access page shows. Secrets never appear: the token only as metadata, the Google client
+# secret not at all.
+function Get-IdentityData([switch]$Deep) {
+  $ctx = Get-IdentityContext -Deep:$Deep
+  $cfg = $ctx.Config; $settings = $ctx.Settings
+  $model = Get-IdentityModel -Facts $ctx.Facts
+  $domains = @($ctx.Cloudflare.domains | ForEach-Object { [string]$_.name })
+  $suggested = $(if ($cfg.authentik.hostname) { $cfg.authentik.hostname } else { Get-SuggestedAuthHostname @($domains)[0] })
+  $googleValues = $null
+  if ($cfg.authentik.publicUrl) { $googleValues = Get-GoogleOAuthSettings -PublicUrl $cfg.authentik.publicUrl -Slug $cfg.authentik.google.slug -Domain $(if ($cfg.authentik.hostname -match '^[^.]+\.(.+)$') { $Matches[1] } else { '' }) }
+  $catalogDefaults = $null
+  try { $m = Get-CatalogApp -CatalogDir $CatalogDir -Id 'authentik'; if (Test-Installed) { $catalogDefaults = Get-AppDefaults $m $settings } } catch { }
+  $routeBody = $null
+  if ($ctx.Install -and $ctx.Install.serverContainer -and $suggested) {
+    $existing = $(if ($cfg.authentik.service) { @($ctx.Services | Where-Object { $_.name -eq $cfg.authentik.service })[0] } else { $null })
+    $name = $(if ($existing) { $existing.name } else { $n = 'authentik'; $i = 1; while (@($ctx.Services | Where-Object { $_.name -eq $n }).Count) { $i++; $n = "authentik-$i" }; $n })
+    $routeBody = [ordered]@{ op = $(if ($existing) { 'update' } else { 'add' }); name = $name
+      service = [ordered]@{ name = $name; displayName = 'authentik (sign-in)'; description = 'authentik sign-in page (Identity & Access)'; enabled = $true; hostnames = @($suggested); pathPrefix = ''; stripPrefix = $false; middlewares = @('default-headers@file')
+        target = [ordered]@{ type = 'docker'; host = $ctx.Install.serverContainer; port = 9000; protocol = 'http'; tlsSkipVerify = $false }
+        cloudflare = [ordered]@{ publish = [bool]$ctx.Cloudflare.tunnelId; access = $false } } }
+  }
+  return [ordered]@{
+    provider = $cfg.provider; providers = @(Get-IdentityProviders); config = $cfg; progress = $cfg.progress
+    installs = @($ctx.Installs); install = $ctx.Install; health = $ctx.Facts.health; token = $ctx.Facts.token; overviewError = $ctx.OverviewError
+    overview = $(if ($ctx.Overview) { [ordered]@{ version = $ctx.Overview.Version; user = $ctx.Overview.User; missingFlows = @($ctx.Overview.MissingFlows); outpost = $(if ($ctx.Overview.Outpost) { [ordered]@{ name = $ctx.Overview.Outpost.Name; authentikHost = $ctx.Overview.Outpost.AuthentikHost; providers = @($ctx.Overview.Outpost.Providers) } } else { $null })
+        settings = $ctx.Overview.Settings; sources = @($ctx.Overview.OAuthSources); loginStage = $ctx.Overview.LoginStage } } else { $null })
+    route = $ctx.Facts.route; cloudflare = $ctx.Facts.cloudflare; publicCheck = $ctx.Facts.publicCheck; google = $ctx.Facts.google; googleValues = $googleValues; apps = @($ctx.Facts.apps)
+    model = $model; domains = $domains; suggestedHostname = $suggested; routeBody = $routeBody; catalogDefaults = $catalogDefaults; contactEmail = [string](Read-SetupDraft).contactEmail
+    cloudflareReady = [bool]($ctx.Cloudflare.tunnelId -and (Get-CloudflareApiTokenInfo -Settings $settings).Stored)
+    services = @($ctx.Services | ForEach-Object { [ordered]@{ name = $_.name; displayName = $(if ($_.PSObject.Properties['displayName']) { $_.displayName } else { '' }); hostnames = @($_.hostnames); enabled = [bool]$_.enabled
+          target = (Get-ServiceUrl $_); publish = [bool]$_.cloudflare.publish; access = [bool]$_.cloudflare.access; auth = $(if ($_.PSObject.Properties['auth']) { $_.auth.provider } else { '' })
+          isIdentity = [bool]($ctx.Install -and $_.target.type -eq 'docker' -and $_.target.host -eq $ctx.Install.serverContainer) } })
+    checkedAt = (Get-Date -Format 's')
+  }
+}
+
+function Set-IdentityProviderRequest($Body) {
+  Assert-Installed
+  $p = [string](Get-Field $Body 'provider' '')
+  if ($p -eq 'authelia') { Stop-Request 409 'Authelia can be installed from the App Catalog, but its sign-in integration (Google, protected applications) is not implemented in this version. Choose authentik or Configure later.' }
+  if ($p -notin 'authentik', 'none') { Stop-Request 400 "Unknown identity provider '$p'." }
+  $settings = Get-Settings
+  $cfg = Read-IdentityConfig -Settings $settings
+  $protected = @((Read-ServiceRegistry -Settings $settings).services | Where-Object { $_.PSObject.Properties['auth'] })
+  if ($p -eq 'none' -and $protected.Count) { Stop-Request 409 "Remove authentik protection from $(@($protected | ForEach-Object { $_.name }) -join ', ') first." }
+  $cfg.provider = $p
+  Set-IdentityProgress $cfg 'provider' 'done' $p
+  Save-IdentityConfig -Settings $settings -Config $cfg
+  Write-Audit 'identity-provider' $p
+  return [ordered]@{ ok = $true; provider = $p }
+}
+
+# Records an authentik installation found on this PC (installed by the catalog or by hand). Nothing in authentik, its
+# containers, volumes or credentials is changed.
+function Invoke-IdentityAdopt($Body) {
+  Assert-Installed
+  $ctx = Get-IdentityContext
+  if ($ctx.Config.provider -ne 'authentik') { Stop-Request 409 'Choose authentik as the identity provider first.' }
+  $project = [string](Get-Field $Body 'project' '')
+  $container = [string](Get-Field $Body 'container' '')
+  $inst = @($ctx.Installs | Where-Object { ($project -and $_.project -eq $project) -or ($container -and $_.serverContainer -eq $container) })[0]
+  if (-not $inst) { Stop-Request 404 'That authentik installation was not found on this Docker engine.' }
+  $notes = @()
+  if (-not $inst.localUrl) { $notes += 'Its web port 9000 is not published on 127.0.0.1, so the manager cannot reach its API from this PC. Publish it as 127.0.0.1:<port>:9000 in its compose file.' }
+  if ($inst.serverContainer -and -not $inst.onProxyNetwork) { $notes += "$($inst.serverContainer) is not on the shared network '$($ctx.Settings.ProxyNetwork)'; Traefik needs that to reach it. Add the network to its compose file (the manager does not edit projects it did not create)." }
+  $cfg = $ctx.Config
+  $cfg.authentik.project = $inst.project; $cfg.authentik.folder = $inst.folder; $cfg.authentik.managed = [bool]$inst.managed
+  $cfg.authentik.serverContainer = $inst.serverContainer; $cfg.authentik.localUrl = $inst.localUrl
+  Set-IdentityProgress $cfg 'install' 'done' "adopted $($inst.project)"
+  Save-IdentityConfig -Settings $ctx.Settings -Config $cfg
+  Write-Audit 'identity-adopt' "project=$($inst.project) container=$($inst.serverContainer) managed=$($inst.managed)"
+  return [ordered]@{ ok = $true; install = $inst; notes = $notes }
+}
+
+# Saves the authentik API token (DPAPI). For installations made by the manager it can be taken from the project's .env
+# (AUTHENTIK_BOOTSTRAP_TOKEN) so the user never has to copy it.
+function Save-IdentityTokenRequest($Body) {
+  Assert-Installed
+  $ctx = Get-IdentityContext
+  if (-not $ctx.Install) { Stop-Request 409 'Install or adopt authentik first.' }
+  if (-not $ctx.BaseUrl) { Stop-Request 409 'authentik has no local address (port 9000 on 127.0.0.1) the manager can reach.' }
+  $token = ''
+  if ([bool](Get-Field $Body 'fromBootstrap' $false)) {
+    if (-not ($ctx.Install.managed -and $ctx.Install.folder)) { Stop-Request 409 'Only installations made by this manager have a bootstrap token; paste a token instead.' }
+    $envFile = Read-AppEnv (Join-Path $ctx.Install.folder '.env')
+    if (-not $envFile.Contains('AUTHENTIK_BOOTSTRAP_TOKEN') -or -not $envFile['AUTHENTIK_BOOTSTRAP_TOKEN']) { Stop-Request 409 'This installation was made without a bootstrap token (an older catalog version). Create a token in authentik and paste it.' }
+    $token = [string]$envFile['AUTHENTIK_BOOTSTRAP_TOKEN']
+  } else { $token = ([string](Get-Field $Body 'token' '')).Trim() }
+  if ($token -notmatch '^[A-Za-z0-9._-]{20,256}$') { Stop-Request 400 'That does not look like an authentik API token.' }
+  $t = Test-AuthentikToken -BaseUrl $ctx.BaseUrl -Token $token
+  if (-not $t.Ok) { Stop-Request 400 $t.Message }
+  Save-ProtectedSecret -Settings $ctx.Settings -Name (Get-IdentityTokenSecretName) -Value $token -Label "authentik API token ($($t.Username))"
+  $token = $null
+  Set-IdentityProgress $ctx.Config 'api' 'done' $t.Username
+  Save-IdentityConfig -Settings $ctx.Settings -Config $ctx.Config
+  Write-Audit 'identity-token' "user=$($t.Username) superuser=$($t.IsSuperuser)"
+  return [ordered]@{ ok = $true; username = $t.Username; superuser = $t.IsSuperuser; version = $t.Version; warning = $(if (-not $t.IsSuperuser) { 'This user is not an authentik administrator: the manager cannot create sources and applications with this token.' } else { '' }) }
+}
+
+# Records the public sign-in hostname (the route itself is created through the normal service preview).
+function Set-IdentityHostnameRequest($Body) {
+  Assert-Installed
+  $settings = Get-Settings
+  $cfg = Read-IdentityConfig -Settings $settings
+  $h = ([string](Get-Field $Body 'hostname' '')).Trim().ToLowerInvariant()
+  if ($h -notmatch '^(?=.{1,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$') { Stop-Request 400 'Enter a hostname such as auth.example.com.' }
+  $svcName = ([string](Get-Field $Body 'service' '')).Trim().ToLowerInvariant()
+  if ($svcName -notmatch '^[a-z0-9]([a-z0-9-]{0,38}[a-z0-9])?$') { Stop-Request 400 'Invalid service name.' }
+  $services = @((Read-ServiceRegistry -Settings $settings).services)
+  $other = @($services | Where-Object { $_.name -ne $svcName -and @($_.hostnames) -contains $h })
+  if ($other.Count) { Stop-Request 409 "$h is already used by service '$($other[0].name)'." }
+  $cfg.authentik.hostname = $h; $cfg.authentik.service = $svcName; $cfg.authentik.publicUrl = "https://$h"
+  Set-IdentityProgress $cfg 'hostname' 'saved' $h
+  Save-IdentityConfig -Settings $settings -Config $cfg
+  Write-Audit 'identity-hostname' $h
+  return [ordered]@{ ok = $true; hostname = $h; publicUrl = "https://$h"; redirectUri = "https://$h/source/oauth/callback/$($cfg.authentik.google.slug)/" }
+}
+
+function Invoke-IdentityOutpost($Body, [switch]$Apply) {
+  Assert-Installed
+  $ctx = Get-IdentityContext
+  Assert-IdentityConnection $ctx
+  if (-not $ctx.Config.authentik.publicUrl) { Stop-Request 409 'Choose the public sign-in address first.' }
+  if (-not $Apply) {
+    $actions = Sync-AuthentikOutpost -Conn $ctx.Conn -PublicUrl $ctx.Config.authentik.publicUrl -WhatIf
+    $id = New-IdpPlanId ([pscustomobject]@{ Kind = 'outpost'; Fingerprint = (Get-AkFingerprint $actions) })
+    return [ordered]@{ planId = $id; actions = @(ConvertTo-AkActionView $actions); canApply = [bool]@($actions | Where-Object { $_.Kind -ne 'none' }).Count }
+  }
+  $p = Use-IdpPlan $Body 'outpost'
+  if ((Get-AkFingerprint (Sync-AuthentikOutpost -Conn $ctx.Conn -PublicUrl $ctx.Config.authentik.publicUrl -WhatIf)) -ne $p.Fingerprint) { Stop-Request 409 'authentik changed since the preview. Preview again.' }
+  $actions = Sync-AuthentikOutpost -Conn $ctx.Conn -PublicUrl $ctx.Config.authentik.publicUrl
+  Set-IdentityProgress $ctx.Config 'outpost' 'done' $ctx.Config.authentik.publicUrl
+  Save-IdentityConfig -Settings $ctx.Settings -Config $ctx.Config
+  Write-Audit 'identity-outpost' $ctx.Config.authentik.publicUrl
+  return [ordered]@{ ok = $true; actions = @(ConvertTo-AkActionView $actions) }
+}
+
+function Get-GoogleDesiredFromBody($Body, $Cfg) {
+  $g = $Cfg.authentik.google
+  $signup = [string](Get-Field $Body 'signup' $g.signup)
+  $matching = [string](Get-Field $Body 'matching' $g.matching)
+  return [pscustomobject]@{
+    Slug = $g.slug; Name = 'Google'; ClientId = ([string](Get-Field $Body 'clientId' $g.clientId)).Trim(); ClientSecret = ([string](Get-Field $Body 'clientSecret' '')).Trim()
+    Signup = $signup; Emails = @(Get-Field $Body 'emails' $g.emails); Domains = @(Get-Field $Body 'domains' $g.domains); Matching = $matching; ShowOnLogin = [bool](Get-Field $Body 'showOnLogin' $g.showOnLogin)
+  }
+}
+
+# Saves what the user typed in the Google wizard (never the secret), so it survives a refresh or a trip to Google Cloud.
+function Save-IdentityGoogleRequest($Body) {
+  Assert-Installed
+  $settings = Get-Settings
+  $cfg = Read-IdentityConfig -Settings $settings
+  $d = Get-GoogleDesiredFromBody $Body $cfg
+  if ($d.ClientId -and -not (Test-GoogleClientId $d.ClientId)) { Stop-Request 400 'The client ID does not look like a Google OAuth client ID (it ends in .apps.googleusercontent.com).' }
+  if ($d.Signup -notin 'allowlist', 'open', 'existing') { Stop-Request 400 'Unknown sign-up option.' }
+  $list = ConvertTo-AccessList $d.Emails $d.Domains
+  if ($list.Errors.Count) { Stop-Request 400 ($list.Errors -join ' ') }
+  $g = $cfg.authentik.google
+  $g.clientId = $d.ClientId; $g.signup = $d.Signup; $g.emails = @($list.Emails); $g.domains = @($list.Domains); $g.matching = $(if ($d.Matching -eq 'email_deny') { 'email_deny' } else { 'identifier' }); $g.showOnLogin = $d.ShowOnLogin
+  Set-IdentityProgress $cfg 'google' 'draft' 'client ID saved'
+  Save-IdentityConfig -Settings $settings -Config $cfg
+  return [ordered]@{ ok = $true; google = $g }
+}
+
+function Invoke-IdentityGooglePlan($Body) {
+  Assert-Installed
+  $ctx = Get-IdentityContext
+  Assert-IdentityConnection $ctx
+  if (-not $ctx.Config.authentik.publicUrl) { Stop-Request 409 'Choose the public sign-in address first: Google needs the https redirect URI.' }
+  $d = Get-GoogleDesiredFromBody $Body $ctx.Config
+  try { $r = Sync-AuthentikGoogleSource -Conn $ctx.Conn -Desired $d -WhatIf } catch { Stop-Request 400 $_.Exception.Message }
+  $id = New-IdpPlanId ([pscustomobject]@{ Kind = 'google'; Desired = $d; Fingerprint = (Get-AkFingerprint $r.Actions) })
+  $values = Get-GoogleOAuthSettings -PublicUrl $ctx.Config.authentik.publicUrl -Slug $d.Slug
+  return [ordered]@{ planId = $id; actions = @(ConvertTo-AkActionView $r.Actions); canApply = $true; secretProvided = [bool]$d.ClientSecret; redirectUri = $values.RedirectUri
+    notes = @($(if ($d.Signup -eq 'open') { 'Any Google account can create an authentik account. New accounts get no access to protected applications until you allow them.' }),
+      $(if ($d.Matching -eq 'identifier') { 'Google accounts are never linked to existing authentik accounts by email. An existing user (e.g. akadmin) links Google from their authentik user settings (Connected services) while signed in.' }),
+      'akadmin keeps signing in with its password: Google is an additional sign-in method, never the only way in.') | Where-Object { $_ } }
+}
+
+function Invoke-IdentityGoogleApply($Body) {
+  Assert-Installed
+  $p = Use-IdpPlan $Body 'google'
+  $ctx = Get-IdentityContext
+  Assert-IdentityConnection $ctx
+  $now = $null; try { $now = Sync-AuthentikGoogleSource -Conn $ctx.Conn -Desired $p.Desired -WhatIf } catch { Stop-Request 409 $_.Exception.Message }
+  if ((Get-AkFingerprint $now.Actions) -ne $p.Fingerprint) { Stop-Request 409 'authentik changed since the preview. Preview again.' }
+  $null = New-ChangeRecoveryPoint 'before Google sign-in configuration'
+  $result = $null; $err = ''
+  try { $result = Sync-AuthentikGoogleSource -Conn $ctx.Conn -Desired $p.Desired } catch { $err = $_.Exception.Message }
+  $p.Desired.ClientSecret = $null
+  $cfg = $ctx.Config; $g = $cfg.authentik.google
+  if ($err) {
+    Set-IdentityProgress $cfg 'google' 'failed' $err
+    Save-IdentityConfig -Settings $ctx.Settings -Config $cfg
+    Write-Audit 'identity-google' "failed: $err"
+    return [ordered]@{ ok = $false; message = "$err Nothing after the failed step was changed; run the preview again to continue where it stopped."; actions = @() }
+  }
+  $g.clientId = $p.Desired.ClientId; $g.signup = $p.Desired.Signup; $g.emails = @(ConvertTo-AccessList $p.Desired.Emails @()).Emails; $g.domains = @(ConvertTo-AccessList @() $p.Desired.Domains).Domains
+  $g.matching = $p.Desired.Matching; $g.showOnLogin = $p.Desired.ShowOnLogin
+  if (@($result.Actions | Where-Object { $_.Kind -ne 'none' }).Count) { $g.configuredAt = (Get-Date -Format 's'); $g.verifiedAt = ''; $g.verifiedBy = '' }
+  Set-IdentityProgress $cfg 'google' 'configured' ''
+  Save-IdentityConfig -Settings $ctx.Settings -Config $cfg
+  Write-Audit 'identity-google' ("applied: " + ((@($result.Actions | Where-Object { $_.Kind -ne 'none' } | ForEach-Object { "$($_.Kind) $($_.Object) $($_.Name)" })) -join '; '))
+  $redir = $null; if ($cfg.authentik.hostname) { $redir = Test-AuthentikGoogleRedirect -BaseUrl $ctx.BaseUrl -PublicHost $cfg.authentik.hostname -Slug $g.slug -ExpectClientId $g.clientId }
+  return [ordered]@{ ok = $true; actions = @(ConvertTo-AkActionView $result.Actions); redirect = $redir }
+}
+
+# Protecting an application = authentik objects (provider, application, access rules, outpost) + the Traefik route
+# with ForwardAuth. Cloudflare Access is kept unless the user explicitly chooses to remove it.
+function Get-ProtectRequest($Body, $Ctx, [switch]$Remove) {
+  $name = ([string](Get-Field $Body 'service' '')).ToLowerInvariant()
+  $svc = @($Ctx.Services | Where-Object { $_.name -eq $name })[0]
+  if (-not $svc) { Stop-Request 404 "No service named '$name'." }
+  if ($Ctx.Install -and $svc.target.type -eq 'docker' -and $svc.target.host -eq $Ctx.Install.serverContainer) { Stop-Request 400 'This is the authentik sign-in page itself; it cannot be protected by authentik (endless redirect loop).' }
+  if ($Ctx.Config.authentik.service -and $svc.name -eq $Ctx.Config.authentik.service) { Stop-Request 400 'This is the authentik sign-in page itself; it cannot be protected by authentik.' }
+  if (-not $Remove -and -not $Ctx.Install.onProxyNetwork) { Stop-Request 409 "authentik ($($Ctx.Install.serverContainer)) is not on the shared network, so Traefik cannot ask it whether a visitor may pass." }
+  $copy = $svc | ConvertTo-Json -Depth 8 | ConvertFrom-Json
+  $accessChoice = [string](Get-Field $Body 'cloudflareAccess' 'keep')
+  if ($accessChoice -notin 'keep', 'remove', 'add') { Stop-Request 400 'cloudflareAccess must be keep, remove or add.' }
+  if ($accessChoice -eq 'remove') { $copy.cloudflare.access = $false } elseif ($accessChoice -eq 'add') { $copy.cloudflare.access = $true }
+  if ($Remove) { $copy.PSObject.Properties.Remove('auth') | Out-Null; $copy | Add-Member -NotePropertyName auth -NotePropertyValue ([pscustomobject]@{ provider = 'none' }) -Force }
+  else { $copy | Add-Member -NotePropertyName auth -NotePropertyValue ([pscustomobject]@{ provider = 'authentik'; endpoint = "http://$($Ctx.Install.serverContainer):9000" }) -Force }
+  $cfReady = [bool]($Ctx.Cloudflare.tunnelId -and (Get-CloudflareApiTokenInfo -Settings $Ctx.Settings).Stored)
+  $emails = @(Get-ManagedAccessEmails $Ctx.Cloudflare @($svc.hostnames)[0])
+  return [pscustomobject]@{ Service = $svc; ChangeBody = [pscustomobject]@{ op = 'update'; name = $svc.name; service = $copy; cloudflare = [pscustomobject]@{ automate = [bool]($cfReady -and $copy.cloudflare.publish); accessEmails = $emails; cleanup = ($accessChoice -eq 'remove') } } }
+}
+
+function Get-ProtectDesired($Body, $Svc) {
+  $e = @(@(Get-Field $Body 'emails' @()) | ForEach-Object { [string]$_ }); $d = @(@(Get-Field $Body 'domains' @()) | ForEach-Object { [string]$_ }); $g = @(@(Get-Field $Body 'groups' @()) | ForEach-Object { [string]$_ })
+  return [pscustomobject]@{ Service = $Svc.name; DisplayName = $(if ($Svc.PSObject.Properties['displayName']) { $Svc.displayName } else { $Svc.name }); Hostname = @($Svc.hostnames)[0]
+    Emails = $e; Domains = $d; Groups = $g; CreateGroup = [bool](Get-Field $Body 'createGroup' $false) }
+}
+
+function Invoke-IdentityProtectPlan($Body, [switch]$Remove) {
+  Assert-Installed
+  $ctx = Get-IdentityContext
+  Assert-IdentityConnection $ctx
+  $req = Get-ProtectRequest $Body $ctx -Remove:$Remove
+  $svc = $req.Service
+  if (@($svc.hostnames).Count -ne 1 -and -not $Remove) { Stop-Request 400 'Protect services with exactly one hostname (authentik identifies an application by its address).' }
+  $desired = $null; $ak = $null
+  try {
+    if ($Remove) { $ak = Remove-AuthentikAppProtection -Conn $ctx.Conn -Service $svc.name -WhatIf }
+    else { $desired = Get-ProtectDesired $Body $svc; $ak = (Sync-AuthentikAppProtection -Conn $ctx.Conn -Desired $desired -Known (Get-IdentityApp $ctx.Config $svc.name) -WhatIf).Actions }
+  } catch { Stop-Request 400 $_.Exception.Message }
+  $plan = Build-ChangePlan $req.ChangeBody
+  $view = ConvertTo-PlanView $plan ''
+  $notes = @()
+  if ($Remove) { $notes += $(if ($svc.cloudflare.publish -and -not $req.ChangeBody.service.cloudflare.access) { 'After this, the application is reachable WITHOUT any sign-in by anyone on the Internet (public, no Cloudflare Access). Its own login is the only protection.' } elseif ($svc.cloudflare.publish) { 'After this, Cloudflare Access is the only sign-in in front of the application.' } else { 'After this, the application is reachable from this PC without sign-in.' }) }
+  else {
+    if ($svc.cloudflare.publish -and $req.ChangeBody.service.cloudflare.access) { $notes += 'Cloudflare Access stays in front of this application: visitors sign in with Cloudflare first, then with authentik. Choose "Remove Cloudflare Access" if authentik should be the only sign-in.' }
+    if (-not $svc.cloudflare.publish) { $notes += 'This application is not published through Cloudflare; the sign-in works for its local address once DNS points the hostname at Traefik.' }
+    $notes += 'If authentik stops, Traefik refuses requests to this application (fails closed) instead of letting them through.'
+  }
+  $id = New-IdpPlanId ([pscustomobject]@{ Kind = $(if ($Remove) { 'unprotect' } else { 'protect' }); Service = $svc.name; Desired = $desired; ChangeBody = ($req.ChangeBody | ConvertTo-Json -Depth 10 -Compress)
+      AkFingerprint = (Get-AkFingerprint $ak); TraefikKey = $plan.TraefikKey; CfFingerprint = $plan.Cloudflare.Fingerprint })
+  $view.planId = $id
+  $errors = @($view.traefik.issues | Where-Object { $_.Level -eq 'Error' }).Count + @($view.cloudflare.errors).Count
+  $work = [bool]$view.hasWork -or [bool]@($ak | Where-Object { $_.Kind -ne 'none' }).Count
+  return [ordered]@{ planId = $id; service = $svc.name; authentik = @(ConvertTo-AkActionView $ak); traefik = $view; notes = $notes; canApply = ($work -and $errors -eq 0) }
+}
+
+function Invoke-IdentityProtectApply($Body, [switch]$Remove) {
+  Assert-Installed
+  $p = Use-IdpPlan $Body $(if ($Remove) { 'unprotect' } else { 'protect' })
+  $ctx = Get-IdentityContext
+  Assert-IdentityConnection $ctx
+  $changeBody = $p.ChangeBody | ConvertFrom-Json
+  $plan = Build-ChangePlan $changeBody
+  $akNow = $(if ($Remove) { Remove-AuthentikAppProtection -Conn $ctx.Conn -Service $p.Service -WhatIf } else { (Sync-AuthentikAppProtection -Conn $ctx.Conn -Desired $p.Desired -Known (Get-IdentityApp $ctx.Config $p.Service) -WhatIf).Actions })
+  if ($plan.TraefikKey -ne $p.TraefikKey -or $plan.Cloudflare.Fingerprint -ne $p.CfFingerprint -or (Get-AkFingerprint $akNow) -ne $p.AkFingerprint) { Stop-Request 409 'The configuration, Cloudflare or authentik changed since the preview. Preview again.' }
+  $confirmed = @(@(Get-Field $Body 'confirmOverwrites' @()) | ForEach-Object { [string]$_ })
+  $missing = @($plan.Cloudflare.Actions | Where-Object { $_.Overwrite -and $confirmed -notcontains $_.Id } | ForEach-Object { $_.Id })
+  if ($missing.Count) { Stop-Request 400 ('Confirm each overwrite of an existing Cloudflare resource: ' + ($missing -join ', ')) }
+  $cfg = $ctx.Config
+  $steps = New-Object System.Collections.ArrayList
+  $out = [ordered]@{ ok = $true; authentik = @(); traefik = $null; challenge = $null; message = '' }
+  if (-not $Remove) {
+    # authentik first: when the route starts asking authentik, the application and provider must already exist.
+    try { $r = Sync-AuthentikAppProtection -Conn $ctx.Conn -Desired $p.Desired -Known (Get-IdentityApp $cfg $p.Service); $out.authentik = @(ConvertTo-AkActionView $r.Actions) }
+    catch {
+      Set-IdentityProgress $cfg 'apps' 'failed' $_.Exception.Message; Save-IdentityConfig -Settings $ctx.Settings -Config $cfg
+      Write-Audit 'identity-protect' "$($p.Service) authentik failed: $($_.Exception.Message)"
+      return [ordered]@{ ok = $false; authentik = @(); traefik = $null; message = "authentik: $($_.Exception.Message) The Traefik route was not changed; the application is exactly as before." }
+    }
+    Set-IdentityApp $cfg $p.Service (Merge-IdentityApp (Get-IdentityApp $cfg $p.Service) @{ slug = $r.Slug; providerPk = $r.ProviderPk; applicationPk = $r.ApplicationPk; policyPk = $r.PolicyPk; bindings = @($r.Bindings); groups = @($r.Groups); emails = @($r.Emails); domains = @($r.Domains); protectedAt = (Get-Date -Format 's'); verifiedAt = ''; verifiedBy = '' })
+    Save-IdentityConfig -Settings $ctx.Settings -Config $cfg
+    # The route switches only once the embedded outpost has loaded the new provider (otherwise it would answer 404).
+    $wait = Wait-AuthentikOutpost -BaseUrl $ctx.BaseUrl -Hostname @($plan.New.hostnames)[0] -Seconds 90
+    if (-not $wait.Ready) {
+      Set-IdentityProgress $cfg 'apps' 'failed' 'outpost not ready'; Save-IdentityConfig -Settings $ctx.Settings -Config $cfg
+      return [ordered]@{ ok = $false; authentik = $out.authentik; traefik = $null; challenge = $null; message = "authentik's embedded outpost has not loaded the new application yet (HTTP $($wait.Status)). The Traefik route was not changed; preview and apply again in a minute (nothing is created twice)." }
+    }
+    if ($plan.Traefik.FileChanges -gt 0 -or $plan.Traefik.RegistryChanged) { $out.traefik = Invoke-ChangePlanSteps $plan $confirmed } else { $out.traefik = [ordered]@{ ok = $true; steps = @(); warnings = @() } }
+    if (-not $out.traefik.ok) { $out.ok = $false; $out.message = 'Traefik did not accept the change; the route is unchanged. The authentik application exists but is not used yet; preview again after fixing the problem.' }
+    else {
+      $deadline = (Get-Date).AddSeconds(20)
+      do { $out.challenge = Test-ForwardAuthChallenge -TraefikPort $ctx.Settings.HttpPort -Hostname @($plan.New.hostnames)[0] -AuthHostname $cfg.authentik.hostname; if ($out.challenge.State -ne 'open') { break }; Start-Sleep -Seconds 2 } while ((Get-Date) -lt $deadline)
+      $State.IdpChecks[$p.Service] = $out.challenge
+      if ($out.challenge.State -eq 'open') { $out.ok = $false; $out.message = 'The application still answers without sign-in. Check the Traefik route.' }
+    }
+    Set-IdentityProgress $cfg 'apps' $(if ($out.ok) { 'protected' } else { 'failed' }) $p.Service
+  } else {
+    # Traefik first: the route stops asking authentik before the authentik objects disappear.
+    if ($plan.Traefik.FileChanges -gt 0 -or $plan.Traefik.RegistryChanged) { $out.traefik = Invoke-ChangePlanSteps $plan $confirmed } else { $out.traefik = [ordered]@{ ok = $true; steps = @(); warnings = @() } }
+    if (-not $out.traefik.ok) { $out.ok = $false; $out.message = 'Traefik did not accept the change; protection is unchanged.' }
+    else {
+      try { $out.authentik = @(ConvertTo-AkActionView (Remove-AuthentikAppProtection -Conn $ctx.Conn -Service $p.Service)) } catch { $out.message = "The route no longer uses authentik, but removing the authentik application failed: $($_.Exception.Message)" }
+      Set-IdentityApp $cfg $p.Service $null
+      $State.IdpChecks.Remove($p.Service)
+    }
+    Set-IdentityProgress $cfg 'apps' 'unprotected' $p.Service
+  }
+  Save-IdentityConfig -Settings $ctx.Settings -Config $cfg
+  Write-Audit $(if ($Remove) { 'identity-unprotect' } else { 'identity-protect' }) "$($p.Service) ok=$($out.ok)"
+  return $out
+}
+
+function Get-IdentityGroups {
+  Assert-Installed
+  $ctx = Get-IdentityContext
+  Assert-IdentityConnection $ctx
+  return [ordered]@{ groups = @(Get-AuthentikList $ctx.Conn '/core/groups/' | ForEach-Object { [ordered]@{ name = [string]$_.name; superuser = [bool]$_.is_superuser; members = @($_.users).Count } }) }
+}
+
 # --- Router ----------------------------------------------------------------------------------------------------
 
 function Invoke-ApiRoute($Request, $Body) {
@@ -2543,6 +3033,27 @@ function Invoke-ApiRoute($Request, $Body) {
     'POST /api/apps/remove' { return Invoke-AppRemove $Body }
     'POST /api/apps/backup' { return Invoke-AppBackup $Body }
     'GET /api/system/resources' { return Get-HostResources }
+    'GET /api/identity' { Assert-Installed; return Get-IdentityData -Deep:([string]$Request.Query['deep'] -eq '1') }
+    'GET /api/identity/groups' { return Get-IdentityGroups }
+    'POST /api/identity/provider' { return Set-IdentityProviderRequest $Body }
+    'POST /api/identity/adopt' { return Invoke-IdentityAdopt $Body }
+    'POST /api/identity/token' { return Save-IdentityTokenRequest $Body }
+    'POST /api/identity/token/delete' {
+      Assert-Installed; Assert-Confirmed $Body
+      $removed = Remove-ProtectedSecret -Settings $settings -Name (Get-IdentityTokenSecretName)
+      Write-Audit 'identity-token-removed' ''
+      return [ordered]@{ removed = $removed }
+    }
+    'POST /api/identity/hostname' { return Set-IdentityHostnameRequest $Body }
+    'POST /api/identity/outpost/plan' { return Invoke-IdentityOutpost $Body }
+    'POST /api/identity/outpost/apply' { return Invoke-IdentityOutpost $Body -Apply }
+    'POST /api/identity/google/save' { return Save-IdentityGoogleRequest $Body }
+    'POST /api/identity/google/plan' { return Invoke-IdentityGooglePlan $Body }
+    'POST /api/identity/google/apply' { return Invoke-IdentityGoogleApply $Body }
+    'POST /api/identity/protect/plan' { return Invoke-IdentityProtectPlan $Body }
+    'POST /api/identity/protect/apply' { return Invoke-IdentityProtectApply $Body }
+    'POST /api/identity/unprotect/plan' { return Invoke-IdentityProtectPlan $Body -Remove }
+    'POST /api/identity/unprotect/apply' { return Invoke-IdentityProtectApply $Body -Remove }
     'GET /api/environment' { return Get-EnvironmentData }
     'GET /api/expert/config' { return Get-ExpertConfigData }
     'POST /api/setup/contact' { return Set-ContactEmailRequest $Body }
