@@ -559,7 +559,7 @@ container on this PC already uses.
                                         # containers (shared, several, no shared network, private), LAN devices, overlapping
                                         # subnets, native Linux / Podman / Unraid, entered vs recommended addresses, custom URLs;
                                         # connection-test classification, generated service URL, hostname collisions
-.	ests\Test-WizardBrowser.ps1 -InstallPath <install> -AppAddress <this PC's LAN IP> -AppPort 80 [-AccessEmail you@example.com]
+.\tests\Test-WizardBrowser.ps1 -InstallPath <install> -AppAddress <this PC's LAN IP> -AppPort 80 [-AccessEmail you@example.com]
                                         # browser test of "How should Traefik connect to this application?" against an
                                         # installed instance, read-only (never applies; fails if routes, registry,
                                         # tunnel config, containers or networks change); -ScreenshotDir saves screenshots
