@@ -333,16 +333,6 @@
   }
   const GOOGLE_CLIENT_ID = /^[0-9]{6,20}-[a-z0-9]{8,64}\.apps\.googleusercontent\.com$/;
   function isGoogleClientId(v) { return GOOGLE_CLIENT_ID.test(String(v || '').trim()); }
-  // Emails and domains typed into one box: "alice@example.com, example.org" -> { emails, domains, invalid }.
-  function splitAccessList(text) {
-    const out = { emails: [], domains: [], invalid: [] };
-    for (const raw of String(text || '').split(/[\s,;]+/)) {
-      const v = raw.trim().toLowerCase().replace(/^@/, '');
-      if (!v) continue;
-      if (isEmail(v)) { if (!out.emails.includes(v)) out.emails.push(v); } else if (/^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/.test(v)) { if (!out.domains.includes(v)) out.domains.push(v); } else out.invalid.push(raw.trim());
-    }
-    return out;
-  }
   // Status of a managed API credential (lib\CredentialManager.psm1). "unreachable" is about the server, not the token.
   const CREDENTIAL_STATUS = {
     valid: { label: 'Connected', tone: 'ok', icon: 'check' },
@@ -364,7 +354,7 @@
   }
 
   return {
-    IDENTITY_STATES, identityState, googleRedirectUri, isGoogleClientId, splitAccessList, identityNextStep, CREDENTIAL_STATUS, credentialStatus,
+    IDENTITY_STATES, identityState, googleRedirectUri, isGoogleClientId, identityNextStep, CREDENTIAL_STATUS, credentialStatus,
     LEVELS, LEVEL_TITLES, DEFAULT_LEVEL, normalizeLevel, levelIndex, isVisibleAt,
     DIMENSIONS, COMPONENT_STATUS, componentStatus, firstBlocked, suggestAppName, displayNameFromLabel, choosePort, reachOptions,
     suggestLabel, suggestServiceName, autoName, autoNameFromSource, autoNameEdit, autoNameReset, isValidSubdomain, joinHostname, splitHostname,

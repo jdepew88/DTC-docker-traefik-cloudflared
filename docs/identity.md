@@ -7,6 +7,23 @@ Tunnel, connects **Google sign-in**, and puts authentik **ForwardAuth** in front
 Tested only on Windows 11 with Docker Desktop (WSL 2). The code avoids Windows-only assumptions where it can (see
 [Portability](#portability)), but other hosts are not supported yet.
 
+## Division of responsibility
+
+One-time setup in the manager (DTC), then authentik decides:
+
+| The manager (DTC) | authentik |
+| --- | --- |
+| Install or adopt authentik; connect to its API | Users, passwords, Google sign-in, invitations |
+| Publish the sign-in page (`auth.<domain>`, Cloudflare, Traefik) | Group memberships (including `DTC owners`) |
+| Guide the Google OAuth client; create the Google source | Sign-in and enrollment flows (including the owner-only enrollment rule after setup) |
+| Initial owner, once: owner-only enrollment, `DTC owners` group | Who may open each application (bindings, policies) |
+| Per application: provider, application, outpost, ForwardAuth route | |
+| Connection health, removing protection | |
+
+The manager keeps no user lists, never asks for emails, groups or domains per application, and never changes authentik's
+users, groups, flows, policies or bindings after creating them once. Changes made in authentik take effect immediately:
+no manager update and no Traefik change is needed. A future Authelia integration follows the same split.
+
 ## The path of a request
 
 ```
@@ -73,21 +90,23 @@ Steps, each with its own state (`lib\IdentityProvider.psm1`, `Get-IdentityModel`
 4. **Manager connection**: the installation's bootstrap token (one click) or a pasted API token; stored with DPAPI in
    `secrets\authentik_api.dpapi`; must belong to an administrator.
    See [Connection settings](#connection-settings-api-token) below: the token can be replaced at any time.
-5. **Public sign-in address**: suggests `auth.<your domain>`, records it, then creates the route through the normal
+5. **Initial owner** (asked once): the Google account of the person who owns this authentik, and whether it also becomes
+   an authentik administrator. It can be changed until the owner has signed in with Google.
+6. **Public sign-in address**: suggests `auth.<your domain>`, records it, then creates the route through the normal
    service preview (hostname claims, Cloudflare DNS/tunnel route checks, validation, backup). Recommended exposure:
    public (authentik is the login); Cloudflare Access in front is possible but means two logins and Google's callback
    has to pass Access. The embedded outpost's `authentik_host` is then pointed at `https://auth.<domain>/`.
-6. **Google sign-in** (below).
-7. **Protected applications** (below).
-8. **Health**: one row per component (server, worker, PostgreSQL, network, administrator setup, API, route, Cloudflare,
+7. **Google sign-in** (below), finished by the owner's first Google sign-in.
+8. **Protect applications** (below).
+9. **Health**: one row per component (server, worker, PostgreSQL, network, administrator setup, API, route, Cloudflare,
    public address, outpost, Google source, OAuth callback, real Google sign-in, ForwardAuth per application).
 
 States: *Not configured*, *Configured*, *Awaiting your action*, *Reachable*, *Authentication required*, *Verified*,
-*Failed*, *Skipped*. **Verified only from evidence**: Google = a user connected to the Google source signed in after it
-was configured; an application = authentik's own `authorize_application` event for it; the public address = an HTTP
+*Failed*, *Skipped*. **Verified only from evidence**: Google and the owner = the owner's account, connected to the Google
+source and holding the owner's address, exists (authentik only creates it after Google verified that address); an application = authentik's own `authorize_application` event for it; the public address = an HTTP
 answer from authentik through Cloudflare. Saved configuration or an HTTP 200 never counts.
 
-Resumable: `config\identity.json` keeps the choice, hostname, the Google client ID and sign-up rules (never the secret),
+Resumable: `config\identity.json` keeps the choice, hostname, the Google client ID, the owner's address (never the secret),
 protected applications and the last step worked on. Every authentik change is computed as a dry run first, applied once
 after confirmation, recomputed right before applying (refused if anything changed) and idempotent (re-running creates
 nothing twice; leftovers of an interrupted run are updated, not duplicated).
@@ -151,36 +170,43 @@ Then the manager configures authentik through its API (dry run first):
 
 - OAuth source `google` (type Google, client ID/secret, *promoted* login button, authentication flow
   `default-source-authentication`).
-- **Sign-up**: *Only the people I list* (default) creates `dm-google-enrollment` (the default enrollment stages, plus the
-  expression policy `dm-google-enrollment-allowlist`: Google's address must be verified and on the email/domain list);
-  *Any Google account* (default enrollment flow; new users get no application access); *No new accounts* (only users who
-  connected Google in their own settings).
-- **Account matching**: `identifier` (default; never links to an existing account by email, so nobody can take over
-  akadmin by controlling an email address) or `email_deny`. `email_link` is not offered. Existing users link Google
-  explicitly from their authentik user settings while signed in.
-- The login page's identification stage shows the Google button.
-- Never grants administrator rights; akadmin keeps its password (Google is never the only way in).
+- **Owner-only sign-up**: enrollment flow `dm-google-enrollment` (the default enrollment stages) with the expression policy
+  `dm-google-initial-owner`: only the owner's address, and only when Google reports it verified, may create an account.
+  After setup this policy is authentik's: edit it there, or use invitations, to let other people in.
+- **Owner group**: `DTC owners`, created with akadmin (the local recovery account) as first member. When the owner has
+  signed in with Google (*Check owner sign-in*), their account joins it and, if chosen, `authentik Admins`. The manager
+  only ever adds these memberships during that one step.
+- **Account matching**: `identifier` (never links an existing account by email, so nobody can take over akadmin by
+  controlling an email address). Existing users link Google from their authentik user settings while signed in.
+- The login page shows the Google button. akadmin keeps its password (Google is never the only way in).
+- Re-running the wizard creates nothing twice and changes only the client ID/secret; the flow, policy and group are left
+  as authentik has them.
 
 The client secret goes from the password field to the local server to authentik in one request; it is not stored by
 the manager, not logged, not returned and not shown again. To rotate it: create a new secret in Google, run the wizard
 again with it (only the source changes), then delete the old secret in Google.
 
-## Protecting an application
+## Protecting applications
 
-Per application (single-application ForwardAuth, so each one has its own rules):
+*Protect applications* lists the services with a checkbox each (compatible: enabled, one hostname, not the sign-in page
+itself) and one action, **Protect selected with authentik**. Nothing about people is asked. For each selected application
+(preview first, then one after the other, each with its own Traefik backup):
 
-- proxy provider `dm-<service>` (mode `forward_single`, external host `https://<hostname>`, implicit-consent authorization
-  flow), application `dm-<service>`, assigned to the embedded outpost;
-- who may open it: email addresses and/or domains (expression policy `dm-<service>-access`, refused while users may change
-  their own email in authentik), existing groups, and/or a new group `<service> users` (administrator groups are never
-  offered). At least one rule is required: an authentik application without bindings admits every user.
-- then the Traefik route (preview with diff, validation in a throwaway Traefik, backup, reload). The route switches only
-  after the outpost has loaded the provider, and the result is checked with an unauthenticated request (must redirect to
-  sign in; loops are detected).
-- Cloudflare Access is kept unless you choose to remove it (or to add it).
+- proxy provider `dm-<service>` (mode `forward_single`, external host `https://<hostname>`) and application
+  `dm-<service>`: created, or reused when they exist (only the provider's mode/address and the link are corrected);
+- access: when the application has **no** binding in authentik yet, the group `DTC owners` is bound (owner-only, never
+  "every signed-in user"); an application that already has bindings keeps exactly those;
+- assignment to the embedded outpost;
+- the Traefik route with ForwardAuth (diff, validation in a throwaway Traefik, backup, reload). The route switches only
+  after the outpost has loaded the provider, and the application counts as protected only after an unauthenticated
+  request was sent to sign in (loops are detected);
+- Cloudflare Access stays as it is unless you choose *Remove Cloudflare Access* for the selection.
 
-Removing protection: Traefik first (the route stops asking authentik), then the authentik application, provider and
-policy; groups are kept. The preview says what remains in front of the application.
+Each protected application shows its status, how many access rules authentik has (read only) and **Open in authentik**.
+
+Removing protection: Traefik first (the route stops asking authentik), then the outpost stops serving the provider. The
+authentik application, its provider and its access rules stay in authentik; protecting again reuses them. The preview
+says what remains in front of the application.
 
 ForwardAuth vs. native OpenID Connect: ForwardAuth works for any web application without changing it (the app sees
 `X-authentik-*` headers and keeps its own login if it has one). Applications with OIDC support (Portainer, Immich, …) can
@@ -194,7 +220,7 @@ sign users in natively through an authentik OAuth2 provider; the manager does no
 - authentik down: protected applications refuse requests (fail closed). Remove protection on Identity & Access, or restore
   the service backup made before protecting (Backups > rollback), to open them without authentik.
 - Rollback of routes: every protect/unprotect writes a service backup; restoring it restores the previous routes.
-- Configuration backups include `config\identity.json` (choices, no secrets, no "verified" marks) and list the authentik
+- Configuration backups include `config\identity.json` (choices and the owner's address; no secrets, no "verified" marks, no access rules) and list the authentik
   token as an excluded credential. authentik's own data (users, sources, the Google secret) is in its database: back it up
   with *Installed apps > Back up* (volume copy).
 
@@ -210,7 +236,7 @@ manifest (plain Linux containers). Debian, Arch and Unraid need a secret-store a
 | --- | --- |
 | `tests\Test-Identity.ps1` | No authentik: ForwardAuth YAML (and, with Docker, acceptance by a throwaway Traefik), validation guards, Google values, allow-lists and policy expressions (injection), discovery, every model state, config resume, secret store, catalog manifest. |
 | `tests\Test-IdentityLive.ps1` | Disposable instance + authentik installed through the catalog API: bootstrap, readiness, network isolation, adopt, token, sign-in route, outpost, Google source with **synthetic** credentials (redirect check, idempotency, secret never leaks), protect/unprotect, sign-ins through the real outpost (allowed, denied, wrong password, group), access evidence, loop detection, fail closed, interrupted setup, rollback, persistence, bootstrap-only-once, browser (screenshots). Removes everything it created and checks that no other container changed. |
-| `node tests\ui-logic.test.js` | Browser-side helpers (state vocabulary, redirect URI, client ID, allow-list parsing, next step). |
+| `node tests\ui-logic.test.js` | Browser-side helpers (state vocabulary, redirect URI, client ID, credential status, next step). |
 
 ## Limitations
 

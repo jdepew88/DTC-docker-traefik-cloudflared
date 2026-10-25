@@ -198,17 +198,18 @@ function ConvertTo-IdentitySection($Raw) {
   if ($hostname -and $hostname -notmatch $script:HostnamePattern) { $hostname = '' }
   $clientId = [string](Get-Prop $g 'clientId' '')
   if ($clientId -notmatch '^[0-9]{6,20}-[a-z0-9]{8,64}\.apps\.googleusercontent\.com$') { $clientId = '' }
-  $apps = [ordered]@{}
-  $rawApps = Get-Prop $a 'apps' $null
-  if ($rawApps) { foreach ($p in $rawApps.PSObject.Properties) { if ($p.Name -match '^[a-z0-9]([a-z0-9-]{0,38}[a-z0-9])?$') { $apps[$p.Name] = [ordered]@{ emails = @(Get-ManifestStrings $p.Value 'emails' | Where-Object { $_ -match $script:EmailPattern }); domains = @(Get-ManifestStrings $p.Value 'domains' | Where-Object { $_ -match $script:HostnamePattern }); groups = @(Get-ManifestStrings $p.Value 'groups' | Where-Object { $_.Length -le 80 }) } } } }
+  # Protected applications by name only: who may open them is authentik's (in its own database backup).
+  $apps = @(); $rawApps = Get-Prop $a 'apps' $null
+  if ($rawApps) { $apps = @($rawApps.PSObject.Properties | Where-Object { $_.Name -match '^[a-z0-9]([a-z0-9-]{0,38}[a-z0-9])?$' } | ForEach-Object { $_.Name }) }
+  $o = Get-Prop $a 'owner' $null
+  $ownerEmail = ([string](Get-Prop $o 'email' '')).ToLowerInvariant(); if ($ownerEmail -notmatch $script:EmailPattern) { $ownerEmail = '' }
   return [ordered]@{
     version = 1; provider = $provider
     authentik = [ordered]@{
       project = [string](Get-Prop $a 'project' ''); serverContainer = [string](Get-Prop $a 'serverContainer' ''); hostname = $hostname; service = [string](Get-Prop $a 'service' ''); publicUrl = $(if ($hostname) { "https://$hostname" } else { '' })
-      google = [ordered]@{ slug = $(if ([string](Get-Prop $g 'slug' 'google') -match '^[a-z0-9][a-z0-9_-]{0,48}$') { [string](Get-Prop $g 'slug' 'google') } else { 'google' }); clientId = $clientId
-        signup = $(if ([string](Get-Prop $g 'signup' '') -in 'allowlist', 'open', 'existing') { [string]$g.signup } else { 'allowlist' }); emails = @(Get-ManifestStrings $g 'emails' | Where-Object { $_ -match $script:EmailPattern }); domains = @(Get-ManifestStrings $g 'domains' | Where-Object { $_ -match $script:HostnamePattern })
-        matching = $(if ([string](Get-Prop $g 'matching' '') -eq 'email_deny') { 'email_deny' } else { 'identifier' }); showOnLogin = [bool](Get-Prop $g 'showOnLogin' $true) }
-      apps = $apps
+      google = [ordered]@{ slug = $(if ([string](Get-Prop $g 'slug' 'google') -match '^[a-z0-9][a-z0-9_-]{0,48}$') { [string](Get-Prop $g 'slug' 'google') } else { 'google' }); clientId = $clientId }
+      owner = [ordered]@{ email = $ownerEmail; makeAdmin = [bool](Get-Prop $o 'makeAdmin' $true) }
+      protectedApps = $apps
     }
   }
 }

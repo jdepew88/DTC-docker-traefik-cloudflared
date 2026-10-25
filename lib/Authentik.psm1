@@ -2,10 +2,14 @@
 # authentik integration: health and first-setup detection, a small API client (/api/v3, token auth) and idempotent
 # "sync" functions for the Google OAuth source, the embedded outpost and per-application ForwardAuth protection.
 #
+# Division of responsibility: the manager sets authentik up once (Google source, owner-only enrollment, the
+# "DTC owners" group) and connects applications to it (proxy provider, application, outpost, Traefik ForwardAuth).
+# Who may sign in and open what is authentik's: users, groups, invitations, flows and access rules are created at most
+# once as safe defaults and never changed by the manager afterwards, so edits made in authentik always stand.
+#
 # Every sync function has a dry-run mode (-WhatIf) that returns the actions it would take without changing anything;
 # the web UI shows that as the preview and applies the same function without -WhatIf after approval. Objects this
-# manager creates carry the "dm-" prefix (slugs/names) and are recorded in config\identity.json, so they can be found
-# again, updated in place (never duplicated) and removed without touching objects created by hand.
+# manager creates carry the "dm-" prefix (slugs/names), so they are found again and never duplicated.
 #
 # Endpoints and fields were verified against the OpenAPI schema of authentik 2026.8.5 (/api/v3/schema/).
 Set-StrictMode -Version 2.0
@@ -266,53 +270,31 @@ function Get-GoogleOAuthSettings {
 function Test-GoogleClientId([string]$Value) { return ([string]$Value).Trim() -match $script:GoogleClientIdPattern }
 function Test-GoogleClientSecret([string]$Value) { return ([string]$Value).Trim() -match $script:GoogleSecretPattern }
 
-# Normalized, validated allow-lists. Returns Emails, Domains and Errors.
-function ConvertTo-AccessList {
-  param($Emails = @(), $Domains = @())
-  $errors = @()
-  $e = @(@($Emails) | ForEach-Object { ([string]$_).Trim().ToLowerInvariant() } | Where-Object { $_ } | Select-Object -Unique)
-  $d = @(@($Domains) | ForEach-Object { ([string]$_).Trim().TrimStart('@').ToLowerInvariant() } | Where-Object { $_ } | Select-Object -Unique)
-  foreach ($x in $e) { if ($x -notmatch $script:EmailPattern) { $errors += "'$x' is not a valid email address." } }
-  foreach ($x in $d) { if ($x -notmatch $script:DomainPattern) { $errors += "'$x' is not a valid domain (for example example.com)." } }
-  if ($e.Count -gt 200 -or $d.Count -gt 50) { $errors += 'At most 200 email addresses and 50 domains.' }
-  return [pscustomobject]@{ Emails = $e; Domains = $d; Errors = $errors }
+# The initial owner's Google address (asked once during setup). Returns the normalized address or throws.
+function ConvertTo-OwnerEmail([string]$Value) {
+  $e = ([string]$Value).Trim().ToLowerInvariant()
+  if ($e -notmatch $script:EmailPattern) { throw "'$Value' is not a valid email address." }
+  return $e
 }
 
-# Python literal list of validated strings (the patterns above exclude quotes and backslashes).
-function ConvertTo-PyList([string[]]$Items) { return '[' + ((@($Items) | ForEach-Object { '"' + $_ + '"' }) -join ', ') + ']' }
-
-# Expression policy: who may open an application (by their authentik email, which users cannot change themselves while
-# "Allow users to change email" is off - checked before this policy is used).
-function New-AppAccessExpression([string[]]$Emails, [string[]]$Domains) {
-  return @(
-    '# Managed by the Deployment Manager: edits are replaced on the next change from the manager.',
-    "allowed_emails = $(ConvertTo-PyList $Emails)",
-    "allowed_domains = $(ConvertTo-PyList $Domains)",
-    'email = (request.user.email or "").strip().lower()',
-    'if not email or not request.user.is_active:',
-    '    return False',
-    'if email in allowed_emails:',
-    '    return True',
-    'return email.rsplit("@", 1)[-1] in allowed_domains'
-  ) -join "`n"
-}
-
-# Expression policy on the Google enrollment flow: only verified Google addresses on the allow-list may create an account.
+# Expression policy on the Google enrollment flow: only the initial owner's verified Google address may create an
+# account. Created once during setup; afterwards it belongs to authentik (edit it there to let others enroll).
 # oauth_userinfo is what Google returned (verified_email from the userinfo endpoint, email_verified from OpenID Connect).
-function New-EnrollmentExpression([string[]]$Emails, [string[]]$Domains) {
+function New-OwnerEnrollmentExpression([string]$OwnerEmail) {
+  $e = ConvertTo-OwnerEmail $OwnerEmail
   return @(
-    '# Managed by the Deployment Manager: who may create an account by signing in with Google.',
-    "allowed_emails = $(ConvertTo-PyList $Emails)",
-    "allowed_domains = $(ConvertTo-PyList $Domains)",
+    '# Created by the Deployment Manager (DTC) during setup: only the initial owner may create an account with Google.',
+    '# This policy now belongs to authentik: edit it here, or use invitations, to let other people enroll.',
+    "owner_email = `"$e`"",
     'info = request.context.get("oauth_userinfo") or {}',
     'email = str(info.get("email") or "").strip().lower()',
     'verified = info.get("verified_email", info.get("email_verified", False)) in (True, "true", "True")',
-    'if not email or not verified:',
+    'if not verified:',
     '    ak_message("Your Google address is not verified.")',
     '    return False',
-    'if email in allowed_emails or email.rsplit("@", 1)[-1] in allowed_domains:',
+    'if email == owner_email:',
     '    return True',
-    'ak_message("This Google account is not allowed to create an account here. Ask the administrator to add it.")',
+    'ak_message("This Google account may not create an account here. Ask the administrator for an invitation.")',
     'return False'
   ) -join "`n"
 }
@@ -382,100 +364,166 @@ function Sync-AuthentikOutpost {
   return $actions.ToArray()
 }
 
-# --- Google source ------------------------------------------------------------------------------------------------------
+# --- Initial owner, Google source -----------------------------------------------------------------------------------
 
-# Desired: Slug, Name, ClientId, ClientSecret (optional when the source exists: the stored secret is kept), Signup
-# ('allowlist' | 'open' | 'existing'), Emails, Domains, Matching ('identifier' | 'email_deny'), ShowOnLogin.
+$script:OwnersGroup = 'DTC owners'
+$script:AdminsGroup = 'authentik Admins'
+function Get-AuthentikOwnersGroupName { return $script:OwnersGroup }
+
+function Get-AuthentikGroup($Conn, [string]$Name) {
+  return @(Get-AuthentikList $Conn "/core/groups/?name=$([Uri]::EscapeDataString($Name))" | Where-Object { [string]$_.name -eq $Name })[0]
+}
+
+# One-time setup in authentik (each object only created when missing; existing ones are never changed):
+#   - group "DTC owners" (the initial owner-only access rule for protected applications), with the administrator whose
+#     token the manager uses (akadmin, the local recovery account) as its first member;
+#   - enrollment flow dm-<slug>-enrollment (the default enrollment stages) with a policy that admits only the owner's
+#     verified Google address; while the owner has not signed in yet, a changed owner address updates that policy;
+#   - the Google OAuth source (client ID/secret; identifier matching: never linked to an existing account by email) and
+#     its button on the login page.
+# Desired: Slug, ClientId, ClientSecret (optional when the source exists), OwnerEmail, OwnerVerified (bool).
 function Sync-AuthentikGoogleSource {
   param([Parameter(Mandatory = $true)]$Conn, [Parameter(Mandatory = $true)]$Desired, [switch]$WhatIf)
   $actions = New-AkActionList
-  $slug = [string]$Desired.Slug
+  $slug = [string](Get-AkProp $Desired 'Slug' 'google')
   if ($slug -notmatch $script:SlugPattern) { throw "Invalid source slug '$slug'." }
-  if (-not (Test-GoogleClientId $Desired.ClientId)) { throw 'The client ID does not look like a Google OAuth client ID (ending in .apps.googleusercontent.com).' }
+  if (-not (Test-GoogleClientId (Get-AkProp $Desired 'ClientId' ''))) { throw 'The client ID does not look like a Google OAuth client ID (ending in .apps.googleusercontent.com).' }
   $secret = [string](Get-AkProp $Desired 'ClientSecret' '')
   if ($secret -and -not (Test-GoogleClientSecret $secret)) { throw 'The client secret contains unexpected characters. Copy it again from Google Cloud.' }
+  $owner = ConvertTo-OwnerEmail (Get-AkProp $Desired 'OwnerEmail' '')
+  $ownerVerified = [bool](Get-AkProp $Desired 'OwnerVerified' $false)
   $ov = Get-AuthentikOverview $Conn
   if ($ov.MissingFlows.Count) { throw "authentik is not fully initialized yet (missing flows: $($ov.MissingFlows -join ', ')). Wait a minute and try again." }
   $existing = @(Get-AuthentikList $Conn "/sources/oauth/?slug=$slug")[0]
   if ($existing -and [string]$existing.provider_type -ne 'google') { throw "A source with the slug '$slug' already exists and is not a Google source. Choose another slug." }
   if (-not $existing -and -not $secret) { throw 'Enter the client secret.' }
-  $list = ConvertTo-AccessList $Desired.Emails $Desired.Domains
-  if ($list.Errors.Count) { throw ($list.Errors -join ' ') }
-  $signup = [string]$Desired.Signup
-  if ($signup -notin 'allowlist', 'open', 'existing') { throw "Unknown sign-up mode '$signup'." }
-  if ($signup -eq 'allowlist' -and -not ($list.Emails.Count + $list.Domains.Count)) { throw 'Add at least one email address or domain that may create an account, or choose another sign-up option.' }
-  $matching = $(if ([string](Get-AkProp $Desired 'Matching' 'identifier') -eq 'email_deny') { 'email_deny' } else { 'identifier' })
 
-  # Enrollment flow.
-  $enrollPk = $null
-  switch ($signup) {
-    'open' { $enrollPk = $ov.Flows['default-source-enrollment'].Pk; Add-AkAction $actions 'none' 'flow' 'default-source-enrollment' 'New Google users enroll through the default source enrollment flow (they get no application access until you grant it)' }
-    'existing' { Add-AkAction $actions 'none' 'flow' '(none)' 'No enrollment: only users who connected Google to their existing authentik account can sign in with Google' }
-    'allowlist' {
-      $fslug = "$($script:Prefix)$slug-enrollment"
-      $flow = $(if ($ov.Flows.ContainsKey($fslug)) { Invoke-AuthentikApi $Conn GET "/flows/instances/$fslug/" } else { $null })
-      $flow = Sync-AkObject -Conn $Conn -Actions $actions -Object 'flow' -Name $fslug -Existing $flow -CollectionPath '/flows/instances/' -ItemPath "/flows/instances/$fslug/" -WhatIf:$WhatIf -Desired @{
-        name = 'Google enrollment (Deployment Manager)'; slug = $fslug; title = 'Create your account'; designation = 'enrollment'; authentication = 'none'; denied_action = 'message'; policy_engine_mode = 'any' }
-      # Same stages, same order as the default source enrollment flow (prompt, write user, log in): the stages are shared.
-      $def = $ov.Flows['default-source-enrollment'].Pk
-      $want = @(Get-AuthentikList $Conn "/flows/bindings/?target=$def&ordering=order")
-      $have = @(); if (-not $flow.PSObject.Properties['planned']) { $have = @(Get-AuthentikList $Conn "/flows/bindings/?target=$($flow.pk)&ordering=order") }
-      foreach ($b in $want) {
-        if (@($have | Where-Object { [string]$_.stage -eq [string]$b.stage }).Count) { Add-AkAction $actions 'none' 'flow stage' $b.stage_obj.name "Stage '$($b.stage_obj.name)' is bound"; continue }
-        Add-AkAction $actions 'create' 'flow stage' $b.stage_obj.name "Bind stage '$($b.stage_obj.name)' (order $($b.order))"
-        if (-not $WhatIf) { $null = Invoke-AuthentikApi $Conn POST '/flows/bindings/' @{ target = $flow.pk; stage = $b.stage; order = [int]$b.order; evaluate_on_plan = [bool]$b.evaluate_on_plan; re_evaluate_policies = [bool]$b.re_evaluate_policies }; Set-AkActionDone $actions }
-      }
-      $pname = "$($script:Prefix)$slug-enrollment-allowlist"
-      $pol = @(Get-AuthentikList $Conn "/policies/expression/?name=$([Uri]::EscapeDataString($pname))")[0]
-      $pol = Sync-AkObject -Conn $Conn -Actions $actions -Object 'policy' -Name $pname -Existing $pol -CollectionPath '/policies/expression/' -ItemPath "/policies/expression/$(Get-AkProp $pol 'pk' '')/" -WhatIf:$WhatIf -Desired @{
-        name = $pname; expression = (New-EnrollmentExpression $list.Emails $list.Domains); execution_logging = $false }
-      $flowPbm = [string](Get-AkProp $flow 'policybindingmodel_ptr_id' $flow.pk)
-      $bound = @(); if (-not $flow.PSObject.Properties['planned'] -and -not $pol.PSObject.Properties['planned']) { $bound = @(Get-AuthentikList $Conn "/policies/bindings/?target=$flowPbm" | Where-Object { [string]$_.policy -eq [string]$pol.pk }) }
-      if ($bound.Count) { Add-AkAction $actions 'none' 'policy binding' $pname 'The allow-list is bound to the enrollment flow' }
-      else {
-        Add-AkAction $actions 'create' 'policy binding' $pname 'Bind the allow-list to the enrollment flow'
-        if (-not $WhatIf) { $null = Invoke-AuthentikApi $Conn POST '/policies/bindings/' @{ policy = $pol.pk; target = $flowPbm; order = 0; enabled = $true; negate = $false; timeout = 30; failure_result = $false }; Set-AkActionDone $actions }
-      }
-      $enrollPk = [string]$flow.pk
+  # Owner group with the administrator as first member.
+  $grp = Get-AuthentikGroup $Conn $script:OwnersGroup
+  if ($grp) { Add-AkAction $actions 'none' 'group' $script:OwnersGroup "Group '$($script:OwnersGroup)' exists (members are managed in authentik)" }
+  else {
+    Add-AkAction $actions 'create' 'group' $script:OwnersGroup "Create group '$($script:OwnersGroup)' with $($ov.User.Username) as first member" 'The initial owner-only access rule for protected applications. Add or remove people in authentik.'
+    if (-not $WhatIf) {
+      $me = Invoke-AuthentikApi $Conn GET '/core/users/me/'
+      $grp = Invoke-AuthentikApi $Conn POST '/core/groups/' @{ name = $script:OwnersGroup; is_superuser = $false; users = @([int]$me.user.pk); attributes = @{ 'created-by' = 'traefik-deployment-manager' } }
+      Set-AkActionDone $actions
     }
   }
 
-  # The source itself.
-  $desiredSource = @{
-    name = [string](Get-AkProp $Desired 'Name' 'Google'); slug = $slug; enabled = $true; promoted = $true; provider_type = 'google'
-    consumer_key = ([string]$Desired.ClientId).Trim(); authentication_flow = $ov.Flows['default-source-authentication'].Pk; enrollment_flow = $enrollPk
-    user_matching_mode = $matching; policy_engine_mode = 'any'
-  }
-  $secretFields = @()
-  if ($secret) { $desiredSource['consumer_secret'] = $secret.Trim(); $secretFields = @('consumer_secret') }
-  $src = Sync-AkObject -Conn $Conn -Actions $actions -Object 'Google source' -Name $slug -Existing $existing -CollectionPath '/sources/oauth/' -ItemPath "/sources/oauth/$slug/" -Desired $desiredSource -SecretFields $secretFields -WhatIf:$WhatIf
-
-  # Login page button.
-  $stage = $ov.LoginStage
-  $show = [bool](Get-AkProp $Desired 'ShowOnLogin' $true)
-  if (-not $stage) { Add-AkAction $actions 'none' 'login page' '(identification stage)' 'The login page''s identification stage was not found: add the Google button in authentik by hand (Flows > default-authentication-flow > identification stage > Sources).' }
+  # Owner-only enrollment flow.
+  $fslug = "$($script:Prefix)$slug-enrollment"
+  $flow = $(if ($ov.Flows.ContainsKey($fslug)) { Invoke-AuthentikApi $Conn GET "/flows/instances/$fslug/" } else { $null })
+  if ($flow) { Add-AkAction $actions 'none' 'flow' $fslug "Enrollment flow '$fslug' exists" }
   else {
-    $srcPk = [string](Get-AkProp $src 'pk' '')
-    $has = $stage.Sources -contains $srcPk
-    if ($show -and -not $has) {
-      Add-AkAction $actions 'update' 'login page' $stage.Name "Show 'Sign in with Google' on the login page (stage '$($stage.Name)')"
-      if (-not $WhatIf) { $null = Invoke-AuthentikApi $Conn PATCH "/stages/identification/$($stage.Pk)/" @{ sources = @(@($stage.Sources) + $srcPk) }; Set-AkActionDone $actions }
-    } elseif (-not $show -and $has) {
-      Add-AkAction $actions 'update' 'login page' $stage.Name "Hide the Google button on the login page (stage '$($stage.Name)')"
-      if (-not $WhatIf) { $null = Invoke-AuthentikApi $Conn PATCH "/stages/identification/$($stage.Pk)/" @{ sources = @($stage.Sources | Where-Object { $_ -ne $srcPk }) }; Set-AkActionDone $actions }
-    } else { Add-AkAction $actions 'none' 'login page' $stage.Name $(if ($show) { 'The login page shows the Google button' } else { 'The login page does not show the Google button' }) }
+    Add-AkAction $actions 'create' 'flow' $fslug "Create enrollment flow '$fslug' (default enrollment stages)"
+    if (-not $WhatIf) { $flow = Invoke-AuthentikApi $Conn POST '/flows/instances/' @{ name = 'Google enrollment (Deployment Manager)'; slug = $fslug; title = 'Create your account'; designation = 'enrollment'; authentication = 'none'; denied_action = 'message'; policy_engine_mode = 'any' }; Set-AkActionDone $actions }
+    else { $flow = [pscustomobject]@{ pk = '<new flow>'; policybindingmodel_ptr_id = '<new flow>'; planned = $true } }
   }
-  return [pscustomobject]@{ Actions = $actions.ToArray(); SourcePk = [string](Get-AkProp $src 'pk' ''); EnrollmentFlow = $enrollPk }
+  if (-not $flow.PSObject.Properties['planned']) {
+    $have = @(Get-AuthentikList $Conn "/flows/bindings/?target=$($flow.pk)&ordering=order")
+    if (-not $have.Count) {
+      foreach ($b in @(Get-AuthentikList $Conn "/flows/bindings/?target=$($ov.Flows['default-source-enrollment'].Pk)&ordering=order")) {
+        Add-AkAction $actions 'create' 'flow stage' $b.stage_obj.name "Bind stage '$($b.stage_obj.name)' (order $($b.order))"
+        if (-not $WhatIf) { $null = Invoke-AuthentikApi $Conn POST '/flows/bindings/' @{ target = $flow.pk; stage = $b.stage; order = [int]$b.order; evaluate_on_plan = [bool]$b.evaluate_on_plan; re_evaluate_policies = [bool]$b.re_evaluate_policies }; Set-AkActionDone $actions }
+      }
+    } else { Add-AkAction $actions 'none' 'flow stage' $fslug "The enrollment flow has its stages ($($have.Count))" }
+  } else { Add-AkAction $actions 'create' 'flow stage' $fslug 'Bind the default enrollment stages (prompt, write user, log in)' }
+  $pname = "$($script:Prefix)$slug-initial-owner"
+  $pol = @(Get-AuthentikList $Conn "/policies/expression/?name=$([Uri]::EscapeDataString($pname))")[0]
+  $expr = New-OwnerEnrollmentExpression $owner
+  if (-not $pol) {
+    Add-AkAction $actions 'create' 'policy' $pname "Only $owner may create an account with Google"
+    if (-not $WhatIf) { $pol = Invoke-AuthentikApi $Conn POST '/policies/expression/' @{ name = $pname; expression = $expr; execution_logging = $false }; Set-AkActionDone $actions }
+    else { $pol = [pscustomobject]@{ pk = '<new policy>'; planned = $true } }
+  } elseif ($ownerVerified -or [string]$pol.expression -eq $expr) { Add-AkAction $actions 'none' 'policy' $pname $(if ($ownerVerified) { 'The enrollment policy belongs to authentik now (not changed)' } else { "Only $owner may create an account with Google" }) }
+  else {
+    Add-AkAction $actions 'update' 'policy' $pname "Change the initial owner to $owner (the owner has not signed in yet)"
+    if (-not $WhatIf) { $null = Invoke-AuthentikApi $Conn PATCH "/policies/expression/$($pol.pk)/" @{ expression = $expr }; Set-AkActionDone $actions }
+  }
+  $flowPbm = [string](Get-AkProp $flow 'policybindingmodel_ptr_id' $flow.pk)
+  $bound = @()
+  if (-not $flow.PSObject.Properties['planned'] -and -not $pol.PSObject.Properties['planned']) { $bound = @(Get-AuthentikList $Conn "/policies/bindings/?target=$flowPbm") }
+  if ($bound.Count) { Add-AkAction $actions 'none' 'policy binding' $fslug 'The enrollment flow has its access rule' }
+  else {
+    Add-AkAction $actions 'create' 'policy binding' $fslug 'Bind the owner-only rule to the enrollment flow'
+    if (-not $WhatIf) { $null = Invoke-AuthentikApi $Conn POST '/policies/bindings/' @{ policy = $pol.pk; target = $flowPbm; order = 0; enabled = $true; negate = $false; timeout = 30; failure_result = $false }; Set-AkActionDone $actions }
+  }
+
+  # The source: client ID and secret are DTC's to set (the user rotates them here); flows and matching only on creation.
+  $src = $existing
+  if (-not $existing) {
+    Add-AkAction $actions 'create' 'Google source' $slug "Create the Google source '$slug' (never linked to existing accounts by email)"
+    if (-not $WhatIf) {
+      $src = Invoke-AuthentikApi $Conn POST '/sources/oauth/' @{ name = 'Google'; slug = $slug; enabled = $true; promoted = $true; provider_type = 'google'; consumer_key = ([string]$Desired.ClientId).Trim(); consumer_secret = $secret
+        authentication_flow = $ov.Flows['default-source-authentication'].Pk; enrollment_flow = [string]$flow.pk; user_matching_mode = 'identifier'; policy_engine_mode = 'any' }
+      Set-AkActionDone $actions
+    }
+  } else {
+    $patch = @{}
+    if ([string]$existing.consumer_key -ne ([string]$Desired.ClientId).Trim()) { $patch.consumer_key = ([string]$Desired.ClientId).Trim() }
+    if ($secret) { $patch.consumer_secret = $secret }
+    if (-not [string](Get-AkProp $existing 'enrollment_flow' '') -and -not $ownerVerified -and -not $flow.PSObject.Properties['planned']) { $patch.enrollment_flow = [string]$flow.pk }
+    if ($patch.Count) {
+      Add-AkAction $actions 'update' 'Google source' $slug "Update the Google source '$slug'" (@($patch.Keys | ForEach-Object { if ($_ -eq 'consumer_secret') { 'client secret (new value)' } elseif ($_ -eq 'consumer_key') { 'client ID' } else { $_ } }) -join ', ')
+      if (-not $WhatIf) { $src = Invoke-AuthentikApi $Conn PATCH "/sources/oauth/$slug/" $patch; Set-AkActionDone $actions }
+    } else { Add-AkAction $actions 'none' 'Google source' $slug "The Google source '$slug' is configured" }
+  }
+
+  # Login page button (added once; removing it later in authentik is respected only after setup).
+  $stage = $ov.LoginStage
+  $srcPk = [string](Get-AkProp $src 'pk' '')
+  if (-not $stage) { Add-AkAction $actions 'none' 'login page' '(identification stage)' 'The login page''s identification stage was not found: add the Google button in authentik by hand.' }
+  elseif ($srcPk -and $stage.Sources -contains $srcPk) { Add-AkAction $actions 'none' 'login page' $stage.Name 'The login page shows "Sign in with Google"' }
+  elseif ($ownerVerified) { Add-AkAction $actions 'none' 'login page' $stage.Name 'The login page is managed in authentik (not changed)' }
+  else {
+    Add-AkAction $actions 'update' 'login page' $stage.Name "Show 'Sign in with Google' on the login page"
+    if (-not $WhatIf) { $null = Invoke-AuthentikApi $Conn PATCH "/stages/identification/$($stage.Pk)/" @{ sources = @(@($stage.Sources) + $srcPk) }; Set-AkActionDone $actions }
+  }
+  return [pscustomobject]@{ Actions = $actions.ToArray(); SourcePk = $srcPk; EnrollmentFlow = [string]$flow.pk; GroupPk = [string](Get-AkProp $grp 'pk' '') }
+}
+
+# The owner's account after their first Google sign-in: users connected to the Google source whose email is the
+# owner's address. (The enrollment policy already required Google to have verified that address.)
+function Find-AuthentikOwner {
+  param([Parameter(Mandatory = $true)]$Conn, [Parameter(Mandatory = $true)][string]$OwnerEmail, [string]$Slug = 'google')
+  $e = ConvertTo-OwnerEmail $OwnerEmail
+  $out = @()
+  foreach ($c in @(Get-AuthentikList $Conn "/sources/user_connections/oauth/?source__slug=$Slug")) {
+    $u = $null; try { $u = Invoke-AuthentikApi $Conn GET "/core/users/$($c.user)/" } catch { continue }
+    if (([string]$u.email).Trim().ToLowerInvariant() -eq $e) {
+      $out += [pscustomobject]@{ Pk = [int]$u.pk; Username = [string]$u.username; Email = [string]$u.email; IsActive = [bool]$u.is_active; IsSuperuser = [bool]$u.is_superuser
+        LastLogin = $(if ($u.last_login) { ([datetime]::Parse([string]$u.last_login, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind)).ToLocalTime().ToString('s') } else { '' })
+        Groups = @(@(Get-AkProp $u 'groups_obj' @()) | ForEach-Object { [string]$_.name }) }
+    }
+  }
+  return $out
+}
+
+# Completes the one-time owner setup: adds the verified owner account to "DTC owners" and, if chosen, to the
+# authentik administrators. Only adds memberships (never removes anything).
+function Complete-AuthentikOwner {
+  param([Parameter(Mandatory = $true)]$Conn, [Parameter(Mandatory = $true)][int]$UserPk, [switch]$MakeAdmin, [switch]$WhatIf)
+  $actions = New-AkActionList
+  $names = @($script:OwnersGroup) + $(if ($MakeAdmin) { @($script:AdminsGroup) } else { @() })
+  foreach ($n in $names) {
+    $g = Get-AuthentikGroup $Conn $n
+    if (-not $g) { Add-AkAction $actions 'none' 'group' $n "Group '$n' does not exist (skipped)"; continue }
+    if (@($g.users | ForEach-Object { [int]$_ }) -contains $UserPk) { Add-AkAction $actions 'none' 'group' $n "Already a member of '$n'"; continue }
+    Add-AkAction $actions 'update' 'group' $n "Add the owner to '$n'"
+    if (-not $WhatIf) { $null = Invoke-AuthentikApi $Conn POST "/core/groups/$($g.pk)/add_user/" @{ pk = $UserPk }; Set-AkActionDone $actions }
+  }
+  return $actions.ToArray()
 }
 
 # --- Application protection (ForwardAuth, single application) -----------------------------------------------------------
 
-# Desired: Service (registry name), DisplayName, Hostname, Emails, Domains, Groups (existing group names), CreateGroup.
-# Creates or updates: an optional group, an expression policy (emails/domains), a proxy provider in forward_single mode,
-# the application with its bindings, and assigns the provider to the embedded outpost. At least one binding is required:
-# an application without bindings is open to every authentik user.
+# Creates or reuses, for one application: the proxy provider dm-<service> (forward_single), the application dm-<service>
+# and the embedded outpost assignment. Access: when the application has no binding yet, the "DTC owners" group is bound
+# (the owner-only rule); an application that already has bindings keeps exactly those. Existing objects are not changed
+# except what the proxy integration needs (provider mode and external address, provider link, outpost assignment).
+# Desired: Service, DisplayName, Hostname, ExternalUrl (optional).
 function Sync-AuthentikAppProtection {
-  param([Parameter(Mandatory = $true)]$Conn, [Parameter(Mandatory = $true)]$Desired, $Known = $null, [switch]$WhatIf)
+  param([Parameter(Mandatory = $true)]$Conn, [Parameter(Mandatory = $true)]$Desired, [switch]$WhatIf)
   $actions = New-AkActionList
   $svc = ([string]$Desired.Service).ToLowerInvariant()
   $slug = "$($script:Prefix)$svc"
@@ -483,84 +531,52 @@ function Sync-AuthentikAppProtection {
   $hostname = ([string]$Desired.Hostname).ToLowerInvariant()
   if ($hostname -notmatch $script:DomainPattern) { throw "Invalid hostname '$hostname'." }
   $display = [string](Get-AkProp $Desired 'DisplayName' $svc)
-  $list = ConvertTo-AccessList (Get-AkProp $Desired 'Emails' @()) (Get-AkProp $Desired 'Domains' @())
-  if ($list.Errors.Count) { throw ($list.Errors -join ' ') }
-  $groupNames = @(@(Get-AkProp $Desired 'Groups' @()) | ForEach-Object { ([string]$_).Trim() } | Where-Object { $_ } | Select-Object -Unique)
-  $createGroup = [bool](Get-AkProp $Desired 'CreateGroup' $false)
-  $ownGroup = "$svc users"
-  if ($createGroup -and $groupNames -notcontains $ownGroup) { $groupNames += $ownGroup }
-  if (-not ($list.Emails.Count + $list.Domains.Count + $groupNames.Count)) { throw 'Choose who may open this application: email addresses, domains or groups. Without any, authentik would let every signed-in user in.' }
+  $external = [string](Get-AkProp $Desired 'ExternalUrl' "https://$hostname")
+  if ($external -notmatch '^https?://[a-z0-9.-]+(:\d{1,5})?$') { throw "Invalid application address '$external'." }
   $ov = Get-AuthentikOverview $Conn
   if ($ov.MissingFlows.Count) { throw "authentik is not fully initialized yet (missing flows: $($ov.MissingFlows -join ', '))." }
   if (-not $ov.Outpost) { throw 'authentik has no embedded outpost yet.' }
-  if (($list.Emails.Count + $list.Domains.Count) -and $ov.Settings.ChangeEmail) {
-    throw 'authentik lets users change their own email address (System > Settings > "Allow users to change email"), so an email allow-list could be bypassed. Turn that setting off, or use groups only.'
-  }
 
-  # Groups (existing ones are reused; only the app's own group is created).
-  $groups = @()
-  foreach ($gn in $groupNames) {
-    $g = @(Get-AuthentikList $Conn "/core/groups/?name=$([Uri]::EscapeDataString($gn))" | Where-Object { [string]$_.name -eq $gn })[0]
-    if (-not $g -and $gn -ne $ownGroup) { throw "authentik has no group named '$gn'." }
-    if ($g -and [bool](Get-AkProp $g 'is_superuser' $false) -and $gn -eq $ownGroup) { throw "The group '$gn' grants authentik administrator rights; choose another name." }
-    $g = Sync-AkObject -Conn $Conn -Actions $actions -Object 'group' -Name $gn -Existing $g -CollectionPath '/core/groups/' -ItemPath "/core/groups/$(Get-AkProp $g 'pk' '')/" -Desired @{ name = $gn; is_superuser = $false } -NoUpdate -WhatIf:$WhatIf
-    $groups += $g
-  }
-
-  # Email/domain policy.
-  $pname = "$slug-access"
-  $pol = @(Get-AuthentikList $Conn "/policies/expression/?name=$([Uri]::EscapeDataString($pname))")[0]
-  if ($list.Emails.Count + $list.Domains.Count) {
-    $pol = Sync-AkObject -Conn $Conn -Actions $actions -Object 'policy' -Name $pname -Existing $pol -CollectionPath '/policies/expression/' -ItemPath "/policies/expression/$(Get-AkProp $pol 'pk' '')/" -WhatIf:$WhatIf -Desired @{
-      name = $pname; expression = (New-AppAccessExpression $list.Emails $list.Domains); execution_logging = $false }
-  }
-
-  # Proxy provider (single application ForwardAuth).
+  # Proxy provider.
   $prov = @(Get-AuthentikList $Conn "/providers/proxy/?name=$([Uri]::EscapeDataString($slug))" | Where-Object { [string]$_.name -eq $slug })[0]
-  # The public address of the application (https via Cloudflare); tests use a local http address with a port.
-  $external = [string](Get-AkProp $Desired 'ExternalUrl' "https://$hostname")
-  if ($external -notmatch '^https?://[a-z0-9.-]+(:\d{1,5})?$') { throw "Invalid application address '$external'." }
-  $prov = Sync-AkObject -Conn $Conn -Actions $actions -Object 'proxy provider' -Name $slug -Existing $prov -CollectionPath '/providers/proxy/' -ItemPath "/providers/proxy/$(Get-AkProp $prov 'pk' '')/" -WhatIf:$WhatIf -Desired @{
-    name = $slug; mode = 'forward_single'; external_host = $external
-    authorization_flow = $ov.Flows['default-provider-authorization-implicit-consent'].Pk; invalidation_flow = $ov.Flows['default-provider-invalidation-flow'].Pk }
+  if (-not $prov) {
+    Add-AkAction $actions 'create' 'proxy provider' $slug "Create proxy provider '$slug' (single application, $external)"
+    if (-not $WhatIf) {
+      $prov = Invoke-AuthentikApi $Conn POST '/providers/proxy/' @{ name = $slug; mode = 'forward_single'; external_host = $external
+        authorization_flow = $ov.Flows['default-provider-authorization-implicit-consent'].Pk; invalidation_flow = $ov.Flows['default-provider-invalidation-flow'].Pk }
+      Set-AkActionDone $actions
+    } else { $prov = [pscustomobject]@{ pk = $null; planned = $true } }
+  } elseif ([string]$prov.mode -ne 'forward_single' -or [string]$prov.external_host -ne $external) {
+    Add-AkAction $actions 'update' 'proxy provider' $slug "Point '$slug' at $external (forward auth, single application)" "mode: '$($prov.mode)' -> 'forward_single'; address: '$($prov.external_host)' -> '$external'"
+    if (-not $WhatIf) { $prov = Invoke-AuthentikApi $Conn PATCH "/providers/proxy/$($prov.pk)/" @{ mode = 'forward_single'; external_host = $external }; Set-AkActionDone $actions }
+  } else { Add-AkAction $actions 'none' 'proxy provider' $slug "Proxy provider '$slug' is reused" }
+  $provPk = $(if ($prov.PSObject.Properties['planned']) { $null } else { [int]$prov.pk })
 
   # Application.
   $app = $null; try { $app = Invoke-AuthentikApi $Conn GET "/core/applications/$slug/" } catch { if ($_.Exception.Data['Status'] -ne 404) { throw } }
-  $provPk = $(if ($prov.PSObject.Properties['planned']) { $null } else { [int]$prov.pk })
-  $appDesired = @{ name = $display; slug = $slug; meta_launch_url = "$external/"; policy_engine_mode = 'any'; meta_description = 'Protected by authentik ForwardAuth (Deployment Manager).' }
-  if ($null -ne $provPk) { $appDesired['provider'] = $provPk }
-  $app = Sync-AkObject -Conn $Conn -Actions $actions -Object 'application' -Name $slug -Existing $app -CollectionPath '/core/applications/' -ItemPath "/core/applications/$slug/" -Desired $appDesired -WhatIf:$WhatIf
+  if (-not $app) {
+    Add-AkAction $actions 'create' 'application' $slug "Create application '$display' ($slug)"
+    if (-not $WhatIf) {
+      $body = @{ name = $display; slug = $slug; meta_launch_url = "$external/"; policy_engine_mode = 'any'; meta_description = 'Protected by authentik forward auth (set up by the Deployment Manager). Who may open it is managed here in authentik.' }
+      if ($null -ne $provPk) { $body.provider = $provPk }
+      $app = Invoke-AuthentikApi $Conn POST '/core/applications/' $body
+      Set-AkActionDone $actions
+    } else { $app = [pscustomobject]@{ pk = $null; pbm_uuid = $null; planned = $true } }
+  } elseif ($null -ne $provPk -and [int](Get-AkProp $app 'provider' 0) -ne $provPk) {
+    Add-AkAction $actions 'update' 'application' $slug "Link application '$slug' to its proxy provider"
+    if (-not $WhatIf) { $app = Invoke-AuthentikApi $Conn PATCH "/core/applications/$slug/" @{ provider = $provPk }; Set-AkActionDone $actions }
+  } else { Add-AkAction $actions 'none' 'application' $slug "Application '$slug' is reused" }
 
-  # Bindings: one per group and one for the email policy. Bindings created earlier by this manager that are no longer
-  # wanted are removed; bindings added by hand in authentik are left alone.
-  $target = [string](Get-AkProp $app 'pbm_uuid' $app.pk)
-  $have = @(); if (-not $app.PSObject.Properties['planned']) { $have = @(Get-AuthentikList $Conn "/policies/bindings/?target=$target") }
-  $order = 0; $keep = @()
-  foreach ($g in $groups) {
-    $order++
-    $b = @($have | Where-Object { [string](Get-AkProp $_ 'group' '') -eq [string]$g.pk })[0]
-    if ($b) { $keep += [string]$b.pk; Add-AkAction $actions 'none' 'binding' "group $($g.name)" "Group '$($g.name)' may open it"; continue }
-    Add-AkAction $actions 'create' 'binding' "group $($g.name)" "Allow group '$($g.name)'"
-    if (-not $WhatIf) { $nb = Invoke-AuthentikApi $Conn POST '/policies/bindings/' @{ group = $g.pk; target = $target; order = $order; enabled = $true; negate = $false; timeout = 30 }; $keep += [string]$nb.pk; Set-AkActionDone $actions }
-  }
-  if ($list.Emails.Count + $list.Domains.Count) {
-    $order++
-    $b = @($have | Where-Object { [string](Get-AkProp $_ 'policy' '') -eq [string]$pol.pk })[0]
-    if ($b) { $keep += [string]$b.pk; Add-AkAction $actions 'none' 'binding' $pname 'The email/domain policy is bound' }
-    else {
-      Add-AkAction $actions 'create' 'binding' $pname "Allow $(@($list.Emails).Count) email address(es) and $(@($list.Domains).Count) domain(s)"
-      if (-not $WhatIf) { $nb = Invoke-AuthentikApi $Conn POST '/policies/bindings/' @{ policy = $pol.pk; target = $target; order = $order; enabled = $true; negate = $false; timeout = 30; failure_result = $false }; $keep += [string]$nb.pk; Set-AkActionDone $actions }
-    }
-  }
-  $knownBindings = @(@(Get-AkProp $Known 'bindings' @()) | ForEach-Object { [string]$_ })
-  foreach ($b in $have) {
-    if ($keep -contains [string]$b.pk -or $knownBindings -notcontains [string]$b.pk) { continue }
-    Add-AkAction $actions 'delete' 'binding' ([string]$b.pk) 'Remove an access rule this manager created earlier'
-    if (-not $WhatIf) { $null = Invoke-AuthentikApi $Conn DELETE "/policies/bindings/$($b.pk)/"; Set-AkActionDone $actions }
-  }
-  if ($pol -and -not ($list.Emails.Count + $list.Domains.Count) -and -not $pol.PSObject.Properties['planned']) {
-    Add-AkAction $actions 'delete' 'policy' $pname 'Remove the email/domain policy (no longer used)'
-    if (-not $WhatIf) { $null = Invoke-AuthentikApi $Conn DELETE "/policies/expression/$($pol.pk)/"; Set-AkActionDone $actions }
+  # Access: owner-only on a new (unbound) application; existing rules are authentik's and stay as they are.
+  $have = @(); if (-not $app.PSObject.Properties['planned']) { $have = @(Get-AuthentikList $Conn "/policies/bindings/?target=$([string](Get-AkProp $app 'pbm_uuid' $app.pk))") }
+  $access = 'existing'
+  if ($have.Count) { Add-AkAction $actions 'none' 'access' $slug "Keeps its $($have.Count) access rule(s) in authentik (not changed)" }
+  else {
+    $access = 'owner-only'
+    $grp = Get-AuthentikGroup $Conn $script:OwnersGroup
+    if (-not $grp) { throw "The group '$($script:OwnersGroup)' does not exist in authentik. Finish the Google sign-in setup first (it creates the owner-only rule), or bind an access rule to '$slug' in authentik." }
+    Add-AkAction $actions 'create' 'access' $slug "Only '$($script:OwnersGroup)' may open it (change this in authentik at any time)"
+    if (-not $WhatIf) { $null = Invoke-AuthentikApi $Conn POST '/policies/bindings/' @{ group = $grp.pk; target = [string](Get-AkProp $app 'pbm_uuid' $app.pk); order = 0; enabled = $true; negate = $false; timeout = 30 }; Set-AkActionDone $actions }
   }
 
   # Embedded outpost.
@@ -573,16 +589,14 @@ function Sync-AuthentikAppProtection {
       Set-AkActionDone $actions
     }
   }
-  return [pscustomobject]@{
-    Actions = $actions.ToArray(); Slug = $slug; ProviderPk = $provPk; ApplicationPk = [string](Get-AkProp $app 'pk' ''); PolicyPk = [string](Get-AkProp $pol 'pk' '')
-    Bindings = $keep; Groups = @($groups | ForEach-Object { [string]$_.name }); Emails = $list.Emails; Domains = $list.Domains
-  }
+  return [pscustomobject]@{ Actions = $actions.ToArray(); Slug = $slug; ProviderPk = $provPk; ApplicationPk = [string](Get-AkProp $app 'pk' ''); Access = $access }
 }
 
-# Removes what Sync-AuthentikAppProtection created for a service: outpost assignment, application, provider and policy.
-# Groups are kept (they may hold users); objects not named dm-<service> are never touched.
+# Removing protection: the outpost stops serving the application's provider. The authentik application, its provider
+# and its access rules stay in authentik (they are authentik's; protecting again reuses them). -DeleteObjects also
+# deletes the application and the provider created for it.
 function Remove-AuthentikAppProtection {
-  param([Parameter(Mandatory = $true)]$Conn, [Parameter(Mandatory = $true)][string]$Service, [switch]$WhatIf)
+  param([Parameter(Mandatory = $true)]$Conn, [Parameter(Mandatory = $true)][string]$Service, [switch]$DeleteObjects, [switch]$WhatIf)
   $actions = New-AkActionList
   $slug = "$($script:Prefix)$($Service.ToLowerInvariant())"
   $ov = Get-AuthentikOverview $Conn
@@ -591,12 +605,12 @@ function Remove-AuthentikAppProtection {
     Add-AkAction $actions 'update' 'outpost' $ov.Outpost.Name "Unassign '$slug' from the embedded outpost"
     if (-not $WhatIf) { $null = Invoke-AuthentikApi $Conn PATCH "/outposts/instances/$($ov.Outpost.Pk)/" @{ providers = @($ov.Outpost.Providers | Where-Object { $_ -ne [int]$prov.pk }) }; Set-AkActionDone $actions }
   }
-  $app = $null; try { $app = Invoke-AuthentikApi $Conn GET "/core/applications/$slug/" } catch { }
-  if ($app) { Add-AkAction $actions 'delete' 'application' $slug "Delete application '$slug' (and its access rules)"; if (-not $WhatIf) { $null = Invoke-AuthentikApi $Conn DELETE "/core/applications/$slug/"; Set-AkActionDone $actions } }
-  if ($prov) { Add-AkAction $actions 'delete' 'proxy provider' $slug "Delete proxy provider '$slug'"; if (-not $WhatIf) { $null = Invoke-AuthentikApi $Conn DELETE "/providers/proxy/$($prov.pk)/"; Set-AkActionDone $actions } }
-  $pol = @(Get-AuthentikList $Conn "/policies/expression/?name=$([Uri]::EscapeDataString("$slug-access"))")[0]
-  if ($pol) { Add-AkAction $actions 'delete' 'policy' "$slug-access" "Delete policy '$slug-access'"; if (-not $WhatIf) { $null = Invoke-AuthentikApi $Conn DELETE "/policies/expression/$($pol.pk)/"; Set-AkActionDone $actions } }
-  if (-not $actions.Count) { Add-AkAction $actions 'none' 'application' $slug 'Nothing to remove in authentik' }
+  if ($DeleteObjects) {
+    $app = $null; try { $app = Invoke-AuthentikApi $Conn GET "/core/applications/$slug/" } catch { }
+    if ($app) { Add-AkAction $actions 'delete' 'application' $slug "Delete application '$slug' (and its access rules)"; if (-not $WhatIf) { $null = Invoke-AuthentikApi $Conn DELETE "/core/applications/$slug/"; Set-AkActionDone $actions } }
+    if ($prov) { Add-AkAction $actions 'delete' 'proxy provider' $slug "Delete proxy provider '$slug'"; if (-not $WhatIf) { $null = Invoke-AuthentikApi $Conn DELETE "/providers/proxy/$($prov.pk)/"; Set-AkActionDone $actions } }
+  } elseif ($prov) { Add-AkAction $actions 'none' 'application' $slug "Application '$slug', its provider and its access rules stay in authentik (protecting again reuses them)" }
+  if (-not $actions.Count) { Add-AkAction $actions 'none' 'application' $slug 'Nothing to change in authentik' }
   return $actions.ToArray()
 }
 
@@ -704,6 +718,6 @@ function Test-ForwardAuthChallenge {
 }
 
 Export-ModuleMember -Function Invoke-AkHttp, Get-AuthentikHealth, New-AuthentikConnection, Invoke-AuthentikApi, Get-AuthentikList, Test-AuthentikToken, Test-AuthentikCredential, Get-AuthentikOverview,
-  Get-GoogleOAuthSettings, Test-GoogleClientId, Test-GoogleClientSecret, ConvertTo-AccessList, New-AppAccessExpression, New-EnrollmentExpression,
-  Sync-AuthentikOutpost, Sync-AuthentikGoogleSource, Sync-AuthentikAppProtection, Remove-AuthentikAppProtection, Test-AuthentikGoogleRedirect,
+  Get-GoogleOAuthSettings, Test-GoogleClientId, Test-GoogleClientSecret, ConvertTo-OwnerEmail, New-OwnerEnrollmentExpression, Get-AuthentikOwnersGroupName, Get-AuthentikGroup,
+  Sync-AuthentikOutpost, Sync-AuthentikGoogleSource, Find-AuthentikOwner, Complete-AuthentikOwner, Sync-AuthentikAppProtection, Remove-AuthentikAppProtection, Test-AuthentikGoogleRedirect,
   Get-AuthentikSourceLogins, Get-AuthentikAppAccessEvidence, Wait-AuthentikOutpost, Test-ForwardAuthChallenge

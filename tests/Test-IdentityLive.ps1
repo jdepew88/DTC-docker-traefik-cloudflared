@@ -183,7 +183,7 @@ try {
   $before1 = & $secretBytes
   $rep1 = Invoke-WebUi $ui POST '/api/identity/token' @{ token = $bootToken }
   Test-Condition 'token mgmt: outpost token -> admin token: validated, replaced, errors cleared' ($rep1.Status -eq 200 -and $rep1.Data.replaced -and $rep1.Data.credential.status -eq 'valid' -and $rep1.Data.credential.account -eq 'akadmin' -and (& $secretBytes) -ne $before1) ($rep1.Body)
-  Test-Condition 'token mgmt: after the replacement onboarding resumes at the next step (public address)' ($rep1.Data.next -eq 'hostname' -and (Get-Step (Invoke-WebUi $ui GET '/api/identity').Data 'api').state -eq 'verified') "next=$($rep1.Data.next)"
+  Test-Condition 'token mgmt: after the replacement onboarding resumes at the next step (initial owner)' ($rep1.Data.next -eq 'owner' -and (Get-Step (Invoke-WebUi $ui GET '/api/identity').Data 'api').state -eq 'verified') "next=$($rep1.Data.next)"
   Test-Condition 'token mgmt: the outpost''s own token is untouched in authentik' (@(Get-AuthentikList $adm "/core/tokens/?identifier=$($outTok.identifier)").Count -eq 1 -and (Test-AuthentikCredential -BaseUrl "http://127.0.0.1:$akPort" -Token $outpostKey).Account -like 'ak-outpost-*') ''
   $bad2 = Invoke-WebUi $ui POST '/api/identity/token' @{ token = $outpostKey }
   $before2 = & $secretBytes
@@ -239,77 +239,129 @@ try {
   $conn = New-AuthentikConnection -BaseUrl "http://127.0.0.1:$akPort" -Token $bootToken
   Test-Condition 'outpost: embedded outpost previewed, then pointed at the public sign-in URL' ($op.Data.canApply -and $opA.Status -eq 200 -and (Get-AuthentikOverview $conn).Outpost.AuthentikHost -eq "https://$authHost/") ($opA.Body)
 
-  # --- Google (synthetic credentials) ---------------------------------------------------------------------------------------
-  $sv = Invoke-WebUi $ui POST '/api/identity/google/save' @{ clientId = $googleId; signup = 'allowlist'; emails = @('alice@idtest.example'); domains = @('partner.idtest.example') }
+  # --- Initial owner and Google (synthetic credentials) ----------------------------------------------------------------------
+  $ownerEmail = 'owner@idtest.example'
+  $gp0 = Invoke-WebUi $ui POST '/api/identity/google/plan' @{ clientId = $googleId; clientSecret = $googleSecret }
+  Test-Condition 'owner: Google sign-in is not set up before the initial owner is known' ($gp0.Status -eq 409 -and $gp0.Data.error -match 'owner') ($gp0.Body)
+  $o1 = Invoke-WebUi $ui POST '/api/identity/owner' @{ email = 'Owner@IDTest.example'; makeAdmin = $true }
+  Test-Condition 'owner: asked once, stored normalized (no other people are entered in the manager)' ($o1.Status -eq 200 -and $o1.Data.owner.email -eq $ownerEmail) ($o1.Body)
+  $sv = Invoke-WebUi $ui POST '/api/identity/google/save' @{ clientId = $googleId }
   Test-Condition 'google: draft saved without any secret (resumable)' ($sv.Status -eq 200 -and [IO.File]::ReadAllText((Join-Path $installPath 'config\identity.json')) -match [regex]::Escape($googleId)) ($sv.Body)
   # Restart the manager (browser refresh / reboot): the draft and progress survive.
   Stop-TestServer $ui
   $ui = Start-WebUiServer -Script (Join-Path $installPath 'webui.ps1') -InstallPath $installPath -WorkDir $uiDir
   $null = Connect-WebUi $ui
   $g3 = Invoke-WebUi $ui GET '/api/identity'
-  Test-Condition 'resume: after a manager restart the Google draft, hostname and progress are still there' ($g3.Data.config.authentik.google.clientId -eq $googleId -and $g3.Data.config.authentik.hostname -eq $authHost -and $g3.Data.progress.step -eq 'google' -and (Get-Step $g3.Data 'google').state -eq 'awaiting-user') ($g3.Data.progress | ConvertTo-Json -Compress)
+  Test-Condition 'resume: after a manager restart the owner, Google draft, hostname and progress are still there' ($g3.Data.config.authentik.google.clientId -eq $googleId -and $g3.Data.config.authentik.owner.email -eq $ownerEmail -and $g3.Data.config.authentik.hostname -eq $authHost -and $g3.Data.progress.step -eq 'google' -and (Get-Step $g3.Data 'google').state -eq 'awaiting-user' -and (Get-Step $g3.Data 'owner').state -eq 'configured') ($g3.Data.progress | ConvertTo-Json -Compress)
   Test-Condition 'google: wizard values (redirect URI, Web application, minimal scopes)' ($g3.Data.googleValues.RedirectUri -eq "https://$authHost/source/oauth/callback/google/" -and $g3.Data.googleValues.ClientType -eq 'Web application' -and (@($g3.Data.googleValues.ScopeNames) -join ',') -eq 'openid,email,profile') ($g3.Data.googleValues | ConvertTo-Json -Compress)
-  $badId = Invoke-WebUi $ui POST '/api/identity/google/plan' @{ clientId = 'not-a-client-id'; clientSecret = $googleSecret; signup = 'allowlist'; emails = @('alice@idtest.example') }
+  $badId = Invoke-WebUi $ui POST '/api/identity/google/plan' @{ clientId = 'not-a-client-id'; clientSecret = $googleSecret }
   Test-Condition 'google: an invalid client ID is refused before authentik is touched' ($badId.Status -eq 400) ($badId.Body)
-  $gp = Invoke-WebUi $ui POST '/api/identity/google/plan' @{ clientId = $googleId; clientSecret = $googleSecret; signup = 'allowlist'; emails = @('alice@idtest.example'); domains = @('partner.idtest.example'); matching = 'identifier'; showOnLogin = $true }
-  Test-Condition 'google: preview lists the enrollment flow, allow-list policy, source and login button (nothing applied)' ($gp.Status -eq 200 -and @($gp.Data.actions | Where-Object { $_.kind -eq 'create' }).Count -ge 4 -and @(Get-AuthentikList $conn '/sources/oauth/?slug=google').Count -eq 0) ($gp.Body)
+  $gp = Invoke-WebUi $ui POST '/api/identity/google/plan' @{ clientId = $googleId; clientSecret = $googleSecret }
+  $created = @($gp.Data.actions | Where-Object { $_.kind -eq 'create' } | ForEach-Object { $_.object })
+  Test-Condition 'google: preview lists owner group, owner-only enrollment, source and login button (nothing applied)' ($gp.Status -eq 200 -and $created -contains 'group' -and $created -contains 'flow' -and $created -contains 'policy' -and $created -contains 'Google source' -and @(Get-AuthentikList $conn '/sources/oauth/?slug=google').Count -eq 0) (($gp.Data.actions | ForEach-Object { "$($_.kind):$($_.object)" }) -join ', ')
   $ga = Invoke-WebUi $ui POST '/api/identity/google/apply' @{ planId = $gp.Data.planId; confirm = $true }
   $src = @(Get-AuthentikList $conn '/sources/oauth/?slug=google')[0]
-  Test-Condition 'google: source created through the API (type google, client ID, identifier matching, restricted enrollment flow)' ($ga.Status -eq 200 -and $ga.Data.ok -and $src -and $src.provider_type -eq 'google' -and $src.consumer_key -eq $googleId -and $src.user_matching_mode -eq 'identifier') ($ga.Body)
+  Test-Condition 'google: source created through the API (type google, client ID, identifier matching, owner-only enrollment flow)' ($ga.Status -eq 200 -and $ga.Data.ok -and $src -and $src.provider_type -eq 'google' -and $src.consumer_key -eq $googleId -and $src.user_matching_mode -eq 'identifier' -and $src.enrollment_flow) ($ga.Body)
   Test-Condition 'google: authentik redirects to Google with the right client ID and redirect URI' ($ga.Data.redirect.ok -and $ga.Data.redirect.redirectUri -eq "https://$authHost/source/oauth/callback/google/") ($ga.Data.redirect | ConvertTo-Json -Compress)
   $ov = Get-AuthentikOverview $conn
   Test-Condition 'google: the login page shows the Google button' ($ov.LoginStage.Sources -contains [string]$src.pk) ''
-  $gp2 = Invoke-WebUi $ui POST '/api/identity/google/plan' @{ clientId = $googleId; signup = 'allowlist'; emails = @('alice@idtest.example'); domains = @('partner.idtest.example') }
-  Test-Condition 'google: running the wizard again changes nothing (no duplicate source, secret kept)' (@($gp2.Data.actions | Where-Object { $_.kind -ne 'none' }).Count -eq 0 -and @(Get-AuthentikList $conn '/sources/oauth/').Count -eq 1) (($gp2.Data.actions | ForEach-Object { "$($_.kind):$($_.summary)" }) -join '; ')
+  $owners = Get-AuthentikGroup $conn 'DTC owners'
+  Test-Condition 'owner-only rule: group "DTC owners" exists with akadmin (local recovery account) as first member' ($owners -and @($owners.users | ForEach-Object { [int]$_ }) -contains $akadminPk) ''
+  # The enrollment policy, asked through authentik's own policy test with the context a Google sign-in provides.
+  $pol = @(Get-AuthentikList $conn '/policies/expression/?name=dm-google-initial-owner')[0]
+  $ptest = { param($email, $verified) [bool](Invoke-AuthentikApi $conn POST "/policies/all/$($pol.pk)/test/" @{ user = $akadminPk; context = @{ oauth_userinfo = @{ email = $email; verified_email = $verified } } }).passing }
+  Test-Condition 'owner-only enrollment: authentik admits the owner''s verified Google address' (& $ptest 'Owner@idtest.example' $true) ''
+  Test-Condition 'owner-only enrollment: another Google account, or the owner''s address unverified, is refused' (-not (& $ptest 'alice@idtest.example' $true) -and -not (& $ptest $ownerEmail $false)) ''
+  $gp2 = Invoke-WebUi $ui POST '/api/identity/google/plan' @{ clientId = $googleId }
+  Test-Condition 'google: running the wizard again changes nothing (no duplicate source, group, flow or policy; secret kept)' (@($gp2.Data.actions | Where-Object { $_.kind -ne 'none' }).Count -eq 0 -and @(Get-AuthentikList $conn '/sources/oauth/').Count -eq 1) (($gp2.Data.actions | ForEach-Object { "$($_.kind):$($_.summary)" }) -join '; ')
   $g4 = Invoke-WebUi $ui GET '/api/identity'
-  Test-Condition 'google: configured, NOT verified (synthetic credentials, nobody signed in with Google)' ((Get-Step $g4.Data 'google').state -eq 'configured' -and -not $g4.Data.google.verifiedAt -and (Get-Comp $g4.Data 'google-login').state -eq 'awaiting-user') (Get-Step $g4.Data 'google' | ConvertTo-Json -Compress)
+  Test-Condition 'google: configured, NOT verified; the owner''s sign-in is awaited' ((Get-Step $g4.Data 'google').state -eq 'configured' -and -not $g4.Data.google.verifiedAt -and (Get-Step $g4.Data 'owner').state -eq 'awaiting-user') (($g4.Data.model.steps | ForEach-Object { "$($_.id)=$($_.state)" }) -join ', ')
+  $ov0 = Invoke-WebUi $ui POST '/api/identity/owner/verify' @{}
+  Test-Condition 'owner: nothing is verified before the owner has signed in with Google' ($ov0.Status -eq 200 -and -not $ov0.Data.ok -and $ov0.Data.message -match 'No account') ($ov0.Body)
+  # SIMULATED owner sign-in: a real one needs Google. The account and its Google connection are created the way authentik's
+  # callback would (ak shell, inside the disposable worker); nothing here talks to Google.
+  $mk = { param($u, $e, $p) $x = Invoke-AuthentikApi $conn POST '/core/users/' @{ username = $u; name = $u; email = $e; is_active = $true; path = 'users' }; $null = Invoke-AuthentikApi $conn POST "/core/users/$($x.pk)/set_password/" @{ password = $p }; $x }
+  $ownerUser = & $mk 'owner' $ownerEmail 'Owner-Live-Test-55q'
+  $sim = Invoke-Docker exec "$akProject-worker" ak shell -c "from authentik.sources.oauth.models import OAuthSource, UserOAuthSourceConnection; from authentik.core.models import User; UserOAuthSourceConnection.objects.create(user=User.objects.get(username='owner'), source=OAuthSource.objects.get(slug='google'), identifier='109876543210')"
+  Test-Condition 'owner (simulated Google sign-in): fixture created inside the disposable authentik' ($sim.ExitCode -eq 0) (($sim.Output | Select-Object -Last 3) -join ' ')
+  $ov1 = Invoke-WebUi $ui POST '/api/identity/owner/verify' @{}
+  $ownerNow = Invoke-AuthentikApi $conn GET "/core/users/$($ownerUser.pk)/"
+  Test-Condition 'owner: verified; the owner joins "DTC owners" and the authentik administrators (as chosen)' ($ov1.Data.ok -and $ov1.Data.username -eq 'owner' -and @($ownerNow.groups_obj | ForEach-Object { $_.name }) -contains 'DTC owners' -and @($ownerNow.groups_obj | ForEach-Object { $_.name }) -contains 'authentik Admins') ($ov1.Body)
+  $o2 = Invoke-WebUi $ui POST '/api/identity/owner' @{ email = 'someone@else.example' }
+  Test-Condition 'owner: cannot be changed in the manager once set up (people are managed in authentik)' ($o2.Status -eq 409) ($o2.Body)
+  $g4b = Invoke-WebUi $ui GET '/api/identity'
+  Test-Condition 'model: owner and Google verified from the owner''s sign-in; next step: protect applications' ((Get-Step $g4b.Data 'owner').state -eq 'verified' -and (Get-Step $g4b.Data 'google').state -eq 'verified' -and @($g4b.Data.model.next)[0] -eq 'apps') (($g4b.Data.model.steps | ForEach-Object { "$($_.id)=$($_.state)" }) -join ', ')
+  Test-Condition 'manager keeps no user lists: identity.json has the owner address only' (([IO.File]::ReadAllText((Join-Path $installPath 'config\identity.json'))) -notmatch 'alice|emails|domains|groups') ''
 
-  # --- Protect a disposable application -------------------------------------------------------------------------------------
+  # --- Protect selected applications ---------------------------------------------------------------------------------------
+  $app2 = "$stack-echo2"; $appHost2 = 'echo2.idtest.example'
   $r0 = Invoke-Docker run -d --name $app --network $network --pull missing $whoami
+  $r0b = Invoke-Docker run -d --name $app2 --network $network --pull missing $whoami
   $add = Invoke-WebUiChange $ui @{ op = 'add'; service = @{ name = 'echo'; displayName = 'Echo test'; hostnames = @($appHost); target = @{ type = 'docker'; host = $app; port = 80 }; cloudflare = @{ publish = $false; access = $false } }; cloudflare = @{ automate = $false } }
-  Test-Condition 'app: disposable whoami published through Traefik (no sign-in yet)' ($r0.ExitCode -eq 0 -and $add.Apply.Data.ok -and (Test-ForwardAuthChallenge -TraefikPort $httpPort -Hostname $appHost).State -eq 'open') ($add.Apply.Body)
-  $self = Invoke-WebUi $ui POST '/api/identity/protect/plan' @{ service = 'authentik'; emails = @('alice@idtest.example') }
+  $add2 = Invoke-WebUiChange $ui @{ op = 'add'; service = @{ name = 'echo2'; displayName = 'Echo two'; hostnames = @($appHost2); target = @{ type = 'docker'; host = $app2; port = 80 }; cloudflare = @{ publish = $false; access = $false } }; cloudflare = @{ automate = $false } }
+  Test-Condition 'apps: two disposable whoami applications published through Traefik (no sign-in yet)' ($r0.ExitCode -eq 0 -and $r0b.ExitCode -eq 0 -and $add.Apply.Data.ok -and $add2.Apply.Data.ok -and (Test-ForwardAuthChallenge -TraefikPort $httpPort -Hostname $appHost).State -eq 'open') ($add.Apply.Body)
+  $self = Invoke-WebUi $ui POST '/api/identity/protect/plan' @{ services = @('authentik') }
   Test-Condition 'protect: the authentik sign-in page itself cannot be protected (loop guard)' ($self.Status -eq 400) ($self.Body)
-  $none = Invoke-WebUi $ui POST '/api/identity/protect/plan' @{ service = 'echo' }
-  Test-Condition 'protect: refused without anyone allowed (an unbound application would admit every user)' ($none.Status -eq 400 -and $none.Data.error -match 'Choose who may open') ($none.Body)
-  # A leftover from an interrupted earlier attempt: the manager reuses it instead of creating a duplicate.
-  $null = Invoke-AuthentikApi $conn POST '/policies/expression/' @{ name = 'dm-echo-access'; expression = 'return False' }
-  $pp = Invoke-WebUi $ui POST '/api/identity/protect/plan' @{ service = 'echo'; emails = @('alice@idtest.example'); createGroup = $true }
-  $diff = (@($pp.Data.traefik.traefik.changes | ForEach-Object { $_.diff }) | ForEach-Object { $_ }) -join "`n"
-  Test-Condition 'protect: preview shows authentik objects and the ForwardAuth route diff' ($pp.Status -eq 200 -and $pp.Data.canApply -and $diff -match 'forwardAuth' -and $diff -match 'svc-echo-outpost' -and $diff -match "address: http://$akProject-server:9000/outpost.goauthentik.io/auth/traefik") ($pp.Body)
-  Test-Condition 'protect: the leftover policy from an interrupted attempt is updated, not duplicated' (@($pp.Data.authentik | Where-Object { $_.object -eq 'policy' -and $_.kind -eq 'update' }).Count -eq 1) (($pp.Data.authentik | ForEach-Object { "$($_.kind):$($_.object)" }) -join ', ')
+  $withEmails = Invoke-WebUi $ui POST '/api/identity/protect/plan' @{ services = @('echo'); emails = @('alice@idtest.example') }
+  Test-Condition 'protect: emails, groups or domains are not accepted (access is managed in authentik)' ($withEmails.Status -eq 400 -and $withEmails.Data.error -match 'managed in authentik') ($withEmails.Body)
+  # echo2 already exists in authentik with its own rule (alice): that rule must be kept, not replaced by owner-only.
+  $alice = & $mk 'alice' 'alice@idtest.example' 'Alice-Live-Test-91x'
+  $mallory = & $mk 'mallory' 'mallory@other.example' 'Mallory-Live-Test-77y'
+  $pre = Invoke-AuthentikApi $conn POST '/core/applications/' @{ name = 'Echo two (made in authentik)'; slug = 'dm-echo2' }
+  $null = Invoke-AuthentikApi $conn POST '/policies/bindings/' @{ user = [int]$alice.pk; target = [string]$pre.pbm_uuid; order = 0; enabled = $true; negate = $false; timeout = 30 }
+  $pp = Invoke-WebUi $ui POST '/api/identity/protect/plan' @{ services = @('echo', 'echo2') }
+  $i1 = @($pp.Data.items | Where-Object { $_.service -eq 'echo' })[0]; $i2 = @($pp.Data.items | Where-Object { $_.service -eq 'echo2' })[0]
+  $diff = (@($i1.traefik.traefik.changes | ForEach-Object { $_.diff }) | ForEach-Object { $_ }) -join "`n"
+  Test-Condition 'protect: one preview for the selected applications, with the ForwardAuth route diff' ($pp.Status -eq 200 -and $pp.Data.canApply -and @($pp.Data.items).Count -eq 2 -and $diff -match 'forwardAuth' -and $diff -match 'svc-echo-outpost' -and $diff -match "address: http://$akProject-server:9000/outpost.goauthentik.io/auth/traefik") ($pp.Body.Substring(0, [Math]::Min(600, $pp.Body.Length)))
+  Test-Condition 'protect: a new application gets the owner-only rule; one with its own authentik rule keeps it' (@($i1.authentik | Where-Object { $_.object -eq 'access' -and $_.kind -eq 'create' }).Count -eq 1 -and @($i2.authentik | Where-Object { $_.object -eq 'access' -and $_.kind -eq 'none' }).Count -eq 1 -and @($i2.authentik | Where-Object { $_.object -eq 'application' -and $_.kind -eq 'create' }).Count -eq 0) (($i2.authentik | ForEach-Object { "$($_.kind):$($_.object)" }) -join ', ')
   $pa = Invoke-WebUi $ui POST '/api/identity/protect/apply' @{ planId = $pp.Data.planId; confirm = $true }
-  Test-Condition 'protect: applied; an unauthenticated request now has to sign in' ($pa.Status -eq 200 -and $pa.Data.ok -and $pa.Data.challenge.State -eq 'auth') ($pa.Body)
-  $protectBackup = [string]$pa.Data.traefik.backup
+  Test-Condition 'protect: both applied and declared protected only after ForwardAuth was verified' ($pa.Status -eq 200 -and $pa.Data.ok -and @($pa.Data.results | Where-Object { $_.ok -and $_.challenge.State -eq 'auth' }).Count -eq 2) ($pa.Body)
+  Test-Condition 'protect: after protecting several at once every selected route still has its ForwardAuth (no later plan undoes an earlier one)' ([IO.File]::ReadAllText((Join-Path $installPath 'traefik\dynamic\svc-echo.yml')) -match 'svc-echo-authentik' -and [IO.File]::ReadAllText((Join-Path $installPath 'traefik\dynamic\svc-echo2.yml')) -match 'svc-echo2-authentik' -and (Test-ForwardAuthChallenge -TraefikPort $httpPort -Hostname $appHost).State -eq 'auth') ''
+  $protectBackup = [string](@($pa.Data.results | Where-Object { $_.service -eq 'echo' })[0].traefik.backup)
   $edit = Invoke-WebUiChange $ui @{ op = 'update'; name = 'echo'; service = @{ name = 'echo'; displayName = 'Echo (renamed)'; hostnames = @($appHost); target = @{ type = 'docker'; host = $app; port = 80 }; cloudflare = @{ publish = $false; access = $false } }; cloudflare = @{ automate = $false } }
   Test-Condition 'services: editing a protected service without the sign-in field keeps its protection' ($edit.Apply.Data.ok -and [IO.File]::ReadAllText((Join-Path $installPath 'traefik\dynamic\svc-echo.yml')) -match 'svc-echo-authentik') ($edit.Apply.Body)
 
   # Sign-ins through the real outpost. The test reaches Traefik on a local port over http, so the provider and outpost
   # addresses are switched to that address for this part (production uses https://<host> without a port).
-  $prov = @(Get-AuthentikList $conn '/providers/proxy/?name=dm-echo')[0]
+  $prov = @(Get-AuthentikList $conn '/providers/proxy/?name=dm-echo')[0]; $prov2 = @(Get-AuthentikList $conn '/providers/proxy/?name=dm-echo2')[0]
   $null = Invoke-AuthentikApi $conn PATCH "/providers/proxy/$($prov.pk)/" @{ mode = 'forward_single'; external_host = "http://${appHost}:$httpPort" }
+  $null = Invoke-AuthentikApi $conn PATCH "/providers/proxy/$($prov2.pk)/" @{ mode = 'forward_single'; external_host = "http://${appHost2}:$httpPort" }
   $null = Sync-AuthentikOutpost -Conn $conn -PublicUrl "http://${authHost}:$httpPort"
-  $mk = { param($u, $e, $p) $x = Invoke-AuthentikApi $conn POST '/core/users/' @{ username = $u; name = $u; email = $e; is_active = $true; path = 'users' }; $null = Invoke-AuthentikApi $conn POST "/core/users/$($x.pk)/set_password/" @{ password = $p }; $x }
-  $alice = & $mk 'alice' 'alice@idtest.example' 'Alice-Live-Test-91x'
-  $mallory = & $mk 'mallory' 'mallory@other.example' 'Mallory-Live-Test-77y'
   # Wait until the outpost has reloaded the test addresses (it refreshes a few seconds after a change).
-  $null = Wait-Until { $x = Test-ForwardAuthChallenge -TraefikPort $httpPort -Hostname $appHost -HostPort $httpPort -AuthHostname $authHost; $x.State -eq 'auth' -and $x.Location -match "^http://${authHost}:$httpPort/" } 90 2000
+  $null = Wait-Until { $x = Test-ForwardAuthChallenge -TraefikPort $httpPort -Hostname $appHost2 -HostPort $httpPort -AuthHostname $authHost; $x.State -eq 'auth' -and $x.Location -match "^http://${authHost}:$httpPort/" } 90 2000
   $anon = Test-ForwardAuthChallenge -TraefikPort $httpPort -Hostname $appHost -HostPort $httpPort -AuthHostname $authHost
   Test-Condition 'forwardauth: anonymous visitors are sent to the authentik sign-in (no loop)' ($anon.State -eq 'auth' -and $anon.Location -match "^http://${authHost}:$httpPort/") ($anon | ConvertTo-Json -Compress)
+  $so = Invoke-SignIn $httpPort $authHost $appHost 'owner' 'Owner-Live-Test-55q' $work
+  Test-Condition 'owner-only: the owner reaches the newly protected application (identity headers passed)' ($so.Login -eq 'xak-flow-redirect' -and $so.ReachedApp -and $so.Body -match 'X-Authentik-Username: owner') "$($so.Status) $($so.Url)"
   $sa = Invoke-SignIn $httpPort $authHost $appHost 'alice' 'Alice-Live-Test-91x' $work
-  Test-Condition 'authorization: an allowed user signs in and reaches the application (identity headers passed)' ($sa.Login -eq 'xak-flow-redirect' -and $sa.ReachedApp -and $sa.Body -match 'X-Authentik-Username: alice') "$($sa.Status) $($sa.Url)"
-  $sm = Invoke-SignIn $httpPort $authHost $appHost 'mallory' 'Mallory-Live-Test-77y' $work
-  Test-Condition 'authorization: a signed-in user who is not allowed is refused and never reaches the application' ($sm.Login -eq 'xak-flow-redirect' -and -not $sm.ReachedApp -and $sm.Body -notmatch 'X-Authentik-Username' -and $sm.Body -match 'Permission denied') "$($sm.Status) $($sm.Url)"
-  $sw = Invoke-SignIn $httpPort $authHost $appHost 'alice' 'wrong-password-123' $work
+  Test-Condition 'owner-only: any other signed-in user is refused and never reaches it' ($sa.Login -eq 'xak-flow-redirect' -and -not $sa.ReachedApp -and $sa.Body -match 'Permission denied') "$($sa.Status) $($sa.Url)"
+  $sa2 = Invoke-SignIn $httpPort $authHost $appHost2 'alice' 'Alice-Live-Test-91x' $work
+  $sm2 = Invoke-SignIn $httpPort $authHost $appHost2 'mallory' 'Mallory-Live-Test-77y' $work
+  Test-Condition 'existing authentik rule respected: alice reaches echo2 (her rule), mallory does not' ($sa2.ReachedApp -and -not $sm2.ReachedApp) "alice $($sa2.Status) $($sa2.Url) / mallory $($sm2.Status)"
+  $sw = Invoke-SignIn $httpPort $authHost $appHost 'owner' 'wrong-password-123' $work
   Test-Condition 'authorization: a wrong password never reaches the application' (-not $sw.ReachedApp) "$($sw.Status) $($sw.Url)"
-  $grp = @(Get-AuthentikList $conn '/core/groups/?name=echo%20users')[0]
-  $null = Invoke-AuthentikApi $conn POST "/core/groups/$($grp.pk)/add_user/" @{ pk = [int]$mallory.pk }
+  # Access changes made in authentik work immediately, without the manager and without touching Traefik files.
+  $filesBefore = @(Get-ChildItem -LiteralPath (Join-Path $installPath 'traefik\dynamic') -File | ForEach-Object { "$($_.Name)=$(Get-FileSha256 $_.FullName)" }) -join ';'
+  $regBefore = Get-FileSha256 (Join-Path $installPath 'config\services.json')
+  $null = Invoke-AuthentikApi $conn POST "/core/groups/$($owners.pk)/add_user/" @{ pk = [int]$mallory.pk }
   $sg = Invoke-SignIn $httpPort $authHost $appHost 'mallory' 'Mallory-Live-Test-77y' $work
-  Test-Condition 'authorization: adding the user to the application''s group grants access' ($sg.ReachedApp) "$($sg.Status) $($sg.Url)"
+  $filesAfter = @(Get-ChildItem -LiteralPath (Join-Path $installPath 'traefik\dynamic') -File | ForEach-Object { "$($_.Name)=$(Get-FileSha256 $_.FullName)" }) -join ';'
+  Test-Condition 'authentik is the authority: adding a user to "DTC owners" in authentik grants access, no manager or Traefik change' ($sg.ReachedApp -and $filesAfter -eq $filesBefore -and (Get-FileSha256 (Join-Path $installPath 'config\services.json')) -eq $regBefore) "$($sg.Status) $($sg.Url)"
+  # The manager never overwrites authentik-side access during refreshes, re-runs or unrelated routing changes.
+  $echoApp = Invoke-AuthentikApi $conn GET '/core/applications/dm-echo/'
+  $null = Invoke-AuthentikApi $conn POST '/policies/bindings/' @{ user = [int]$alice.pk; target = [string]$echoApp.pbm_uuid; order = 5; enabled = $true; negate = $false; timeout = 30 }
+  $bindsBefore = @(Get-AuthentikList $conn "/policies/bindings/?target=$($echoApp.pbm_uuid)" | ForEach-Object { [string]$_.pk } | Sort-Object) -join ','
+  $null = Invoke-WebUi $ui GET '/api/identity?deep=1'
+  $null = Invoke-WebUiChange $ui @{ op = 'update'; name = 'echo2'; service = @{ name = 'echo2'; displayName = 'Echo two (renamed)'; hostnames = @($appHost2); target = @{ type = 'docker'; host = $app2; port = 80 }; cloudflare = @{ publish = $false; access = $false } }; cloudflare = @{ automate = $false } }
+  $again = Invoke-WebUi $ui POST '/api/identity/protect/plan' @{ services = @('echo') }
+  $bindsAfter = @(Get-AuthentikList $conn "/policies/bindings/?target=$($echoApp.pbm_uuid)" | ForEach-Object { [string]$_.pk } | Sort-Object) -join ','
+  Test-Condition 'no overwrite: refresh, an unrelated route change and protecting again leave authentik''s access rules alone' ($bindsAfter -eq $bindsBefore -and -not @($again.Data.items[0].authentik | Where-Object { $_.object -eq 'access' -and $_.kind -ne 'none' }).Count -and (Invoke-SignIn $httpPort $authHost $appHost 'alice' 'Alice-Live-Test-91x' $work).ReachedApp) "$bindsBefore -> $bindsAfter"
   $g5 = Invoke-WebUi $ui GET '/api/identity?deep=1'
   $ea = @($g5.Data.apps | Where-Object { $_.service -eq 'echo' })[0]
-  Test-Condition 'verification: the application is marked verified only from authentik''s own access event' ($ea.verifiedAt -and $ea.verifiedBy -in 'alice', 'mallory' -and (Get-Comp $g5.Data 'app:echo').state -eq 'verified') ($ea | ConvertTo-Json -Compress -Depth 4)
+  Test-Condition 'verification: the application is marked verified only from authentik''s own access event' ($ea.verifiedAt -and (Get-Comp $g5.Data 'app:echo').state -eq 'verified') ($ea | ConvertTo-Json -Compress -Depth 4)
+  Test-Condition 'status: the page shows how many access rules authentik has (read only), and an Open in authentik address' ($ea.rules -eq 2 -and -not $ea.ownerOnly -and $g5.Data.adminLinks.applications -match '/if/admin/') ($ea | ConvertTo-Json -Compress -Depth 4)
   $null = Invoke-AuthentikApi $conn PATCH "/providers/proxy/$($prov.pk)/" @{ mode = 'forward_single'; external_host = "https://$appHost" }
+  $null = Invoke-AuthentikApi $conn PATCH "/providers/proxy/$($prov2.pk)/" @{ mode = 'forward_single'; external_host = "https://$appHost2" }
   $null = Sync-AuthentikOutpost -Conn $conn -PublicUrl "https://$authHost"
 
   # Loop detection: a hand-written route that redirects to itself.
@@ -333,7 +385,7 @@ try {
   $null = Invoke-Docker stop "$akProject-server"
   $down = Invoke-AkHttp -Url "http://127.0.0.1:$httpPort/" -Headers @{ Host = $appHost }
   Test-Condition 'fail closed: with authentik stopped the application is not served' ($down.Status -ge 500 -and $down.Body -notmatch 'Hostname:') "HTTP $($down.Status)"
-  $gp3 = Invoke-WebUi $ui POST '/api/identity/protect/plan' @{ service = 'echo'; emails = @('alice@idtest.example') }
+  $gp3 = Invoke-WebUi $ui POST '/api/identity/protect/plan' @{ services = @('echo') }
   Test-Condition 'interrupted: with authentik unreachable no change is previewed or applied' ($gp3.Status -eq 409) ($gp3.Body)
   $null = Invoke-Docker start "$akProject-server"
   $back = Wait-Until { (Get-AuthentikHealth -BaseUrl "http://127.0.0.1:$akPort").Ready } 180 3000
@@ -344,17 +396,20 @@ try {
   $rs = Invoke-WebUi $ui POST '/api/backups/restore' @{ id = $protectBackup; confirm = $true }
   $echoYaml = [IO.File]::ReadAllText((Join-Path $installPath 'traefik\dynamic\svc-echo.yml'))
   Test-Condition 'rollback: restoring the backup made before protection restores the previous route (no ForwardAuth)' ($rs.Status -eq 200 -and $echoYaml -notmatch 'forwardAuth') ($rs.Body)
-  $pp2 = Invoke-WebUi $ui POST '/api/identity/protect/plan' @{ service = 'echo'; emails = @('alice@idtest.example'); createGroup = $true }
-  Test-Condition 'rollback: protecting again reuses the authentik objects (only the route changes)' ($pp2.Status -eq 200 -and @($pp2.Data.authentik | Where-Object { $_.kind -eq 'create' }).Count -eq 0 -and @($pp2.Data.traefik.traefik.changes).Count -eq 1) (($pp2.Data.authentik | ForEach-Object { "$($_.kind):$($_.object)" }) -join ', ')
+  $pp2 = Invoke-WebUi $ui POST '/api/identity/protect/plan' @{ services = @('echo') }
+  Test-Condition 'rollback: protecting again reuses the authentik objects and their rules (only the route changes)' ($pp2.Status -eq 200 -and @($pp2.Data.items[0].authentik | Where-Object { $_.kind -ne 'none' }).Count -eq 0 -and @($pp2.Data.items[0].traefik.traefik.changes).Count -eq 1) (($pp2.Data.items[0].authentik | ForEach-Object { "$($_.kind):$($_.object)" }) -join ', ')
   $pa2 = Invoke-WebUi $ui POST '/api/identity/protect/apply' @{ planId = $pp2.Data.planId; confirm = $true }
-  Test-Condition 'rollback: protection re-applied' ($pa2.Data.ok -and $pa2.Data.challenge.State -eq 'auth') ($pa2.Body)
+  Test-Condition 'rollback: protection re-applied and verified' ($pa2.Data.ok -and $pa2.Data.challenge.State -eq 'auth') ($pa2.Body)
 
-  # --- Unprotect ------------------------------------------------------------------------------------------------------------
+  # --- Remove protection ----------------------------------------------------------------------------------------------------
   $up = Invoke-WebUi $ui POST '/api/identity/unprotect/plan' @{ service = 'echo' }
-  Test-Condition 'unprotect: preview warns what stays in front of the application' ($up.Status -eq 200 -and (@($up.Data.notes) -join ' ') -match 'without sign-in') ($up.Body)
+  Test-Condition 'unprotect: preview warns what stays in front of the application and that authentik keeps its rules' ($up.Status -eq 200 -and (@($up.Data.notes) -join ' ') -match 'without sign-in' -and (@($up.Data.notes) -join ' ') -match 'stay in authentik') ($up.Body)
   $ua = Invoke-WebUi $ui POST '/api/identity/unprotect/apply' @{ planId = $up.Data.planId; confirm = $true }
-  $apps = @(Get-AuthentikList $conn '/core/applications/?slug=dm-echo')
-  Test-Condition 'unprotect: route without ForwardAuth, authentik application and provider removed, group kept' ($ua.Data.ok -and [IO.File]::ReadAllText((Join-Path $installPath 'traefik\dynamic\svc-echo.yml')) -notmatch 'forwardAuth' -and $apps.Count -eq 0 -and @(Get-AuthentikList $conn '/core/groups/?name=echo%20users').Count -eq 1) ($ua.Body)
+  $provNow = @(Get-AuthentikList $conn '/providers/proxy/?name=dm-echo')[0]
+  $bindsKept = @(Get-AuthentikList $conn "/policies/bindings/?target=$($echoApp.pbm_uuid)" | ForEach-Object { [string]$_.pk } | Sort-Object) -join ','
+  Test-Condition 'unprotect: route without ForwardAuth; outpost no longer serves it; authentik application and its rules kept' ($ua.Data.ok -and [IO.File]::ReadAllText((Join-Path $installPath 'traefik\dynamic\svc-echo.yml')) -notmatch 'forwardAuth' -and (Get-AuthentikOverview $conn).Outpost.Providers -notcontains [int]$provNow.pk -and @(Get-AuthentikList $conn '/core/applications/?slug=dm-echo').Count -eq 1 -and $bindsKept -eq $bindsBefore) ($ua.Body)
+  $pp3 = Invoke-WebUi $ui POST '/api/identity/protect/plan' @{ services = @('echo') }
+  Test-Condition 'unprotect: protecting again restores the same rules (only outpost assignment and route)' (@($pp3.Data.items[0].authentik | Where-Object { $_.kind -ne 'none' } | ForEach-Object { $_.object }) -join ',' -eq 'outpost') (($pp3.Data.items[0].authentik | ForEach-Object { "$($_.kind):$($_.object)" }) -join ', ')
 
   # --- Persistence and bootstrap semantics ----------------------------------------------------------------------------------
   $akadmin = @(Get-AuthentikList $conn '/core/users/?username=akadmin')[0]
@@ -393,7 +448,9 @@ try {
       Open-Page $cdp "$base/#identity?level=$lv"
       $ok = Wait-PageCondition $cdp "!!document.querySelector('#identity-google') && !!document.querySelector('.id-steps')" 60
       $text = [string](Invoke-PageScript $cdp 'document.body.innerText')
-      Test-Condition "browser ($lv): Identity & Access page with progress, Google wizard and protected applications" ($ok -and $text -match 'Setup progress' -and $text -match [regex]::Escape("https://$authHost/source/oauth/callback/google/") -and $text -match 'Protected applications') ''
+      Test-Condition "browser ($lv): Identity & Access page with progress, Google wizard, owner and protect section" ($ok -and $text -match 'Setup progress' -and $text -match [regex]::Escape("https://$authHost/source/oauth/callback/google/") -and $text -match 'Protect applications' -and $text -match 'Initial owner' -and $text -match 'managed in authentik') ''
+      $noPeople = [bool](Invoke-PageScript $cdp "!document.querySelector('#id-p-list') && ![...document.querySelectorAll('#identity-apps input')].some((i) => i.type === 'email' || i.type === 'text') && document.querySelectorAll('#identity-apps tbody input[type=checkbox]').length >= 1 && [...document.querySelectorAll('#identity-apps a, #identity-managed a')].some((a) => a.textContent.includes('Open in authentik'))")
+      Test-Condition "browser ($lv): the protect section has application checkboxes, no email/group fields, and Open in authentik links" $noPeople ''
       Test-Condition "browser ($lv): no secret is shown" ($text -notmatch [regex]::Escape($googleSecret) -and $text -notmatch [regex]::Escape($bootToken) -and $text -notmatch [regex]::Escape($adminPass)) ''
       if ($ScreenshotDir) { Save-PageScreenshot $cdp (Join-Path $ScreenshotDir "identity-$lv-1366.png") }
     }
@@ -438,7 +495,7 @@ try {
   if ($KeepOnFailure -and ($failed -or @($script:Results | Where-Object { $_.Status -eq 'FAIL' }).Count)) {
     Write-Host "Kept for inspection: $work (stack $stack). Remove with: docker compose -p $akProject down -v; install.ps1 -Stop" -ForegroundColor Yellow
   } else {
-    $null = Invoke-Docker rm -f $app
+    $null = Invoke-Docker rm -f $app "$stack-echo2"
     if (Test-Path -LiteralPath (Join-Path $akFolder 'compose.yaml')) { $null = Invoke-Docker compose --project-directory $akFolder -f (Join-Path $akFolder 'compose.yaml') down -v --remove-orphans }
     $null = Invoke-Docker volume rm "${akProject}_database"
     if ($installed) { $null = Invoke-Ps (Join-Path $installPath 'install.ps1') @('-InstallPath', $installPath, '-Stop'); $null = Invoke-Docker rm -f "$stack-whoami" }

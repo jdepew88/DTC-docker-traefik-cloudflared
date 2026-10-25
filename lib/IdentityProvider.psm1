@@ -50,7 +50,10 @@ function New-IdentityConfig {
     authentik = [pscustomobject][ordered]@{
       project = ''; folder = ''; managed = $false; serverContainer = ''; port = 9000; localUrl = ''
       hostname = ''; service = ''; publicUrl = ''
-      google = [pscustomobject][ordered]@{ slug = 'google'; clientId = ''; signup = 'allowlist'; emails = @(); domains = @(); matching = 'identifier'; showOnLogin = $true; configuredAt = ''; verifiedAt = ''; verifiedBy = '' }
+      google = [pscustomobject][ordered]@{ slug = 'google'; clientId = ''; configuredAt = ''; verifiedAt = ''; verifiedBy = '' }
+      # The initial owner (asked once): their Google address, used only to set authentik up. Who else may sign in is
+      # decided in authentik; the manager keeps no user lists.
+      owner = [pscustomobject][ordered]@{ email = ''; makeAdmin = $true; username = ''; verifiedAt = '' }
       apps = [pscustomobject]@{}
     }
     progress = [pscustomobject][ordered]@{ step = ''; status = ''; message = ''; at = '' }
@@ -73,10 +76,12 @@ function Read-IdentityConfig {
     $cfg.authentik.port = [int](Get-IdProp $ra 'port' 9000)
     $rg = Get-IdProp $ra 'google' $null
     if ($rg) {
-      foreach ($k in @('slug', 'clientId', 'signup', 'matching', 'configuredAt', 'verifiedAt', 'verifiedBy')) { $v = Get-IdProp $rg $k $null; if ($null -ne $v) { $cfg.authentik.google.$k = [string]$v } }
-      $cfg.authentik.google.emails = @(Get-IdProp $rg 'emails' @() | ForEach-Object { [string]$_ })
-      $cfg.authentik.google.domains = @(Get-IdProp $rg 'domains' @() | ForEach-Object { [string]$_ })
-      $cfg.authentik.google.showOnLogin = [bool](Get-IdProp $rg 'showOnLogin' $true)
+      foreach ($k in @('slug', 'clientId', 'configuredAt', 'verifiedAt', 'verifiedBy')) { $v = Get-IdProp $rg $k $null; if ($null -ne $v) { $cfg.authentik.google.$k = [string]$v } }
+    }
+    $ro = Get-IdProp $ra 'owner' $null
+    if ($ro) {
+      foreach ($k in @('email', 'username', 'verifiedAt')) { $cfg.authentik.owner.$k = [string](Get-IdProp $ro $k '') }
+      $cfg.authentik.owner.makeAdmin = [bool](Get-IdProp $ro 'makeAdmin' $true)
     }
     $apps = Get-IdProp $ra 'apps' $null
     if ($apps) { $cfg.authentik.apps = $apps }
@@ -245,6 +250,17 @@ function Get-IdentityModel {
   & $add $comp (New-IdState 'api' 'authentik API connection' $(if ($tokOk -and (Get-IdProp $token 'superuser' $null)) { 'verified' } elseif ($token -and (Get-IdProp $token 'stored' $null)) { 'failed' } else { 'not-configured' }) $(if ($tokOk) { "As $((Get-IdProp $token 'username' $null))." } elseif ($token -and (Get-IdProp $token 'stored' $null)) { [string](Get-IdProp $token 'message' $null) } else { 'No token saved.' }))
   if ($ov -and @($ov.MissingFlows).Count) { & $add $comp (New-IdState 'flows' 'authentik default flows' 'configured' "Still being created: $(@($ov.MissingFlows) -join ', ').") }
 
+  # Initial owner (asked once; verified by their first Google sign-in, which authentik checks against this address).
+  $own = Get-IdProp $f 'owner' $null
+  $ownEmail = [string](Get-IdProp $own 'email' '')
+  $ownVerified = [string](Get-IdProp $own 'verifiedAt' '')
+  $gfact = Get-IdProp $f 'google' $null
+  $hasSource = [bool]($gfact -and (Get-IdProp $gfact 'source' $null))
+  if ($ownVerified) { & $add $steps (New-IdState 'owner' 'Initial owner' 'verified' "$ownEmail signed in with Google as '$((Get-IdProp $own 'username' ''))' ($ownVerified) and is in the owner group. From now on users and access are managed in authentik." 'owner') }
+  elseif (-not $ownEmail) { & $add $steps (New-IdState 'owner' 'Initial owner' $(if ($tokOk) { 'awaiting-user' } else { 'not-configured' }) 'Enter the Google account of the person who owns this authentik (asked once).' 'owner') }
+  elseif (-not $hasSource) { & $add $steps (New-IdState 'owner' 'Initial owner' 'configured' "$ownEmail will be the only Google account that may create an account at first (set up with Google sign-in)." 'owner') }
+  else { & $add $steps (New-IdState 'owner' 'Initial owner' 'awaiting-user' "Sign in once with Google as $ownEmail on the sign-in page, then check again here." 'owner') }
+
   # Public hostname.
   $hostname = [string](Get-IdProp $f 'hostname' '')
   $route = Get-IdProp $f 'route' $null
@@ -276,17 +292,19 @@ function Get-IdentityModel {
   elseif (-not $publicUrl) { & $add $steps (New-IdState 'google' 'Google sign-in' 'not-configured' 'Needs the public sign-in address first (Google only accepts https redirect URIs).' '' $true) }
   elseif (-not $src) { & $add $steps (New-IdState 'google' 'Google sign-in' 'awaiting-user' $(if ($g -and (Get-IdProp $g 'clientId' $null)) { 'Client ID saved. Enter the client secret to finish (Google shows it only once).' } else { 'Create a Google OAuth client (guided), then paste its client ID and secret.' }) 'google' $true) }
   elseif ($verifiedAt) { & $add $steps (New-IdState 'google' 'Google sign-in' 'verified' "A real Google sign-in succeeded$(if ((Get-IdProp $g 'verifiedBy' $null)) { " ($((Get-IdProp $g 'verifiedBy' $null)))" }) at $verifiedAt." 'google' $true) }
+  elseif ($ownVerified) { & $add $steps (New-IdState 'google' 'Google sign-in' 'verified' "The owner signed in with Google at $ownVerified." 'google' $true) }
   elseif ($redir -and -not (Get-IdProp $redir 'ok' $null)) { & $add $steps (New-IdState 'google' 'Google sign-in' 'failed' ([string](Get-IdProp $redir 'message' $null)) 'google' $true) }
   else { & $add $steps (New-IdState 'google' 'Google sign-in' 'configured' "The Google source is configured$(if ($redir -and (Get-IdProp $redir 'ok' $null)) { ' and redirects correctly' }). Not verified until someone signs in with Google." 'google' $true) }
   & $add $comp (New-IdState 'google-source' 'Google OAuth source' $(if ($src) { 'configured' } else { 'not-configured' }) $(if ($src) { "Source '$((Get-IdProp $src 'Slug' $null))', client $((Get-IdProp $src 'ConsumerKey' $null))" } else { 'No Google source.' }))
   & $add $comp (New-IdState 'google-callback' 'OAuth callback configuration' $(if ($redir) { $(if ((Get-IdProp $redir 'ok' $null)) { 'configured' } else { 'failed' }) } else { 'not-configured' }) $(if ($redir) { [string](Get-IdProp $redir 'message' $null) } else { 'Not checked.' }))
+  if ($ownVerified -and -not $verifiedAt) { $verifiedAt = $ownVerified }
   & $add $comp (New-IdState 'google-login' 'Real Google sign-in' $(if ($verifiedAt) { 'verified' } elseif ($src) { 'awaiting-user' } else { 'not-configured' }) $(if ($verifiedAt) { "Last confirmed $verifiedAt." } elseif ($src) { 'Sign in with a Google account to verify.' } else { '' }))
 
   # Protected applications.
   $apps = @(Get-IdProp $f 'apps' @())
   $protected = @($apps | Where-Object { $_.protected })
   if (-not $tokOk) { & $add $steps (New-IdState 'apps' 'Protect applications' 'not-configured' 'Needs the API connection first.' '' $true) }
-  elseif (-not $protected.Count) { & $add $steps (New-IdState 'apps' 'Protect applications' 'awaiting-user' 'Choose an application to put behind authentik sign-in.' 'protect' $true) }
+  elseif (-not $protected.Count) { & $add $steps (New-IdState 'apps' 'Protect applications' 'awaiting-user' 'Select the applications to put behind authentik sign-in.' 'protect' $true) }
   else {
     $bad = @($protected | Where-Object { $_.challenge -and $_.challenge.State -in 'open', 'loop', 'failed' })
     $ver = @($protected | Where-Object { $_.verifiedAt })

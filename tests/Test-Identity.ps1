@@ -85,14 +85,13 @@ try {
   Test-Condition 'google: client ID and secret shapes' ((Test-GoogleClientId '123456789012-abcdefgh12345678.apps.googleusercontent.com') -and -not (Test-GoogleClientId 'abc.apps.googleusercontent.com') -and -not (Test-GoogleClientId '1234567-x.apps.googleusercontent.com.evil.com') -and (Test-GoogleClientSecret 'GOCSPX-abcdefghijklmnop_1234') -and -not (Test-GoogleClientSecret 'bad secret with spaces')) ''
 
   # --- Allow-lists and policy expressions -------------------------------------------------------------------------------------
-  $al = ConvertTo-AccessList @(' Alice@Example.com ', 'alice@example.com') @('@Example.org', 'example.org')
-  Test-Condition 'access list: normalized and de-duplicated' ((@($al.Emails) -join ',') -eq 'alice@example.com' -and (@($al.Domains) -join ',') -eq 'example.org' -and -not $al.Errors.Count) ''
-  $inj = ConvertTo-AccessList @('x"]; import os; os.system("id") #@a.com') @('evil.com"); return True #')
-  Test-Condition 'access list: quotes and code are rejected (no injection into the policy expression)' ($inj.Errors.Count -eq 2) ($inj.Errors -join ' | ')
-  $expr = New-AppAccessExpression @('alice@example.com') @('example.org')
-  Test-Condition 'policy: application access by email or domain, inactive users refused' ($expr -match 'allowed_emails = \["alice@example.com"\]' -and $expr -match 'allowed_domains = \["example.org"\]' -and $expr -match 'request.user.is_active' -and $expr -match 'return False') $expr
-  $enr = New-EnrollmentExpression @('alice@example.com') @()
-  Test-Condition 'policy: Google enrollment requires a verified Google address on the list' ($enr -match 'oauth_userinfo' -and $enr -match 'verified_email' -and $enr -match 'email_verified' -and $enr -match 'not verified') $enr
+  # --- Initial owner (no user lists in the manager) ---------------------------------------------------------------------------
+  Test-Condition 'owner: the address is normalized; quotes and code are rejected (no injection into the policy)' ((ConvertTo-OwnerEmail ' Owner@Example.COM ') -eq 'owner@example.com' -and $(try { $null = ConvertTo-OwnerEmail 'x"; return True #@a.com'; $false } catch { $true }) -and $(try { $null = ConvertTo-OwnerEmail 'not-an-email'; $false } catch { $true })) ''
+  $enr = New-OwnerEnrollmentExpression 'owner@example.com'
+  Test-Condition 'owner: Google enrollment admits only the owner''s address, and only when Google verified it' ($enr -match 'owner_email = "owner@example.com"' -and $enr -match 'oauth_userinfo' -and $enr -match 'verified_email' -and $enr -match 'email_verified' -and $enr -match 'return False') $enr
+  Test-Condition 'owner: the policy text tells admins it now belongs to authentik' ($enr -match 'belongs to authentik') ''
+  $mods = @(Get-Command -Module Authentik | ForEach-Object { $_.Name })
+  Test-Condition 'no user lists: the allow-list functions are gone from the manager' (-not ($mods -match 'AccessList|AppAccessExpression|EnrollmentExpression$' | Where-Object { $_ -ne 'New-OwnerEnrollmentExpression' })) ($mods -join ', ')
 
   # --- Discovery ----------------------------------------------------------------------------------------------------------------
   $ct = { param($name, $image, $proj, $svcName, $state, $nets, $pub) [pscustomobject]@{ name = $name; image = $image; tag = ($image -replace '^[^:]+:([^@]+).*$', '$1'); state = $state; health = 'healthy'
@@ -145,12 +144,18 @@ try {
   $m6 = Get-IdentityModel -Facts ($base + @{ apps = $apps })
   Test-Condition 'model: per application: sign-in required, verified only from access evidence, open/missing are failures' ((& $co $m6 'app:wiki') -eq 'auth-required' -and (& $co $m6 'app:git') -eq 'verified' -and (& $co $m6 'app:blog') -eq 'failed' -and (& $co $m6 'app:old') -eq 'failed' -and (& $st $m6 'apps') -eq 'failed') ''
   Test-Condition 'model: the next step is the first failure or open action' (@($m6.next)[0] -eq 'apps' -and @((Get-IdentityModel -Facts @{ provider = 'authentik'; install = $null }).next)[0] -eq 'install') ''
+  $ownerStep = { param($facts) & $st (Get-IdentityModel -Facts ($base + $facts)) 'owner' }
+  Test-Condition 'model: owner not entered yet -> awaiting the user (asked once)' ((& $ownerStep @{ owner = @{ email = '' } }) -eq 'awaiting-user') ''
+  Test-Condition 'model: owner entered, Google not set up -> configured (does not block the next steps)' ((& $ownerStep @{ owner = @{ email = 'o@example.com' } }) -eq 'configured') ''
+  Test-Condition 'model: Google set up, owner has not signed in -> awaiting the owner''s Google sign-in' ((& $ownerStep @{ owner = @{ email = 'o@example.com' }; google = @{ source = $src } }) -eq 'awaiting-user') ''
+  $mo = Get-IdentityModel -Facts ($base + @{ owner = @{ email = 'o@example.com'; verifiedAt = '2026-10-25T10:00:00'; username = 'owner' }; google = @{ source = $src; redirect = [pscustomobject]@{ ok = $true; message = 'ok' } } })
+  Test-Condition 'model: the owner''s real Google sign-in verifies both the owner and Google sign-in' ((& $st $mo 'owner') -eq 'verified' -and (& $st $mo 'google') -eq 'verified' -and (& $co $mo 'google-login') -eq 'verified') ''
   $stopped = $a1 | ConvertTo-Json -Depth 5 | ConvertFrom-Json; $stopped.server.state = 'exited'
   Test-Condition 'model: a stopped server fails the installation step and its component' ((& $st (Get-IdentityModel -Facts @{ provider = 'authentik'; install = $stopped; token = @{ stored = $false } }) 'install') -eq 'failed' -and (& $co (Get-IdentityModel -Facts @{ provider = 'authentik'; install = $stopped }) 'server') -eq 'failed') ''
 
   # --- Configuration and resume -------------------------------------------------------------------------------------------------
   $cfg = Read-IdentityConfig -Settings $settings
-  Test-Condition 'config: defaults without a file (no provider, Google slug "google", allow-list sign-up)' ($cfg.provider -eq '' -and $cfg.authentik.google.slug -eq 'google' -and $cfg.authentik.google.signup -eq 'allowlist' -and $cfg.authentik.google.matching -eq 'identifier') ''
+  Test-Condition 'config: defaults without a file (no provider, Google slug "google", no owner yet, owner becomes admin unless unticked)' ($cfg.provider -eq '' -and $cfg.authentik.google.slug -eq 'google' -and $cfg.authentik.owner.email -eq '' -and $cfg.authentik.owner.makeAdmin -and -not $cfg.authentik.google.PSObject.Properties['emails']) ''
   $cfg.provider = 'authentik'; $cfg.authentik.hostname = 'auth.example.com'; $cfg.authentik.google.clientId = '1-x.apps.googleusercontent.com'
   Set-IdentityProgress $cfg 'google' 'draft' 'client ID saved'
   Set-IdentityApp $cfg 'wiki' ([pscustomobject]@{ slug = 'dm-wiki'; bindings = @('b1') })
@@ -213,12 +218,13 @@ try {
   $bk = Read-IdentityConfig -Settings $settings
   $bk.provider = 'authentik'; $bk.authentik.hostname = 'auth.example.com'; $bk.authentik.google.clientId = '123456789012-abcdefgh12345678.apps.googleusercontent.com'
   $bk.authentik.google.verifiedAt = '2026-10-25T10:00:00'; $bk.authentik.google.verifiedBy = 'joe'
-  Set-IdentityApp $bk 'wiki' ([pscustomobject]@{ slug = 'dm-wiki'; emails = @('a@example.com'); verifiedAt = '2026-10-25T10:00:00'; verifiedBy = 'joe' })
+  $bk.authentik.owner.email = 'Owner@Example.com'; $bk.authentik.owner.verifiedAt = '2026-10-25T10:00:00'; $bk.authentik.owner.username = 'owner'
+  Set-IdentityApp $bk 'wiki' ([pscustomobject]@{ slug = 'dm-wiki'; initialAccess = 'owner-only'; verifiedAt = '2026-10-25T10:00:00'; verifiedBy = 'joe' })
   Save-IdentityConfig -Settings $settings -Config $bk
   $man = Get-ConfigManifest -Settings $settings -SourceRoot $repo
   $mj = ConvertTo-ManifestJson $man
-  Test-Condition 'backup: Identity & Access choices are in the backup (provider, sign-in hostname, Google client ID, app rules)' ($man.identity.provider -eq 'authentik' -and $man.identity.authentik.hostname -eq 'auth.example.com' -and $man.identity.authentik.google.clientId -match 'googleusercontent' -and @($man.identity.authentik.apps.wiki.emails) -contains 'a@example.com') ''
-  Test-Condition 'backup: no sign-in evidence is backed up (a restore never claims "verified")' ($mj -notmatch 'verifiedAt' -and $mj -notmatch 'verifiedBy') ''
+  Test-Condition 'backup: Identity & Access choices are in the backup (provider, sign-in hostname, Google client ID, owner, protected apps by name)' ($man.identity.provider -eq 'authentik' -and $man.identity.authentik.hostname -eq 'auth.example.com' -and $man.identity.authentik.google.clientId -match 'googleusercontent' -and $man.identity.authentik.owner.email -eq 'owner@example.com' -and @($man.identity.authentik.protectedApps) -contains 'wiki') ($mj)
+  Test-Condition 'backup: no sign-in evidence and no access rules are backed up (authentik keeps those)' ($mj -notmatch 'verifiedAt' -and $mj -notmatch 'verifiedBy' -and $mj -notmatch 'initialAccess') ''
   Test-Condition 'backup: the authentik API token is listed as a credential that is never exported' (@($man.credentials | Where-Object { $_.id -eq 'authentik-api-token' -and -not $_.included }).Count -eq 1) ''
 
   # --- Secret store -------------------------------------------------------------------------------------------------------------

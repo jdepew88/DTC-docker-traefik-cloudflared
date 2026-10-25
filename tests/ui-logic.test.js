@@ -298,13 +298,6 @@ test('identity: Google client ID shape', () => {
   assert.ok(!L.isGoogleClientId('1234567-x.apps.googleusercontent.com.evil.com'));
 });
 
-test('identity: allow-list box splits emails and domains, rejects junk', () => {
-  const r = L.splitAccessList('Alice@Example.com, example.org; @partner.example\n alice@example.com bad"value');
-  assert.deepStrictEqual(r.emails, ['alice@example.com']);
-  assert.deepStrictEqual(r.domains, ['example.org', 'partner.example']);
-  assert.deepStrictEqual(r.invalid, ['bad"value']);
-});
-
 test('identity: next step is the first failure, else the first step waiting for the user', () => {
   const steps = [{ id: 'install', state: 'reachable' }, { id: 'google', state: 'awaiting-user' }, { id: 'apps', state: 'failed' }];
   assert.strictEqual(L.identityNextStep(steps).id, 'apps');
