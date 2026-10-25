@@ -164,6 +164,49 @@ try {
   Test-Condition 'config: a partial (older) file is completed with defaults' ($partial.authentik.hostname -eq 'auth.example.com' -and $partial.authentik.google.slug -eq 'google' -and $partial.progress.step -eq '') ''
   Test-Condition 'config: never contains a secret field' ((Get-Content -Raw (Join-Path $work 'config\identity.json')) -notmatch 'secret|token|password') ''
 
+  # --- Credential manager (reusable; fake validators) -----------------------------------------------------------------------
+  Import-Module (Join-Path $repo 'lib\CredentialManager.psm1') -Force
+  $script:calls = 0
+  $good = { param($t) $script:calls++; if ($t -like 'good-*') { @{ Ok = $true; Status = 'valid'; Account = 'akadmin'; Server = 'http://127.0.0.1:9000'; Version = '2026.8.5'; ExpiresAt = $(if ($t -like '*-soon') { (Get-Date).AddDays(5).ToUniversalTime().ToString('o') } elseif ($t -like '*-past') { (Get-Date).AddMinutes(1).ToUniversalTime().ToString('o') } else { '' }); Message = 'ok' } }
+    elseif ($t -like 'outpost-*') { @{ Ok = $false; Status = 'insufficient'; Account = 'ak-outpost-123'; Message = 'outpost token' } }
+    elseif ($t -like 'down-*') { @{ Ok = $false; Status = 'unreachable'; Message = 'server down' } }
+    else { @{ Ok = $false; Status = 'rejected'; Message = 'rejected' } } }
+  $ca = @{ Settings = $settings; Id = 'test-api'; SecretName = 'test_api'; Label = 'test token'; Validator = $good }
+  $v0 = Get-CredentialView -Settings $settings -Id 'test-api' -SecretName 'test_api'
+  Test-Condition 'credentials: nothing saved -> "missing", replacement offered' ($v0.status -eq 'missing' -and -not $v0.stored) ''
+  $r1 = Set-CredentialFromCandidate @ca -Candidate 'outpost-token-0000000000000000000000'
+  Test-Condition 'credentials: an outpost token (insufficient) is refused and not saved' (-not $r1.Ok -and -not $r1.View.stored -and $r1.Result.Status -eq 'insufficient' -and -not (Test-Path -LiteralPath (Get-ProtectedSecretPath $settings 'test_api'))) ''
+  $r2 = Set-CredentialFromCandidate @ca -Candidate 'good-admin-token-1111111111111111111111'
+  Test-Condition 'credentials: a valid token is saved with account, server and validation time' ($r2.Ok -and -not $r2.Replaced -and $r2.View.status -eq 'valid' -and $r2.View.account -eq 'akadmin' -and $r2.View.lastSuccessAt) ($r2.View | ConvertTo-Json -Compress)
+  $before = [IO.File]::ReadAllBytes((Get-ProtectedSecretPath $settings 'test_api'))
+  foreach ($bad in @('rejected-token-22222222222222222222', 'outpost-token-33333333333333333333', 'down-token-444444444444444444444')) {
+    $rb = Set-CredentialFromCandidate @ca -Candidate $bad
+    Test-Condition "credentials: failed replacement ($($rb.Result.Status)) keeps the stored token byte for byte and its status" (-not $rb.Ok -and (Read-ProtectedSecret -Settings $settings -Name 'test_api') -eq 'good-admin-token-1111111111111111111111' -and [Convert]::ToBase64String($before) -eq [Convert]::ToBase64String([IO.File]::ReadAllBytes((Get-ProtectedSecretPath $settings 'test_api'))) -and $rb.View.status -eq 'valid' -and $rb.View.lastAttempt.status -eq $rb.Result.Status) ''
+  }
+  $r3 = Set-CredentialFromCandidate @ca -Candidate 'good-rotated-token-5555555555555555555-soon'
+  Test-Condition 'credentials: voluntary rotation of a working token replaces it and records the time' ($r3.Ok -and $r3.Replaced -and $r3.View.rotatedAt -and (Read-ProtectedSecret -Settings $settings -Name 'test_api') -eq 'good-rotated-token-5555555555555555555-soon') ''
+  Test-Condition 'credentials: an expiry date within 14 days produces a warning' ($r3.View.expiresAt -and $r3.View.expiresInDays -le 5 -and $r3.View.expiryWarning -match 'expires in') ($r3.View.expiryWarning)
+  $script:calls = 0
+  $t1 = Test-StoredCredential @ca -IfOlderThanMinutes 5
+  Test-Condition 'credentials: page loads reuse a recent validation (no API call)' ($script:calls -eq 0 -and $t1.status -eq 'valid') ''
+  $t2 = Test-StoredCredential @ca
+  Test-Condition 'credentials: "Test connection" validates again without re-entering the token' ($script:calls -eq 1 -and $t2.ok -and $t2.lastValidatedAt) ''
+  $ca2 = $ca.Clone(); $ca2.Validator = { param($t) @{ Ok = $false; Status = 'unreachable'; Message = 'server down' } }
+  $t3 = Test-StoredCredential @ca2
+  Test-Condition 'credentials: an unreachable server is reported, the token and its last good status are kept' ($t3.status -eq 'unreachable' -and (Get-CredentialRecord $settings 'test-api').status -eq 'valid' -and (Read-ProtectedSecret -Settings $settings -Name 'test_api') -like 'good-rotated*') ''
+  $null = Set-CredentialFromCandidate @ca -Candidate 'good-short-lived-666666666666666666-past'
+  $rec = Get-CredentialRecord $settings 'test-api'; $rec.expiresAt = (Get-Date).AddMinutes(-5).ToString('s'); Save-CredentialRecord $settings 'test-api' $rec
+  $ca3 = $ca.Clone(); $ca3.Validator = { param($t) @{ Ok = $false; Status = 'rejected'; Message = 'rejected' } }
+  $t4 = Test-StoredCredential @ca3
+  Test-Condition 'credentials: a token refused after its expiry date is reported as expired' ($t4.status -eq 'expired' -and -not $t4.ok -and $t4.expiryWarning -match 'expired') ($t4 | ConvertTo-Json -Compress)
+  $r5 = Set-CredentialFromCandidate @ca -Candidate 'good-replacement-777777777777777777777'
+  Test-Condition 'credentials: an expired token is replaced; previous errors are cleared' ($r5.Ok -and $r5.View.status -eq 'valid' -and -not $r5.View.expiryWarning -and $r5.View.lastAttempt.status -eq 'valid') ''
+  $recText = [IO.File]::ReadAllText((Join-Path $work 'config\credentials.json'))
+  Test-Condition 'credentials: the status file holds no token value' ($recText -notmatch 'good-|outpost-token|rejected-token' -and ($r5.View | ConvertTo-Json -Depth 5) -notmatch 'good-replacement') ''
+  [IO.File]::WriteAllText((Get-ProtectedSecretPath $settings 'test_api'), '{"version":1,"data":"bm90LWRwYXBp"}')
+  Test-Condition 'credentials: a token saved by another Windows account is "unreadable" and can be replaced' ((Get-CredentialView -Settings $settings -Id 'test-api' -SecretName 'test_api').status -eq 'unreadable' -and (Set-CredentialFromCandidate @ca -Candidate 'good-after-unreadable-88888888888888').Ok) ''
+  Test-Condition 'credentials: removal forgets the token and its record' ((Remove-StoredCredential -Settings $settings -Id 'test-api' -SecretName 'test_api') -and (Get-CredentialView -Settings $settings -Id 'test-api' -SecretName 'test_api').status -eq 'missing' -and -not (Get-CredentialRecord $settings 'test-api').status) ''
+
   # --- Configuration backup -------------------------------------------------------------------------------------------------
   Import-Module (Join-Path $repo 'lib\Dashboard.psm1') -Force
   Import-Module (Join-Path $repo 'lib\ConfigBackup.psm1') -Force

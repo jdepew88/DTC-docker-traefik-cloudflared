@@ -581,3 +581,7 @@ dialog::backdrop { background: rgba(5, 8, 12, .65); }
 .choice.selected { border-color: var(--accent); }
 .wizard .wiz-step h3 { display: flex; align-items: center; gap: .5rem; font-size: 1rem; }
 @media (max-width: 640px) { .copy-row { grid-template-columns: 1fr auto; } .copy-row .copy-label { grid-column: 1 / -1; } }
+
+/* --- Credential card (credentials.js) ------------------------------------------------------------------------------- */
+.cred-form { margin-top: .8rem; padding: .8rem; border: 1px solid var(--border); border-radius: 10px; background: var(--neutral-soft); }
+.cred-form h3 { margin-top: 0; font-size: 1rem; }

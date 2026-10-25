@@ -312,5 +312,14 @@ test('identity: next step is the first failure, else the first step waiting for 
   assert.strictEqual(L.identityNextStep([{ id: 'x', state: 'verified' }]), null);
 });
 
+test('credentials: status labels; an unreachable server is a warning, not a token failure', () => {
+  assert.strictEqual(L.credentialStatus({ status: 'valid' }).tone, 'ok');
+  assert.strictEqual(L.credentialStatus({ status: 'insufficient' }).tone, 'err');
+  assert.strictEqual(L.credentialStatus({ status: 'expired' }).label, 'Expired');
+  assert.strictEqual(L.credentialStatus({ status: 'unreachable' }).tone, 'warn');
+  assert.strictEqual(L.credentialStatus(null).label, 'Not connected');
+  assert.strictEqual(L.credentialStatus({ status: 'whatever' }).label, 'Not checked yet');
+});
+
 console.log(`\n${passed} passed, ${failures.length} failed`);
 process.exit(failures.length ? 1 : 0);

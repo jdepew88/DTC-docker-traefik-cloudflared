@@ -343,6 +343,20 @@
     }
     return out;
   }
+  // Status of a managed API credential (lib\CredentialManager.psm1). "unreachable" is about the server, not the token.
+  const CREDENTIAL_STATUS = {
+    valid: { label: 'Connected', tone: 'ok', icon: 'check' },
+    insufficient: { label: 'Not usable: missing permissions', tone: 'err', icon: 'x' },
+    rejected: { label: 'Rejected by the server', tone: 'err', icon: 'x' },
+    expired: { label: 'Expired', tone: 'err', icon: 'x' },
+    revoked: { label: 'Revoked', tone: 'err', icon: 'x' },
+    unreadable: { label: 'Cannot be decrypted here', tone: 'err', icon: 'x' },
+    unreachable: { label: 'Server unreachable', tone: 'warn', icon: 'alert' },
+    missing: { label: 'Not connected', tone: 'warn', icon: 'key' },
+    unknown: { label: 'Not checked yet', tone: 'neutral', icon: 'minus' },
+  };
+  function credentialStatus(view) { return CREDENTIAL_STATUS[(view && view.status) || 'missing'] || CREDENTIAL_STATUS.unknown; }
+
   // The first step that needs the user (or failed), else the first unfinished one.
   function identityNextStep(steps) {
     const list = Array.isArray(steps) ? steps : [];
@@ -350,7 +364,7 @@
   }
 
   return {
-    IDENTITY_STATES, identityState, googleRedirectUri, isGoogleClientId, splitAccessList, identityNextStep,
+    IDENTITY_STATES, identityState, googleRedirectUri, isGoogleClientId, splitAccessList, identityNextStep, CREDENTIAL_STATUS, credentialStatus,
     LEVELS, LEVEL_TITLES, DEFAULT_LEVEL, normalizeLevel, levelIndex, isVisibleAt,
     DIMENSIONS, COMPONENT_STATUS, componentStatus, firstBlocked, suggestAppName, displayNameFromLabel, choosePort, reachOptions,
     suggestLabel, suggestServiceName, autoName, autoNameFromSource, autoNameEdit, autoNameReset, isValidSubdomain, joinHostname, splitHostname,

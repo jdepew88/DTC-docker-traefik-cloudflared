@@ -33,7 +33,7 @@ function Read-ProtectedSecret {
   param([Parameter(Mandatory = $true)]$Settings, [Parameter(Mandatory = $true)][string]$Name)
   $path = Get-ProtectedSecretPath $Settings $Name
   if (-not (Test-Path -LiteralPath $path)) { return $null }
-  $doc = [IO.File]::ReadAllText($path) | ConvertFrom-Json
+  try { $doc = [IO.File]::ReadAllText($path) | ConvertFrom-Json; if (-not $doc.PSObject.Properties['data']) { throw 'no data' } } catch { throw "The stored secret '$Name' is damaged. Save it again." }
   try { $plain = [Security.Cryptography.ProtectedData]::Unprotect([Convert]::FromBase64String($doc.data), $script:Entropy, [Security.Cryptography.DataProtectionScope]::CurrentUser) }
   catch { throw "The stored secret '$Name' cannot be decrypted by this Windows account (it was saved by another user or machine). Save it again." }
   return [Text.Encoding]::UTF8.GetString($plain)
@@ -43,10 +43,11 @@ function Get-ProtectedSecretInfo {
   param([Parameter(Mandatory = $true)]$Settings, [Parameter(Mandatory = $true)][string]$Name)
   $path = Get-ProtectedSecretPath $Settings $Name
   if (-not (Test-Path -LiteralPath $path)) { return [pscustomobject]@{ Stored = $false; Readable = $false; SavedAt = ''; User = ''; Label = '' } }
-  $doc = [IO.File]::ReadAllText($path) | ConvertFrom-Json
+  $doc = $null; try { $doc = [IO.File]::ReadAllText($path) | ConvertFrom-Json } catch { }
   $readable = $true
   try { $null = Read-ProtectedSecret -Settings $Settings -Name $Name } catch { $readable = $false }
-  return [pscustomobject]@{ Stored = $true; Readable = $readable; SavedAt = [string]$doc.savedAt; User = [string]$doc.user; Label = [string]$(if ($doc.PSObject.Properties['label']) { $doc.label } else { '' }) }
+  $field = { param($n) if ($doc -and $doc.PSObject.Properties[$n]) { [string]$doc.$n } else { '' } }
+  return [pscustomobject]@{ Stored = $true; Readable = $readable; SavedAt = (& $field 'savedAt'); User = (& $field 'user'); Label = (& $field 'label') }
 }
 
 function Remove-ProtectedSecret {

@@ -159,6 +159,71 @@ try {
   Test-Condition 'model: install reachable, administrator configured, API verified' ((Get-Step $g1.Data 'install').state -eq 'reachable' -and (Get-Step $g1.Data 'admin').state -eq 'configured' -and (Get-Step $g1.Data 'api').state -eq 'verified') (($g1.Data.model.steps | ForEach-Object { "$($_.id)=$($_.state)" }) -join ', ')
   Test-Condition 'model: Google and applications await the public address / user (never verified yet)' ((Get-Step $g1.Data 'google').state -eq 'not-configured' -and (Get-Step $g1.Data 'apps').state -eq 'awaiting-user' -and (Get-Step $g1.Data 'hostname').state -eq 'awaiting-user') ''
 
+  # --- API token management: replace, rotate, refuse, preserve -------------------------------------------------------------
+  # Real tokens of this authentik: the embedded outpost's own token (what a user can pick by mistake), admin tokens that
+  # expire, get deleted or rotate. Nothing in authentik is changed by the manager; the test itself creates/deletes tokens.
+  Import-Module (Join-Path $repo 'lib\SecretStore.psm1') -Force
+  $adm = New-AuthentikConnection -BaseUrl "http://127.0.0.1:$akPort" -Token $bootToken
+  $akadminPk = [int]@(Get-AuthentikList $adm '/core/users/?username=akadmin')[0].pk
+  $outTok = @(Get-AuthentikList $adm '/core/tokens/?intent=api' | Where-Object { [string]$_.identifier -like 'ak-outpost-*' })[0]
+  $outpostKey = [string](Invoke-AuthentikApi $adm GET "/core/tokens/$($outTok.identifier)/view_key/").key
+  $newTok = { param([string]$Ident, [int]$Seconds = 0)
+    $b = @{ identifier = $Ident; intent = 'api'; user = $akadminPk; description = 'tpx identity test'; expiring = [bool]$Seconds }
+    if ($Seconds) { $b.expires = (Get-Date).ToUniversalTime().AddSeconds($Seconds).ToString('o') }
+    $null = Invoke-AuthentikApi $adm POST '/core/tokens/' $b
+    [string](Invoke-AuthentikApi $adm GET "/core/tokens/$Ident/view_key/").key }
+  $settingsI = Get-StackSettings -InstallPath $installPath
+  $secretBytes = { [Convert]::ToBase64String([IO.File]::ReadAllBytes((Join-Path $installPath 'secrets\authentik_api.dpapi'))) }
+  # The situation from the field: an earlier version saved the outpost's token. (Written the way the old version did.)
+  Save-ProtectedSecret -Settings $settingsI -Name 'authentik_api' -Value $outpostKey -Label 'old version'
+  $c0 = Invoke-WebUi $ui GET '/api/identity?deep=1'
+  Test-Condition 'token mgmt: a saved outpost token is reported as not usable, with the reason (outpost) and the API step failed' ($c0.Data.credential.status -eq 'insufficient' -and $c0.Data.credential.message -match 'outpost' -and $c0.Data.credential.account -like 'ak-outpost-*' -and (Get-Step $c0.Data 'api').state -eq 'failed') ($c0.Data.credential | ConvertTo-Json -Compress)
+  $bad1 = Invoke-WebUi $ui POST '/api/identity/token' @{ token = 'wrongwrongwrongwrongwrongwrong0123456789' }
+  Test-Condition 'token mgmt: a wrong replacement is refused; the saved token is preserved and another attempt is possible' ($bad1.Status -eq 400 -and $bad1.Data.preserved -and $bad1.Data.candidate.status -eq 'rejected' -and (Invoke-WebUi $ui GET '/api/identity').Data.credential.account -like 'ak-outpost-*') ($bad1.Body)
+  $before1 = & $secretBytes
+  $rep1 = Invoke-WebUi $ui POST '/api/identity/token' @{ token = $bootToken }
+  Test-Condition 'token mgmt: outpost token -> admin token: validated, replaced, errors cleared' ($rep1.Status -eq 200 -and $rep1.Data.replaced -and $rep1.Data.credential.status -eq 'valid' -and $rep1.Data.credential.account -eq 'akadmin' -and (& $secretBytes) -ne $before1) ($rep1.Body)
+  Test-Condition 'token mgmt: after the replacement onboarding resumes at the next step (public address)' ($rep1.Data.next -eq 'hostname' -and (Get-Step (Invoke-WebUi $ui GET '/api/identity').Data 'api').state -eq 'verified') "next=$($rep1.Data.next)"
+  Test-Condition 'token mgmt: the outpost''s own token is untouched in authentik' (@(Get-AuthentikList $adm "/core/tokens/?identifier=$($outTok.identifier)").Count -eq 1 -and (Test-AuthentikCredential -BaseUrl "http://127.0.0.1:$akPort" -Token $outpostKey).Account -like 'ak-outpost-*') ''
+  $bad2 = Invoke-WebUi $ui POST '/api/identity/token' @{ token = $outpostKey }
+  $before2 = & $secretBytes
+  Test-Condition 'token mgmt: replacing a working token with the outpost token is refused; the working token keeps working' ($bad2.Status -eq 400 -and $bad2.Data.candidate.status -eq 'insufficient' -and (Invoke-WebUi $ui POST '/api/identity/token/test' @{}).Data.ok -and (& $secretBytes) -eq $before2) ($bad2.Body)
+  # Voluntary rotation of a healthy connection.
+  $rotKey = & $newTok 'tpx-rotation' 0
+  $rot = Invoke-WebUi $ui POST '/api/identity/token' @{ token = $rotKey }
+  Test-Condition 'token mgmt: voluntary rotation of a healthy token' ($rot.Status -eq 200 -and $rot.Data.replaced -and $rot.Data.credential.rotatedAt -and $rot.Data.credential.status -eq 'valid' -and -not $rot.Data.credential.expiresAt) ($rot.Body)
+  # Expiring token: the expiry date is read from authentik, a warning is shown, then it expires.
+  # authentik gives every expiring API token the system's default token duration (it ignores a requested date), so
+  # the disposable instance's default is shortened to 25 seconds for this token and restored right after.
+  $prevDuration = [string](Invoke-AuthentikApi $adm GET '/admin/settings/').default_token_duration
+  $null = Invoke-AuthentikApi $adm PATCH '/admin/settings/' @{ default_token_duration = 'seconds=25' }
+  $expKey = & $newTok 'tpx-expiring' 25
+  $null = Invoke-AuthentikApi $adm PATCH '/admin/settings/' @{ default_token_duration = $prevDuration }
+  $exp = Invoke-WebUi $ui POST '/api/identity/token' @{ token = $expKey }
+  Test-Condition 'token mgmt: an expiring token shows its expiry date and a warning' ($exp.Status -eq 200 -and $exp.Data.credential.expiresAt -and $exp.Data.credential.expiryWarning -match 'expires') ($exp.Data.credential | ConvertTo-Json -Compress)
+  Start-Sleep -Seconds 35
+  $t1 = Invoke-WebUi $ui POST '/api/identity/token/test' @{}
+  Test-Condition 'token mgmt: Test connection reports the expired token (without asking for it)' ($t1.Status -eq 200 -and -not $t1.Data.ok -and $t1.Data.credential.status -eq 'expired') ($t1.Data.credential | ConvertTo-Json -Compress)
+  $g1x = Invoke-WebUi $ui GET '/api/identity'
+  Test-Condition 'token mgmt: with an expired token the API step fails and nothing is attempted with it' ((Get-Step $g1x.Data 'api').state -eq 'failed' -and (Invoke-WebUi $ui POST '/api/identity/outpost/plan' @{}).Status -eq 409) ''
+  $rep2 = Invoke-WebUi $ui POST '/api/identity/token' @{ token = $rotKey }
+  Test-Condition 'token mgmt: expired token -> replacement' ($rep2.Status -eq 200 -and $rep2.Data.credential.status -eq 'valid' -and -not $rep2.Data.credential.expiryWarning) ($rep2.Body)
+  # Revoked (deleted in authentik).
+  $null = Invoke-AuthentikApi $adm DELETE '/core/tokens/tpx-rotation/'
+  $t2 = Invoke-WebUi $ui POST '/api/identity/token/test' @{}
+  Test-Condition 'token mgmt: a revoked token is reported as rejected (wrong, expired or revoked)' (-not $t2.Data.ok -and $t2.Data.credential.status -eq 'rejected' -and $t2.Data.credential.message -match 'revoked') ($t2.Data.credential | ConvertTo-Json -Compress)
+  # The manager restarts (or the browser reloads): the failed state and the way out are still there.
+  Stop-TestServer $ui
+  $ui = Start-WebUiServer -Script (Join-Path $installPath 'webui.ps1') -InstallPath $installPath -WorkDir $uiDir
+  $null = Connect-WebUi $ui
+  $g2x = Invoke-WebUi $ui GET '/api/identity'
+  Test-Condition 'token mgmt: after a manager restart the revoked token is still reported and replaceable' ($g2x.Data.credential.status -eq 'rejected' -and $g2x.Data.credential.stored -and $g2x.Data.config.provider -eq 'authentik') ($g2x.Data.credential | ConvertTo-Json -Compress)
+  $rep3 = Invoke-WebUi $ui POST '/api/identity/token' @{ fromBootstrap = $true }
+  Test-Condition 'token mgmt: revoked token -> replacement (installation token); setup progress kept' ($rep3.Status -eq 200 -and $rep3.Data.credential.status -eq 'valid' -and (Invoke-WebUi $ui GET '/api/identity').Data.config.authentik.project -eq $akProject) ($rep3.Body)
+  $logText = ''
+  foreach ($f in @(Get-ChildItem -LiteralPath (Join-Path $installPath 'logs') -File -Recurse -ErrorAction SilentlyContinue) + @(Get-Item (Join-Path $installPath 'config\credentials.json'))) { $fs = [IO.File]::Open($f.FullName, 'Open', 'Read', 'ReadWrite'); try { $logText += (New-Object IO.StreamReader($fs)).ReadToEnd() } finally { $fs.Close() } }
+  Test-Condition 'token mgmt: no token value in any response, status file or log' (-not @(@($ui.Bodies) + $logText | Where-Object { $_ -match [regex]::Escape($outpostKey) -or $_ -match [regex]::Escape($rotKey) -or $_ -match [regex]::Escape($expKey) -or $_ -match [regex]::Escape($bootToken) }).Count) ''
+
   # --- Sign-in hostname ---------------------------------------------------------------------------------------------------
   $hn = Invoke-WebUi $ui POST '/api/identity/hostname' @{ hostname = $authHost; service = 'authentik' }
   Test-Condition 'hostname: saved; redirect URI derived from it (no hard-coded domain)' ($hn.Status -eq 200 -and $hn.Data.redirectUri -eq "https://$authHost/source/oauth/callback/google/") ($hn.Body)
@@ -332,6 +397,27 @@ try {
       Test-Condition "browser ($lv): no secret is shown" ($text -notmatch [regex]::Escape($googleSecret) -and $text -notmatch [regex]::Escape($bootToken) -and $text -notmatch [regex]::Escape($adminPass)) ''
       if ($ScreenshotDir) { Save-PageScreenshot $cdp (Join-Path $ScreenshotDir "identity-$lv-1366.png") }
     }
+    # Token management in the browser: an unusable token opens the replacement form; replacing works from the page.
+    Save-ProtectedSecret -Settings (Get-StackSettings -InstallPath $installPath) -Name 'authentik_api' -Value $outpostKey -Label 'old version'
+    $null = Invoke-WebUi $ui POST '/api/identity/token/test' @{}
+    Open-Page $cdp "$base/#identity?level=beginner"
+    $ok1 = Wait-PageCondition $cdp "!!document.querySelector('#cred-card-authentik-api') && !!document.querySelector('#cred-authentik-api')" 60
+    $cardText = [string](Invoke-PageScript $cdp "document.querySelector('#cred-card-authentik-api').innerText")
+    Test-Condition 'browser token: a failed token shows the reason, Replace API token and the replacement field right away' ($ok1 -and $cardText -match 'Replace API token' -and $cardText -match 'outpost' -and $cardText -match 'Try a different token' -and $cardText -match 'Test connection') $cardText
+    if ($ScreenshotDir) { Save-PageScreenshot $cdp (Join-Path $ScreenshotDir 'identity-token-failed-1366.png') }
+    Open-Page $cdp "$base/#identity?level=beginner"
+    $ok2 = Wait-PageCondition $cdp "!!document.querySelector('#cred-authentik-api')" 60
+    Test-Condition 'browser token: after a page refresh the replacement form is still offered' $ok2 ''
+    $null = Invoke-PageScript $cdp "(() => { const i = document.querySelector('#cred-authentik-api'); i.value = 'wrongwrongwrongwrongwrongwrong0123456789'; [...document.querySelectorAll('#cred-card-authentik-api button')].find((b) => b.textContent.includes('Validate and save')).click(); return true; })()"
+    $ok3 = Wait-PageCondition $cdp "(document.querySelector('#cred-card-authentik-api .form-error') || {}).textContent.includes('not saved')" 60
+    Test-Condition 'browser token: a refused token shows why and keeps the form for another attempt' ($ok3 -and [bool](Invoke-PageScript $cdp "!!document.querySelector('#cred-authentik-api') && document.querySelector('#cred-authentik-api').value === ''")) ''
+    $null = Invoke-PageScript $cdp "(() => { const i = document.querySelector('#cred-authentik-api'); i.value = '$bootToken'; [...document.querySelectorAll('#cred-card-authentik-api button')].find((b) => b.textContent.includes('Validate and save')).click(); return true; })()"
+    $ok4 = Wait-PageCondition $cdp "(() => { const c = document.querySelector('#cred-card-authentik-api'); return c && c.innerText.includes('Connected') && !document.querySelector('#cred-authentik-api'); })()" 60
+    $card2 = [string](Invoke-PageScript $cdp "document.querySelector('#cred-card-authentik-api').innerText")
+    Test-Condition 'browser token: replacing from the page connects; Replace API token stays available on a healthy connection' ($ok4 -and $card2 -match 'akadmin' -and $card2 -match 'Replace API token' -and $card2 -notmatch [regex]::Escape($bootToken)) $card2
+    if ($ScreenshotDir) { Save-PageScreenshot $cdp (Join-Path $ScreenshotDir 'identity-token-connected-1366.png') }
+    Open-Page $cdp "$base/#identity?level=expert"
+    $null = Wait-PageCondition $cdp "!!document.querySelector('#identity-google') && !!document.querySelector('.id-steps')" 60
     $raw = [string](Invoke-PageScript $cdp "(document.querySelector('details.tech pre') || {}).textContent || ''")
     Test-Condition 'browser (expert): raw state is shown without secrets' ($raw -match 'clientId' -and $raw -notmatch [regex]::Escape($googleSecret)) ''
     Set-Viewport $cdp 390 844 -Mobile

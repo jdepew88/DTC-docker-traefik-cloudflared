@@ -133,6 +133,67 @@ function Test-AuthentikToken {
   }
 }
 
+# API areas the Deployment Manager reads and changes; a token must be able to list each of them.
+$script:RequiredApi = [ordered]@{
+  'flows' = '/flows/instances/?page_size=1'; 'stages' = '/stages/identification/?page_size=1'; 'sources' = '/sources/oauth/?page_size=1'
+  'providers' = '/providers/proxy/?page_size=1'; 'applications' = '/core/applications/?page_size=1'; 'policies' = '/policies/expression/?page_size=1'
+  'policy bindings' = '/policies/bindings/?page_size=1'; 'groups' = '/core/groups/?page_size=1'; 'outposts' = '/outposts/instances/?page_size=1'; 'events' = '/events/events/?page_size=1'
+}
+
+# Credential validator for CredentialManager.psm1: is this token usable by the Deployment Manager on this authentik?
+# Status: valid | rejected (wrong, expired or deleted) | insufficient (works, but not for an administrator or
+# missing API access) | unreachable (authentik does not answer: says nothing about the token). Also returns the
+# account, the server version and, when authentik lists it, the token's expiry date. The token is never returned.
+function Test-AuthentikCredential {
+  param([Parameter(Mandatory = $true)][string]$BaseUrl, [Parameter(Mandatory = $true)][string]$Token)
+  $base = $BaseUrl.TrimEnd('/')
+  $out = [ordered]@{ Ok = $false; Status = 'rejected'; Message = ''; Account = ''; Server = $base; Version = ''; ExpiresAt = ''; Details = $null }
+  if ($Token -notmatch '^[A-Za-z0-9._-]{20,256}$') { $out.Message = 'That does not look like an authentik API token (letters, digits, . _ - only, at least 20 characters).'; return $out }
+  $live = Invoke-AkHttp -Url "$base/-/health/live/" -TimeoutMs 5000
+  if ($live.Status -ne 200) { $out.Status = 'unreachable'; $out.Message = "authentik does not answer at $base$(if ($live.Error) { " ($($live.Error))" } else { " (HTTP $($live.Status))" }); the token was not checked."; return $out }
+  $conn = New-AuthentikConnection -BaseUrl $base -Token $Token
+  $me = $null
+  try { $me = Invoke-AuthentikApi $conn GET '/core/users/me/' }
+  catch {
+    $st = $_.Exception.Data['Status']
+    if ($st -in 401, 403) { $out.Message = 'authentik rejected this token: it is wrong, has expired or was deleted (revoked). Create a new API token in authentik (Directory > Tokens and App passwords) for akadmin or another administrator.' }
+    else { $out.Status = 'unreachable'; $out.Message = "authentik could not check the token: $($_.Exception.Message)" }
+    return $out
+  }
+  $u = $me.user
+  $out.Account = [string]$u.username
+  $type = [string](Get-AkProp $u 'type' '')
+  try { $out.Version = [string](Invoke-AuthentikApi $conn GET '/admin/version/').version_current } catch { }
+  if ($type -eq 'internal_service_account' -and $out.Account -like 'ak-outpost-*') {
+    $out.Status = 'insufficient'
+    $out.Message = "This is the token of authentik's own outpost (user $($out.Account)). It only lets the outpost read its configuration and must stay with the outpost. Create an API token for akadmin (or another administrator) and use that instead; the outpost token is not changed."
+    return $out
+  }
+  if (-not [bool](Get-AkProp $u 'is_superuser' $false)) {
+    $out.Status = 'insufficient'
+    $out.Message = "The token belongs to '$($out.Account)', who is not an authentik administrator. The manager creates sources, applications, providers and policies, which needs an administrator's API token."
+    return $out
+  }
+  $missing = @()
+  foreach ($k in $script:RequiredApi.Keys) { try { $null = Invoke-AuthentikApi $conn GET $script:RequiredApi[$k] } catch { if ($_.Exception.Data['Status'] -in 401, 403) { $missing += $k } } }
+  if ($missing.Count) { $out.Status = 'insufficient'; $out.Message = "The token cannot read: $($missing -join ', '). Use an administrator's API token without restrictions."; return $out }
+  # Expiry: find this token among the account's API tokens (keys are compared here, in memory, and never returned).
+  try {
+    foreach ($t in @(Get-AuthentikList $conn "/core/tokens/?user__username=$([Uri]::EscapeDataString($out.Account))&intent=api")) {
+      $k = $null; try { $k = [string](Invoke-AuthentikApi $conn GET "/core/tokens/$([Uri]::EscapeDataString([string]$t.identifier))/view_key/").key } catch { }
+      if ($k -and $k -ceq $Token) {
+        $out.Details = [ordered]@{ identifier = [string]$t.identifier; description = [string](Get-AkProp $t 'description' ''); expiring = [bool](Get-AkProp $t 'expiring' $false) }
+        if ([bool](Get-AkProp $t 'expiring' $false) -and (Get-AkProp $t 'expires' $null)) { $out.ExpiresAt = [string]$t.expires }
+        break
+      }
+      $k = $null
+    }
+  } catch { }
+  $out.Ok = $true; $out.Status = 'valid'
+  $out.Message = "Connected as $($out.Account) (administrator) to authentik $($out.Version)$(if ($out.Details) { ", token '$($out.Details.identifier)'" })."
+  return $out
+}
+
 # Read-only snapshot of everything the integration depends on.
 function Get-AuthentikOverview {
   param([Parameter(Mandatory = $true)]$Conn)
@@ -642,7 +703,7 @@ function Test-ForwardAuthChallenge {
   return [pscustomobject]@{ State = 'loop'; Status = 0; Location = ''; Chain = $chain; Message = 'More than 8 redirects without reaching a sign-in page.' }
 }
 
-Export-ModuleMember -Function Invoke-AkHttp, Get-AuthentikHealth, New-AuthentikConnection, Invoke-AuthentikApi, Get-AuthentikList, Test-AuthentikToken, Get-AuthentikOverview,
+Export-ModuleMember -Function Invoke-AkHttp, Get-AuthentikHealth, New-AuthentikConnection, Invoke-AuthentikApi, Get-AuthentikList, Test-AuthentikToken, Test-AuthentikCredential, Get-AuthentikOverview,
   Get-GoogleOAuthSettings, Test-GoogleClientId, Test-GoogleClientSecret, ConvertTo-AccessList, New-AppAccessExpression, New-EnrollmentExpression,
   Sync-AuthentikOutpost, Sync-AuthentikGoogleSource, Sync-AuthentikAppProtection, Remove-AuthentikAppProtection, Test-AuthentikGoogleRedirect,
   Get-AuthentikSourceLogins, Get-AuthentikAppAccessEvidence, Wait-AuthentikOutpost, Test-ForwardAuthChallenge

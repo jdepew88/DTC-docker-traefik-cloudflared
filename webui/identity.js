@@ -128,22 +128,43 @@
           h('li', null, 'Google sign-in never replaces the local administrator; accounts created through Google never become administrators automatically.'))));
   }
 
-  // --- API connection ----------------------------------------------------------------------------------------------------
+  // --- Connection settings (managed API credential) ---------------------------------------------------------------------
+  // The reusable credential card (credentials.js): status, Test connection, Replace API token (always available). A
+  // replacement is validated against this authentik before it replaces the saved token; a refused one changes nothing.
   function apiSection(ctx, d, reload) {
-    const t = d.token || {};
-    const input = h('input', { type: 'password', id: 'id-token', autocomplete: 'off', spellcheck: 'false', placeholder: 'authentik API token' });
-    const save = (body) => (e) => withBusy(e.currentTarget, async () => { const r = await api('POST', '/api/identity/token', body); input.value = ''; toast(r.warning || `Connected as ${r.username}.`, !!r.warning); await reload(false); });
+    const C = window.TPMCredentials;
+    const v = d.credential || { status: 'missing', stored: false };
+    const local = d.install && d.install.localUrl;
     const remove = (e) => withBusy(e.currentTarget, async () => {
       if (!await U.confirmDialog({ title: 'Remove the authentik API token', okText: 'Remove', danger: true, body: ['The manager can no longer read or change authentik. authentik itself and the token inside authentik are not changed (revoke it there under Directory > Tokens).'] })) return;
       await api('POST', '/api/identity/token/delete', { confirm: true }); await reload(false);
     });
-    return h('section', { class: 'card', id: 'identity-api', 'aria-labelledby': 'id-api-h' }, h('h2', { id: 'id-api-h' }, 'Manager connection to authentik'),
-      t.stored ? h('p', null, t.ok ? stateChip('verified') : stateChip('failed'), ' ', t.ok ? `API token of ${t.username}${t.superuser ? ' (administrator)' : ' (NOT an administrator)'}.` : t.message || 'The token could not be checked.',
-        h('span', { class: 'small muted' }, ` Saved ${t.savedAt} by ${t.user}, encrypted for this Windows account.`)) : h('p', null, 'No token saved yet.'),
-      d.install && d.install.managed && !t.ok ? h('div', { class: 'actions' }, h('button', { type: 'button', class: 'btn primary', onclick: save({ fromBootstrap: true }) }, icon('key'), 'Use the token created at installation')) : null,
-      !t.ok ? [field({ id: 'id-token', label: 'API token', control: input, hint: 'In authentik: Directory > Tokens and App passwords > Create, user akadmin (or another administrator), intent "API Token", then copy it. It is stored encrypted on this PC and never shown again.' }),
-        h('div', { class: 'actions' }, h('button', { type: 'button', class: 'btn', onclick: (e) => save({ token: input.value })(e) }, 'Save and test'))] : null,
-      t.stored ? gate('advanced', h('div', { class: 'actions' }, h('button', { type: 'button', class: 'btn small ghost', onclick: remove }, 'Remove saved token'))) : null);
+    const fromBootstrap = (e) => withBusy(e.currentTarget, async () => {
+      try { const r = await api('POST', '/api/identity/token', { fromBootstrap: true }); toast(`Connected as ${r.username}.`); await afterChange(r); }
+      catch (x) { toast(x.message, true); }
+    });
+    async function afterChange(r) {
+      await reload(false);
+      // Resume where the setup stands now: the next step that needs attention.
+      const next = r && r.next ? document.getElementById(`identity-${r.next}`) : null;
+      if (next) next.scrollIntoView({ block: 'start' });
+    }
+    const explain = h('details', { class: 'more', open: v.status === 'insufficient' || !v.stored ? true : null }, h('summary', null, 'How to create an API token in authentik'),
+      h('ol', { class: 'small' },
+        h('li', null, 'Sign in to authentik as akadmin (or another administrator)', local ? [' at ', h('a', { href: `${local}/if/admin/#/core/tokens`, target: '_blank', rel: 'noopener noreferrer' }, `${local}/if/admin/`, ' ', icon('external'))] : '', '.'),
+        h('li', null, 'Directory > Tokens and App passwords > Create.'),
+        h('li', null, 'User: akadmin (or your administrator account). Intent: API Token. Turn "Expiring" off: authentik gives expiring API tokens its default token lifetime (1 day unless changed under System > Settings). If you keep it on, the manager warns before it runs out.'),
+        h('li', null, 'Create, then use "Copy token" and paste it below.')),
+      h('p', { class: 'small muted' }, 'Do not use a token whose user starts with ak-outpost-: it belongs to authentik\'s own outpost and cannot administer authentik.'));
+    return h('div', { id: 'identity-api' },
+      C.card({
+        id: 'authentik-api', title: 'authentik: Connection settings', view: v, testPath: '/api/identity/token/test', replacePath: '/api/identity/token',
+        tokenLabel: 'New authentik API token', serverLabel: 'Connected authentik server', accountLabel: 'API account', explain,
+        tokenHint: 'Checked against this authentik (administrator account, API access) before it is saved, encrypted for this Windows account. If it is refused, the current token stays as it is. Nothing in authentik is changed.',
+        extraActions: [d.install && d.install.managed && !v.ok ? h('button', { type: 'button', class: 'btn', onclick: fromBootstrap }, 'Use the token created at installation') : null,
+          v.stored ? h('span', { 'data-min-level': 'advanced' }, h('button', { type: 'button', class: 'btn ghost', onclick: remove }, 'Remove saved token')) : null],
+        onChanged: (r) => afterChange(r), rerender: () => reload(false),
+      }));
   }
 
   // --- Public sign-in address --------------------------------------------------------------------------------------------

@@ -57,6 +57,7 @@ Import-Module (Join-Path $here 'lib\ServiceHealth.psm1') -Force
 Import-Module (Join-Path $here 'lib\BackendResolver.psm1') -Force
 Import-Module (Join-Path $here 'lib\AppCatalog.psm1') -Force
 Import-Module (Join-Path $here 'lib\SecretStore.psm1') -Force
+Import-Module (Join-Path $here 'lib\CredentialManager.psm1') -Force
 Import-Module (Join-Path $here 'lib\Authentik.psm1') -Force
 Import-Module (Join-Path $here 'lib\IdentityProvider.psm1') -Force
 if (-not $CatalogDir) { $CatalogDir = Join-Path $here 'catalog' }
@@ -130,6 +131,7 @@ $StaticFiles = @{
   '/explorer.js' = @('explorer.js', 'text/javascript; charset=utf-8')
   '/discover.js' = @('discover.js', 'text/javascript; charset=utf-8')
   '/catalog.js' = @('catalog.js', 'text/javascript; charset=utf-8')
+  '/credentials.js' = @('credentials.js', 'text/javascript; charset=utf-8')
   '/identity.js' = @('identity.js', 'text/javascript; charset=utf-8')
   '/learn.json' = @('learn.json', 'application/json; charset=utf-8')
   '/app.css'    = @('app.css', 'text/css; charset=utf-8')
@@ -2515,19 +2517,29 @@ function Get-IdentityContext([switch]$Deep) {
   $baseUrl = $(if ($install -and $install.localUrl) { $install.localUrl } else { $cfg.authentik.localUrl })
   $running = [bool]($install -and $install.server -and $install.server.state -eq 'running')
   $health = $null; if ($running -and $baseUrl) { $health = Get-AuthentikHealth -BaseUrl $baseUrl }
-  $tokInfo = Get-ProtectedSecretInfo -Settings $settings -Name (Get-IdentityTokenSecretName)
-  $token = [ordered]@{ stored = $tokInfo.Stored; readable = $tokInfo.Readable; savedAt = $tokInfo.SavedAt; user = $tokInfo.User; ok = $false; username = ''; superuser = $false; message = '' }
+  # The API token is a managed credential (lib\CredentialManager.psm1): validated at most every two minutes on page
+  # loads, immediately on -Deep ("Run checks"), and again whenever authentik refuses it.
+  $credential = $null
   $conn = $null; $overview = $null; $overviewError = ''
-  if ($tokInfo.Stored -and $tokInfo.Readable -and $health -and $health.Live) {
-    $plain = Read-ProtectedSecret -Settings $settings -Name (Get-IdentityTokenSecretName)
-    $t = Test-AuthentikToken -BaseUrl $baseUrl -Token $plain
-    $token.ok = $t.Ok; $token.username = $t.Username; $token.superuser = $t.IsSuperuser; $token.message = $t.Message
-    if ($t.Ok) {
+  $credArgs = Get-IdentityCredentialArgs $settings $baseUrl
+  if ($health -and $health.Live) {
+    $credential = Test-StoredCredential @credArgs -IfOlderThanMinutes $(if ($Deep) { 0 } else { 2 })
+    if ($credential.ok) {
+      $plain = Read-ProtectedSecret -Settings $settings -Name (Get-IdentityTokenSecretName)
       $conn = New-AuthentikConnection -BaseUrl $baseUrl -Token $plain
-      try { $overview = Get-AuthentikOverview $conn } catch { $overviewError = $_.Exception.Message }
+      $plain = $null
+      try { $overview = Get-AuthentikOverview $conn }
+      catch {
+        $overviewError = $_.Exception.Message
+        if ($_.Exception.Data['Status'] -in 401, 403) { $credential = Test-StoredCredential @credArgs; $conn = $null; $overviewError = '' }
+      }
     }
-    $plain = $null
-  } elseif ($tokInfo.Stored -and -not ($health -and $health.Live)) { $token.message = 'authentik is not reachable, so the token was not checked.' }
+  } else {
+    $credential = Get-CredentialView -Settings $settings -Id 'authentik-api' -SecretName (Get-IdentityTokenSecretName) -Label 'authentik API token'
+    if ($credential.stored -and $credential.readable) { $credential.status = 'unreachable'; $credential.ok = $false; $credential.message = 'authentik is not reachable, so the token was not checked. It is kept as it is.' }
+  }
+  $token = [ordered]@{ stored = $credential.stored; readable = $credential.readable; savedAt = $credential.savedAt; user = $credential.savedBy; ok = [bool]$credential.ok; username = $credential.account
+    superuser = [bool]$credential.ok; message = $credential.message; status = $credential.status }
   $services = @(); if (Test-Installed) { try { $services = @((Read-ServiceRegistry -Settings $settings).services) } catch { } }
   $routers = $null; if (Test-Installed) { $routers = Get-TraefikApi $settings '/api/http/routers' }
   $route = $null
@@ -2580,8 +2592,14 @@ function Get-IdentityContext([switch]$Deep) {
   }
   $facts = [ordered]@{ provider = $cfg.provider; install = $install; health = $health; token = $token; overview = $overview; hostname = $cfg.authentik.hostname; publicUrl = $cfg.authentik.publicUrl
     route = $route; cloudflare = $cfFacts; publicCheck = $pub; google = $google; apps = $appFacts }
-  return [pscustomobject]@{ Settings = $settings; Config = $cfg; Installs = $installs; Install = $install; BaseUrl = $baseUrl; Conn = $conn; Overview = $overview; OverviewError = $overviewError
+  return [pscustomobject]@{ Settings = $settings; Config = $cfg; Installs = $installs; Install = $install; BaseUrl = $baseUrl; Conn = $conn; Overview = $overview; OverviewError = $overviewError; Credential = $credential
     Facts = $facts; Services = $services; Cloudflare = $cf }
+}
+
+# Arguments for the reusable credential functions: the authentik API token, validated against this installation.
+function Get-IdentityCredentialArgs($Settings, [string]$BaseUrl) {
+  $u = $BaseUrl
+  return @{ Settings = $Settings; Id = 'authentik-api'; SecretName = (Get-IdentityTokenSecretName); Label = 'authentik API token'; Validator = { param($t) Test-AuthentikCredential -BaseUrl $u -Token $t }.GetNewClosure() }
 }
 
 function Get-IdProp2($Object, [string]$Name, $Default = $null) {
@@ -2651,7 +2669,7 @@ function Get-IdentityData([switch]$Deep) {
   }
   return [ordered]@{
     provider = $cfg.provider; providers = @(Get-IdentityProviders); config = $cfg; progress = $cfg.progress
-    installs = @($ctx.Installs); install = $ctx.Install; health = $ctx.Facts.health; token = $ctx.Facts.token; overviewError = $ctx.OverviewError
+    installs = @($ctx.Installs); install = $ctx.Install; health = $ctx.Facts.health; token = $ctx.Facts.token; credential = $ctx.Credential; overviewError = $ctx.OverviewError
     overview = $(if ($ctx.Overview) { [ordered]@{ version = $ctx.Overview.Version; user = $ctx.Overview.User; missingFlows = @($ctx.Overview.MissingFlows); outpost = $(if ($ctx.Overview.Outpost) { [ordered]@{ name = $ctx.Overview.Outpost.Name; authentikHost = $ctx.Overview.Outpost.AuthentikHost; providers = @($ctx.Overview.Outpost.Providers) } } else { $null })
         settings = $ctx.Overview.Settings; sources = @($ctx.Overview.OAuthSources); loginStage = $ctx.Overview.LoginStage } } else { $null })
     route = $ctx.Facts.route; cloudflare = $ctx.Facts.cloudflare; publicCheck = $ctx.Facts.publicCheck; google = $ctx.Facts.google; googleValues = $googleValues; apps = @($ctx.Facts.apps)
@@ -2702,8 +2720,11 @@ function Invoke-IdentityAdopt($Body) {
   return [ordered]@{ ok = $true; install = $inst; notes = $notes }
 }
 
-# Saves the authentik API token (DPAPI). For installations made by the manager it can be taken from the project's .env
-# (AUTHENTIK_BOOTSTRAP_TOKEN) so the user never has to copy it.
+# Replaces (or sets) the authentik API token. The candidate is validated against this authentik first: it must work,
+# belong to an administrator and reach every API area the manager uses. Only then does it replace the stored token;
+# a failed candidate leaves the stored token exactly as it was, so another attempt is always possible. For
+# installations made by the manager the token can be taken from the project's .env (AUTHENTIK_BOOTSTRAP_TOKEN).
+# Nothing in authentik changes: no container, account, outpost token or configuration is touched.
 function Save-IdentityTokenRequest($Body) {
   Assert-Installed
   $ctx = Get-IdentityContext
@@ -2713,18 +2734,34 @@ function Save-IdentityTokenRequest($Body) {
   if ([bool](Get-Field $Body 'fromBootstrap' $false)) {
     if (-not ($ctx.Install.managed -and $ctx.Install.folder)) { Stop-Request 409 'Only installations made by this manager have a bootstrap token; paste a token instead.' }
     $envFile = Read-AppEnv (Join-Path $ctx.Install.folder '.env')
-    if (-not $envFile.Contains('AUTHENTIK_BOOTSTRAP_TOKEN') -or -not $envFile['AUTHENTIK_BOOTSTRAP_TOKEN']) { Stop-Request 409 'This installation was made without a bootstrap token (an older catalog version). Create a token in authentik and paste it.' }
+    if (-not $envFile.Contains('AUTHENTIK_BOOTSTRAP_TOKEN') -or -not $envFile['AUTHENTIK_BOOTSTRAP_TOKEN']) { Stop-Request 409 'This installation was made without a bootstrap token (an older catalog version). Create an API token in authentik and paste it.' }
     $token = [string]$envFile['AUTHENTIK_BOOTSTRAP_TOKEN']
   } else { $token = ([string](Get-Field $Body 'token' '')).Trim() }
-  if ($token -notmatch '^[A-Za-z0-9._-]{20,256}$') { Stop-Request 400 'That does not look like an authentik API token.' }
-  $t = Test-AuthentikToken -BaseUrl $ctx.BaseUrl -Token $token
-  if (-not $t.Ok) { Stop-Request 400 $t.Message }
-  Save-ProtectedSecret -Settings $ctx.Settings -Name (Get-IdentityTokenSecretName) -Value $token -Label "authentik API token ($($t.Username))"
+  if (-not $token) { Stop-Request 400 'Paste the new API token.' }
+  $credArgs = Get-IdentityCredentialArgs $ctx.Settings $ctx.BaseUrl
+  $r = Set-CredentialFromCandidate @credArgs -Candidate $token
   $token = $null
-  Set-IdentityProgress $ctx.Config 'api' 'done' $t.Username
+  if (-not $r.Ok) {
+    Write-Audit 'identity-token-rejected' "status=$($r.Result.Status) account=$($r.Result.Account)"
+    $msg = $(if ($r.Result.Status -eq 'unreachable') { "$($r.Result.Message) Nothing was changed." } else { "$($r.Result.Message) The token you entered was not saved; $(if ($r.View.stored) { 'the previously saved token is unchanged.' } else { 'nothing is saved yet.' })" })
+    Stop-Request 400 $msg @{ credential = $r.View; candidate = [ordered]@{ status = $r.Result.Status; account = $r.Result.Account; message = $r.Result.Message }; preserved = [bool]$r.View.stored }
+  }
+  Set-IdentityProgress $ctx.Config 'api' 'done' $r.Result.Account
   Save-IdentityConfig -Settings $ctx.Settings -Config $ctx.Config
-  Write-Audit 'identity-token' "user=$($t.Username) superuser=$($t.IsSuperuser)"
-  return [ordered]@{ ok = $true; username = $t.Username; superuser = $t.IsSuperuser; version = $t.Version; warning = $(if (-not $t.IsSuperuser) { 'This user is not an authentik administrator: the manager cannot create sources and applications with this token.' } else { '' }) }
+  Write-Audit 'identity-token' "$(if ($r.Replaced) { 'replaced' } else { 'saved' }) account=$($r.Result.Account) expires=$($r.View.expiresAt)"
+  $model = Get-IdentityModel -Facts (Get-IdentityContext).Facts
+  return [ordered]@{ ok = $true; replaced = $r.Replaced; credential = $r.View; username = $r.Result.Account; superuser = $true; version = $r.Result.Version; next = @($model.next)[0]; warning = $r.View.expiryWarning }
+}
+
+# "Test connection": validates the stored token again without asking for it.
+function Test-IdentityTokenRequest {
+  Assert-Installed
+  $ctx = Get-IdentityContext
+  if (-not $ctx.BaseUrl) { Stop-Request 409 'No authentik installation with a local address is recorded.' }
+  $credArgs = Get-IdentityCredentialArgs $ctx.Settings $ctx.BaseUrl
+  $view = Test-StoredCredential @credArgs
+  Write-Audit 'identity-token-test' "status=$($view.status) account=$($view.account)"
+  return [ordered]@{ ok = [bool]$view.ok; credential = $view; next = @((Get-IdentityModel -Facts (Get-IdentityContext).Facts).next)[0] }
 }
 
 # Records the public sign-in hostname (the route itself is created through the normal service preview).
@@ -3038,9 +3075,10 @@ function Invoke-ApiRoute($Request, $Body) {
     'POST /api/identity/provider' { return Set-IdentityProviderRequest $Body }
     'POST /api/identity/adopt' { return Invoke-IdentityAdopt $Body }
     'POST /api/identity/token' { return Save-IdentityTokenRequest $Body }
+    'POST /api/identity/token/test' { return Test-IdentityTokenRequest }
     'POST /api/identity/token/delete' {
       Assert-Installed; Assert-Confirmed $Body
-      $removed = Remove-ProtectedSecret -Settings $settings -Name (Get-IdentityTokenSecretName)
+      $removed = Remove-StoredCredential -Settings $settings -Id 'authentik-api' -SecretName (Get-IdentityTokenSecretName)
       Write-Audit 'identity-token-removed' ''
       return [ordered]@{ removed = $removed }
     }

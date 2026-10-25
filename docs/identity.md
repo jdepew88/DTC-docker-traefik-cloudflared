@@ -72,6 +72,7 @@ Steps, each with its own state (`lib\IdentityProvider.psm1`, `Get-IdentityModel`
    it: shown as urgent). The manager never resets the akadmin password or the secret key.
 4. **Manager connection**: the installation's bootstrap token (one click) or a pasted API token; stored with DPAPI in
    `secrets\authentik_api.dpapi`; must belong to an administrator.
+   See [Connection settings](#connection-settings-api-token) below: the token can be replaced at any time.
 5. **Public sign-in address**: suggests `auth.<your domain>`, records it, then creates the route through the normal
    service preview (hostname claims, Cloudflare DNS/tunnel route checks, validation, backup). Recommended exposure:
    public (authentik is the login); Cloudflare Access in front is possible but means two logins and Google's callback
@@ -90,6 +91,35 @@ Resumable: `config\identity.json` keeps the choice, hostname, the Google client 
 protected applications and the last step worked on. Every authentik change is computed as a dry run first, applied once
 after confirmation, recomputed right before applying (refused if anything changed) and idempotent (re-running creates
 nothing twice; leftovers of an interrupted run are updated, not duplicated).
+
+## Connection settings (API token)
+
+*Identity & Access > authentik: Connection settings* shows the connected authentik server and version, the API account,
+the validation status, the last successful validation, when the token was saved and replaced, and its expiry date
+(read from authentik; a warning appears 14 days before it runs out). Always available:
+
+- **Test connection**: validates the saved token again, without asking for it.
+- **Replace API token**: opens a password field. The new token is checked against this authentik first: it must be
+  accepted, belong to an administrator (an `ak-outpost-…` token is refused with an explanation: it belongs to authentik's
+  own outpost) and be able to read every API area the manager uses. **Only then** does it replace the saved token. A
+  refused token changes nothing: the previous token stays saved and working, and you can try again. When the saved token
+  stops working (wrong, expired, revoked, missing permissions, saved by another Windows account), the page explains why
+  and opens the field right away (*Try a different token*).
+- Installations made by the manager can use *Use the token created at installation* instead of pasting one.
+
+Token lifetime: authentik 2026.8 gives every API token created with **Expiring** on its *default token duration*
+(System > Settings, 1 day unless changed) and ignores a requested date. For the manager's token, turn **Expiring** off;
+otherwise the page warns before it runs out and you replace it here.
+
+Replacing the token changes nothing in authentik (no container, database, account, outpost token or object is touched)
+and keeps all Identity & Access settings and progress; the page continues at the next step that needs attention.
+Status (no token value) is kept in `config\credentials.json`; the token itself only in `secrets\authentik_api.dpapi`.
+Expired and revoked tokens look the same to authentik's API ("rejected"); a token refused after its recorded expiry date
+is reported as expired.
+
+The pattern is reusable: `lib\CredentialManager.psm1` (validate-then-replace, status records, throttled re-checks) and
+`webui\credentials.js` (the card) take a validator and two endpoints; Authelia, Cloudflare and other API integrations can
+use the same pieces.
 
 ## Google sign-in
 
