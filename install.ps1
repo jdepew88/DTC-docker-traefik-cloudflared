@@ -119,7 +119,7 @@ $ManagedFiles = @(
   'tests\Test-Catalog.ps1',
   'webui\discover.js',
   'tests\Test-Discovery.ps1',
-  'tests\Test-Routing.ps1', 'tests\Test-BackendResolver.ps1',
+  'tests\Test-Routing.ps1', 'tests\Test-BackendResolver.ps1', 'tests\Test-WizardBrowser.ps1',
   'lib\ProjectDiscovery.psm1',
   'Start-DeploymentManager.ps1',
   'START-HERE.cmd',

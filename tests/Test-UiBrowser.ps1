@@ -295,8 +295,8 @@ try {
     $null = Js "__t.set('#svc-sub', 'movies'); __t.set('#svc-display', 'Notflix HD'); true"
     $s2 = [string](Js "document.querySelector('#svc-sub').value"); $disp = [string](Js "document.querySelector('#svc-display').value")
     Test-Condition 'services: subdomain suggested from the display name; a manual subdomain survives later name changes' ($s1 -eq 'notflix' -and $s2 -eq 'movies' -and $disp -eq 'Notflix HD') "$s1 $s2 $disp"
-    # Where is your application running? Another device: its address is kept as typed, without a local-host warning.
-    Test-Condition 'wizard: "Where is your application running?" offers a Docker container, this computer and another device' ([int](Js "document.querySelectorAll('input[name=svc-where]').length") -eq 3 -and [string](Js "document.querySelector('[role=radiogroup][aria-label=\'Where is your application running?\']') ? 'yes' : ''") -eq 'yes') ''
+    # How should Traefik connect to this application? Another device: its address is kept as typed, without a local-host warning.
+    Test-Condition 'wizard: "How should Traefik connect to this application?" offers a Docker container, this computer and another device' ([int](Js "document.querySelectorAll('input[name=svc-where]').length") -eq 3 -and [string](Js "document.querySelector('[role=radiogroup][aria-label=\'How should Traefik connect to this application?\']') ? 'yes' : ''") -eq 'yes') ''
     $null = Js "document.querySelector('input[name=svc-where][value=lan]').click(); true"
     $null = Wait-PageCondition $cdp "document.querySelector('#svc-address')" 10; Prepare-Page
     $null = Js "__t.set('#svc-sub', 'movies'); document.querySelector('[aria-label=Domain]').value='example.test'; document.querySelector('[aria-label=Domain]').dispatchEvent(new Event('input', {bubbles:true})); __t.set('#svc-address', '10.99.0.5'); __t.set('#svc-port', '4119'); true"
@@ -323,7 +323,7 @@ try {
     Test-Condition 'edit service: "another device" preselected, the saved backend 10.99.0.5:4119 kept' ($ok -and [bool](Js "document.querySelector('input[name=svc-where][value=lan]').checked") -and [string](Js "document.querySelector('#svc-address').value") -eq '10.99.0.5') ([string](Js "document.querySelector('#svc-backend').innerText"))
     Shot 'services-edit-1366'
 
-    # A Windows app typed as 127.0.0.1: contextual guidance, "Use recommended address", a real connection test.
+    # A Windows app typed as 127.0.0.1: contextual guidance, the only usable address selected, a real connection test.
     $winPort = Get-FreeTcpPort
     Go 'services/add' "document.querySelector('#svc-backend')"
     $null = Js "__t.set('#svc-display', 'Win App'); document.querySelector('input[name=svc-where][value=this-computer]').click(); true"
@@ -333,18 +333,19 @@ try {
     $gText = [string](Js "document.querySelector('[data-guidance=loopback]').innerText")
     Test-Condition 'guidance: 127.0.0.1 shows "Use the Docker host address instead" and recommends host.docker.internal' ($ok -and $gText -match 'Use the Docker host address instead' -and $gText -match 'its own container' -and $gText -match "host\.docker\.internal:$winPort") $gText
     Shot 'services-add-guidance-1366'
-    $null = Js "__t.click('Use recommended address', document.querySelector('[data-guidance=loopback]')); true"
-    $ok = Wait-PageCondition $cdp "!document.querySelector('[data-guidance=loopback]') && /Connection refused|Timeout/.test(document.querySelector('#svc-backend').innerText)" 60; Prepare-Page
+    $loopDisabled = [bool](Js "(() => { const i = document.querySelector('#svc-candidates input[value=\'http://127.0.0.1:$winPort\']'); return !!(i && i.disabled); })()")
+    $null = Js "__t.click('Test connection', document.querySelector('#svc-backend')); true"
+    $ok = Wait-PageCondition $cdp "/Connection refused|Timeout/.test(document.querySelector('#svc-backend').innerText)" 60; Prepare-Page
     $bText = [string](Js "document.querySelector('#svc-backend').innerText")
-    Test-Condition 'guidance: "Use recommended address" sets host.docker.internal, hides the settled notice and tests it from Traefik (nothing listens: not green)' ($ok -and $bText -match "http://host\.docker\.internal:$winPort" -and $bText -notmatch 'Verified reachable') $bText
+    Test-Condition 'guidance: 127.0.0.1 cannot be selected; host.docker.internal (the only usable address) is selected and tested from Traefik (nothing listens: not green)' ($ok -and $loopDisabled -and [string](Js "document.querySelector('#svc-selected-url').innerText") -eq "http://host.docker.internal:$winPort" -and $bText -notmatch 'Verified reachable') $bText
     Test-Condition 'wizard: Test connection and View diagnostic details are named buttons' ([bool](Js "!!__t.btn('Test connection', document.querySelector('#svc-backend')) && !!__t.btn('View diagnostic details', document.querySelector('#svc-backend'))")) ''
     # Detail levels: Beginner gets a plain sentence; Advanced a custom address; Expert the exact configuration.
     $null = Js "TPMUI.setLevel('beginner'); true"; Start-Sleep -Milliseconds 300
     $begin = [string](Js "document.querySelector('#svc-backend').innerText")
-    Test-Condition 'beginner: the backend is explained in plain language; Docker networks and subnets are hidden' ($begin -match "through Docker's host address" -and $begin -notmatch 'Recommended backend' -and -not (Js "__t.visible('#svc-custom')")) $begin
+    Test-Condition 'beginner: the backend is explained in plain language; Docker networks and subnets are hidden' ($begin -match "through Docker's host address" -and $begin -notmatch 'Docker subnets' -and -not (Js "__t.visible('#svc-custom')")) $begin
     $null = Js "TPMUI.setLevel('intermediate'); true"; Start-Sleep -Milliseconds 300
     $mid = [string](Js "document.querySelector('#svc-backend').innerText")
-    Test-Condition 'intermediate: recommended backend, application port, connection type and status' ($mid -match 'Recommended backend' -and $mid -match 'Application port' -and $mid -match 'Connection type' -and $mid -match 'Connection status' -and -not (Js "__t.visible('#svc-custom')")) $mid
+    Test-Condition 'intermediate: address entered, recommended alternative, address used, application port, connection type and status' ($mid -match 'Address you entered' -and $mid -match 'Recommended alternative' -and $mid -match 'Traefik will use' -and $mid -match 'Application port' -and $mid -match 'Connection type' -and $mid -match 'Connection status' -and -not (Js "__t.visible('#svc-custom')")) $mid
     $null = Js "TPMUI.setLevel('advanced'); true"; Start-Sleep -Milliseconds 300
     $null = Js "__t.click('View diagnostic details', document.querySelector('#svc-backend')); true"; Start-Sleep -Milliseconds 300
     $adv = [string](Js "document.querySelector('#svc-backend').innerText")

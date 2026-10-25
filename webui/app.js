@@ -167,6 +167,8 @@
     if (plan.backend) {
       const st = L.backendStatus(plan.backend);
       content.append(h('section', { class: 'plan-backend' }, h('h3', null, icon('pulse'), ' Connection test from Traefik'),
+        plan.backendUrl ? h('p', null, 'Backend Traefik will use: ', h('code', { id: 'plan-backend-url' }, plan.backendUrl)) : null,
+        h('p', null, h('strong', null, L.backendHeadline(plan.backend, plan.backendUrl ? L.parseBackendAddress(plan.backendUrl) : null))),
         h('p', null, plainChip(st.label, st.tone), ' ', plan.backend.message),
         U.gate('expert', arr(plan.backend.evidence).length ? U.technical(arr(plan.backend.evidence), 'Connection test output (redacted)') : null)));
     }

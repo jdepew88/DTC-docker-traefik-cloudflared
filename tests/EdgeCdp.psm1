@@ -94,7 +94,7 @@ function Wait-PageCondition($Session, [string]$Expression, [int]$Seconds = 20) {
 }
 
 function Send-Key($Session, [string]$Key, [int]$Modifiers = 0) {
-  $codes = @{ Tab = 9; Enter = 13; Escape = 27; ArrowRight = 39; ArrowLeft = 37; ' ' = 32 }
+  $codes = @{ Tab = 9; Enter = 13; Escape = 27; ArrowRight = 39; ArrowLeft = 37; ArrowUp = 38; ArrowDown = 40; ' ' = 32 }
   $code = if ($codes.ContainsKey($Key)) { $codes[$Key] } else { 0 }
   # keyDown with text produces the character event that activates buttons (Enter, Space).
   $text = @{ Enter = "`r"; ' ' = ' ' }[$Key]

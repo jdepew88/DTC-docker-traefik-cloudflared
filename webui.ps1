@@ -402,10 +402,19 @@ function Get-TargetCheck($Settings, $Service) {
     $warnings += @(Get-LanTargetIssues $Service.target.host (Get-LocalIPv4Addresses) (Get-DockerSubnets) | ForEach-Object { $_.message })
   }
   if ($probe) {
-    $verdict = Get-BackendVerdict (Test-BackendFromTraefik -Settings $Settings -Service $Service) $Service $Settings.ProxyNetwork $knownPorts
+    $verdict = Add-BackendVerdictCause (Get-BackendVerdict (Test-BackendFromTraefik -Settings $Settings -Service $Service -CompareHostHeader) $Service $Settings.ProxyNetwork $knownPorts) $Service.target
     if ($verdict.state -in 'failed', 'warning') { $warnings += "Backend test from Traefik's network: $($verdict.message)" }
   }
   return [pscustomobject]@{ Warnings = $warnings; Verdict = $verdict }
+}
+
+# A timeout to an address inside a Docker network's subnet has a known cause: say so instead of guessing.
+function Add-BackendVerdictCause($Verdict, $Target) {
+  if ($Verdict -and $Verdict.result -in @('timeout', 'error') -and $Target.type -eq 'lan' -and (Test-IPv4Address ([string]$Target.host))) {
+    $cap = @(Get-LanTargetIssues ([string]$Target.host) (Get-LocalIPv4Addresses) (Get-DockerSubnets) | Where-Object { $_.Contains('cause') -and $_['cause'] -eq 'subnet-overlap' })
+    if ($cap.Count) { $Verdict.cause = 'subnet-overlap'; $Verdict.message = "Traefik could not connect to $($Target.host):$($Target.port). $($cap[0].message)" }
+  }
+  return $Verdict
 }
 
 # Where an application runs and what the user typed -> the backend address Traefik should use, with the reasons, the
@@ -427,22 +436,31 @@ function Invoke-BackendResolve($Body) {
         ports = @($_.ports | ForEach-Object { [ordered]@{ port = $_.port; proto = $_.proto; guess = $_.guess; reason = $_.reason; hostPort = $_.hostPort; hostIp = $_.hostIp } }) } })
   $hostname = ([string](Get-Field $Body 'hostname' '')).Trim().ToLowerInvariant()
   if ($hostname -notmatch '^(?=.{1,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$') { $hostname = '' }
-  $verification = $null; $yaml = ''
-  $t = Get-Field $Body 'target' $null
-  $target = $null
-  if ($t) { $target = [ordered]@{ type = [string](Get-Field $t 'type' ''); host = [string](Get-Field $t 'host' ''); port = [int](Get-Field $t 'port' 0); protocol = [string](Get-Field $t 'protocol' 'http'); tlsSkipVerify = [bool](Get-Field $t 'tlsSkipVerify' $false) } }
-  elseif ($res.recommended) { $target = [ordered]@{ type = $res.recommended.type; host = $res.recommended.host; port = $res.recommended.port; protocol = $res.recommended.protocol; tlsSkipVerify = $false } }
-  if ($target -and $target.host -match '^[A-Za-z0-9][A-Za-z0-9_.-]{0,252}$' -and $target.port -ge 1 -and $target.port -le 65535 -and $target.protocol -in @('http', 'https', 'h2c') -and $target.type -in @('docker', 'host', 'lan')) {
-    $svc = [pscustomobject]@{ name = 'backend-test'; enabled = $true; hostnames = @($(if ($hostname) { $hostname } else { $target.host })); pathPrefix = ''; stripPrefix = $false; target = [pscustomobject]$target }
-    try { $yaml = ConvertTo-TraefikRouteYaml (ConvertTo-ServiceDefinition @{ name = 'preview'; hostnames = @($(if ($hostname) { $hostname } else { 'app.example.com' })); middlewares = @('default-headers@file'); target = @{ type = $target.type; host = $target.host; port = $target.port; protocol = $target.protocol; tlsSkipVerify = $target.tlsSkipVerify } }) } catch { $yaml = '' }
-    if ([bool](Get-Field $Body 'test' $false)) {
-      $known = @(); $tc = @($inv | Where-Object { $_.name -eq $target.host }); if ($tc.Count) { $known = @($tc[0].exposed | Where-Object { $_.proto -eq 'tcp' } | ForEach-Object { [int]$_.port }) }
-      $verification = Get-BackendVerdict (Test-BackendFromTraefik -Settings $settings -Service $svc) $svc $settings.ProxyNetwork $known
-      $verification.target = $target; $verification.testedAt = (Get-Date -Format 's')
-      Write-Audit 'backend-test' "$($target.protocol)://$($target.host):$($target.port) $($verification.result)"
-    }
+  $verification = $null; $yaml = ''; $verifications = @()
+  $toTarget = { param($t) if ($null -eq $t) { return $null } [ordered]@{ type = [string](Get-Field $t 'type' ''); host = [string](Get-Field $t 'host' ''); port = [int](Get-Field $t 'port' 0); protocol = [string](Get-Field $t 'protocol' 'http'); tlsSkipVerify = [bool](Get-Field $t 'tlsSkipVerify' $false) } }
+  $valid = { param($x) [bool]($x -and $x.host -match '^[A-Za-z0-9][A-Za-z0-9_.-]{0,252}$' -and $x.port -ge 1 -and $x.port -le 65535 -and $x.protocol -in @('http', 'https', 'h2c') -and $x.type -in @('docker', 'host', 'lan') -and -not (Test-LoopbackHost $x.host)) }
+  # One verification of exactly this target from Traefik's network: never a substitute address.
+  $verify = {
+    param($x)
+    $svc = [pscustomobject]@{ name = 'backend-test'; enabled = $true; hostnames = @($(if ($hostname) { $hostname } else { $x.host })); pathPrefix = ''; stripPrefix = $false; target = [pscustomobject]$x }
+    $known = @(); $tc = @($inv | Where-Object { $_.name -eq $x.host }); if ($tc.Count) { $known = @($tc[0].exposed | Where-Object { $_.proto -eq 'tcp' } | ForEach-Object { [int]$_.port }) }
+    $vr = Add-BackendVerdictCause (Get-BackendVerdict (Test-BackendFromTraefik -Settings $settings -Service $svc -CompareHostHeader:([bool]$hostname)) $svc $settings.ProxyNetwork $known) $x
+    $vr.target = $x; $vr.targetUrl = "$($x.protocol)://$($x.host):$($x.port)"; $vr.testedAt = (Get-Date -Format 's')
+    Write-Audit 'backend-test' "$($vr.targetUrl) $($vr.result)"
+    return $vr
   }
-  return [ordered]@{ resolution = $res; environment = $envr; containers = $containers; verification = $verification; traefikYaml = $yaml }
+  $target = & $toTarget (Get-Field $Body 'target' $null)
+  $pick = $(if ($res.custom -and $res.override) { $res.custom } else { $res.recommended })
+  if (-not $target -and $pick) { $target = [ordered]@{ type = $pick.type; host = $pick.host; port = $pick.port; protocol = $pick.protocol; tlsSkipVerify = $false } }
+  if (& $valid $target) {
+    try { $yaml = ConvertTo-TraefikRouteYaml (ConvertTo-ServiceDefinition @{ name = 'preview'; hostnames = @($(if ($hostname) { $hostname } else { 'app.example.com' })); middlewares = @('default-headers@file'); target = @{ type = $target.type; host = $target.host; port = $target.port; protocol = $target.protocol; tlsSkipVerify = $target.tlsSkipVerify } }) } catch { $yaml = '' }
+    if ([bool](Get-Field $Body 'test' $false)) { $verification = & $verify $target }
+  }
+  # "Test every address": each candidate on its own, one after another (at most four).
+  $many = @(Get-Field $Body 'targets' @())
+  if ($many.Count -gt 4) { Stop-Request 400 'At most four addresses are tested at once.' }
+  foreach ($m in $many) { $x = & $toTarget $m; if (& $valid $x) { $verifications += & $verify $x } }
+  return [ordered]@{ resolution = $res; environment = $envr; containers = $containers; verification = $verification; verifications = @($verifications); traefikYaml = $yaml }
 }
 
 # Builds the Traefik + Cloudflare plan for a change request. Pure read: nothing is written.
@@ -546,6 +564,8 @@ function ConvertTo-PlanView($Plan, [string]$PlanId) {
     hasWork    = $hasWork
     # The connection test from Traefik's network; when it failed, applying needs an explicit acknowledgment.
     backend    = $Plan.Backend
+    # The exact backend URL this plan writes into the Traefik service (the user's choice, never a substitute).
+    backendUrl = $(if ($Plan.New) { Get-ServiceUrl $Plan.New } else { '' })
     needsBackendAck = [bool]($Plan.Backend -and $Plan.Backend.state -eq 'failed')
   }
 }

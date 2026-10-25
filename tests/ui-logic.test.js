@@ -159,8 +159,7 @@ test('explorer: the first failing component in path order blocks the rest', () =
   assert.strictEqual(L.firstBlocked([mk('a', { running: true }), mk('b', { running: false }, false), mk('c', { running: false }), mk('d', { running: false })], order), 2);
 });
 
-test('backend: where the app runs, from a saved target type', () => {
-  assert.deepStrictEqual(L.WHERE, ['docker', 'this-computer', 'lan']);
+test('backend: connection option from a saved target type', () => {
   assert.strictEqual(L.whereFromTargetType('docker'), 'docker');
   assert.strictEqual(L.whereFromTargetType('host'), 'this-computer');
   assert.strictEqual(L.whereFromTargetType('lan'), 'lan');
@@ -173,34 +172,99 @@ test('backend: pasted addresses are parsed; loopback is recognised', () => {
   assert.ok(L.isLoopbackHost('localhost') && L.isLoopbackHost('127.0.0.1') && !L.isLoopbackHost('10.10.0.11'));
 });
 
-test('backend: a clear suggestion is filled in; a correction of what was typed waits for "Use recommended address"', () => {
-  const rec = { type: 'host', host: 'host.docker.internal', port: 4119, protocol: 'http' };
-  const auto = L.chooseBackend({}, { suggested: rec, recommended: rec, guidance: [], candidates: [rec] });
-  assert.strictEqual(auto.source, 'auto'); assert.ok(L.sameTarget(auto.target, rec));
-  const loop = L.chooseBackend({}, { suggested: rec, recommended: rec, guidance: [{ id: 'loopback', action: 'use-recommended' }], candidates: [rec] });
-  assert.strictEqual(loop.target, null); assert.ok(loop.needsChoice);
+// Candidates as the resolver returns them for HFS on this PC, typed as 10.10.0.11:80 under "another device".
+const ENTERED = { type: 'lan', host: '10.10.0.11', port: 80, protocol: 'http', url: 'http://10.10.0.11:80', role: 'entered', rejected: false };
+const GATEWAY = { type: 'host', host: 'host.docker.internal', port: 80, protocol: 'http', url: 'http://host.docker.internal:80', role: 'recommended', rejected: false };
+const HFS = { recommended: GATEWAY, suggested: GATEWAY, entered: ENTERED, candidates: [ENTERED, GATEWAY],
+  guidance: [{ id: 'own-lan-ip', severity: 'info', category: 'recommendation', action: 'use-recommended', condition: 'own-lan-ip|10.10.0.11|80', about: ENTERED.url },
+    { id: 'subnet-overlap', severity: 'warn', category: 'connectivity', action: '', condition: 'subnet-overlap|10.10.0.11|unifi', about: ENTERED.url }] };
+
+test('backend: the question and the three connection options', () => {
+  assert.strictEqual(L.BACKEND_QUESTION, 'How should Traefik connect to this application?');
+  assert.deepStrictEqual(L.WHERE, ['docker', 'this-computer', 'lan']);
 });
 
-test('backend: ambiguous paths are offered, never picked silently', () => {
-  const a = { type: 'host', host: 'host.docker.internal', port: 8088 }; const b = { type: 'docker', host: 'isolated', port: 80 };
-  const r = L.chooseBackend({}, { suggested: a, recommended: a, ambiguous: true, guidance: [], candidates: [a, b] });
+test('backend: the address entered stays selected; the recommendation is offered next to it, never forced (HFS 10.10.0.11:80)', () => {
+  const r = L.chooseBackend({}, HFS);
+  assert.strictEqual(r.source, 'entered'); assert.ok(L.sameTarget(r.target, ENTERED)); assert.strictEqual(r.needsChoice, false);
+  const list = L.backendCandidates(HFS);
+  assert.deepStrictEqual(list.map((c) => c.label), ['Address you entered', 'Recommended alternative']);
+  assert.ok(list[1].isRecommended && !list[0].isRecommended);
+});
+
+test('backend: an explicitly chosen non-recommended backend survives a new recommendation', () => {
+  const later = { ...HFS, recommended: { ...GATEWAY, port: 81, url: 'http://host.docker.internal:81' } };
+  const r = L.chooseBackend({ source: 'chosen', target: ENTERED }, later);
+  assert.strictEqual(r.source, 'chosen'); assert.ok(L.sameTarget(r.target, ENTERED));
+  const g = L.chooseBackend({ source: 'chosen', target: GATEWAY }, HFS);
+  assert.ok(L.sameTarget(g.target, GATEWAY));
+});
+
+test('backend: exactly one usable candidate is selected automatically (localhost typed: only the gateway can work)', () => {
+  const loop = { ...ENTERED, host: '127.0.0.1', url: 'http://127.0.0.1:80', rejected: true, rejectedReason: 'Traefik itself' };
+  const r = L.chooseBackend({}, { recommended: GATEWAY, candidates: [loop, GATEWAY], guidance: [{ id: 'loopback', action: 'use-recommended' }] });
+  assert.strictEqual(r.source, 'auto'); assert.ok(L.sameTarget(r.target, GATEWAY)); assert.strictEqual(r.needsChoice, false);
+});
+
+test('backend: several discovered paths and nothing typed: a choice is needed, and the message says what to do', () => {
+  const a = { type: 'host', host: 'host.docker.internal', port: 8088, url: 'http://host.docker.internal:8088', role: 'recommended' };
+  const b = { type: 'docker', host: 'isolated', port: 80, url: 'http://isolated:80', role: 'alternative' };
+  const res = { recommended: a, ambiguous: true, guidance: [], candidates: [a, b] };
+  const r = L.chooseBackend({}, res);
   assert.strictEqual(r.target, null); assert.ok(r.needsChoice);
+  assert.strictEqual(L.backendValidation({ where: 'docker', target: null, backend: { resolution: res } }), 'Select the address Traefik should use to reach your application.');
 });
 
-test('backend: an existing service keeps its saved backend; a chosen one and an override are kept', () => {
+test('backend: no candidates -> no "choose an option" error; a plain instruction instead', () => {
+  const r = L.chooseBackend({}, { candidates: [], guidance: [] });
+  assert.strictEqual(r.target, null); assert.strictEqual(r.needsChoice, false);
+  assert.strictEqual(L.backendValidation({ where: 'lan', target: null, backend: { resolution: { candidates: [] } } }), 'Enter the address and port of the application.');
+  assert.strictEqual(L.backendValidation({ where: 'docker', target: null, backend: null }), 'Choose the container and its port.');
+  assert.strictEqual(L.backendValidation({ where: 'lan', target: ENTERED }), '');
+});
+
+test('backend: an existing service keeps its saved backend; a custom URL is used exactly, an invalid one selects nothing', () => {
   const saved = { type: 'lan', host: '10.10.0.11', port: 4119 };
-  const rec = { type: 'host', host: 'host.docker.internal', port: 4119 };
-  assert.ok(L.sameTarget(L.chooseBackend({ source: 'existing', target: saved }, { suggested: rec, recommended: rec, guidance: [] }).target, saved));
-  assert.ok(L.sameTarget(L.chooseBackend({ source: 'chosen', target: rec }, { suggested: saved, recommended: saved, guidance: [] }).target, rec));
-  const ov = { type: 'lan', host: '10.20.0.5', port: 8080 };
-  const r = L.chooseBackend({ override: true }, { override: true, recommended: ov, suggested: rec, guidance: [] });
+  assert.ok(L.sameTarget(L.chooseBackend({ source: 'existing', target: saved }, HFS).target, saved));
+  const ov = { type: 'lan', host: '10.20.0.5', port: 8080, url: 'http://10.20.0.5:8080', role: 'custom', rejected: false };
+  const r = L.chooseBackend({ override: true }, { override: true, custom: ov, recommended: GATEWAY, candidates: [ov, GATEWAY], guidance: [] });
   assert.strictEqual(r.source, 'override'); assert.ok(L.sameTarget(r.target, ov));
+  const bad = L.chooseBackend({ override: true }, { override: false, custom: null, recommended: GATEWAY, candidates: [GATEWAY], guidance: [] });
+  assert.strictEqual(bad.target, null);
+  assert.deepStrictEqual(L.backendCandidates({ candidates: [GATEWAY, ov], recommended: GATEWAY }).map((c) => c.role), ['custom', 'recommended']);
 });
 
-test('backend: a dismissed notice stays hidden until its condition changes; errors always show', () => {
-  const g = [{ id: 'loopback', severity: 'warn', condition: 'loopback|127.0.0.1|4119' }, { id: 'subnet-overlap', severity: 'error', condition: 'x' }];
+test('backend: complete backend URLs (Advanced/Expert): protocol, host, port; no loopback, no base path', () => {
+  assert.deepStrictEqual(L.parseBackendUrl('http://10.10.0.8:8080'), { ok: true, scheme: 'http', host: '10.10.0.8', port: 8080, path: '', url: 'http://10.10.0.8:8080' });
+  assert.strictEqual(L.parseBackendUrl('https://nas.home.arpa').port, 443);
+  assert.ok(!L.parseBackendUrl('10.10.0.8:8080').ok);
+  assert.match(L.parseBackendUrl('http://127.0.0.1:80').error, /Traefik itself/);
+  assert.match(L.parseBackendUrl('http://10.10.0.8:8080/files').error, /Path prefix/);
+  assert.match(L.backendValidation({ override: true, custom: 'http://localhost:1' }), /Traefik itself/);
+});
+
+test('backend: notices - dismissed stay hidden, restrictions always show, a followed recommendation hides', () => {
+  const g = [{ id: 'loopback', severity: 'warn', condition: 'loopback|127.0.0.1|4119' }, { id: 'private', severity: 'error', condition: 'x' }];
   assert.strictEqual(L.visibleGuidance(g, { 'loopback|127.0.0.1|4119': true, x: true }).length, 1);
   assert.strictEqual(L.visibleGuidance([{ id: 'loopback', severity: 'warn', condition: 'loopback|127.0.0.1|4120' }], { 'loopback|127.0.0.1|4119': true }).length, 1);
+  const shown = L.visibleGuidance(HFS.guidance, {}, { target: ENTERED, verification: null, recommended: GATEWAY });
+  assert.deepStrictEqual(shown.map((x) => x.id), ['own-lan-ip', 'subnet-overlap']);
+  const followed = L.visibleGuidance(HFS.guidance, {}, { target: GATEWAY, verification: null, recommended: GATEWAY });
+  assert.deepStrictEqual(followed.map((x) => x.id), ['subnet-overlap']);
+});
+
+test('backend: connectivity warnings disappear after the selected backend passes a test, not after a failure', () => {
+  const ok = { state: 'ok', result: 'verified', targetUrl: 'http://host.docker.internal:80', target: { protocol: 'http' } };
+  assert.deepStrictEqual(L.visibleGuidance(HFS.guidance, {}, { target: GATEWAY, verification: ok, recommended: GATEWAY }).map((x) => x.id), []);
+  const fail = { state: 'failed', result: 'timeout', targetUrl: 'http://10.10.0.11:80', target: { protocol: 'http' } };
+  assert.ok(L.visibleGuidance(HFS.guidance, {}, { target: ENTERED, verification: fail, recommended: GATEWAY }).some((x) => x.id === 'subnet-overlap'));
+});
+
+test('backend: test headlines - success, could not connect (with the address), hostname rejected', () => {
+  assert.strictEqual(L.backendHeadline({ state: 'ok', result: 'verified' }, GATEWAY), 'Traefik successfully connected to the selected application.');
+  assert.strictEqual(L.backendHeadline({ state: 'failed', result: 'timeout' }, ENTERED), 'Traefik could not connect to 10.10.0.11:80. Test another address or explicitly save the route without verification.');
+  assert.match(L.backendHeadline({ state: 'failed', result: 'host-rejected' }, ENTERED), /rejected the public hostname/);
+  assert.match(L.backendHeadline({ state: 'auth', result: 'auth' }, ENTERED), /login/);
 });
 
 test('backend: status tones - green only for an application answer; a login is "auth"; untested is neutral', () => {

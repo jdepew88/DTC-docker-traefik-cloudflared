@@ -360,7 +360,7 @@
   function flowFacts(flow, id) {
     const pairs = [['Hostnames', arr(flow.hostnames).join(', ') || '(none)'], ['Who can reach it', { access: 'Cloudflare Access login', public: 'Public (no login)', local: 'This PC only' }[flow.exposure]]];
     if (id === 'router' || id === 'middleware') pairs.push(['Router', flow.router ? `${flow.router.name} (${flow.router.status})` : 'not loaded by Traefik'], ['Rule', flow.router ? flow.router.rule : '-'], ['Middlewares', arr(flow.middlewares).join(', ') || 'none']);
-    if (id === 'service' || id === 'app') pairs.push(['Backend', `${flow.target.protocol}://${flow.target.host}:${flow.target.port}`], ['Traefik service', flow.service ? `${flow.service.name} (${flow.service.status})` : 'not loaded']);
+    if (id === 'service' || id === 'app') pairs.push(['How Traefik connects', { docker: 'Docker container', host: 'Application on this computer', lan: 'Another computer or network device' }[flow.target.type] || flow.target.type], ['Backend', `${flow.target.protocol}://${flow.target.host}:${flow.target.port}`], ['Traefik service', flow.service ? `${flow.service.name} (${flow.service.status})` : 'not loaded']);
     return kv(pairs);
   }
 

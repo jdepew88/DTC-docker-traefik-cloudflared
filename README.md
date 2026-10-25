@@ -387,33 +387,52 @@ bodies are capped at 100 MB on Free/Pro. For Plex, prefer Plex's own Remote Acce
 (Cloudflare WARP / Cloudflare One, a VPN) for streaming, and use the tunnel at most for light web access behind
 Cloudflare Access. The remaining Cloudflare steps for the hostname are the same as for any service (below).
 
-### Backend addresses: "Where is your application running?"
+### Backend addresses: "How should Traefik connect to this application?"
 
-The Add Service and Edit Service forms start with one question: **in a Docker container**, **on this computer**, or
-**on another computer or device on my network**. The manager then proposes the address Traefik must use from
-*inside* its container (`lib\BackendResolver.psm1`, `POST /api/services/backend`) and tests it from Traefik's own
-network before anything is saved:
+The Add Service and Edit Service forms ask one question with three options: **Docker container** (its container
+network name and internal port), **Application on this computer** (an HTTP app running directly on Windows) and
+**Another computer or network device** (any IP address or hostname on your network). The option helps the manager
+discover and recommend an address; it never restricts what you may choose. The manager proposes the address Traefik
+must use from *inside* its container (`lib\BackendResolver.psm1`, `POST /api/services/backend`) and tests it from
+Traefik's own network before anything is saved:
 
-| You run or type | Traefik uses | Why |
+| You run or type | Recommended | Why |
 | --- | --- | --- |
 | A container on the shared network (`uptime-kuma`) | `http://uptime-kuma:3001` | Docker DNS name and the port *inside* the container |
-| A Windows app, typed as `127.0.0.1:4119` or `localhost:4119` | `http://host.docker.internal:4119` | Inside Traefik, 127.0.0.1 is Traefik itself |
-| A Windows app, typed as this PC's LAN address (`10.10.0.11:4119`) | `http://host.docker.internal:4119` | Does not depend on Docker routing to the LAN (a Docker network on the same subnet would capture it) |
+| A Windows app, typed as `127.0.0.1:4119` or `localhost:4119` | `http://host.docker.internal:4119` | Inside Traefik, 127.0.0.1 is Traefik itself (the typed address cannot be selected) |
+| A Windows app, typed as this PC's LAN address (`10.10.0.11:80`) | `http://host.docker.internal:80`, next to `http://10.10.0.11:80` | Both are selectable; the LAN address depends on Docker routing to the LAN |
 | A Windows port that a container publishes (`127.0.0.1:3010`) | `http://homepage:3000` | The container is reached directly, by name and internal port |
-| Another device (`10.10.0.8:32800`, `nas.home.arpa`) | As typed | Never replaced by `host.docker.internal`; a Docker subnet that captures it is reported |
+| Another device (`10.10.0.8:8080`, `nas.home.arpa`) | As typed | Never replaced by `host.docker.internal`; a Docker subnet that captures it is reported |
 | A container on another network | Options: its published port through the host gateway, or a Compose network attachment | Shown as choices, never picked silently; databases and caches are never offered |
 
-When the recommendation corrects what you typed, the form explains it and offers **Use recommended address**; a
-deliberate custom address (Advanced) is kept once it passes the test. Editing an existing service keeps its saved
-backend until you choose another one. On native Linux, Podman or Unraid, `host.docker.internal` is recommended only
+**A recommendation is never a requirement.** The form lists every candidate with its own radio button: *Address you
+entered*, *Recommended alternative*, other *Discovered alternatives* and, in Advanced and Expert, a *Custom address*
+(a complete URL such as `http://10.10.0.8:8080`). The address you typed stays selected until you pick another one;
+**Use recommended address** switches to the recommendation. The address you select is the one tested, previewed and
+written to the Traefik service (`loadBalancer.servers[0].url`). Editing an existing service keeps its saved backend
+until you choose another one, and a backend picked under one option is kept when you switch options and back.
+
+Notices are of four kinds: *recommendations* (informational, never blocking), *connectivity warnings* (the address may
+not connect, for example because a Docker network overlaps the destination subnet; they disappear once the selected
+address passes a test), *restrictions* (an address that cannot or must not be used: loopback, a base path in the
+URL, a database container) and *help*. On native Linux, Podman or Unraid, `host.docker.internal` is recommended only
 after it is verified to resolve inside Traefik (add `extra_hosts: ['host.docker.internal:host-gateway']` to the
 Traefik service otherwise).
 
-The connection test is the readiness check. It runs during the preview and again immediately before applying, and
-names the result: *Verified reachable*, *Reachable, authentication required*, *Application redirect*, *Wrong
-protocol*, *Wrong port*, *DNS resolution failure*, *Connection refused*, *Timeout*, *Hostname rejected*, *TLS
-verification failure*, *Application error* or *Not tested*. A route whose backend fails is saved only after an
-explicit "Save the route anyway", and is never shown as healthy.
+**Docker networks that overlap your LAN.** A Docker network whose subnet contains a LAN address (for example a
+Compose network on `10.10.0.0/24` while the LAN is `10.10.0.0/24`) captures that traffic inside Docker Desktop's VM:
+Traefik's requests to `10.10.0.11` go to that bridge, not to Windows, and time out. The form names the network;
+the fix is to move that network to another subnet in its compose file (or remove it once nothing uses it). The
+manager never changes networks itself.
+
+The connection test is the readiness check. **Test connection** tests the selected address; **Test every address**
+tests each candidate on its own, never substituting one for another. Each test reports DNS, the TCP connection, the
+HTTP answer, TLS, redirects and the Host header (the public hostname, compared with the backend's own address so an
+app that rejects unfamiliar hostnames is recognised), and names the result: *Verified reachable*, *Reachable,
+authentication required*, *Application redirect*, *Wrong protocol*, *Wrong port*, *DNS resolution failure*,
+*Connection refused*, *Timeout*, *Hostname rejected*, *TLS verification failure*, *Application error* or *Not
+tested*. An HTTP 400 is never a pass. The test runs during the preview and again immediately before applying; a
+route whose backend fails is saved only after an explicit **Save the route anyway**, and is never shown as healthy.
 
 ### Target notes
 
@@ -538,7 +557,12 @@ container on this PC already uses.
                                         # route mismatches, Access login ("authentication required", never "passed")
 .\tests\Test-BackendResolver.ps1        # backend address selection (no Docker): 127.0.0.1 / this PC's LAN IP -> host gateway,
                                         # containers (shared, several, no shared network, private), LAN devices, overlapping
-                                        # subnets, native Linux / Podman / Unraid, overrides; connection-test classification
+                                        # subnets, native Linux / Podman / Unraid, entered vs recommended addresses, custom URLs;
+                                        # connection-test classification, generated service URL, hostname collisions
+.	ests\Test-WizardBrowser.ps1 -InstallPath <install> -AppAddress <this PC's LAN IP> -AppPort 80 [-AccessEmail you@example.com]
+                                        # browser test of "How should Traefik connect to this application?" against an
+                                        # installed instance, read-only (never applies; fails if routes, registry,
+                                        # tunnel config, containers or networks change); -ScreenshotDir saves screenshots
 .\tests\Test-Projects.ps1               # launcher (single-use link, duplicate start, ports, stop, START-HERE.cmd), discovery,
                                         # attach without changes, recent projects, upgrade preview/apply, browser;
                                         # -LiveReadOnly also inspects %USERPROFILE%\.docker\projects\traefik-proxy read-only

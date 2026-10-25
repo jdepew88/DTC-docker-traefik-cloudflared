@@ -15,6 +15,12 @@ Set-StrictMode -Version 2.0
 #   - A container on no shared network: its published port through the host gateway, or a persistent Compose network
 #     attachment. Databases, caches and proxy infrastructure are never offered for attachment.
 #   - Ambiguous cases return the options instead of one silent choice; a validated user override is kept.
+#
+# A recommendation never replaces what the user typed: the typed address is always returned as its own candidate
+# (role 'entered', or 'custom' for an override) next to the recommendation, and stays selectable unless it cannot work
+# at all (a loopback address is Traefik itself) or is not allowed (a base path). Guidance carries a category:
+#   recommendation  informational, never blocks         connectivity  may not connect (Docker routing, a captured subnet)
+#   restriction     cannot or must not be used          help          explains how Traefik reaches the app
 
 # Host adapters: how containers reach the computer running the engine. Docker Desktop provides host.docker.internal;
 # native Linux engines (Debian, Unraid, ...) and Podman need a host-gateway mapping on the Traefik container, so the
@@ -37,11 +43,14 @@ function Split-BackendAddress([string]$Text) {
   $v = ([string]$Text).Trim()
   $scheme = ''
   if ($v -match '^(?i)(https?|h2c)://') { $scheme = $Matches[1].ToLowerInvariant(); $v = $v.Substring($Matches[0].Length) }
-  $v = ($v -split '[/?#]', 2)[0]
+  $path = ''
+  $i = $v.IndexOfAny([char[]]'/?#')
+  if ($i -ge 0) { $path = $v.Substring($i); $v = $v.Substring(0, $i) }
+  if ($path -in @('/', '')) { $path = '' }
   $port = 0; $hostPart = $v
   if ($v -match '^\[(.+)\](?::(\d{1,5}))?$') { $hostPart = $Matches[1]; if ($Matches[2]) { $port = [int]$Matches[2] } }
   elseif ($v -match '^([^:]+):(\d{1,5})$') { $hostPart = $Matches[1]; $port = [int]$Matches[2] }
-  return [ordered]@{ scheme = $scheme; host = $hostPart.ToLowerInvariant(); port = $port }
+  return [ordered]@{ scheme = $scheme; host = $hostPart.ToLowerInvariant(); port = $port; path = $path }
 }
 
 function Test-LoopbackHost([string]$Value) { return ($Value -match '^(127\.\d+\.\d+\.\d+|localhost|::1|0\.0\.0\.0)$') }
@@ -88,13 +97,18 @@ function Find-PublishedPortOwner($Containers, [int]$Port, [string]$ViaAddress = 
   return @($found)
 }
 
-function New-BackendCandidate([string]$Type, [string]$TargetHost, [int]$Port, [string]$Protocol, [string]$Reason, [string]$Via = '', [string]$Action = '') {
+# role: entered (what the user typed), recommended, alternative, custom (an override). rejectedReason: why a rejected
+# candidate cannot be selected; warning: why a selectable one may not connect.
+function New-BackendCandidate([string]$Type, [string]$TargetHost, [int]$Port, [string]$Protocol, [string]$Reason, [string]$Via = '', [string]$Action = '', [string]$Role = 'alternative') {
   $url = "${Protocol}://${TargetHost}:$Port"
-  return [ordered]@{ type = $Type; host = $TargetHost; port = $Port; protocol = $Protocol; url = $url; reason = $Reason; via = $Via; action = $Action; rejected = $false }
+  return [ordered]@{ type = $Type; host = $TargetHost; port = $Port; protocol = $Protocol; url = $url; reason = $Reason; via = $Via; action = $Action; role = $Role; rejected = $false; rejectedReason = ''; warning = '' }
 }
 
-function New-BackendGuidance([string]$Id, [string]$Severity, [string]$Title, [string]$Text, [string]$Action = '', [string]$Condition = '') {
-  return [ordered]@{ id = $Id; severity = $Severity; title = $Title; text = $Text; action = $Action; condition = $(if ($Condition) { "$Id|$Condition" } else { $Id }) }
+$script:GuidanceCategory = @{ error = 'restriction'; warn = 'connectivity'; info = 'help' }
+# $About: the candidate URL the notice is about (the UI hides a connectivity notice once that question is settled).
+function New-BackendGuidance([string]$Id, [string]$Severity, [string]$Title, [string]$Text, [string]$Action = '', [string]$Condition = '', [string]$Category = '', [string]$About = '') {
+  return [ordered]@{ id = $Id; severity = $Severity; category = $(if ($Category) { $Category } else { $script:GuidanceCategory[$Severity] }); title = $Title; text = $Text; action = $Action
+    condition = $(if ($Condition) { "$Id|$Condition" } else { $Id }); about = $About }
 }
 
 # Pure: the protocol a container port most likely speaks (from the discovery port hints).
@@ -191,9 +205,18 @@ function Resolve-BackendAddress {
   $adapter = Get-ResolverProp $Environment 'adapter' $null
   $local = @(Get-ResolverProp $Environment 'localAddresses' @())
   $subnets = @(Get-ResolverProp $Environment 'dockerSubnets' @())
-  $res = [ordered]@{ location = $loc; detectedLocation = ''; input = [ordered]@{ address = $Address; host = $a.host; port = $a.port; protocol = $Protocol }
-    kind = ''; recommended = $null; suggested = $null; candidates = @(); guidance = @(); evidence = @(); ambiguous = $false; override = $false; container = ''; portChoices = @() }
+  $res = [ordered]@{ location = $loc; detectedLocation = ''; input = [ordered]@{ address = $Address; host = $a.host; port = $a.port; protocol = $Protocol; path = $a.path }
+    kind = ''; recommended = $null; suggested = $null; entered = $null; custom = $null; candidates = @(); guidance = @(); evidence = @(); ambiguous = $false; override = $false; container = ''; portChoices = @() }
   $h = $a.host
+  $proto = $(if ($Protocol) { $Protocol } else { 'http' })
+  $typedUrl = "${proto}://${h}:$($a.port)"
+  # A Docker network whose subnet contains the destination: containers deliver that traffic into the network.
+  $overlap = {
+    param($Cap, [string]$Destination)
+    $res.guidance += New-BackendGuidance 'subnet-overlap' 'warn' 'Docker network overlaps the destination subnet' ("Your Docker network overlaps the destination subnet. Traffic to $Destination may be routed into Docker instead of reaching $(if ($res.kind -eq 'this-pc-ip') { 'your Windows computer' } else { 'that device' })." +
+      " Docker network '$($Cap[0].name)' ($($Cap[0].subnet)) contains $Destination, so containers send this traffic into that network. To use $Destination, move that Docker network to another subnet in its compose file, or remove it once nothing uses it$(if ($res.kind -eq 'this-pc-ip') { '; host.docker.internal avoids the conflict without any change' })." +
+      ' Nothing is changed automatically.') '' "$Destination|$($Cap[0].name)" 'connectivity' $typedUrl
+  }
   $useGateway = {
     param([int]$P, [string]$Why)
     if (-not $gw -or $gwVerified -eq $false) {
@@ -250,12 +273,15 @@ function Resolve-BackendAddress {
       }
       if ($res.kind -eq 'loopback') {
         $rec = $(if ($res.candidates.Count) { $res.candidates[0].url } else { '' })
-        $res.guidance += New-BackendGuidance 'loopback' 'warn' 'Use the Docker host address instead' "Traefik runs inside Docker. Inside Traefik, $h refers to its own container, not the Windows computer.$(if ($rec) { " Recommended backend: $rec" })" 'use-recommended' "$h|$($a.port)"
+        $res.guidance += New-BackendGuidance 'loopback' 'warn' 'Use the Docker host address instead' "Traefik runs inside Docker. Inside Traefik, $h refers to its own container, not the Windows computer.$(if ($rec) { " Recommended backend: $rec" })" 'use-recommended' "$h|$($a.port)" 'restriction' $typedUrl
       } elseif ($res.kind -eq 'this-pc-ip') {
         $cap = @($subnets | Where-Object { Test-AddressInSubnet $h $_.subnet })
-        $rec = $(if ($res.candidates.Count) { $res.candidates[0].url } else { '' })
-        $res.guidance += New-BackendGuidance 'own-lan-ip' 'warn' 'Use the Docker host address instead' ("$h is this computer's own address. Traefik runs inside Docker, which reaches this computer as host.docker.internal without depending on Docker routing to your network." +
-          $(if ($cap.Count) { " Here it matters: Docker network '$($cap[0].name)' ($($cap[0].subnet)) contains $h, so Docker delivers that traffic into that network instead." } else { '' }) + $(if ($rec) { " Recommended backend: $rec" } else { '' })) 'use-recommended' "$h|$($a.port)"
+        $gwc = @($res.candidates | Where-Object { $_.via -eq 'host-gateway' })
+        if ($gwc.Count) {
+          $res.guidance += New-BackendGuidance 'own-lan-ip' 'info' "$($gwc[0].host) is recommended" ("$h is this computer's own address. Traefik runs inside Docker. Docker Desktop provides $($gwc[0].host) as a way to reach applications running directly on Windows." +
+            " Your LAN IP is also configurable, but Docker network routing may affect connectivity. Recommended alternative: $($gwc[0].url)") 'use-recommended' "$h|$($a.port)" 'recommendation' $typedUrl
+        }
+        if ($cap.Count) { & $overlap $cap $h }
       }
     }
     { $_ -in @('container', 'container-ip') } {
@@ -272,37 +298,61 @@ function Resolve-BackendAddress {
     }
     'docker-subnet' {
       $cap = @($subnets | Where-Object { Test-AddressInSubnet $h $_.subnet })
-      $res.guidance += New-BackendGuidance 'subnet-overlap' 'error' 'Docker captures this address' "$h lies inside Docker network '$($cap[0].name)' ($($cap[0].subnet)). Containers deliver this traffic into that network, never to your LAN. Move that Docker network to another subnet (or remove it) to reach the device." '' "$h|$($cap[0].name)"
+      & $overlap $cap $h
       if ($loc -eq 'this-computer') { & $useGateway $a.port 'An app on this computer is reached from inside Docker through the host gateway.' }
-      else { $res.candidates += New-BackendCandidate 'lan' $h $a.port $(if ($Protocol) { $Protocol } else { 'http' }) 'As typed; it cannot work while that Docker network exists.' 'lan'; $res.candidates[-1].rejected = $true }
-    }
-    { $_ -in @('lan-ip', 'lan-name') } {
-      $res.candidates += New-BackendCandidate 'lan' $h $a.port $(if ($Protocol) { $Protocol } else { 'http' }) 'Another device on your network: its own address, as typed.' 'lan'
     }
     'unknown-name' {
       $res.guidance += New-BackendGuidance 'no-container' 'warn' "No container named $h" "No container or network alias named $h exists on this Docker engine. Check the name (docker ps), or start the container first." '' $h
-      $res.candidates += New-BackendCandidate 'docker' $h $a.port $(if ($Protocol) { $Protocol } else { 'http' }) 'As typed; no such container right now.' 'docker'
+      $res.candidates += New-BackendCandidate 'docker' $h $a.port $proto 'As typed; no such container right now.' 'docker' '' 'entered'
     }
   }
 
-  # 4. Location: what the address says, and a mismatch with what the user chose.
+  # 4. The address as typed: always its own candidate, merged with an identical discovered one. It is rejected only
+  #    when it cannot work at all (loopback is Traefik itself) or carries a base path; a captured subnet is a warning.
+  $role = $(if ($Override) { 'custom' } else { 'entered' })
+  if ($h -and $a.port -gt 0) {
+    $etype = $(switch ($res.kind) { 'host-gateway' { 'host' } { $_ -in @('container', 'unknown-name') } { 'docker' } default { 'lan' } })
+    $same = @($res.candidates | Where-Object { $_.type -eq $etype -and $_.host -eq $h -and [int]$_.port -eq $a.port })
+    if ($same.Count) { $e = $same[0] }
+    elseif ($res.kind -eq 'container' -and -not $Override) { $e = $null }
+    else {
+      $why = $(switch ($res.kind) { 'this-pc-ip' { "This computer's LAN address, exactly as you entered it." } 'container-ip' { "The container's current internal address, as you entered it." } { $_ -in @('lan-ip', 'lan-name', 'docker-subnet') } { 'Another device on your network: its own address, as you entered it.' } default { 'The address you entered, kept exactly as typed.' } })
+      $e = New-BackendCandidate $etype $h $a.port $proto $why 'as-entered' '' $role
+      $res.candidates = @($e) + @($res.candidates)
+    }
+    if ($e) {
+      $e.role = $role
+      if (Test-LoopbackHost $h) { $e.rejected = $true; $e.rejectedReason = "Inside Traefik's container, $h is Traefik itself, not this computer: it cannot reach the app." }
+      elseif ($a.path) {
+        $e.rejected = $true; $e.rejectedReason = "A base path ($($a.path)) in the backend address is not supported: Traefik forwards the request path unchanged. Use Path prefix under Advanced routing instead."
+        $res.guidance += New-BackendGuidance 'backend-path' 'error' 'Remove the path from the backend address' $e.rejectedReason '' $a.path
+      }
+      $cap = @($subnets | Where-Object { Test-AddressInSubnet $h $_.subnet })
+      if ($cap.Count -and $res.kind -ne 'container-ip') { $e.warning = "Docker network '$($cap[0].name)' ($($cap[0].subnet)) contains ${h}: traffic from Traefik may never reach it." }
+      if ($Override) { $res.custom = $e } else { $res.entered = $e }
+    }
+  }
+
+  # 5. Location: what the address says, and a mismatch with what the user chose. The user's choice is never changed.
   $res.detectedLocation = $(switch ($res.kind) { { $_ -in @('loopback', 'this-pc-ip', 'host-gateway') } { if ($owner.Count) { 'docker' } else { 'this-computer' } } { $_ -in @('container', 'container-ip', 'unknown-name') } { 'docker' } { $_ -in @('lan-ip', 'lan-name', 'docker-subnet') } { 'lan' } default { $loc } })
-  if ($loc -eq 'lan' -and $res.kind -in @('loopback', 'this-pc-ip', 'host-gateway')) { $res.evidence += "Chosen 'another device', but $h is this computer: treated as an app on this computer." }
+  if ($loc -eq 'lan' -and $res.kind -in @('loopback', 'this-pc-ip', 'host-gateway')) { $res.evidence += "$h is this computer, although 'another computer or device' is chosen: the address is kept as you entered it, and the Docker host address is offered as an alternative." }
   if ($loc -eq 'this-computer' -and $res.kind -in @('lan-ip', 'lan-name')) {
     $res.guidance += New-BackendGuidance 'not-this-pc' 'info' 'This address is another device' "$h is not one of this computer's addresses ($($local -join ', ')). It is kept as another device on your network." '' $h
   }
 
-  # 5. The recommendation, or the user's validated override.
+  # 6. The recommendation: the best discovered path, else the typed address. It never replaces the typed address;
+  #    the UI shows both. A validated override is returned as 'custom'.
   $usable = @($res.candidates | Where-Object { -not $_.rejected })
-  if ($usable.Count -and -not ($res.ambiguous -and $usable.Count -gt 1)) { $res.recommended = $usable[0] }
-  elseif ($usable.Count) { $res.recommended = $usable[0]; $res.evidence += 'Several paths are possible: the first is suggested; the others are listed.' }
+  $found = @($usable | Where-Object { $_.role -notin @('entered', 'custom') })
+  if ($found.Count) { $res.recommended = $found[0] } elseif ($usable.Count) { $res.recommended = $usable[0] }
+  if ($res.recommended -and $res.recommended.role -eq 'alternative') { $res.recommended.role = 'recommended' }
+  if ($res.ambiguous -and $usable.Count -gt 1) { $res.evidence += 'Several paths are possible: the first is suggested; the others are listed.' }
   $res.suggested = $res.recommended
   if ($Override -and $h) {
     if (Test-LoopbackHost $h) {
       $res.guidance += New-BackendGuidance 'override-loopback' 'error' 'This address cannot work from Traefik' "$h inside Traefik's container is Traefik itself, so it cannot be kept as an override." '' $h
-    } else {
-      $type = $(switch ($res.kind) { 'host-gateway' { 'host' } { $_ -in @('container', 'unknown-name') } { 'docker' } default { 'lan' } })
-      $res.recommended = New-BackendCandidate $type $h $a.port $(if ($Protocol) { $Protocol } else { 'http' }) 'Your address (override), kept as typed.' 'override'
+    } elseif ($res.custom -and -not $res.custom.rejected) {
+      $res.custom.reason = 'Your custom address, kept exactly as typed.'; $res.custom.via = 'override'
       $res.override = $true
     }
   }

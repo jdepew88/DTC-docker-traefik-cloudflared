@@ -69,9 +69,16 @@ $r = & $resolve 'auto' 'http://localhost:4119'
 Test-Condition 'Windows app typed as localhost (any location) is also recognised as this computer' ($r.recommended.url -eq 'http://host.docker.internal:4119' -and $r.kind -eq 'loopback') (Show $r)
 $r = & $resolve 'auto' '10.10.0.11:4119'
 $g = @($r.guidance | Where-Object { $_.id -eq 'own-lan-ip' })
-Test-Condition 'Windows app typed as the host''s LAN IP 10.10.0.11:4119 -> host.docker.internal:4119, naming the capturing Docker network' ($r.recommended.url -eq 'http://host.docker.internal:4119' -and $r.kind -eq 'this-pc-ip' -and $g.Count -eq 1 -and $g[0].text -match 'unifi-lan_unifi_net' -and $g[0].text -match "this computer's own address") (Show $r)
-$r = & $resolve 'lan' '10.10.0.11:4119'
-Test-Condition 'chosen "another device" but the address is this PC: treated as this computer (after confirming it is a local address)' ($r.recommended.type -eq 'host' -and $r.detectedLocation -eq 'this-computer' -and (@($r.evidence) -join ' ') -match 'treated as an app on this computer') (Show $r)
+$o = @($r.guidance | Where-Object { $_.id -eq 'subnet-overlap' })
+Test-Condition 'Windows app typed as the host''s LAN IP 10.10.0.11:4119: host.docker.internal:4119 is recommended (a recommendation, not a requirement)' ($r.recommended.url -eq 'http://host.docker.internal:4119' -and $r.kind -eq 'this-pc-ip' -and $g.Count -eq 1 -and $g[0].category -eq 'recommendation' -and $g[0].severity -eq 'info' -and $g[0].text -match "this computer's own address" -and $g[0].text -match 'Your LAN IP is also configurable') (Show $r)
+Test-Condition 'the typed LAN IP stays a selectable candidate ("Address you entered"), flagged by the capturing Docker network' ($r.entered.url -eq 'http://10.10.0.11:4119' -and $r.entered.role -eq 'entered' -and -not $r.entered.rejected -and $r.entered.warning -match 'unifi-lan_unifi_net' -and @($r.candidates | Where-Object { $_.url -eq 'http://10.10.0.11:4119' }).Count -eq 1) (Show $r)
+Test-Condition 'overlapping Docker/LAN subnet: a connectivity warning naming the network, with the brief''s wording' ($o.Count -eq 1 -and $o[0].category -eq 'connectivity' -and $o[0].severity -eq 'warn' -and $o[0].text -match 'Your Docker network overlaps the destination subnet' -and $o[0].text -match 'unifi-lan_unifi_net' -and $o[0].about -eq 'http://10.10.0.11:4119') (Show $o)
+$r = & $resolve 'lan' '10.10.0.11:80'
+Test-Condition 'HFS: "another device" with this PC''s address 10.10.0.11:80 is kept as entered and not recategorised; host.docker.internal:80 is offered next to it' ($r.location -eq 'lan' -and $r.entered.url -eq 'http://10.10.0.11:80' -and $r.entered.type -eq 'lan' -and $r.recommended.url -eq 'http://host.docker.internal:80' -and @($r.candidates | Where-Object { -not $_.rejected }).Count -eq 2 -and (@($r.evidence) -join ' ') -match 'kept as you entered it') (Show $r)
+$r = & $resolve 'this-computer' '10.10.0.11:80' $plain
+Test-Condition 'this PC''s LAN address without an overlapping network: selectable, no connectivity warning' ($r.entered.url -eq 'http://10.10.0.11:80' -and -not $r.entered.warning -and -not @($r.guidance | Where-Object { $_.category -eq 'connectivity' }).Count) (Show $r)
+$r = & $resolve 'this-computer' '127.0.0.1:4119'
+Test-Condition 'localhost typed: the entered address is listed but cannot be selected (restriction), the gateway is the only usable path' ($r.entered.rejected -and $r.entered.rejectedReason -match 'Traefik itself' -and @($r.candidates | Where-Object { -not $_.rejected }).Count -eq 1 -and @($r.guidance | Where-Object { $_.id -eq 'loopback' -and $_.category -eq 'restriction' }).Count -eq 1) (Show $r)
 $r = & $resolve 'this-computer' '' $desktop 4119
 Test-Condition 'host.docker.internal: just a port on this computer -> the verified host gateway, no correction to explain' ($r.recommended.url -eq 'http://host.docker.internal:4119' -and -not @($r.guidance | Where-Object { $_.action -eq 'use-recommended' }).Count) (Show $r)
 $r = & $resolve 'auto' 'host.docker.internal:9696'
@@ -119,7 +126,9 @@ Test-Condition 'a remote LAN device (Plex 10.10.0.8:32800) is kept as typed, wit
 $r = & $resolve 'lan' 'nas.home.arpa:5000' $plain
 Test-Condition 'a LAN DNS name is kept as typed' ($r.recommended.url -eq 'http://nas.home.arpa:5000' -and $r.kind -eq 'lan-name') (Show $r)
 $r = & $resolve 'lan' '10.10.0.8:32800'
-Test-Condition 'a LAN address inside an overlapping Docker subnet: reported (names the network), not recommended, never replaced by host.docker.internal' (-not $r.recommended -and @($r.guidance | Where-Object { $_.id -eq 'subnet-overlap' -and $_.text -match 'unifi-lan_unifi_net' }).Count -eq 1 -and -not @($r.candidates | Where-Object { $_.host -eq 'host.docker.internal' }).Count) (Show $r)
+Test-Condition 'a LAN address inside an overlapping Docker subnet: reported (names the network) as a warning, still selectable, never replaced by host.docker.internal' ($r.recommended.url -eq 'http://10.10.0.8:32800' -and -not $r.entered.rejected -and @($r.guidance | Where-Object { $_.id -eq 'subnet-overlap' -and $_.severity -eq 'warn' -and $_.text -match 'unifi-lan_unifi_net' }).Count -eq 1 -and -not @($r.candidates | Where-Object { $_.host -eq 'host.docker.internal' }).Count) (Show $r)
+$r = & $resolve 'lan' 'http://10.10.0.8:8080/files' $plain
+Test-Condition 'a base path in the backend address is a restriction: the candidate cannot be selected and the reason is given' ($r.entered.rejected -and $r.entered.rejectedReason -match 'Path prefix' -and @($r.guidance | Where-Object { $_.id -eq 'backend-path' -and $_.severity -eq 'error' }).Count -eq 1) (Show $r)
 $r = & $resolve 'this-computer' '10.10.0.8:32800' $plain
 Test-Condition 'chosen "this computer" but the address is another device: kept, with a note' ($r.recommended.type -eq 'lan' -and @($r.guidance | Where-Object { $_.id -eq 'not-this-pc' }).Count -eq 1) (Show $r)
 
@@ -137,11 +146,13 @@ Test-Condition 'native Linux with a verified mapping: host.docker.internal is re
 
 # --- Overrides -----------------------------------------------------------------------------------------------------------------------
 $r = & $resolve 'lan' '10.20.0.5:8080' $plain -Override
-Test-Condition 'a deliberate override is kept as typed; the resolver''s own suggestion stays available' ($r.override -and $r.recommended.url -eq 'http://10.20.0.5:8080' -and $r.recommended.via -eq 'override' -and $r.suggested.url -eq 'http://10.20.0.5:8080') (Show $r)
+Test-Condition 'a deliberate custom address is kept as typed (role custom)' ($r.override -and $r.custom.url -eq 'http://10.20.0.5:8080' -and $r.custom.via -eq 'override' -and $r.custom.role -eq 'custom') (Show $r)
 $r = & $resolve 'this-computer' '10.10.0.11:4119' $desktop -Override
-Test-Condition 'an override of this PC''s LAN address is kept (with the explanation), the suggestion remains host.docker.internal' ($r.override -and $r.recommended.host -eq '10.10.0.11' -and $r.suggested.url -eq 'http://host.docker.internal:4119' -and @($r.guidance | Where-Object { $_.id -eq 'own-lan-ip' }).Count -eq 1) (Show $r)
+Test-Condition 'a custom address of this PC''s LAN IP is kept; the recommendation remains host.docker.internal and does not replace it' ($r.override -and $r.custom.host -eq '10.10.0.11' -and $r.recommended.url -eq 'http://host.docker.internal:4119' -and @($r.guidance | Where-Object { $_.id -eq 'own-lan-ip' }).Count -eq 1) (Show $r)
 $r = & $resolve 'this-computer' '127.0.0.1:4119' $desktop -Override
-Test-Condition 'an override to 127.0.0.1 is refused: inside Traefik it is Traefik' (-not $r.override -and $r.recommended.url -eq 'http://host.docker.internal:4119' -and @($r.guidance | Where-Object { $_.id -eq 'override-loopback' }).Count -eq 1) (Show $r)
+Test-Condition 'a custom address of 127.0.0.1 is refused: inside Traefik it is Traefik' (-not $r.override -and $r.custom.rejected -and $r.recommended.url -eq 'http://host.docker.internal:4119' -and @($r.guidance | Where-Object { $_.id -eq 'override-loopback' }).Count -eq 1) (Show $r)
+$r = & $resolve 'docker' 'isolated'
+Test-Condition 'several discovered paths and nothing typed beyond the container: no "entered" candidate is invented' (-not $r.entered -and $r.ambiguous) (Show $r)
 
 # --- Connection test classification -----------------------------------------------------------------------------------------------
 function New-Try([string]$Scheme, [string]$Result, [int]$Status = 0, [string]$Detail = '', [string]$Location = '', [int]$Final = 0) {
@@ -186,8 +197,39 @@ $z = & $v @(New-Try 'http' 'http' 404)
 Test-Condition 'connection: 503 is "Application error" and 404 an unexpected answer: warnings, never green' ($x.result -eq 'unavailable' -and $x.state -eq 'warning' -and $z.result -eq 'http-error' -and $z.state -eq 'warning') "$(Show $x) $(Show $z)"
 $x = Get-BackendVerdict ([ordered]@{ performed = $false; tries = @(); detail = 'Traefik is not running.' }) (New-Svc) 'proxynet'
 Test-Condition 'connection: a test that could not run is "Not tested" (skipped), never passed' ($x.result -eq 'not-tested' -and $x.state -eq 'skipped') (Show $x)
+$hp = [ordered]@{ performed = $true; tries = @((New-Try 'http' 'http' 400)); timeout = 5; hostname = 'files.example.com'; hostCheck = (New-Try 'http' 'http' 200) }
+$hp.hostCheck.hostHeader = '10.10.0.11:80'
+$x = Get-BackendVerdict $hp (New-Svc 'lan' '10.10.0.11' 80) 'proxynet'
+Test-Condition 'Host header: 400 for the public hostname but 200 for the backend''s own address is "Hostname rejected" with both answers, never green' ($x.result -eq 'host-rejected' -and $x.state -eq 'failed' -and $x.message -match 'refuses Host: files.example.com' -and $x.hostCheck.backendStatus -eq 200 -and $x.steps.hostHeader -match '10.10.0.11:80 -> HTTP 200') (Show $x)
+$t = New-Try 'http' 'timeout'; $t.resolved = ''
+$x = Get-BackendVerdict (& $probe @($t)) (New-Svc 'lan' '10.10.0.11' 80) 'proxynet'
+$t2 = New-Try 'http' 'http' 200; $t2.resolved = '192.168.65.254:80'
+$y = Get-BackendVerdict (& $probe @($t2)) (New-Svc 'host' 'host.docker.internal' 80) 'proxynet'
+Test-Condition 'test steps: DNS, TCP and HTTP are reported separately (IP: no DNS needed, timeout: no TCP answer; name: resolved address)' ($x.steps.dns -match 'not needed' -and $x.steps.tcp -match 'timeout' -and $x.steps.http -eq 'no HTTP answer' -and $y.steps.dns -match '192.168.65.254' -and $y.steps.tcp -eq 'connected' -and $y.steps.http -eq 'HTTP 200 over http') "$(Show $x) $(Show $y)"
 $ev = Get-ProbeEvidence @('  HTTP/1.1 302 Found', '  Set-Cookie: session=abc123', '  Location: /login?next=/&token=s3cr3t', '  WWW-Authenticate: Basic realm="x"', 'wget: server returned error: HTTP/1.1 401')
 Test-Condition 'evidence: cookies are dropped, secret-looking query values are masked, auth challenges keep only the scheme' (($ev -join '|') -notmatch 'abc123|s3cr3t|realm' -and ($ev -join '|') -match 'token=<redacted>' -and ($ev -join '|') -match 'WWW-Authenticate: Basic') ($ev -join ' | ')
+
+# --- The selected backend in the generated Traefik configuration ------------------------------------------------------------------
+# HFS on this PC, published as files.example.com, with the address the user selected (10.10.0.11:80, not the recommendation).
+$files = ConvertTo-ServiceDefinition @{ name = 'files'; displayName = 'Files'; hostnames = @('files.example.com'); middlewares = @('default-headers@file')
+  target = @{ type = 'lan'; host = '10.10.0.11'; port = 80; protocol = 'http' }; cloudflare = @{ publish = $true; access = $true } }
+$yaml = ConvertTo-TraefikRouteYaml $files
+Test-Condition 'generated service: the selected backend URL is written exactly (http://10.10.0.11:80), the router matches the hostname on the web entry point and references its service' ($yaml -match '(?m)^          - url: http://10\.10\.0\.11:80$' -and $yaml -match "rule: 'Host\(``files\.example\.com``\)'" -and $yaml -match 'entryPoints: \[web\]' -and $yaml -match '(?m)^      service: svc-files$' -and $yaml -match '(?m)^    svc-files:\s*$' -and $yaml -notmatch 'host\.docker\.internal') $yaml
+$gw = ConvertTo-TraefikRouteYaml (ConvertTo-ServiceDefinition @{ name = 'files'; hostnames = @('files.example.com'); target = @{ type = 'host'; host = 'host.docker.internal'; port = 80; protocol = 'http' } })
+Test-Condition 'generated service: choosing the recommendation instead writes http://host.docker.internal:80' ($gw -match '(?m)^          - url: http://host\.docker\.internal:80$') $gw
+$tmp = Join-Path ([IO.Path]::GetTempPath()) ("tpm-resolver-" + [guid]::NewGuid().ToString('n').Substring(0, 8))
+$null = New-Item -ItemType Directory -Path $tmp
+try {
+  [IO.File]::WriteAllText((Join-Path $tmp 'middlewares.yml'), "http:`n  middlewares:`n    default-headers:`n      headers:`n        frameDeny: true`n")
+  $notflix = ConvertTo-ServiceDefinition @{ name = 'notflix'; hostnames = @('notflix.example.com'); middlewares = @('default-headers@file'); target = @{ type = 'host'; host = 'host.docker.internal'; port = 4119; protocol = 'http' } }
+  [IO.File]::WriteAllText((Join-Path $tmp 'svc-notflix.yml'), (ConvertTo-TraefikRouteYaml $notflix))
+  $st = [pscustomobject]@{ DynamicDir = $tmp; RegistryPath = (Join-Path $tmp 'services.json') }
+  $plan = Get-ServicePlan -Settings $st -Services @($notflix, $files)
+  Test-Condition 'plan: adding the HFS route leaves the existing route unchanged (svc-notflix.yml unchanged, svc-files.yml added)' (-not $plan.HasErrors -and @($plan.Changes | Where-Object { $_.File -eq 'svc-notflix.yml' -and $_.Action -eq 'unchanged' }).Count -eq 1 -and @($plan.Changes | Where-Object { $_.File -eq 'svc-files.yml' -and $_.Action -eq 'add' -and $_.NewContent -match 'url: http://10\.10\.0\.11:80' }).Count -eq 1) (($plan.Changes | ForEach-Object { "$($_.File) $($_.Action)" }) -join ', ')
+  $dupe = ConvertTo-ServiceDefinition @{ name = 'files2'; hostnames = @('files.example.com'); middlewares = @('default-headers@file'); target = @{ type = 'lan'; host = '10.10.0.8'; port = 8080; protocol = 'http' } }
+  $plan2 = Get-ServicePlan -Settings $st -Services @($notflix, $files, $dupe)
+  Test-Condition 'plan: a second router claiming the same hostname is an error, and is not rendered' ($plan2.HasErrors -and @($plan2.Issues | Where-Object { $_.Level -eq 'Error' -and $_.Message -match 'already routed' }).Count -ge 1 -and -not @($plan2.Changes | Where-Object { $_.File -eq 'svc-files2.yml' }).Count) (($plan2.Issues | ForEach-Object { $_.Message }) -join ' | ')
+} finally { Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue }
 
 $failed = @($script:Results | Where-Object { $_.Status -eq 'FAIL' })
 Write-Host ''

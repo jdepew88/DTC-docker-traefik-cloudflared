@@ -123,7 +123,8 @@
         h('tbody', null, rows)), s.services.length ? null : h('p', { class: 'empty' }, 'No services yet. Choose one of the three ways above to publish your first app.')),
       h('p', { class: 'muted small', 'data-help-host': '' }, 'Seeing 404 or 502 in the browser? ', help('http-errors', 'HTTP errors')),
       gate('advanced', h('p', { class: 'muted small' }, 'This tool covers basic publishing. For middleware chains, certificates, load balancing or plugins use Traefik\'s own configuration (a hand-written .yml in traefik\\dynamic) or a dedicated Traefik manager as a separate product.')));
-    if (ctx.state.sub === 'add') openForm(ctx, null);
+    // An add form in progress survives leaving the page and coming back (and the browser's back and forward buttons).
+    if (ctx.state.sub === 'add') { if (s.forms.svc && !s.forms.svc.editing) renderForm(ctx); else openForm(ctx, null); }
     const hm = /^health\/(.+)$/.exec(ctx.state.sub || '');
     if (hm && P.serviceHealth) P.serviceHealth($('#health-host'), decodeURIComponent(hm[1]));
   };
@@ -144,6 +145,12 @@
     f.hostname = sv ? arr(sv.hostnames)[0] : '';
     renderForm(ctx);
     const host = $('#service-form-host'); if (host) host.scrollIntoView({ block: 'start', behavior: 'smooth' });
+  }
+
+  // Closing the add form also leaves #services/add, so "Enter an HTTP backend manually" opens a fresh form again.
+  function closeForm(ctx, host) {
+    ctx.state.forms.svc = null; clear(host);
+    if (ctx.state.sub === 'add') ctx.navigate('services');
   }
 
   function renderForm(ctx) {
@@ -191,7 +198,7 @@
     const mws = Array.from(new Set([...s.middlewares, ...f.middlewares])).map((m) => { const b = h('input', { type: 'checkbox', value: m, checked: f.middlewares.includes(m) }); b.addEventListener('change', () => { f.middlewares = b.checked ? [...new Set([...f.middlewares, m])] : f.middlewares.filter((x) => x !== m); }); return h('label', { class: 'check' }, b, h('span', { class: 'mono' }, m)); });
     const err = h('p', { class: 'form-error', role: 'alert' });
     const form = h('form', { class: 'card', novalidate: true, 'aria-labelledby': 'svc-form-title' },
-      h('div', { class: 'card-head' }, h('h2', { id: 'svc-form-title' }, f.editing ? `Edit ${f.display || f.editing}` : 'Add a service'), h('span', { class: 'grow' }), h('button', { type: 'button', class: 'icon-btn', 'aria-label': 'Close', onclick: () => { s.forms.svc = null; clear(host); } }, icon('x'))),
+      h('div', { class: 'card-head' }, h('h2', { id: 'svc-form-title' }, f.editing ? `Edit ${f.display || f.editing}` : 'Add a service'), h('span', { class: 'grow' }), h('button', { type: 'button', class: 'icon-btn', 'aria-label': 'Close', onclick: () => closeForm(ctx, host) }, icon('x'))),
       h('div', { class: 'grid' },
         field({ id: 'svc-display', label: 'Service name', control: display, hint: 'Any name, e.g. Notflix. It stays as you typed it.' }),
         field({ id: 'svc-id', label: 'Service id', control: idInput, minLevel: 'advanced', hint: 'Lowercase id used in file names (svc-<id>.yml); cannot change later.' })),
@@ -214,7 +221,7 @@
         cb('enabled', 'Enabled'))),
       gate('expert', h('p', { class: 'small muted' }, 'Generated rule: ', h('code', null, `Host(\`${L.joinHostname(f.sub.value, f.domain)}\`)${f.path ? ` && PathPrefix(\`${f.path}\`)` : ''}`), ' → ', h('code', null, f.target ? `${f.protocol}://${f.target.host}:${f.target.port}` : '(backend not chosen yet)'))),
       err,
-      h('div', { class: 'actions' }, h('button', { type: 'submit', class: 'btn primary' }, 'Preview changes'), h('button', { type: 'button', class: 'btn', onclick: () => { s.forms.svc = null; clear(host); } }, 'Cancel')));
+      h('div', { class: 'actions' }, h('button', { type: 'submit', class: 'btn primary' }, 'Preview changes'), h('button', { type: 'button', class: 'btn', onclick: () => closeForm(ctx, host) }, 'Cancel')));
     form.addEventListener('submit', (e) => {
       e.preventDefault();
       const errors = [];
@@ -226,7 +233,8 @@
       if (!/^[a-z0-9]([a-z0-9-]{0,38}[a-z0-9])?$/.test(id)) errors.push('Enter a service name (it becomes the id).');
       if (f.sub.value && !L.isValidSubdomain(f.sub.value)) errors.push('The subdomain may use letters, digits and dashes.');
       if (!f.domain) errors.push('Choose a domain.');
-      if (!f.target) errors.push(f.needsChoice ? 'Choose how Traefik reaches the app: use the recommended address or pick one of the options.' : f.where === 'docker' ? 'Choose the container and its port.' : 'Enter the address and port of the app.');
+      const backendError = L.backendValidation(f);
+      if (backendError) errors.push(backendError);
       else if (!(portN >= 1 && portN <= 65535)) errors.push('Enter a port from 1 to 65535.');
       if (f.exposure === 'access' && L.splitEmails(f.emails).some((x) => !L.isEmail(x))) errors.push('Check the email addresses.');
       err.textContent = errors.join(' ');

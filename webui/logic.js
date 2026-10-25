@@ -67,8 +67,10 @@
   }
   function isPrivateIPv4(v) { return PRIVATE_RE.test(String(v || '')); }
 
-  // --- Backend selection ("Where is your application running?") ------------------------------------------------------
-  // The wizard's three locations and the registry's target types. "this-computer" is Windows itself (host.docker.internal).
+  // --- Backend selection ("How should Traefik connect to this application?") -----------------------------------------
+  // The wizard's three connection options and the registry's target types. "this-computer" is Windows itself. The option
+  // helps discovery and recommendations; it never restricts the address the user may choose.
+  const BACKEND_QUESTION = 'How should Traefik connect to this application?';
   const WHERE = ['docker', 'this-computer', 'lan'];
   function whereFromTargetType(type) { return type === 'docker' ? 'docker' : type === 'host' ? 'this-computer' : 'lan'; }
   function isLoopbackHost(v) { return /^(127\.\d+\.\d+\.\d+|localhost|::1|0\.0\.0\.0)$/.test(String(v || '').trim().toLowerCase()); }
@@ -85,25 +87,88 @@
     return { scheme, host: v.toLowerCase(), port: 0 };
   }
   function sameTarget(a, b) { return !!(a && b && a.type === b.type && a.host === b.host && Number(a.port) === Number(b.port)); }
-  // Which backend the form uses after the resolver answered. A deliberate override and an existing service's backend are
-  // kept (an existing backend changes only when the user chooses so); an unambiguous suggestion without a correction to
-  // explain is filled in automatically; a suggestion that corrects what the user typed waits for "Use recommended address".
+  function targetUrl(t, protocol) { return t ? `${protocol || t.protocol || 'http'}://${t.host}:${t.port}` : ''; }
+  // The candidates as the form lists them: one per address, the address the user entered (or their custom address)
+  // first, then the recommendation, then other discovered paths. role -> the label shown next to each.
+  const ROLE_LABELS = { entered: 'Address you entered', custom: 'Custom address', recommended: 'Recommended alternative', alternative: 'Discovered alternative' };
+  function backendCandidates(resolution) {
+    const res = resolution || {};
+    const rank = { custom: 0, entered: 1, recommended: 2, alternative: 3 };
+    const seen = new Set();
+    const rec = res.recommended || null;
+    return (res.candidates || []).filter((c) => { if (seen.has(c.url)) return false; seen.add(c.url); return true; })
+      .map((c) => ({ ...c, role: c.role || 'alternative', isRecommended: !!(rec && c.url === rec.url) }))
+      .sort((a, b) => (rank[a.role] ?? 3) - (rank[b.role] ?? 3))
+      .map((c) => ({ ...c, label: c.role === 'recommended' && !(res.candidates || []).some((x) => x.role === 'entered' || x.role === 'custom') ? 'Recommended' : ROLE_LABELS[c.role] || ROLE_LABELS.alternative }));
+  }
+  // Which backend the form uses after the resolver answered. A recommendation never replaces a choice:
+  //   - custom address (Advanced/Expert override): kept when it is valid, else nothing is selected;
+  //   - an existing service's backend, or one the user picked: kept until the user picks another;
+  //   - exactly one usable candidate: selected automatically;
+  //   - an address the user typed that can work: selected as typed (the recommendation is offered next to it);
+  //   - several discovered paths and nothing typed: the user chooses (needsChoice), each option has a control.
   function chooseBackend(state, resolution) {
     const st = state || {};
     const res = resolution || {};
-    const suggested = res.suggested || res.recommended || null;
-    if (st.override && res.override && res.recommended) return { target: res.recommended, source: 'override', needsChoice: false };
-    if (st.source === 'existing' || st.source === 'chosen') return { target: st.target || null, source: st.source, needsChoice: false };
-    if (!suggested) return { target: null, source: '', needsChoice: !!res.ambiguous };
-    const correction = (res.guidance || []).some((g) => g.action === 'use-recommended');
-    if (correction) return { target: null, source: '', needsChoice: true };
-    if (res.ambiguous && (res.candidates || []).filter((c) => !c.rejected).length > 1) return { target: null, source: '', needsChoice: true };
-    return { target: suggested, source: 'auto', needsChoice: false };
+    if (st.override) return res.override && res.custom && !res.custom.rejected ? { target: res.custom, source: 'override', needsChoice: false } : { target: null, source: 'override', needsChoice: false };
+    if ((st.source === 'existing' || st.source === 'chosen') && st.target) return { target: st.target, source: st.source, needsChoice: false };
+    const usable = backendCandidates(res).filter((c) => !c.rejected);
+    if (!usable.length) return { target: null, source: '', needsChoice: false };
+    if (usable.length === 1) return { target: usable[0], source: 'auto', needsChoice: false };
+    const entered = usable.find((c) => c.role === 'entered');
+    if (entered) return { target: entered, source: 'entered', needsChoice: false };
+    if (res.ambiguous) return { target: null, source: '', needsChoice: true };
+    return { target: usable.find((c) => c.isRecommended) || usable[0], source: 'auto', needsChoice: false };
   }
-  // Notices the user dismissed stay hidden until their condition (what they are about) changes; errors always show.
-  function visibleGuidance(list, dismissed) {
+  // Notices the user dismissed stay hidden until their condition (what they are about) changes; restrictions always show.
+  // ctx { target, verification }: a recommendation already followed is hidden, and connectivity warnings disappear once
+  // the selected backend answered a connection test (the problem they warn about did not stop it).
+  function visibleGuidance(list, dismissed, ctx) {
     const d = dismissed || {};
-    return (list || []).filter((g) => g.severity === 'error' || !d[g.condition]);
+    const c = ctx || {};
+    const passed = !!(c.verification && (c.verification.state === 'ok' || c.verification.state === 'auth') && c.target && c.verification.targetUrl === targetUrl(c.target, c.verification.target && c.verification.target.protocol));
+    return (list || []).filter((g) => {
+      if (g.severity === 'error') return true;
+      if (d[g.condition]) return false;
+      if (g.category === 'connectivity' && passed) return false;
+      if (g.category === 'recommendation' && c.recommended && c.target && sameTarget(c.recommended, c.target)) return false;
+      return true;
+    });
+  }
+  // A complete backend URL typed by an Advanced or Expert user: scheme, host and port; a path is refused (Traefik sends
+  // the request path unchanged) and loopback is refused (inside Traefik it is Traefik).
+  function parseBackendUrl(text) {
+    const v = String(text || '').trim();
+    if (!v) return { ok: false, error: 'Enter a complete backend URL, e.g. http://10.10.0.8:8080.' };
+    const m = /^(https?|h2c):\/\/(\[[^\]]+\]|[^/:?#\s]+)(?::(\d{1,5}))?([/?#].*)?$/i.exec(v);
+    if (!m) return { ok: false, error: 'Enter a complete backend URL with its protocol, e.g. http://10.10.0.8:8080.' };
+    const scheme = m[1].toLowerCase(); const host = m[2].toLowerCase();
+    const port = m[3] ? Number(m[3]) : scheme === 'https' ? 443 : 80;
+    const path = m[4] && m[4] !== '/' ? m[4] : '';
+    if (!(port >= 1 && port <= 65535)) return { ok: false, error: 'The port must be from 1 to 65535.' };
+    if (isLoopbackHost(host)) return { ok: false, error: `${host} inside Traefik's container is Traefik itself: use host.docker.internal for an app on this computer.` };
+    if (path) return { ok: false, error: 'A base path in the backend URL is not supported: use Path prefix under Advanced routing instead.' };
+    return { ok: true, scheme, host, port, path: '', url: `${scheme}://${host}:${port}` };
+  }
+  // The validation message when no usable backend is selected, or ''.
+  function backendValidation(f) {
+    const s = f || {};
+    if (s.override) { const p = parseBackendUrl(s.custom); if (!p.ok) return p.error; }
+    if (s.target) return '';
+    const usable = s.backend ? backendCandidates(s.backend.resolution).filter((c) => !c.rejected) : [];
+    if (usable.length) return 'Select the address Traefik should use to reach your application.';
+    return s.where === 'docker' ? 'Choose the container and its port.' : 'Enter the address and port of the application.';
+  }
+  // The sentence that heads a connection test result.
+  function backendHeadline(v, target) {
+    if (!v) return '';
+    const where = target ? `${target.host}:${target.port}` : 'the backend';
+    if (v.state === 'ok') return 'Traefik successfully connected to the selected application.';
+    if (v.state === 'auth') return 'Traefik reached the selected application; it asks for a login.';
+    if (['timeout', 'refused', 'dns', 'error'].includes(v.result)) return `Traefik could not connect to ${where}. Test another address or explicitly save the route without verification.`;
+    if (v.result === 'host-rejected') return `Traefik reached ${where}, but the application rejected the public hostname.`;
+    if (v.state === 'skipped') return 'The connection test could not run.';
+    return `Traefik reached ${where}, but the answer needs attention.`;
   }
   // A verification result -> how it is shown. Green only for an application answer (verified, or a redirect to a page
   // that answered); a login is "auth"; everything else is a warning or a failure; no test is neutral.
@@ -251,7 +316,8 @@
     DIMENSIONS, COMPONENT_STATUS, componentStatus, firstBlocked, suggestAppName, displayNameFromLabel, choosePort, reachOptions,
     suggestLabel, suggestServiceName, autoName, autoNameFromSource, autoNameEdit, autoNameReset, isValidSubdomain, joinHostname, splitHostname,
     detectTarget, isPrivateIPv4,
-    WHERE, whereFromTargetType, isLoopbackHost, parseBackendAddress, sameTarget, chooseBackend, visibleGuidance, backendStatus,
+    BACKEND_QUESTION, WHERE, whereFromTargetType, isLoopbackHost, parseBackendAddress, sameTarget, targetUrl, ROLE_LABELS, backendCandidates, chooseBackend,
+    visibleGuidance, parseBackendUrl, backendValidation, backendHeadline, backendStatus,
     stableStringify, fingerprint, reviewState, markReviewed, reopenReview,
     STATUS, statusFromReview, worstStatus,
     formatBytes, splitEmails, isEmail,
