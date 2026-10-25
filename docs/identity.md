@@ -275,6 +275,7 @@ manifest (plain Linux containers). Debian, Arch and Unraid need a secret-store a
 | --- | --- |
 | `tests\Test-Identity.ps1` | No authentik: ForwardAuth YAML (and, with Docker, acceptance by a throwaway Traefik), validation guards, Google values, allow-lists and policy expressions (injection), discovery, every model state, config resume, secret store, catalog manifest. |
 | `tests\Test-IdentityLive.ps1` | Disposable instance + authentik installed through the catalog API: bootstrap, readiness, network isolation, adopt, token, sign-in route, outpost, Google source with **synthetic** credentials (redirect check, idempotency, secret never leaks), protect/unprotect, sign-ins through the real outpost (allowed, denied, wrong password, group), access evidence, loop detection, fail closed, interrupted setup, rollback, persistence, bootstrap-only-once, browser (screenshots). Removes everything it created and checks that no other container changed. |
+| `tests\Test-IdentityWizardBrowser.ps1` | No Docker, small footprint: the wizard in headless Edge with the authentik side of `/api/identity` answered in the page. Select all / Clear all / count, ticking without the page moving, already protected applications never selectable, exactly the ticked applications sent, review before apply, per-application result, 390 px. Real protection is covered by the live test. |
 | `node tests\ui-logic.test.js` | Browser-side helpers (state vocabulary, redirect URI, client ID, credential status, next step). |
 
 ## Limitations
