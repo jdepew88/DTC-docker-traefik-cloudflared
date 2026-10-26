@@ -322,14 +322,16 @@ function Get-IdentityModel {
   if (-not $tokOk) { & $add $steps (New-IdState 'apps' 'Protect applications' 'not-configured' 'Needs the API connection first.' '' $true) }
   elseif (-not $protected.Count) { & $add $steps (New-IdState 'apps' 'Protect applications' 'awaiting-user' 'Select the applications to put behind authentik sign-in.' 'protect' $true) }
   else {
-    $bad = @($protected | Where-Object { $_.challenge -and $_.challenge.State -in 'open', 'loop', 'failed' })
+    $bad = @($protected | Where-Object { $_.challenge -and $_.challenge.State -in 'open', 'loop', 'failed', 'misrouted' })
     $ver = @($protected | Where-Object { $_.verifiedAt })
     $st = $(if ($bad.Count) { 'failed' } elseif ($ver.Count -eq $protected.Count) { 'verified' } elseif (@($protected | Where-Object { $_.challenge -and $_.challenge.State -eq 'auth' }).Count) { 'auth-required' } else { 'configured' })
     & $add $steps (New-IdState 'apps' 'Protected applications' $st "$($protected.Count) protected$(if ($bad.Count) { "; problem: $(@($bad | ForEach-Object { "$($_.service): $($_.challenge.Message)" }) -join ' ')" })." 'protect' $true)
   }
   foreach ($a in $protected) {
     $c = Get-IdProp $a 'challenge' $null
-    $st = $(if ((Get-IdProp $a 'verifiedAt' $null)) { 'verified' } elseif (-not (Get-IdProp $a 'authentik' $null)) { 'failed' } elseif ($c) { @{ auth = 'auth-required'; open = 'failed'; loop = 'failed'; failed = 'failed' }[[string](Get-IdProp $c 'State' $null)] } else { 'configured' })
+    # A current failed check outranks older sign-in evidence (e.g. a redirect that only works on this PC).
+    $cur = [string](Get-IdProp $c 'State' '')
+    $st = $(if ($cur -in 'open', 'loop', 'failed', 'misrouted') { 'failed' } elseif ((Get-IdProp $a 'verifiedAt' $null)) { 'verified' } elseif (-not (Get-IdProp $a 'authentik' $null)) { 'failed' } elseif ($c) { @{ auth = 'auth-required'; open = 'failed'; loop = 'failed'; failed = 'failed'; misrouted = 'failed' }[[string](Get-IdProp $c 'State' $null)] } else { 'configured' })
     $msg = $(if (-not (Get-IdProp $a 'authentik' $null)) { 'The authentik application or provider is missing.' } elseif ($c) { [string](Get-IdProp $c 'Message' $null) } else { 'ForwardAuth middleware and authentik application are configured.' })
     & $add $comp (New-IdState "app:$((Get-IdProp $a 'service' $null))" "ForwardAuth: $((Get-IdProp $a 'hostname' $null))" $st $msg)
   }

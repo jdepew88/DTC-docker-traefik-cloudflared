@@ -10,6 +10,8 @@
 # Every sync function has a dry-run mode (-WhatIf) that returns the actions it would take without changing anything;
 # the web UI shows that as the preview and applies the same function without -WhatIf after approval. Objects this
 # manager creates carry the "dm-" prefix (slugs/names), so they are found again and never duplicated.
+
+Import-Module (Join-Path $PSScriptRoot 'RoutingModel.psm1')
 #
 # Endpoints and fields were verified against the OpenAPI schema of authentik 2026.8.5 (/api/v3/schema/).
 Set-StrictMode -Version 2.0
@@ -382,24 +384,48 @@ function Sync-AkObject {
 
 # --- Embedded outpost ---------------------------------------------------------------------------------------------------
 
-# Sets the embedded outpost's authentik_host to the public URL, so sign-in redirects send browsers to
+# The address the embedded outpost sends browsers to for signing in: authentik_host_browser when set, else
+# authentik_host. Traefik reaches the outpost separately (http://<authentik container>:9000, inside Docker).
+function Get-AkOutpostBrowserHost($Outpost) {
+  $cfg = $Outpost.Config
+  $b = [string](Get-AkProp $cfg 'authentik_host_browser' '')
+  if ($b) { return $b }
+  return [string](Get-AkProp $cfg 'authentik_host' '')
+}
+
+# Public sign-in address for the outpost: must be a public hostname (https; plain http only for disposable test setups
+# on a dotted name). A loopback, LAN or Docker-only address works on this PC only, so it is refused.
+function Assert-AkPublicSignInUrl([string]$PublicUrl) {
+  $t = Test-BrowserEndpoint $PublicUrl -AllowHttp
+  if (-not $t.ok) { throw "The public sign-in address '$PublicUrl' cannot be used for browsers: $($t.problems[0])" }
+}
+
+# Adds (and, without -WhatIf, applies) the outpost change that makes sign-in redirects use $PublicUrl.
+function Sync-AkOutpostBrowserHost($Conn, $Outpost, [string]$PublicUrl, $Actions, [switch]$WhatIf) {
+  Assert-AkPublicSignInUrl $PublicUrl
+  $want = $PublicUrl.TrimEnd('/') + '/'
+  $now = Get-AkOutpostBrowserHost $Outpost
+  if ($now.TrimEnd('/') -eq $want.TrimEnd('/')) { Add-AkAction $Actions 'none' 'outpost' $Outpost.Name "Embedded outpost already sends browsers to $want"; return }
+  $why = $(if ($now) { $k = Test-BrowserEndpoint $now -AllowHttp; if ($k.ok) { '' } else { " ($($k.problems[0]))" } } else { '' })
+  Add-AkAction $Actions 'update' 'outpost' $Outpost.Name "Embedded outpost: send browsers to $want for signing in" "Sign-in redirects currently go to '$now'$why. Traefik keeps reaching authentik internally."
+  if (-not $WhatIf) {
+    $cfg = $Outpost.Config
+    $cfg.authentik_host = $want
+    if ($cfg.PSObject.Properties['authentik_host_browser'] -and [string]$cfg.authentik_host_browser -and ([string]$cfg.authentik_host_browser).TrimEnd('/') -ne $want.TrimEnd('/')) { $cfg.authentik_host_browser = '' }
+    $null = Invoke-AuthentikApi $Conn PATCH "/outposts/instances/$($Outpost.Pk)/" @{ config = $cfg }
+    Set-AkActionDone $Actions
+  }
+}
+
+# Sets the embedded outpost's sign-in address to the public URL, so sign-in redirects send browsers to
 # https://auth.<domain>/ (not to an internal address).
 function Sync-AuthentikOutpost {
   param([Parameter(Mandatory = $true)]$Conn, [Parameter(Mandatory = $true)][string]$PublicUrl, [switch]$WhatIf)
+  Assert-AkPublicSignInUrl $PublicUrl
   $actions = New-AkActionList
   $ov = Get-AuthentikOverview $Conn
   if (-not $ov.Outpost) { throw 'authentik has no embedded outpost (it is created on first start). Wait until authentik is ready.' }
-  $want = $PublicUrl.TrimEnd('/') + '/'
-  if ($ov.Outpost.AuthentikHost.TrimEnd('/') -eq $want.TrimEnd('/')) { Add-AkAction $actions 'none' 'outpost' $ov.Outpost.Name "Embedded outpost already uses $want" }
-  else {
-    Add-AkAction $actions 'update' 'outpost' $ov.Outpost.Name "Embedded outpost: send browsers to $want" "authentik_host: '$($ov.Outpost.AuthentikHost)' -> '$want'"
-    if (-not $WhatIf) {
-      $cfg = $ov.Outpost.Config
-      $cfg.authentik_host = $want
-      $null = Invoke-AuthentikApi $Conn PATCH "/outposts/instances/$($ov.Outpost.Pk)/" @{ config = $cfg }
-      Set-AkActionDone $actions
-    }
-  }
+  Sync-AkOutpostBrowserHost $Conn $ov.Outpost $PublicUrl $actions -WhatIf:$WhatIf
   return $actions.ToArray()
 }
 
@@ -722,6 +748,7 @@ function Sync-AuthentikAppProtection {
   $display = [string](Get-AkProp $Desired 'DisplayName' $svc)
   $external = [string](Get-AkProp $Desired 'ExternalUrl' "https://$hostname")
   if ($external -notmatch '^https?://[a-z0-9.-]+(:\d{1,5})?$') { throw "Invalid application address '$external'." }
+  if ([string](Get-AkProp $Desired 'PublicUrl' '')) { Assert-AkPublicSignInUrl ([string]$Desired.PublicUrl) }
   $ov = Get-AuthentikOverview $Conn
   if ($ov.MissingFlows.Count) { throw "authentik is not fully initialized yet (missing flows: $($ov.MissingFlows -join ', '))." }
   if (-not $ov.Outpost) { throw 'authentik has no embedded outpost yet.' }
@@ -768,7 +795,15 @@ function Sync-AuthentikAppProtection {
     if (-not $WhatIf) { $null = Invoke-AuthentikApi $Conn POST '/policies/bindings/' @{ group = $grp.pk; target = [string](Get-AkProp $app 'pbm_uuid' $app.pk); order = 0; enabled = $true; negate = $false; timeout = 30 }; Set-AkActionDone $actions }
   }
 
-  # Embedded outpost.
+  # Embedded outpost: the sign-in address browsers are sent to, then serving this provider. Without a public sign-in
+  # address the redirect would only work on this PC, so protection is refused instead of half-working.
+  $pub = [string](Get-AkProp $Desired 'PublicUrl' '')
+  if ($pub) { Sync-AkOutpostBrowserHost $Conn $ov.Outpost $pub $actions -WhatIf:$WhatIf }
+  else {
+    $now = Get-AkOutpostBrowserHost $ov.Outpost
+    $k = Test-BrowserEndpoint $now -AllowHttp
+    if (-not $now -or -not $k.ok) { throw "authentik's embedded outpost sends browsers to '$now' for signing in$(if ($k.problems.Count) { ": $($k.problems[0])" } else { '' }) Set the public sign-in address first (Identity & Access, Public sign-in address)." }
+  }
   if ($null -ne $provPk -and $ov.Outpost.Providers -contains $provPk) { Add-AkAction $actions 'none' 'outpost' $ov.Outpost.Name 'The embedded outpost serves this provider' }
   else {
     Add-AkAction $actions 'update' 'outpost' $ov.Outpost.Name "Assign '$slug' to the embedded outpost"
@@ -891,7 +926,14 @@ function Test-ForwardAuthChallenge {
     if ($r.Status -in 301, 302, 303, 307, 308) {
       $loc = New-Object Uri ([Uri]"http://$hostHeader"), $r.Location
       if ($loc.AbsolutePath -match '^/(application/o/authorize|flows/-/default/authentication|if/flow/)' -or ($AuthHostname -and $loc.Host -eq $AuthHostname)) {
-        return [pscustomobject]@{ State = 'auth'; Status = $r.Status; Location = $loc.GetLeftPart([UriPartial]::Path); Chain = $chain; Message = "Sign-in required: redirected to $($loc.Host)$($loc.AbsolutePath)." }
+        # ForwardAuth works; whether the browser can follow the redirect is a separate question (the outpost's
+        # authentik_host): a loopback, LAN or Docker-only address, or another host than the sign-in page, fails.
+        $b = Test-BrowserEndpoint $loc.AbsoluteUri $AuthHostname -AllowHttp
+        if (-not $b.ok -or ($AuthHostname -and $loc.Host -ne $AuthHostname)) {
+          $why = $(if ($b.problems.Count) { $b.problems[0] } else { "The sign-in page is $AuthHostname." })
+          return [pscustomobject]@{ State = 'misrouted'; Status = $r.Status; Location = (Get-RedactedUrl $loc.AbsoluteUri); Chain = $chain; Message = "ForwardAuth works, but browsers are sent to $($loc.Scheme)://$($loc.Authority) to sign in. $why Set authentik's embedded outpost to the public sign-in address." }
+        }
+        return [pscustomobject]@{ State = 'auth'; Status = $r.Status; Location = (Get-RedactedUrl $loc.AbsoluteUri); Chain = $chain; Message = "Sign-in required: redirected to $($loc.Host)$($loc.AbsolutePath)." }
       }
       if ($loc.Host -ne $Hostname -and $loc.Host -ne $AuthHostname) { return [pscustomobject]@{ State = 'failed'; Status = $r.Status; Location = $loc.AbsoluteUri; Chain = $chain; Message = "Unexpected redirect to $($loc.Host)." } }
       $hostHeader = $loc.Authority; $url = "http://127.0.0.1:$TraefikPort$($loc.PathAndQuery)"

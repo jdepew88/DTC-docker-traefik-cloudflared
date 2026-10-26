@@ -97,7 +97,8 @@ function Js([string]$Expr) { return Invoke-PageScript $cdp $Expr }
 function Shot([string]$Name) {
   if (-not $ScreenshotDir) { return }
   # Full-page captures stitch the fixed header into the middle when the page is scrolled.
-  try { $null = Js 'window.scrollTo(0, 0); true'; Start-Sleep -Milliseconds 200; Save-PageScreenshot $cdp (Join-Path $ScreenshotDir "$Name.png") } catch { Write-Host "  (screenshot $Name skipped: $($_.Exception.Message))" -ForegroundColor DarkYellow }
+  try { $null = Js 'window.scrollTo(0, 0); true'; $w = [int](Js 'window.innerWidth'); $hh = [int](Js 'window.innerHeight'); $full = [Math]::Min(8000, [int](Js 'document.documentElement.scrollHeight'))
+    Set-Viewport $cdp $w $full -Mobile:($w -lt 800); Start-Sleep -Milliseconds 300; Save-PageScreenshot $cdp (Join-Path $ScreenshotDir "$Name.png"); Set-Viewport $cdp $w $hh -Mobile:($w -lt 800) } catch { Write-Host "  (screenshot $Name skipped: $($_.Exception.Message))" -ForegroundColor DarkYellow }
 }
 function Go([string]$Hash, [string]$Ready) {
   Open-Page $cdp "$base/#$Hash"

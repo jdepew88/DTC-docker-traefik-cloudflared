@@ -409,10 +409,35 @@ try {
   $null = Invoke-AuthentikApi $conn PATCH "/providers/proxy/$($prov.pk)/" @{ mode = 'forward_single'; external_host = "http://${appHost}:$httpPort" }
   $null = Invoke-AuthentikApi $conn PATCH "/providers/proxy/$($prov2.pk)/" @{ mode = 'forward_single'; external_host = "http://${appHost2}:$httpPort" }
   $null = Sync-AuthentikOutpost -Conn $conn -PublicUrl "http://${authHost}:$httpPort"
+  # This test publishes the sign-in page as http://<auth host>:<port>; record that as the public address, so protecting
+  # an application keeps (and, if needed, restores) the outpost on it.
+  $idPath = Join-Path $installPath 'config\identity.json'
+  $idj = [IO.File]::ReadAllText($idPath) | ConvertFrom-Json; $idj.authentik.publicUrl = "http://${authHost}:$httpPort"
+  [IO.File]::WriteAllText($idPath, (ConvertTo-Json -InputObject $idj -Depth 10))
   # Wait until the outpost has reloaded the test addresses (it refreshes a few seconds after a change).
   $null = Wait-Until { @($appHost, $appHost2 | Where-Object { $x = Test-ForwardAuthChallenge -TraefikPort $httpPort -Hostname $_ -HostPort $httpPort -AuthHostname $authHost; $x.State -eq 'auth' -and $x.Location -match "^http://${authHost}:$httpPort/" }).Count -eq 2 } 90 2000
   $anon = Test-ForwardAuthChallenge -TraefikPort $httpPort -Hostname $appHost -HostPort $httpPort -AuthHostname $authHost
   Test-Condition 'forwardauth: anonymous visitors are sent to the authentik sign-in (no loop)' ($anon.State -eq 'auth' -and $anon.Location -match "^http://${authHost}:$httpPort/") ($anon | ConvertTo-Json -Compress)
+
+  # --- Regression (Notflix): the outpost sends browsers to a local address ---------------------------------------------------
+  # ForwardAuth keeps working (Traefik reaches authentik internally), but the sign-in redirect only works on this PC. The
+  # probe, the routing view and the next protection must catch it; protecting again restores the public address.
+  $bindsBefore = @(Get-AuthentikList $conn '/policies/bindings/').Count
+  $ovm = Get-AuthentikOverview $conn; $cfgm = $ovm.Outpost.Config; $cfgm.authentik_host = "http://127.0.0.1:$akPort/"
+  $null = Invoke-AuthentikApi $conn PATCH "/outposts/instances/$($ovm.Outpost.Pk)/" @{ config = $cfgm }
+  $null = Wait-Until { (Test-ForwardAuthChallenge -TraefikPort $httpPort -Hostname $appHost -HostPort $httpPort -AuthHostname $authHost).State -eq 'misrouted' } 90 2000
+  $mis = Test-ForwardAuthChallenge -TraefikPort $httpPort -Hostname $appHost -HostPort $httpPort -AuthHostname $authHost
+  Test-Condition 'misroute: a sign-in redirect to 127.0.0.1 is reported as misrouted, never as protected' ($mis.State -eq 'misrouted' -and $mis.Location -match '^http://127\.0\.0\.1:' -and $mis.Location -notmatch 'state=ey') ($mis | ConvertTo-Json -Compress)
+  $rv = Invoke-WebUi $ui GET '/api/routing?service=echo&probe=1'
+  $rvStage = { param($id) @($rv.Data.model.stages | Where-Object { $_.id -eq $id })[0] }
+  Test-Condition 'routing view: the browser redirect is the first problem, ForwardAuth itself verified, internal address kept internal' ($rv.Status -eq 200 -and $rv.Data.model.firstProblem.id -eq 'redirect' -and (& $rvStage 'forwardauth').state -eq 'verified' -and (& $rvStage 'redirect').detail.fix -match [regex]::Escape("http://${authHost}:$httpPort/") -and @((& $rvStage 'forwardauth').endpoints | Where-Object { $_.audience -eq 'internal' -and $_.value -match "$akProject-server:9000" }).Count -eq 1) ($rv.Body.Substring(0, [Math]::Min(600, $rv.Body.Length)))
+  Test-Condition 'routing view: no state token, cookie or API token in the response' ($rv.Body -notmatch 'state=ey' -and $rv.Body -notmatch '(?i)set-cookie|authentik_proxy' -and $rv.Body -notmatch [regex]::Escape($bootToken)) ''
+  $fx = Invoke-WebUi $ui POST '/api/identity/protect/plan' @{ services = @('echo') }
+  Test-Condition 'protect: the preview includes sending browsers to the public sign-in address again' ($fx.Status -eq 200 -and @($fx.Data.items[0].authentik | Where-Object { $_.object -eq 'outpost' -and $_.kind -eq 'update' -and $_.summary -match 'send browsers to' }).Count -eq 1) (($fx.Data.items[0].authentik | ForEach-Object { "$($_.kind):$($_.summary)" }) -join '; ')
+  $fa = Invoke-WebUi $ui POST '/api/identity/protect/apply' @{ planId = $fx.Data.planId; confirm = $true }
+  $null = Wait-Until { (Test-ForwardAuthChallenge -TraefikPort $httpPort -Hostname $appHost -HostPort $httpPort -AuthHostname $authHost).State -eq 'auth' } 90 2000
+  $fixed = Test-ForwardAuthChallenge -TraefikPort $httpPort -Hostname $appHost -HostPort $httpPort -AuthHostname $authHost
+  Test-Condition 'protect: applying restores the public sign-in redirect, the return address and every access rule' ($fa.Data.ok -and $fixed.State -eq 'auth' -and $fixed.Location -match "^http://${authHost}:$httpPort/" -and $fixed.Location -match [regex]::Escape("redirect_uri=http://${appHost}:$httpPort/outpost.goauthentik.io/callback") -and @(Get-AuthentikList $conn '/policies/bindings/').Count -eq $bindsBefore) ($fixed | ConvertTo-Json -Compress)
   $so = Invoke-SignIn $httpPort $authHost $appHost 'owner' 'Owner-Live-Test-55q' $work
   Test-Condition 'owner-only: the owner reaches the newly protected application (identity headers passed)' ($so.Login -eq 'xak-flow-redirect' -and $so.ReachedApp -and $so.Body -match 'X-Authentik-Username: owner') "$($so.Status) $($so.Url)"
   $sa = Invoke-SignIn $httpPort $authHost $appHost 'alice' 'Alice-Live-Test-91x' $work

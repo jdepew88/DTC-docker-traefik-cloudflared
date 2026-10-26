@@ -100,6 +100,7 @@
       footer);
     fill(main,
       head('Access', 'Identity & Access', 'A one-time guided setup of sign-in (authentik, optionally with Google) for the applications you choose. Afterwards users and access are managed in authentik. Basic setup and Cloudflare Access work without it.',
+        h('a', { href: `#routing${arr(d.apps).find((a) => a.protected) ? `/${arr(d.apps).find((a) => a.protected).service}` : ''}`, class: 'btn small', id: 'id-flow-link' }, icon('route'), 'View Authentication Flow'),
         h('button', { type: 'button', class: 'btn small', onclick: (e) => withBusy(e.currentTarget, () => reload(true)) }, icon('refresh'), 'Check again')),
       h('div', { class: 'wizard' }, nav, panel),
       gate('advanced', healthSection(d)),
@@ -458,7 +459,8 @@
     const rows = services.map((s) => {
       const a = byName[s.name];
       const prot = s.auth === 'authentik';
-      const state = a ? (a.verifiedAt ? 'verified' : !a.authentik ? 'failed' : a.challenge ? ({ auth: 'auth-required', open: 'failed', loop: 'failed', failed: 'failed' })[a.challenge.State] : 'configured') : 'not-configured';
+      const bad = a && a.challenge && ['open', 'loop', 'failed', 'misrouted'].includes(a.challenge.State);
+      const state = a ? (bad ? 'failed' : a.verifiedAt ? 'verified' : !a.authentik ? 'failed' : a.challenge ? ({ auth: 'auth-required' })[a.challenge.State] || 'failed' : 'configured') : 'not-configured';
       let cell;
       if (prot) cell = h('span', { title: 'Already protected (not affected by this selection)' }, icon('lock'), h('span', { class: 'sr-only' }, 'Already protected'));
       else {
@@ -520,7 +522,8 @@
         h('ul', { class: 'checks' },
           checkItem(stepState(x, 'Backend reachable from Traefik'), 'Backend reachable', (arr(x.traefik && x.traefik.steps).find((s) => s.name === 'Backend reachable from Traefik') || {}).message || 'Not checked.'),
           checkItem(stepState(x, 'Traefik reload'), 'Route loaded by Traefik', (arr(x.traefik && x.traefik.steps).find((s) => s.name === 'Traefik reload') || {}).message || ''),
-          checkItem(x.challenge ? (x.challenge.State === 'auth' ? 'ok' : 'err') : 'neutral', 'ForwardAuth enforced', x.challenge ? x.challenge.Message : (x.message || 'Not checked.')),
+          checkItem(x.challenge ? (['auth', 'misrouted'].includes(x.challenge.State) ? 'ok' : 'err') : 'neutral', 'ForwardAuth enforced', x.challenge ? (x.challenge.State === 'misrouted' ? 'Anonymous visitors are stopped by authentik.' : x.challenge.Message) : (x.message || 'Not checked.')),
+          x.challenge && ['auth', 'misrouted'].includes(x.challenge.State) ? checkItem(x.challenge.State === 'auth' ? 'ok' : 'err', 'Browsers sent to the public sign-in page', x.challenge.State === 'auth' ? 'The sign-in redirect uses the public address.' : x.challenge.Message) : null,
           checkItem('neutral', 'Sign-in verified', 'Shown as Verified after someone opened it through authentik.'))))) : null;
     const out = [
       h('p', null, 'Tick the applications that should require signing in. New ones start owner-only (group DTC owners); applications that already have rules in authentik keep them. Already protected applications are not affected by what you tick.', help('forwardauth', 'ForwardAuth'), help('dtc-owners', 'DTC owners')),

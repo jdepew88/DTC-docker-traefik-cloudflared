@@ -251,6 +251,59 @@ ForwardAuth vs. native OpenID Connect: ForwardAuth works for any web application
 `X-authentik-*` headers and keeps its own login if it has one). Applications with OIDC support (Portainer, Immich, …) can
 sign users in natively through an authentik OAuth2 provider; the manager does not configure native OIDC yet.
 
+## Authentication & Routing page (`#routing/<service>`)
+
+Opened with **View Authentication Flow** on Identity & Access (no sidebar entry; **Back to Identity & Access** returns).
+Choose an application; the page draws its real request path from `GET /api/routing?service=<name>`
+(`lib\RoutingModel.psm1` builds the model from facts gathered by `webui.ps1`). Nobody has to open it to publish or protect
+an application.
+
+- **Browser journey**: the ten steps of a visit (open the address, Cloudflare and the tunnel, the Traefik router,
+  ForwardAuth, the redirect to the sign-in page, choosing Google, authentik's policies, the return to
+  `https://<app>/outpost.goauthentik.io/callback`, the second check, the application's answer). Each step says whether it is
+  the browser's request or a server-to-server request; the browser never talks to the internal outpost address.
+- **Internal routing**: the stages in request order with their real values: public hostname, DNS, Cloudflare Access,
+  tunnel origin, router rule, middleware order, ForwardAuth address (internal), authentik application, provider and outpost,
+  where the outpost sends browsers, the public sign-in page, the return address, the backend URL and the Docker networks.
+  Browser endpoints (public HTTPS) and internal endpoints (Docker names) are labelled as such.
+- **States**: *Verified* only from a real request; *Configured, not tested* when only configuration was read; *Warning*;
+  *Failed*; *Not applicable*. A failed stage opens with the tested endpoint, the expected and the actual result, why, and
+  what to do. Each stage has a **?** explaining what it does, why it is needed, what the manager sets up, what you may
+  manage yourself, and common failures. Choosing Google and authentik's access decision are never shown as verified
+  without evidence of a real sign-in.
+- **Run checks** is read-only: one anonymous GET through Traefik (no cookies; it never follows a sign-in and never tries
+  to get past Google or authentik), the backend request from Traefik's container (as on the Services page), GETs to the
+  public application and sign-in addresses through Cloudflare, and GET requests to the Cloudflare and authentik APIs.
+  Redirect addresses are shown with `state`, `client_id` and codes redacted; tokens and cookies are never returned.
+- **Guided mode** only for now. The stage model and its checks are separate from the page so that a later manual mode can
+  inspect and edit the same stages (backend, networks, routers, middleware order, Cloudflare routes, authentik settings).
+
+### Public and internal sign-in addresses
+
+Two different addresses are involved, and mixing them up breaks sign-in for everyone except the authentik PC:
+
+| Used by | Address | Set in |
+| --- | --- | --- |
+| Traefik asking authentik (server to server) | `http://<authentik container>:9000/outpost.goauthentik.io/auth/traefik` | the ForwardAuth middleware (generated) |
+| Browsers sent to sign in | `https://auth.<domain>/` | the embedded outpost's `authentik_host` (or `authentik_host_browser`) |
+
+If the outpost's `authentik_host` is `http://127.0.0.1:9000` (or a LAN IP, or a Docker name), ForwardAuth still works, but
+every sign-in redirect points there: it works only on the PC running authentik. The manager now:
+
+- refuses a loopback, LAN, raw-IP or Docker-only address as the public sign-in address;
+- includes "Embedded outpost: send browsers to https://auth.<domain>/" in the preview whenever protecting an application
+  finds the outpost elsewhere (and refuses to protect while no public sign-in address is set and the outpost would send
+  browsers to a local address);
+- reports such a redirect as **misrouted** (not "sign-in required") in every check, and a current failed check outranks
+  older sign-in evidence.
+
+### Cloudflare Access left in front
+
+Turning **Require Cloudflare Access** off (on the Services page, or *Remove Cloudflare Access* when protecting) now deletes
+the Access application this manager created for that hostname, listed in the preview. An Access application left over
+from an earlier version is reported (Services preview note, health check and routing page: "Cloudflare challenge") and is
+never removed without an explicit change; Access applications created by hand are left alone.
+
 ## Recovery
 
 - akadmin keeps signing in with its password on the local address (`http://127.0.0.1:<port>/`), independent of Google
@@ -275,6 +328,8 @@ manifest (plain Linux containers). Debian, Arch and Unraid need a secret-store a
 | --- | --- |
 | `tests\Test-Identity.ps1` | No authentik: ForwardAuth YAML (and, with Docker, acceptance by a throwaway Traefik), validation guards, Google values, allow-lists and policy expressions (injection), discovery, every model state, config resume, secret store, catalog manifest. |
 | `tests\Test-IdentityLive.ps1` | Disposable instance + authentik installed through the catalog API: bootstrap, readiness, network isolation, adopt, token, sign-in route, outpost, Google source with **synthetic** credentials (redirect check, idempotency, secret never leaks), protect/unprotect, sign-ins through the real outpost (allowed, denied, wrong password, group), access evidence, loop detection, fail closed, interrupted setup, rollback, persistence, bootstrap-only-once, browser (screenshots). Removes everything it created and checks that no other container changed. |
+| `tests\Test-AuthRouting.ps1` | No Docker: browser versus internal addresses, sign-in redirects leaking 127.0.0.1, LAN or Docker-only addresses, the return address after signing in, redaction, the routing model's states for healthy and broken paths (missing or unhealthy authentication endpoint, broken router, missing network, tunnel to localhost, leftover Access), the ForwardAuth probe against a stub outpost, the public sign-in address guard, Access cleanup on turn-off (Cloudflare API mock). |
+| `tests\Test-RoutingBrowser.ps1` | No Docker: the Authentication & Routing page in headless Edge with models from the real model code: link and way back, application selection, both views, failed-stage details, help, Run checks, redaction, 1366 px and 390 px. |
 | `tests\Test-IdentityWizardBrowser.ps1` | No Docker, small footprint: the wizard in headless Edge with the authentik side of `/api/identity` answered in the page. Select all / Clear all / count, ticking without the page moving, already protected applications never selectable, exactly the ticked applications sent, review before apply, per-application result, 390 px. Real protection is covered by the live test. |
 | `node tests\ui-logic.test.js` | Browser-side helpers (state vocabulary, redirect URI, client ID, credential status, next step). |
 

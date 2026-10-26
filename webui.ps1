@@ -58,6 +58,7 @@ Import-Module (Join-Path $here 'lib\BackendResolver.psm1') -Force
 Import-Module (Join-Path $here 'lib\AppCatalog.psm1') -Force
 Import-Module (Join-Path $here 'lib\SecretStore.psm1') -Force
 Import-Module (Join-Path $here 'lib\CredentialManager.psm1') -Force
+Import-Module (Join-Path $here 'lib\RoutingModel.psm1') -Force
 Import-Module (Join-Path $here 'lib\Authentik.psm1') -Force
 Import-Module (Join-Path $here 'lib\IdentityProvider.psm1') -Force
 if (-not $CatalogDir) { $CatalogDir = Join-Path $here 'catalog' }
@@ -133,6 +134,7 @@ $StaticFiles = @{
   '/catalog.js' = @('catalog.js', 'text/javascript; charset=utf-8')
   '/credentials.js' = @('credentials.js', 'text/javascript; charset=utf-8')
   '/identity.js' = @('identity.js', 'text/javascript; charset=utf-8')
+  '/routing.js' = @('routing.js', 'text/javascript; charset=utf-8')
   '/learn.json' = @('learn.json', 'application/json; charset=utf-8')
   '/app.css'    = @('app.css', 'text/css; charset=utf-8')
   '/icon.svg'   = @('icon.svg', 'image/svg+xml')
@@ -2237,6 +2239,124 @@ function Invoke-NetworkConnect($Body) {
   return [ordered]@{ connected = $true; changed = $true; message = "$($c.name) is now attached to '$($settings.ProxyNetwork)'. It stays attached until the container is recreated; add the lines below to its compose file to keep it."; composeSnippet = $snippet; workingDir = $c.compose.workingDir }
 }
 
+# --- Authentication & Routing (read-only) -------------------------------------------------------------------------------
+# Facts about one service for lib\RoutingModel.psm1. Without -Probe only configuration is read: route files, Docker,
+# Traefik's API and GET requests to the authentik and Cloudflare APIs. -Probe adds real requests: one anonymous GET
+# through Traefik (no cookies, never follows a sign-in), the backend from Traefik's container, and GETs to the public
+# addresses through Cloudflare. Nothing is changed and no credential is sent to an application.
+function Get-RouteFileFacts([string]$Path, [string]$Name) {
+  $f = [ordered]@{ fileExists = $false; rule = ''; entryPoints = @(); middlewares = @(); forwardAuthAddress = ''; outpostRouter = $false; backendUrl = '' }
+  if (-not (Test-Path -LiteralPath $Path)) { return $f }
+  $f.fileExists = $true
+  $lines = [IO.File]::ReadAllLines($Path)
+  $section = ''; $block = ''
+  foreach ($l in $lines) {
+    if ($l -match '^  (routers|middlewares|services):\s*$') { $section = $Matches[1]; $block = ''; continue }
+    if ($l -match '^    ([A-Za-z0-9@._-]+):\s*$') { $block = $Matches[1]; continue }
+    if ($section -eq 'routers' -and $block -eq "svc-$Name") {
+      if ($l -match "^\s+rule:\s*'(.*)'\s*$") { $f.rule = $Matches[1].Replace("''", "'") }
+      elseif ($l -match '^\s+entryPoints:\s*\[(.*)\]') { $f.entryPoints = @($Matches[1].Split(',') | ForEach-Object { $_.Trim() } | Where-Object { $_ }) }
+      elseif ($l -match '^\s+middlewares:\s*\[(.*)\]') { $f.middlewares = @($Matches[1].Split(',') | ForEach-Object { $_.Trim() } | Where-Object { $_ }) }
+    }
+    if ($section -eq 'routers' -and $block -eq "svc-$Name-outpost") { $f.outpostRouter = $true }
+    if ($section -eq 'middlewares' -and $block -eq "svc-$Name-authentik" -and $l -match '^\s+address:\s*(\S+)') { $f.forwardAuthAddress = $Matches[1] }
+    if ($section -eq 'services' -and $block -eq "svc-$Name" -and $l -match '^\s+-\s*url:\s*(\S+)' -and -not $f.backendUrl) { $f.backendUrl = $Matches[1] }
+  }
+  return $f
+}
+
+function Get-ContainerNetworkNames([string]$Container) {
+  if (-not $Container) { return @() }
+  $r = Invoke-Docker inspect $Container --format '{{json .NetworkSettings.Networks}}'
+  if ($r.ExitCode -ne 0) { return @() }
+  try { return @(((@($r.Output) -join '') | ConvertFrom-Json).PSObject.Properties | ForEach-Object { $_.Name }) } catch { return @() }
+}
+
+function Get-RoutingFacts($Settings, $Svc, [switch]$Probe) {
+  $cfg = Read-IdentityConfig -Settings $Settings
+  $h = [string]@($Svc.hostnames)[0]
+  $authP = $(if ($Svc.PSObject.Properties['auth'] -and $Svc.auth -and $Svc.auth.PSObject.Properties['provider']) { [string]$Svc.auth.provider } else { '' })
+  $route = Get-RouteFileFacts (Join-Path $InstallPath "traefik\dynamic\svc-$($Svc.name).yml") $Svc.name
+  $routers = $null
+  $tr = Get-TraefikApi $Settings '/api/http/routers'
+  if ($null -ne $tr) { $routers = @{}; foreach ($r in $tr) { if ($r -and $r.name -like "svc-$($Svc.name)*") { $routers[[string]$r.name] = [string]$r.status } } }
+  $server = [string]$cfg.authentik.serverContainer
+  $akNets = @(Get-ContainerNetworkNames $server)
+  $identity = [ordered]@{ publicUrl = [string]$cfg.authentik.publicUrl; authHostname = [string]$cfg.authentik.hostname; serverContainer = $(if ($server) { $server } else { 'authentik-server' })
+    onProxyNetwork = $(if ($server) { $akNets -contains $Settings.ProxyNetwork } else { $true }); googleConfigured = [bool]$cfg.authentik.google.clientId
+    appVerifiedAt = [string](Get-IdProp2 (Get-IdentityApp $cfg $Svc.name) 'verifiedAt' '') }
+
+  # authentik objects (GET only), when the manager is connected.
+  $ak = $null
+  if ($authP -eq 'authentik') {
+    $ak = [ordered]@{ connected = $false; error = '' }
+    $base = [string]$cfg.authentik.localUrl
+    if ($base) {
+      try {
+        $credArgs = Get-IdentityCredentialArgs $Settings $base
+        $cred = Test-StoredCredential @credArgs -IfOlderThanMinutes 2
+        if ($cred.ok) {
+          $conn = New-AuthentikConnection -BaseUrl $base -Token (Read-ProtectedSecret -Settings $Settings -Name (Get-IdentityTokenSecretName))
+          $slug = "dm-$($Svc.name)"
+          $out = @(Get-AuthentikList $conn '/outposts/instances/' | Where-Object { [string](Get-IdProp2 $_ 'managed' '') -eq 'goauthentik.io/outposts/embedded' })[0]
+          $prov = @(Get-AuthentikList $conn "/providers/proxy/?name=$([Uri]::EscapeDataString($slug))" | Where-Object { [string]$_.name -eq $slug })[0]
+          $app = $null; try { $app = Invoke-AuthentikApi $conn GET "/core/applications/$slug/" } catch { }
+          $rules = $null; if ($app) { try { $rules = @(Get-AuthentikList $conn "/policies/bindings/?target=$([string](Get-IdProp2 $app 'pbm_uuid' $app.pk))").Count } catch { } }
+          $ak = [ordered]@{ connected = $true; error = ''; outpostName = [string](Get-IdProp2 $out 'name' '')
+            outpostHost = [string](Get-IdProp2 (Get-IdProp2 $out 'config' $null) 'authentik_host' ''); outpostBrowserHost = [string](Get-IdProp2 (Get-IdProp2 $out 'config' $null) 'authentik_host_browser' '')
+            providerFound = [bool]$prov; providerExternalHost = [string](Get-IdProp2 $prov 'external_host' ''); providerMode = [string](Get-IdProp2 $prov 'mode' '')
+            providerAssigned = [bool]($prov -and $out -and @($out.providers | ForEach-Object { [int]$_ }) -contains [int]$prov.pk); applicationFound = [bool]$app; rules = $rules }
+        } else { $ak.error = [string]$cred.message }
+      } catch { $ak.error = $_.Exception.Message }
+    } else { $ak.error = 'authentik is not set up in the manager.' }
+  }
+
+  # Cloudflare (configuration only here; the health checks below read the API).
+  $cf = Read-CloudflareConfig -Settings $Settings
+  $accId = [string](Get-ManagedResource $cf $h 'accessAppId')
+  $accName = ''
+  if ($accId -and -not $Svc.cloudflare.access) {
+    try { $a = Invoke-CloudflareApi -Settings $Settings -Path "/accounts/$($cf.accountId)/access/apps/$accId"; $accName = [string]$a.name } catch { if ((Get-CfErrorStatus $_) -ne 404) { $accName = "(id $accId)" } }
+  }
+  $backendNets = $null
+  if ($Svc.target.type -eq 'docker') { $backendNets = @(Get-ContainerNetworkNames $Svc.target.host) }
+
+  $facts = [ordered]@{
+    service = [ordered]@{ name = $Svc.name; displayName = $(if ($Svc.PSObject.Properties['displayName'] -and $Svc.displayName) { $Svc.displayName } else { $Svc.name }); hostname = $h; enabled = [bool]$Svc.enabled
+      publish = [bool]$Svc.cloudflare.publish; access = [bool]$Svc.cloudflare.access; authProvider = $authP; targetUrl = (Get-ServiceUrl $Svc); targetType = [string]$Svc.target.type; targetHost = [string]$Svc.target.host }
+    route = $route; traefik = [ordered]@{ apiOk = ($null -ne $routers); routers = $routers }; identity = $identity; authentik = $ak
+    cloudflare = [ordered]@{ connected = [bool]$cf.tunnelId; tunnelName = [string]$cf.tunnelName; accessAppName = $accName; accessAppByDtc = [bool]$accName }
+    networks = [ordered]@{ proxy = $Settings.ProxyNetwork; traefik = @(Get-ContainerNetworkNames "$($Settings.StackName)-traefik"); authentik = $akNets; backend = $backendNets }
+    health = $null; challenge = $null; publicAuth = $null; checkedAt = (Get-Date -Format 's')
+  }
+  if ($Probe) {
+    $facts.health = Get-ServiceHealth -Settings $Settings -Service $Svc -Public:([bool]$Svc.cloudflare.publish)
+    if ($authP -eq 'authentik' -and $Svc.enabled) { $facts.challenge = Test-ForwardAuthChallenge -TraefikPort $Settings.HttpPort -Hostname $h -AuthHostname ([string]$cfg.authentik.hostname) }
+    if ($authP -eq 'authentik' -and $cfg.authentik.publicUrl) {
+      $pr = Invoke-ProbeRequest "$(([string]$cfg.authentik.publicUrl).TrimEnd('/'))/-/health/live/"
+      $facts.publicAuth = [ordered]@{ status = $pr.Status; location = (Get-RedactedUrl $pr.Location); error = $pr.Error }
+    }
+  }
+  return $facts
+}
+
+# GET /api/routing[?service=<name>][&probe=1]: the applications that can be shown and the request path of one of them.
+function Get-RoutingView($Query) {
+  Assert-Installed
+  $settings = Get-Settings
+  $all = @((Read-ServiceRegistry -Settings $settings).services | Where-Object { $_ -and @($_.hostnames).Count })
+  $list = @($all | ForEach-Object { [ordered]@{ name = $_.name; displayName = $(if ($_.PSObject.Properties['displayName'] -and $_.displayName) { $_.displayName } else { $_.name }); hostname = [string]@($_.hostnames)[0]
+        protected = [bool]($_.PSObject.Properties['auth'] -and $_.auth -and [string]$_.auth.provider -eq 'authentik'); publish = [bool]$_.cloudflare.publish; enabled = [bool]$_.enabled } })
+  $want = [string]$Query['service']
+  $svc = $(if ($want) { @($all | Where-Object { $_.name -eq $want.ToLowerInvariant() })[0] } else { $null })
+  if ($want -and -not $svc) { Stop-Request 404 "No service named '$want'." }
+  if (-not $svc) { $svc = @($all | Where-Object { $_.PSObject.Properties['auth'] -and $_.auth -and [string]$_.auth.provider -eq 'authentik' })[0] }
+  if (-not $svc) { $svc = @($all)[0] }
+  $model = $null
+  if ($svc) { $model = Get-RoutingModel -Facts (Get-RoutingFacts $settings $svc -Probe:([string]$Query['probe'] -eq '1')) }
+  return [ordered]@{ mode = 'guided'; services = $list; selected = $(if ($svc) { $svc.name } else { '' }); model = $model }
+}
+
 function Invoke-ServiceHealth($Body) {
   Assert-Installed
   $settings = Get-Settings
@@ -3058,8 +3178,11 @@ function Get-ProtectRequest([string]$Name, $Ctx, [string]$AccessChoice = 'keep',
   return [pscustomobject]@{ Service = $svc; ChangeBody = [pscustomobject]@{ op = 'update'; name = $svc.name; service = $copy; cloudflare = [pscustomobject]@{ automate = [bool]($cfReady -and $copy.cloudflare.publish); accessEmails = @(Get-ManagedAccessEmails $Ctx.Cloudflare @($svc.hostnames)[0]); cleanup = ($AccessChoice -eq 'remove') } } }
 }
 
+# PublicUrl: the sign-in address browsers are sent to; protection points the embedded outpost at it (or refuses when
+# none is set and the outpost would send browsers to an address that only works on this PC).
 function Get-ProtectDesired($Svc) {
-  return [pscustomobject]@{ Service = $Svc.name; DisplayName = $(if ($Svc.PSObject.Properties['displayName']) { $Svc.displayName } else { $Svc.name }); Hostname = @($Svc.hostnames)[0] }
+  $pub = ''; try { $pub = [string](Read-IdentityConfig -Settings (Get-Settings)).authentik.publicUrl } catch { }
+  return [pscustomobject]@{ Service = $Svc.name; DisplayName = $(if ($Svc.PSObject.Properties['displayName']) { $Svc.displayName } else { $Svc.name }); Hostname = @($Svc.hostnames)[0]; PublicUrl = $pub }
 }
 
 # Preview for "Protect selected with authentik" (services: [...]) or for removing protection from one (service).
@@ -3244,6 +3367,7 @@ function Invoke-ApiRoute($Request, $Body) {
     'POST /api/apps/backup' { return Invoke-AppBackup $Body }
     'GET /api/system/resources' { return Get-HostResources }
     'GET /api/identity' { Assert-Installed; return Get-IdentityData -Deep:([string]$Request.Query['deep'] -eq '1') }
+    'GET /api/routing' { return Get-RoutingView $Request.Query }
     'POST /api/identity/provider' { return Set-IdentityProviderRequest $Body }
     'POST /api/identity/adopt' { return Invoke-IdentityAdopt $Body }
     'POST /api/identity/token' { return Save-IdentityTokenRequest $Body }

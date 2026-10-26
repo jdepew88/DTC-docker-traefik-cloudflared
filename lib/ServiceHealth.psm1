@@ -284,6 +284,9 @@ function Get-FirstFailure($Checks) {
 
 # Pure: the public URL's answer -> (Access state, app state). A redirect to *.cloudflareaccess.com proves Access only.
 function ConvertFrom-PublicProbe([int]$Status, [string]$Location, [string]$ErrorText, [string]$Exposure) {
+  if ($Status -ge 300 -and $Status -lt 400 -and $Location -match '^https://[^/]+\.cloudflareaccess\.com/' -and $Exposure -ne 'access') {
+    return [ordered]@{ access = 'warning'; app = 'auth'; message = 'Cloudflare Access shows its login page, although this service is not set to use Cloudflare Access: an Access application still covers this hostname. The request never reaches the tunnel, Traefik or authentik.' }
+  }
   if ($Status -ge 300 -and $Status -lt 400 -and $Location -match '^https://[^/]+\.cloudflareaccess\.com/') {
     return [ordered]@{ access = 'ok'; app = 'auth'; message = 'Cloudflare Access shows its login page (authentication required). The application behind it was not reached by this check (that needs a signed-in browser or an Access service token).' }
   }
@@ -329,7 +332,17 @@ function Get-ServiceHealth {
     if ($exposure -eq 'access') {
       $a = Test-DashboardAccess $Settings $cf.accountId $hostname
       & $add (New-HealthCheck 'access' 'Cloudflare Access' $(if ($a.Ok) { 'ok' } else { 'failed' }) $a.Message)
-    } else { & $add (New-HealthCheck 'access' 'Cloudflare Access' 'skipped' 'This service is public: it relies on its own login.' $false) }
+    } else {
+      # Not supposed to use Access: an Access application left for this hostname still puts Cloudflare's login in front.
+      try {
+        $apps = @(Invoke-CloudflareApi -Settings $Settings -Path "/accounts/$($cf.accountId)/access/apps" -All | Where-Object {
+            ($_.PSObject.Properties['domain'] -and ($_.domain -eq $hostname -or $_.domain -like "$hostname/*")) -or ($_.PSObject.Properties['self_hosted_domains'] -and @($_.self_hosted_domains) -contains $hostname) })
+        if ($apps.Count) {
+          $mine = [bool]((Get-ManagedResource $cf $hostname 'accessAppId') -eq $apps[0].id)
+          & $add (New-HealthCheck 'access' 'Cloudflare Access' 'warning' "Access application '$($apps[0].name)'$(if ($mine) { ' (created by this tool)' }) still asks visitors for a Cloudflare login, although this service does not use Cloudflare Access. Delete it in Cloudflare Zero Trust (Access > Applications) if the application's own login or authentik should be the only one.")
+        } else { & $add (New-HealthCheck 'access' 'Cloudflare Access' 'skipped' $(if ($Service.PSObject.Properties['auth'] -and $Service.auth -and [string]$Service.auth.provider -eq 'authentik') { 'Not used: authentik is the login.' } else { 'This service is public: it relies on its own login.' }) $false) }
+      } catch { & $add (New-HealthCheck 'access' 'Cloudflare Access' 'skipped' "Not checked: $($_.Exception.Message)" $false) }
+    }
     try {
       $tc = Invoke-CloudflareApi -Settings $Settings -Path "/accounts/$($cf.accountId)/cfd_tunnel/$($cf.tunnelId)/configurations"
       $rules = @()
@@ -409,6 +422,7 @@ function Get-ServiceHealth {
     $pub = ConvertFrom-PublicProbe $p.Status $p.Location $p.Error $exposure
     & $add (New-HealthCheck 'public' 'Public URL' $pub.app $pub.message)
     if ($pub.access -eq 'failed') { foreach ($c in $checks) { if ($c.id -eq 'access') { $c.state = 'failed'; $c.message += ' The public URL answered without a login.' } } }
+    if ($pub.access -eq 'warning') { foreach ($c in $checks) { if ($c.id -eq 'access' -and $c.state -ne 'warning') { $c.state = 'warning'; $c.performed = $true; $c.message = $pub.message } } }
   } elseif ($exposure -ne 'local') {
     & $add (New-HealthCheck 'public' 'Public URL' 'skipped' 'Not requested (Check the public URL sends one GET to the hostname from this PC).' $false)
   }

@@ -368,5 +368,35 @@ test('wizard: adding Google later only adds steps; the owner then also has to si
   assert.strictEqual(nb.prev.id, 'address'); assert.strictEqual(nb.next.id, 'signin');
 });
 
+test('routing: browser endpoints versus local, LAN and Docker-only addresses (same rules as the server)', () => {
+  assert.strictEqual(L.endpointKind('http://127.0.0.1:9000/application/o/authorize/'), 'loopback');
+  assert.strictEqual(L.endpointKind('http://localhost:9000'), 'loopback');
+  assert.strictEqual(L.endpointKind('http://192.168.1.20:9000'), 'private');
+  assert.strictEqual(L.endpointKind('http://172.25.0.11:9000'), 'private');
+  assert.strictEqual(L.endpointKind('http://authentik-server:9000'), 'internal-name');
+  assert.strictEqual(L.endpointKind('http://host.docker.internal:4119'), 'internal-name');
+  assert.strictEqual(L.endpointKind('https://203.0.113.7/'), 'public-ip');
+  assert.strictEqual(L.endpointKind('https://auth.example.com/'), 'public');
+  assert.strictEqual(L.endpointKind('not a url'), 'invalid');
+});
+
+test('routing: stage states never call configuration "verified"; every stage has five-part help', () => {
+  assert.strictEqual(L.routingState('verified').label, 'Verified');
+  assert.strictEqual(L.routingState('configured').label, 'Configured, not tested');
+  assert.strictEqual(L.routingState('unknown-state').label, 'Configured, not tested');
+  assert.strictEqual(L.routingEvidence('configuration'), 'Configuration only, not tested');
+  assert.strictEqual(L.endpointAudience('browser').label, 'Browser endpoint');
+  assert.strictEqual(L.endpointAudience('internal').label, 'Internal endpoint');
+  const ids = ['public-url', 'dns', 'access', 'tunnel', 'router', 'middlewares', 'forwardauth', 'authentik', 'redirect', 'signin', 'callback', 'backend', 'networks'];
+  for (const id of ids) {
+    const t = L.routingHelp(id);
+    assert.ok(t, `help for ${id}`);
+    for (const k of ['what', 'why', 'dtc', 'you', 'fails']) assert.ok(t[k] && t[k].length > 20, `${id}.${k}`);
+  }
+  assert.ok(/127\.0\.0\.1:9000/.test(L.routingHelp('redirect').fails));
+  assert.strictEqual(L.journeyPath('browser').label, 'Browser');
+  assert.strictEqual(L.journeyPath('server').label, 'Server to server');
+});
+
 console.log(`\n${passed} passed, ${failures.length} failed`);
 process.exit(failures.length ? 1 : 0);

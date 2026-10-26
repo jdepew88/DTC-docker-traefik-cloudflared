@@ -400,7 +400,60 @@
     return list.find((s) => s.state === 'failed') || list.find((s) => s.state === 'awaiting-user') || null;
   }
 
+  // --- Authentication & Routing ------------------------------------------------------------------------------------------
+  // States of one stage of a request path (lib\RoutingModel.psm1). "verified" needs a real request; configuration that
+  // exists is only "configured".
+  const ROUTING_STATES = {
+    verified: { label: 'Verified', tone: 'ok', icon: 'check', text: 'A real request proved this part works.' },
+    configured: { label: 'Configured, not tested', tone: 'neutral', icon: 'minus', text: 'The configuration is in place; connectivity was not tested.' },
+    warning: { label: 'Warning', tone: 'warn', icon: 'alert', text: 'Works, but not the way it should.' },
+    failed: { label: 'Failed', tone: 'err', icon: 'x', text: 'This part does not work; see what to do.' },
+    na: { label: 'Not applicable', tone: 'neutral', icon: 'minus', text: 'Not used by this application.' },
+  };
+  function routingState(state) { return ROUTING_STATES[state] || ROUTING_STATES.configured; }
+  const ROUTING_EVIDENCE = { connectivity: 'Proven by a real request', configuration: 'Configuration only, not tested', none: '' };
+  function routingEvidence(e) { return ROUTING_EVIDENCE[e] || ''; }
+  // Browser endpoints are addresses a visitor's browser opens; internal endpoints are only used between containers.
+  const ENDPOINT_AUDIENCE = {
+    browser: { label: 'Browser endpoint', tone: 'info', icon: 'globe', text: 'An address your visitors\' browsers open. It must be a public HTTPS hostname.' },
+    internal: { label: 'Internal endpoint', tone: 'neutral', icon: 'lock', text: 'Used only between containers inside Docker. Browsers never see it.' },
+  };
+  function endpointAudience(a) { return ENDPOINT_AUDIENCE[a] || ENDPOINT_AUDIENCE.internal; }
+  // Mirrors Get-EndpointKind: which addresses a browser outside this PC can use.
+  function endpointKind(url) {
+    let u;
+    try { u = new URL(url); } catch (e) { return 'invalid'; }
+    if (!['http:', 'https:'].includes(u.protocol)) return 'invalid';
+    const host = u.hostname.toLowerCase().replace(/^\[|\]$/g, '');
+    if (/^(localhost|127\.\d{1,3}\.\d{1,3}\.\d{1,3}|::1|0\.0\.0\.0)$/.test(host) || host.endsWith('.localhost')) return 'loopback';
+    if (/^(10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|169\.254\.|100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.)/.test(host) || /^(f[cd][0-9a-f]{2}|fe80):/.test(host)) return 'private';
+    if (/^\d{1,3}(\.\d{1,3}){3}$/.test(host) || host.includes(':')) return 'public-ip';
+    if (!host.includes('.') || /\.(internal|local|lan|home|docker|localdomain|home\.arpa)$/.test(host)) return 'internal-name';
+    return 'public';
+  }
+  // What each stage is, for the "?" next to it: what it does, why it is needed, what the manager configures, what you
+  // may manage yourself, and the usual reasons it fails.
+  const ROUTING_HELP = {
+    'public-url': { title: 'Public address', what: 'The https:// address people type or bookmark, for example https://notflix.example.com.', why: 'It is the only address visitors need. Everything behind it stays private.', dtc: 'Publishes the hostname through Cloudflare when you choose "Publish".', you: 'Choose the hostname under a domain you own in Cloudflare.', fails: 'DNS not created yet (wait a few minutes), the tunnel is down, or a Cloudflare login is in front.' },
+    dns: { title: 'DNS at Cloudflare', what: 'A DNS record that points the hostname at your Cloudflare Tunnel (a proxied CNAME).', why: 'Browsers find Cloudflare through DNS; Cloudflare then knows to use your tunnel.', dtc: 'Creates and checks the record with your Cloudflare API token.', you: 'Nothing, unless another record already uses the name.', fails: 'An older A/CNAME record with the same name, the record not proxied, or the domain not in your Cloudflare account.' },
+    access: { title: 'Cloudflare Access', what: 'An optional Cloudflare login (Zero Trust) that runs at Cloudflare, before the request reaches your PC.', why: 'Useful for apps without a login. With authentik it is a second login and usually not wanted.', dtc: 'Creates an Access application when you tick "Require Cloudflare Access", and removes the one it created when you turn it off.', you: 'Access applications created by hand in Cloudflare Zero Trust are yours; the manager leaves them alone.', fails: 'A leftover Access application still asks for a Cloudflare login (the "challenge" before your sign-in page).' },
+    tunnel: { title: 'Cloudflare Tunnel', what: 'An outbound connection from cloudflared on this PC to Cloudflare. Requests come back through it.', why: 'No port on your router has to be opened, and your home IP address stays hidden.', dtc: 'Adds a route hostname -> http://traefik:80 to the tunnel and runs cloudflared next to Traefik.', you: 'Nothing for routes. Tunnels created elsewhere keep their own settings.', fails: 'cloudflared not running or not connected, or the route pointing at localhost (inside the cloudflared container that is cloudflared itself).' },
+    router: { title: 'Traefik router', what: 'A rule in Traefik, the reverse proxy: requests for this hostname go to this application.', why: 'One Traefik serves many applications; the hostname decides which one gets the request.', dtc: 'Writes traefik/dynamic/svc-<name>.yml from the Services page; Traefik loads it within seconds.', you: 'Nothing. Hand edits to generated files are overwritten.', fails: 'The route file is missing or invalid (Traefik answers 404), or the service is disabled.' },
+    middlewares: { title: 'Middleware chain', what: 'Steps Traefik runs before passing a request on, in order: the sign-in check, then security headers.', why: 'The sign-in check must come first, so nothing reaches the application unchecked.', dtc: 'Puts the authentik check first when you protect an application.', you: 'Extra middlewares can be added on the Services page (advanced).', fails: 'The sign-in middleware missing or not first in the chain.' },
+    forwardauth: { title: 'ForwardAuth (internal)', what: 'For every request Traefik asks authentik\'s outpost, server to server, whether the visitor may pass. The address is internal, like http://authentik-server:9000/...', why: 'Your application does not need to know about sign-in at all; Traefik enforces it.', dtc: 'Writes the ForwardAuth middleware with authentik\'s container name on the shared Docker network. If authentik does not answer, Traefik refuses the request (fails closed).', you: 'Keep authentik running: while it is down, protected applications refuse visitors instead of opening without sign-in.', fails: 'authentik stopped or not on the shared network (HTTP 500), or the address set to localhost, which inside Traefik\'s container is Traefik itself.' },
+    authentik: { title: 'authentik application, provider and outpost', what: 'In authentik: an application (what users see), a proxy provider (how it is protected, with the public address) and the embedded outpost that answers Traefik.', why: 'authentik decides who may open what using its users, groups and access rules (policies).', dtc: 'Creates or reuses them once, assigns the provider to the embedded outpost, and starts new applications owner-only.', you: 'Users, groups and who may open which application: in authentik. The manager never overwrites access rules.', fails: 'Provider not assigned to the outpost (404), wrong external address, or the application deleted in authentik.' },
+    redirect: { title: 'Redirect to the sign-in page', what: 'When you are not signed in, authentik answers Traefik with a redirect, and your browser opens the sign-in page.', why: 'The browser must be able to open that address from anywhere, so it has to be the public https://auth.<domain> address.', dtc: 'Points authentik\'s embedded outpost at the public sign-in address when you set it up or protect an application.', you: 'Nothing. If you change the outpost in authentik, keep its authentik_host at the public address.', fails: 'The outpost set to http://127.0.0.1:9000 or another local address: it works on the authentik PC only; everywhere else the browser cannot connect.' },
+    signin: { title: 'Public sign-in page', what: 'authentik\'s own page, published like any other application (for example https://auth.example.com). Google returns here after you choose your account.', why: 'Visitors and Google both need to reach it from the internet. Traefik still talks to authentik internally.', dtc: 'Publishes it through Cloudflare (without Cloudflare Access) and checks that it answers.', you: 'Sign-in options, branding and flows: in authentik.', fails: 'Not published, Cloudflare Access in front (Google\'s return gets blocked), or authentik not running.' },
+    callback: { title: 'Return to the application', what: 'After signing in, authentik sends the browser back to https://<app>/outpost.goauthentik.io/callback, which sets the sign-in cookie and then opens the page you asked for.', why: 'The cookie belongs to the application\'s own hostname, so the return must go through the same public address.', dtc: 'Adds a route for /outpost.goauthentik.io/ on the application\'s hostname and sets the provider to the public https address.', you: 'Nothing, as long as the application keeps its public https address in authentik.', fails: 'No outpost route (404 after signing in), or the provider set to another address (you land on the wrong page or loop).' },
+    backend: { title: 'Application backend', what: 'Where Traefik sends authorised requests: a container by its Docker name (http://app:8080) or a program on Windows (http://host.docker.internal:port).', why: 'Only Traefik talks to the application; it is not exposed to the internet directly.', dtc: 'Finds a working address with the backend finder and tests it from inside Traefik\'s container.', you: 'Keep the application running. Some applications need their public URL set in their own settings.', fails: 'Wrong port or scheme, the app stopped, or a container not on the shared network (502/504).' },
+    networks: { title: 'Docker networks', what: 'Private networks between containers. Traefik, authentik and container applications meet on one shared network.', why: 'Containers reach each other by name only on a network they share; nothing else on the network is published.', dtc: 'Creates the shared network, attaches Traefik and authentik, and offers to attach applications.', you: 'Containers you manage yourself must stay attached after you recreate them (add the network to their compose file).', fails: 'A recreated container that lost its network attachment.' },
+  };
+  function routingHelp(id) { return ROUTING_HELP[id] || null; }
+  // Journey step path: whose request it is.
+  function journeyPath(path) { return path === 'browser' ? { label: 'Browser', tone: 'info', icon: 'globe' } : { label: 'Server to server', tone: 'neutral', icon: 'server' }; }
+
   return {
+    ROUTING_STATES, routingState, routingEvidence, endpointAudience, endpointKind, ROUTING_HELP, routingHelp, journeyPath,
     IDENTITY_STATES, identityState, googleRedirectUri, isGoogleClientId, identityNextStep, identityWizard, wizardNeighbours, CREDENTIAL_STATUS, credentialStatus,
     LEVELS, LEVEL_TITLES, DEFAULT_LEVEL, normalizeLevel, levelIndex, isVisibleAt,
     DIMENSIONS, COMPONENT_STATUS, componentStatus, firstBlocked, suggestAppName, displayNameFromLabel, choosePort, reachOptions,

@@ -599,7 +599,10 @@ function Get-CloudflareServicePlan {
   $observed['ingress'] = $ingress.ToArray()
   $accessApps = @()
   $needAccess = $Service -and $Service.cloudflare.access -and $publish.Count -gt 0
-  if ($needAccess -or $unpublish.Count -gt 0) { $accessApps = @(Invoke-CloudflareApi -Settings $Settings -Path "/accounts/$acct/access/apps" -All) }
+  # Access off on a published hostname: an Access application this tool created for it would still show Cloudflare's
+  # login in front, so it is looked up too.
+  $managedAccess = @($publish | Where-Object { -not ($Service -and $Service.cloudflare.access) -and (Get-ManagedResource $config $_ 'accessAppId') })
+  if ($needAccess -or $unpublish.Count -gt 0 -or $managedAccess.Count -gt 0) { $accessApps = @(Invoke-CloudflareApi -Settings $Settings -Path "/accounts/$acct/access/apps" -All) }
   $observed['accessApps'] = @($accessApps | ForEach-Object { "$($_.id)|$($_.domain)" })
 
   $hostRule = { param($h) @($ingress | Where-Object { $_.PSObject.Properties['hostname'] -and $_.hostname -eq $h -and -not ($_.PSObject.Properties['path'] -and $_.path) }) }
@@ -633,6 +636,19 @@ function Get-CloudflareServicePlan {
           policies = @([ordered]@{ name = 'Allowed users'; decision = 'allow'; include = @(@($AccessEmails) | ForEach-Object { @{ email = @{ email = $_ } } }) })
         }
         $actions += New-CfAction 'access' 'create' $h "Create Access application for $h" ("Allow: " + (@($AccessEmails) -join ', ') + '. Session 24h. Everyone else is blocked by Cloudflare before reaching your network.') $false $body
+      }
+    } else {
+      # Access is off. Turning it off in this change removes the Access application this tool created for it (shown in
+      # the preview). One left over from before is only reported: it is never removed without an explicit change.
+      $appId = Get-ManagedResource $config $h 'accessAppId'
+      $apps = @($accessApps | Where-Object { $appId -and $_.id -eq $appId })
+      $wasOn = [bool]($PreviousService -and $PreviousService.PSObject.Properties['cloudflare'] -and $PreviousService.cloudflare.access -and (@(Get-PublishedHostnames $PreviousService) -contains $h))
+      if ($apps.Count -gt 0 -and $wasOn) {
+        $actions += New-CfAction 'access' 'delete' $h "Delete Access application '$($apps[0].name)' (created by this tool)" "Cloudflare Access is turned off for $h, so Cloudflare no longer asks for its own login first." $false ([pscustomobject]@{ AppId = $appId })
+      } elseif ($apps.Count -gt 0) {
+        $plan.Notes += "Cloudflare Access application '$($apps[0].name)' (created by this tool) still asks visitors of $h for a Cloudflare login, although Access is off for this service. Delete it in Cloudflare Zero Trust (Access > Applications) if authentik alone should protect $h."
+      } elseif (@(& $accessFor $h).Count -gt 0) {
+        $plan.Notes += "An Access application not created by this tool covers $h; Cloudflare asks for its login first. It is left alone."
       }
     }
     # 2. Tunnel route
