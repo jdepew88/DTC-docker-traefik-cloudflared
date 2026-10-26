@@ -25,7 +25,9 @@
     a.kind === 'none' ? 'neutral' : a.status === 'Failed' ? 'err' : a.status === 'Done' ? 'ok' : a.kind === 'delete' ? 'warn' : 'auth',
     `${({ create: 'Create', update: 'Change', delete: 'Remove', none: 'No change' })[a.kind] || a.kind}: ${a.summary}`, a.detail || a.message || '')));
 
-  async function load(ctx, deep) { ctx.state.identity = await api('GET', `/api/identity${deep ? '?deep=1' : ''}`); return ctx.state.identity; }
+  // probe=apps: the server sends one anonymous request per protected application through Traefik, so step 8 and the
+  // summary show what is enforced now, not stored flags.
+  async function load(ctx, deep) { ctx.state.identity = await api('GET', `/api/identity?probe=apps${deep ? '&deep=1' : ''}`); return ctx.state.identity; }
   const form = (ctx) => ctx.state.forms.identity || (ctx.state.forms.identity = { google: null, protect: null, plans: {}, secret: '', owner: null, verify: null, loginPlan: null, json: null });
 
   // Why each step exists, in plain words (shown at the top of the step).
@@ -62,19 +64,31 @@
     const step = byId[id];
     const rerender = (keep = true) => render(main, ctx, ctx.state.identity, id, keep);
     const reload = async (deep) => { await load(ctx, deep); rerender(true); };
-    const go = (to) => {
-      api('POST', '/api/identity/wizard', { step: to }).catch(() => {});
+    const go = (to, extra) => {
+      const req = api('POST', '/api/identity/wizard', { step: to, ...(extra || {}) }).catch(() => {});
+      if (extra && extra.skip) { req.then(() => load(ctx, false)).then(() => render(main, ctx, ctx.state.identity, to, true)); }
       if (location.hash !== `#identity/${to}`) history.replaceState(null, '', `#identity/${to}`);
       render(main, ctx, ctx.state.identity, to, false);
       const p = document.getElementById('wizard-panel'); if (p) p.scrollIntoView({ block: 'start' });
     };
     const nb = L.wizardNeighbours(wiz, id);
-    const nav = h('nav', { class: 'wizard-steps', 'aria-label': 'Setup steps' }, h('ol', null, wiz.steps.map((s) => h('li', { class: `${s.id === id ? 'current' : ''} ${s.done ? 'done' : ''} ${!s.available ? 'locked' : ''}` },
+    const nav = h('nav', { class: 'wizard-steps', 'aria-label': 'Setup steps' }, h('ol', null, wiz.steps.map((s) => h('li', { class: `${s.id === id ? 'current' : ''} ${s.done ? 'done' : ''} ${s.skipped ? 'skipped' : ''} ${!s.available ? 'locked' : ''}`, 'data-step': s.id },
       s.available ? h('button', { type: 'button', class: 'step-link', 'aria-current': s.id === id ? 'step' : null, onclick: () => go(s.id) },
-        h('span', { class: 'step-num', 'aria-hidden': 'true' }, s.done ? '✓' : String(s.number)), h('span', null, s.title, s.optional ? h('span', { class: 'small muted' }, ' (optional)') : null),
-        h('span', { class: 'sr-only' }, s.done ? ', complete' : s.id === id ? ', current step' : ''))
+        h('span', { class: 'step-num', 'aria-hidden': 'true' }, s.done ? '✓' : s.skipped ? '–' : String(s.number)), h('span', null, s.title, s.optional ? h('span', { class: 'small muted' }, ' (optional)') : null, s.badge ? h('span', { class: 'step-badge small muted' }, s.badge) : null),
+        h('span', { class: 'sr-only' }, `${s.done ? ', complete' : s.skipped ? ', skipped' : ''}${s.id === id ? ', current step' : ''}`))
         : h('span', { class: 'step-link', title: `First: ${s.blockedBy}` }, h('span', { class: 'step-num', 'aria-hidden': 'true' }, String(s.number)), h('span', null, s.title), h('span', { class: 'sr-only' }, `, available after: ${s.blockedBy}`))))));
-    const status = step.final ? null : step.done ? h('p', { class: 'step-status ok', role: 'status' }, icon('check'), ' Done. ', step.optional ? 'You can change it here at any time.' : 'Continue to the next step.')
+    const pr = wiz.protection;
+    const appsStatus = () => ({
+      done: h('p', { class: 'step-status ok', role: 'status', id: 'id-apps-status' }, icon('check'), ` Done: ${pr.protected} of ${pr.total} application(s) protected; ForwardAuth verified just now (anonymous visitors are sent to sign in).${pr.unprotected ? ` ${pr.unprotected} not protected.` : ''} You can protect more or remove protection here at any time.`),
+      skipped: h('p', { class: 'step-status skipped', role: 'status', id: 'id-apps-status' }, icon('minus'), ' Skipped: no application is protected by authentik. Come back here at any time to protect applications.'),
+      attention: h('p', { class: 'step-status todo', role: 'status', id: 'id-apps-status' }, icon('alert'), ` ${pr.protected} of ${pr.total} protected, but ForwardAuth is not working for ${pr.failing.join(', ')}. See the table below.`),
+      checking: h('p', { class: 'step-status todo', role: 'status', id: 'id-apps-status' }, icon('refresh'), ` ${pr.protected} of ${pr.total} protected; not verified yet.`),
+      open: h('p', { class: 'step-status todo', role: 'status', id: 'id-apps-status' }, icon('alert'), ' Optional: protect applications now, or skip this step.'),
+    })[pr.state];
+    const status = step.final ? (step.done ? h('p', { class: 'step-status ok', role: 'status', id: 'id-done-status' }, icon('check'), ' Setup is complete (checked just now).')
+      : h('p', { class: 'step-status todo', role: 'status', id: 'id-done-status' }, icon('alert'), ` Not finished yet: ${arr(step.missing).length ? arr(step.missing).join(', ') : 'protection needs attention'}.`))
+      : id === 'apps' ? appsStatus()
+      : step.done ? h('p', { class: 'step-status ok', role: 'status' }, icon('check'), ' Done. ', step.optional ? 'You can change it here at any time.' : 'Continue to the next step.')
       : h('p', { class: 'step-status todo', role: 'status' }, icon('alert'), step.optional ? ' Optional: do it now or skip it.' : ' Not done yet: follow the instructions below.');
     const bodyFor = {
       mode: () => modeStep(ctx, d, reload, go),
@@ -85,13 +99,14 @@
       signin: () => signinStep(ctx, d, f, reload, rerender),
       owner: () => ownerStep(ctx, d, f, reload, rerender, go),
       apps: () => protectStep(ctx, d, f, reload, rerender),
-      done: () => doneStep(d),
+      done: () => doneStep(d, wiz, go),
     };
-    const continueLabel = nb.next ? (step.done || !step.optional ? `Continue: ${nb.next.title}` : `Skip for now: ${nb.next.title}`) : '';
+    const skipping = id === 'apps' && !step.done && !pr.protected;
+    const continueLabel = nb.next ? (step.done || step.skipped || !step.optional ? `Continue: ${nb.next.title}` : `Skip for now: ${nb.next.title}`) : '';
     const footer = h('div', { class: 'wizard-foot' },
       nb.prev ? h('button', { type: 'button', class: 'btn', onclick: () => go(nb.prev.id) }, '← Back') : h('span'),
       h('span', { class: 'grow' }),
-      nb.next ? h('button', { type: 'button', class: `btn ${step.done ? 'primary' : ''}`, disabled: !(step.done || step.optional), title: step.done || step.optional ? '' : 'Finish this step first', onclick: () => go(nb.next.id) }, continueLabel, ' →') : null);
+      nb.next ? h('button', { type: 'button', class: `btn ${step.done ? 'primary' : ''}`, disabled: !(step.done || step.optional), title: step.done || step.optional ? '' : 'Finish this step first', onclick: () => go(nb.next.id, skipping && !step.skipped ? { skip: 'apps' } : null) }, continueLabel, ' →') : null);
     const panel = h('section', { class: 'card wizard-panel', id: 'wizard-panel', 'aria-labelledby': 'wizard-title' },
       h('div', { class: 'eyebrow' }, `Step ${step.number} of ${wiz.steps.length}`),
       h('h2', { id: 'wizard-title', tabindex: '-1' }, step.title),
@@ -459,8 +474,8 @@
     const rows = services.map((s) => {
       const a = byName[s.name];
       const prot = s.auth === 'authentik';
-      const bad = a && a.challenge && ['open', 'loop', 'failed', 'misrouted'].includes(a.challenge.State);
-      const state = a ? (bad ? 'failed' : a.verifiedAt ? 'verified' : !a.authentik ? 'failed' : a.challenge ? ({ auth: 'auth-required' })[a.challenge.State] || 'failed' : 'configured') : 'not-configured';
+      const ps = L.appProtectionState(a);
+      const state = a ? (ps === 'verified' ? (a.verifiedAt ? 'verified' : 'auth-required') : ({ unchecked: 'configured', disabled: 'configured' })[ps] || 'failed') : 'not-configured';
       let cell;
       if (prot) cell = h('span', { title: 'Already protected (not affected by this selection)' }, icon('lock'), h('span', { class: 'sr-only' }, 'Already protected'));
       else {
@@ -475,7 +490,7 @@
         h('td', null, arr(s.hostnames).join(', ')),
         h('td', null, prot ? [h('span', { class: 'small' }, 'Already protected '), stateChip(state), access ? h('div', { class: 'small muted' }, access) : null] : s.publish && s.access ? plainChip('Cloudflare Access', 'info') : !s.publish ? plainChip('Local only') : plainChip('Public', 'warn')),
         h('td', null, prot ? [link ? h('a', { class: 'btn small', href: `${link.base}/if/admin/#/core/applications/${a ? a.slug : `dm-${s.name}`}`, target: '_blank', rel: 'noopener noreferrer' }, 'Open in authentik ', icon('external')) : null,
-          h('button', { type: 'button', class: 'btn small ghost', onclick: (e) => withBusy(e.currentTarget, async () => { pf.plan = await api('POST', '/api/identity/unprotect/plan', { service: s.name }); pf.plan.remove = true; pf.result = null; rerender(); }) }, 'Remove protection…')] : null));
+          h('button', { type: 'button', class: 'btn small ghost', onclick: (e) => withBusy(e.currentTarget, async () => { pf.plan = await api('POST', '/api/identity/unprotect/plan', { service: s.name, cloudflareAccess: 'keep' }); pf.plan.remove = true; pf.result = null; rerender(); }) }, 'Remove protection…')] : null));
     });
     const selAll = h('button', { type: 'button', class: 'btn small', id: 'id-sel-all', disabled: !candidates.length || !connected, onclick: () => { candidates.forEach((s) => { pf.selected[s.name] = true; }); pf.plan = null; sync(); } }, 'Select all');
     const clrAll = h('button', { type: 'button', class: 'btn small ghost', id: 'id-sel-none', onclick: () => { pf.selected = {}; pf.plan = null; sync(); } }, 'Clear all');
@@ -495,8 +510,10 @@
       const reviewed = h('input', { type: 'checkbox' });
       const overwrites = its.flatMap((it) => arr(it.traefik.cloudflare.actions).filter((x) => x.overwrite).map((x) => { const b = h('input', { type: 'checkbox', 'data-id': x.id }); return h('label', { class: 'check' }, b, h('span', null, `Overwrite: ${x.summary}`)); }));
       const apply = h('button', { type: 'button', class: `btn ${plan.remove ? 'danger' : 'primary'}`, disabled: true }, plan.remove ? 'Remove protection' : `Protect ${its.length} application(s)`);
-      const syncApply = () => { apply.disabled = !(reviewed.checked && plan.canApply && overwrites.every((o) => o.querySelector('input').checked)); };
-      reviewed.addEventListener('change', syncApply); overwrites.forEach((o) => o.querySelector('input').addEventListener('change', syncApply));
+      const goesPublic = plan.remove && its.some((it) => it.becomesPublic);
+      const ackPublic = h('input', { type: 'checkbox', id: 'id-ack-public' });
+      const syncApply = () => { apply.disabled = !(reviewed.checked && plan.canApply && overwrites.every((o) => o.querySelector('input').checked) && (!goesPublic || ackPublic.checked)); };
+      reviewed.addEventListener('change', syncApply); ackPublic.addEventListener('change', syncApply); overwrites.forEach((o) => o.querySelector('input').addEventListener('change', syncApply));
       apply.addEventListener('click', () => withBusy(apply, async () => {
         const ids = overwrites.map((o) => o.querySelector('input')).filter((b) => b.checked).map((b) => b.dataset.id);
         const progress = document.getElementById('id-protect-progress'); if (progress) progress.textContent = `Working on ${its.length} application(s), one after the other…`;
@@ -510,7 +527,10 @@
           h('h4', null, 'authentik'), actionList(it.authentik),
           h('h4', null, 'Traefik'), arr(it.traefik.traefik.changes).length ? arr(it.traefik.traefik.changes).map((c) => h('details', { class: 'tech' }, h('summary', null, `${c.action}: ${c.file}`), U.diffBlock(c.diff))) : h('p', { class: 'muted' }, 'No route change.'),
           arr(it.traefik.traefik.issues).filter((i) => i.Level === 'Error').length ? h('ul', { class: 'checks' }, arr(it.traefik.traefik.issues).filter((i) => i.Level === 'Error').map((i) => checkItem('err', i.Field, i.Message))) : null,
-          arr(it.traefik.cloudflare.actions).filter((x) => x.kind !== 'none').length ? [h('h4', null, 'Cloudflare'), h('ul', { class: 'checks' }, arr(it.traefik.cloudflare.actions).filter((x) => x.kind !== 'none').map((x) => checkItem('auth', x.summary, x.detail)))] : null)),
+          arr(it.traefik.cloudflare.actions).filter((x) => x.kind !== 'none').length ? [h('h4', null, 'Cloudflare'), h('ul', { class: 'checks' }, arr(it.traefik.cloudflare.actions).filter((x) => x.kind !== 'none').map((x) => checkItem('auth', x.summary, x.detail)))] : null,
+          plan.remove && arr(it.keeps).length ? [h('h4', null, 'Stays as it is'), h('ul', { class: 'checks', id: 'id-unprotect-keeps' }, arr(it.keeps).map((k) => checkItem('ok', k, '')))] : null)),
+        goesPublic ? h('div', { class: 'callout warn', id: 'id-public-warning' }, h('p', null, h('strong', null, 'Public without sign-in. '), 'After this, anyone on the Internet can open the application without signing in (no authentik, no Cloudflare Access). Its own login, if it has one, is the only protection.'),
+          h('label', { class: 'check' }, ackPublic, h('span', null, 'I understand that this application becomes publicly accessible.'))) : null,
         overwrites, plan.canApply ? h('div', { class: 'actions' }, h('label', { class: 'check grow' }, reviewed, h('span', null, 'I reviewed these changes')), apply, h('button', { type: 'button', class: 'btn ghost', onclick: () => { pf.plan = null; rerender(); } }, 'Cancel'))
           : h('p', { class: 'muted' }, 'The preview has problems (see above); nothing can be applied.'),
         h('p', { class: 'small muted', id: 'id-protect-progress', role: 'status', 'aria-live': 'polite' }));
@@ -538,10 +558,15 @@
   }
 
   // --- 9. Finished -------------------------------------------------------------------------------------------------------------
-  function doneStep(d) {
-    const prot = arr(d.apps).filter((a) => a.protected);
-    return [h('div', { class: 'verified-banner', role: 'status' }, icon('check'), h('div', null, h('strong', null, 'Sign-in is set up'),
-      h('p', null, `${prot.length} protected application(s). Manage people, groups, invitations and who may open what in authentik.`))), managedSection(d)];
+  function doneStep(d, wiz, go) {
+    const pr = wiz.protection;
+    const line = pr.state === 'skipped' ? 'Protecting applications was skipped: no application asks for sign-in yet.'
+      : `${pr.protected} of ${pr.total} application(s) protected${pr.state === 'done' ? ' and verified just now' : ''}${pr.unprotected ? `; ${pr.unprotected} not protected` : ''}.`;
+    const manage = h('button', { type: 'button', class: 'btn', id: 'id-manage-protection', onclick: () => go('apps') }, icon('lock'), pr.protected ? 'Manage protection…' : 'Protect applications…');
+    return [wiz.complete ? h('div', { class: 'verified-banner', role: 'status' }, icon('check'), h('div', null, h('strong', null, 'Sign-in is set up'),
+      h('p', { id: 'id-done-summary' }, `${line} Manage people, groups, invitations and who may open what in authentik.`)))
+      : h('div', { class: 'callout warn', role: 'status' }, h('p', { id: 'id-done-summary' }, line)),
+    h('div', { class: 'actions' }, manage), managedSection(d)];
   }
 
   // --- Health (advanced) -----------------------------------------------------------------------------------------------------

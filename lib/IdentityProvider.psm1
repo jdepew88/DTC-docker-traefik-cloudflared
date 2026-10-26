@@ -52,6 +52,8 @@ function New-IdentityConfig {
     authMode = ''
     # The wizard step the user was on (resume after a refresh or restart).
     wizardStep = ''
+    # When the user deliberately skipped the optional "Protect applications" step (cleared once one is protected).
+    protectSkippedAt = ''
     authentik = [pscustomobject][ordered]@{
       project = ''; folder = ''; managed = $false; serverContainer = ''; port = 9000; localUrl = ''
       hostname = ''; service = ''; publicUrl = ''
@@ -78,6 +80,7 @@ function Read-IdentityConfig {
   $cfg.updatedAt = [string](Get-IdProp $raw 'updatedAt' '')
   $mode = [string](Get-IdProp $raw 'authMode' ''); if ($mode -in 'local', 'google') { $cfg.authMode = $mode }
   $cfg.wizardStep = [string](Get-IdProp $raw 'wizardStep' '')
+  $cfg.protectSkippedAt = [string](Get-IdProp $raw 'protectSkippedAt' '')
   $ra = Get-IdProp $raw 'authentik' $null
   if ($ra) {
     foreach ($k in @('project', 'folder', 'serverContainer', 'localUrl', 'hostname', 'service', 'publicUrl')) { $cfg.authentik.$k = [string](Get-IdProp $ra $k '') }

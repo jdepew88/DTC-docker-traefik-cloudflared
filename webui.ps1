@@ -2969,7 +2969,7 @@ function Invoke-ManagerStop($Body) {
 # in authentik is previewed first (the sync functions' dry run), applied once after confirmation, and recomputed right
 # before applying; the Traefik side goes through the same plan/validate/backup/apply path as every service change.
 
-function Get-IdentityContext([switch]$Deep) {
+function Get-IdentityContext([switch]$Deep, [switch]$ProbeApps) {
   $settings = Get-Settings
   $cfg = Read-IdentityConfig -Settings $settings
   $inv = @(); try { $inv = @(Get-DockerContainerInventory -ProxyNetwork $settings.ProxyNetwork) } catch { }
@@ -3050,9 +3050,16 @@ function Get-IdentityContext([switch]$Deep) {
       try { $ev = Get-AuthentikAppAccessEvidence -Conn $conn -ApplicationPk $appPk -Since $since; if ($ev) { $verifiedAt = $ev.At; Set-IdentityApp $cfg $s.name (Merge-IdentityApp $known @{ verifiedAt = $ev.At; verifiedBy = $ev.Username }); $changed = $true } } catch { }
     }
     $check = $(if ($State.IdpChecks.ContainsKey($s.name)) { $State.IdpChecks[$s.name] } else { $null })
-    if ($Deep -and $s.enabled) { $check = Test-ForwardAuthChallenge -TraefikPort $settings.HttpPort -Hostname @($s.hostnames)[0] -AuthHostname $cfg.authentik.hostname; $State.IdpChecks[$s.name] = $check }
+    # -ProbeApps (the wizard's protection step and summary): one anonymous request through Traefik per application, so
+    # completion is shown from what Traefik and authentik do now, not from stored flags. Read-only.
+    if (($Deep -or $ProbeApps) -and $s.enabled) { $check = Test-ForwardAuthChallenge -TraefikPort $settings.HttpPort -Hostname @($s.hostnames)[0] -AuthHostname $cfg.authentik.hostname; $State.IdpChecks[$s.name] = $check }
+    # ForwardAuth in the configuration: the route file attaches the authentik middleware, and Traefik has loaded it.
+    $rf = Get-RouteFileFacts (Join-Path $InstallPath "traefik\dynamic\svc-$($s.name).yml") $s.name
+    $rt = @($routers | Where-Object { $null -ne $_ -and $_.name -eq "svc-$($s.name)@file" })
+    $fa = [ordered]@{ configured = [bool](@($rf.middlewares) -contains "svc-$($s.name)-authentik" -and $rf.forwardAuthAddress)
+      loaded = $(if ($null -eq $routers) { $null } else { [bool]($rt.Count -and [string]$rt[0].status -eq 'enabled' -and @(if ($rt[0].PSObject.Properties['middlewares']) { $rt[0].middlewares }) -contains "svc-$($s.name)-authentik@file") }) }
     $appFacts += [ordered]@{ service = $s.name; displayName = $(if ($s.PSObject.Properties['displayName']) { $s.displayName } else { $s.name }); hostname = @($s.hostnames)[0]; protected = $true; authentik = $exists; challenge = $check; verifiedAt = $verifiedAt
-      verifiedBy = [string](Get-IdProp2 (Get-IdentityApp $cfg $s.name) 'verifiedBy' ''); rules = $rules; ownerOnly = $ownerOnly; cloudflareAccess = [bool]$s.cloudflare.access; publish = [bool]$s.cloudflare.publish; slug = "dm-$($s.name)" }
+      verifiedBy = [string](Get-IdProp2 (Get-IdentityApp $cfg $s.name) 'verifiedBy' ''); forwardAuth = $fa; enabled = [bool]$s.enabled; rules = $rules; ownerOnly = $ownerOnly; cloudflareAccess = [bool]$s.cloudflare.access; publish = [bool]$s.cloudflare.publish; slug = "dm-$($s.name)" }
   }
   if ($changed) { Save-IdentityConfig -Settings $settings -Config $cfg }
   $pub = $(if ($State.IdpChecks.ContainsKey('__public')) { $State.IdpChecks['__public'] } else { $null })
@@ -3120,8 +3127,8 @@ function Use-IdpPlan($Body, [string]$Kind) {
 
 # Everything the Identity & Access page shows. Secrets never appear: the token only as metadata, the Google client
 # secret not at all.
-function Get-IdentityData([switch]$Deep) {
-  $ctx = Get-IdentityContext -Deep:$Deep
+function Get-IdentityData([switch]$Deep, [switch]$ProbeApps) {
+  $ctx = Get-IdentityContext -Deep:$Deep -ProbeApps:$ProbeApps
   $cfg = $ctx.Config; $settings = $ctx.Settings
   $model = Get-IdentityModel -Facts $ctx.Facts
   $domains = @($ctx.Cloudflare.domains | ForEach-Object { [string]$_.name })
@@ -3456,6 +3463,8 @@ function Set-IdentityWizardStepRequest($Body) {
   $settings = Get-Settings
   $cfg = Read-IdentityConfig -Settings $settings
   $cfg.wizardStep = $step
+  $skip = [string](Get-Field $Body 'skip' '')
+  if ($skip -eq 'apps') { $cfg.protectSkippedAt = (Get-Date -Format 's') } elseif ($skip -eq 'clear-apps') { $cfg.protectSkippedAt = '' }
   Save-IdentityConfig -Settings $settings -Config $cfg
   return [ordered]@{ ok = $true }
 }
@@ -3552,7 +3561,16 @@ function Invoke-IdentityProtectPlan($Body, [switch]$Remove) {
       if (@($ak | Where-Object { $_.Object -eq 'access' -and $_.Kind -eq 'none' }).Count) { $notes += 'This application already has access rules in authentik; they are kept exactly as they are.' }
     }
     $errors = @($view.traefik.issues | Where-Object { $_.Level -eq 'Error' }).Count + @($view.cloudflare.errors).Count
-    $items += [ordered]@{ service = $svc.name; displayName = (Get-ProtectDesired $svc).DisplayName; hostname = @($svc.hostnames)[0]; authentik = @(ConvertTo-AkActionView $ak); traefik = $view; notes = $notes; errors = $errors }
+    # Removal: what stays exactly as it is, and whether the application ends up open to the Internet without any
+    # sign-in (the page then asks for an explicit acknowledgement).
+    $keeps = @(); $public = $false
+    if ($Remove) {
+      $public = [bool]($svc.cloudflare.publish -and -not $req.ChangeBody.service.cloudflare.access)
+      $keeps = @("The container and the application itself", "The route: $(@($svc.hostnames)[0]) still goes to $(Get-ServiceUrl $svc)",
+        "authentik: the application dm-$($svc.name), its provider, users, groups and access rules (protecting again reuses them)",
+        $(if ($svc.cloudflare.access) { 'Cloudflare Access in front of the application' } elseif ($svc.cloudflare.publish) { 'Cloudflare DNS record and tunnel route' } else { 'Local only: nothing is published' }))
+    }
+    $items += [ordered]@{ service = $svc.name; displayName = (Get-ProtectDesired $svc).DisplayName; hostname = @($svc.hostnames)[0]; authentik = @(ConvertTo-AkActionView $ak); traefik = $view; notes = $notes; errors = $errors; keeps = $keeps; becomesPublic = $public }
     $stored += [pscustomobject]@{ Service = $svc.name; ChangeBody = ($req.ChangeBody | ConvertTo-Json -Depth 10 -Compress); AkFingerprint = (Get-AkFingerprint $ak); TraefikKey = $plan.TraefikKey; CfFingerprint = $plan.Cloudflare.Fingerprint }
   }
   $id = New-IdpPlanId ([pscustomobject]@{ Kind = $(if ($Remove) { 'unprotect' } else { 'protect' }); Items = $stored; Access = $access })
@@ -3619,6 +3637,8 @@ function Invoke-IdentityProtectApply($Body, [switch]$Remove) {
     $results += $out
   }
   $allOk = -not @($results | Where-Object { -not $_.ok }).Count
+  # Protecting an application ends a deliberate skip of the wizard's protection step.
+  if (-not $Remove -and @($results | Where-Object { $_.ok }).Count) { $cfg.protectSkippedAt = '' }
   Set-IdentityProgress $cfg 'apps' $(if ($allOk) { $(if ($Remove) { 'unprotected' } else { 'protected' }) } else { 'failed' }) ((@($results | ForEach-Object { $_.service })) -join ', ')
   Save-IdentityConfig -Settings $ctx.Settings -Config $cfg
   Write-Audit $(if ($Remove) { 'identity-unprotect' } else { 'identity-protect' }) ((@($results | ForEach-Object { "$($_.service) ok=$($_.ok)" })) -join '; ')
@@ -3714,7 +3734,7 @@ function Invoke-ApiRoute($Request, $Body) {
     'POST /api/apps/remove' { return Invoke-AppRemove $Body }
     'POST /api/apps/backup' { return Invoke-AppBackup $Body }
     'GET /api/system/resources' { return Get-HostResources }
-    'GET /api/identity' { Assert-Installed; return Get-IdentityData -Deep:([string]$Request.Query['deep'] -eq '1') }
+    'GET /api/identity' { Assert-Installed; return Get-IdentityData -Deep:([string]$Request.Query['deep'] -eq '1') -ProbeApps:([string]$Request.Query['probe'] -eq 'apps') }
     'GET /api/routing' { return Get-RoutingView $Request.Query }
     'POST /api/identity/provider' { return Set-IdentityProviderRequest $Body }
     'POST /api/identity/adopt' { return Invoke-IdentityAdopt $Body }

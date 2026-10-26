@@ -698,3 +698,8 @@ ol.gsteps li { margin: .45rem 0; }
 }
 /* An open app spans the whole row so its service and network tables have room. */
 .disc-list .dep-card.open { grid-column: 1 / -1; }
+/* A completed or skipped step keeps its marker when it is the current step (the frame shows where you are). */
+.wizard-steps li.done.current .step-num { background: var(--ok-soft); color: var(--ok); border-color: color-mix(in srgb, var(--ok) 45%, transparent); box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 55%, transparent); }
+.wizard-steps li.skipped .step-num { color: var(--muted); border-style: dashed; }
+.wizard-steps .step-badge { display: block; font-weight: 400; }
+.step-status.skipped { color: var(--muted); }
