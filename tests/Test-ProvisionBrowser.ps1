@@ -138,7 +138,7 @@ try {
   $ok = Wait "!!document.querySelector('#prov-ai-run')"
   Test-Condition 'ai: the estimate shows the provider, the maximum cost and exactly what would be sent; sending stays disabled until approved' ($ok -and (Js "document.querySelector('#prov-ai').textContent") -match '0\.0021' -and (Js "document.querySelector('#prov-ai-preview pre').textContent") -match 'untrusted_documentation' -and (Js "document.querySelector('#prov-ai-run').disabled")) ''
   Shot 'provision-3-ai-estimate'
-  $null = Js "const a = document.querySelector('#prov-ai-approve'); a.checked = true; a.dispatchEvent(new Event('change')); true"
+  $null = Js "{ const a = document.querySelector('#prov-ai-approve'); a.checked = true; a.dispatchEvent(new Event('change')); true }"
   $null = Click '#prov-ai-run'
   $ok = Wait "!window.__provmock.calls.some((c) => c.path === '/api/provision/ai/estimate' && !window.__provmock.aiRun) || document.querySelector('#prov-draft') && window.__provmock.aiRun"
   $null = Wait "window.__provmock.aiRun && /LOG_LEVEL/.test(document.querySelector('#prov-draft').textContent)"
@@ -155,23 +155,23 @@ try {
 
   $null = Click '#prov-next'
   $null = Wait "!!document.querySelector('#prov-access')"
-  $null = Js "const r = document.querySelector('input[name=prov-access][value=public]'); r.checked = true; r.dispatchEvent(new Event('change')); true"
+  $null = Js "{ const r = document.querySelector('input[name=prov-access][value=public]'); r.checked = true; r.dispatchEvent(new Event('change')); true }"
   $null = Wait "!!document.querySelector('#prov-hostname')"
   Test-Condition 'step 2: public access suggests <app>.<your Cloudflare domain> and the step completes with a valid host name' ((Js "document.querySelector('#prov-hostname').value") -eq 'notes.provtest.example' -and (Step 'proxy').cls -match '\bdone\b') (Js "document.querySelector('#prov-hostname').value")
-  $null = Js "const h = document.querySelector('#prov-hostname'); h.value = 'not a host'; h.dispatchEvent(new Event('input')); h.dispatchEvent(new Event('change')); true"
+  $null = Js "{ const h = document.querySelector('#prov-hostname'); h.value = 'not a host'; h.dispatchEvent(new Event('input')); h.dispatchEvent(new Event('change')); true }"
   $null = Wait "!document.querySelector('.wizard-steps li[data-step=proxy]').classList.contains('done')"
   Test-Condition 'step 2: an invalid host name makes the step incomplete again (Continue disabled)' ((Js "document.querySelector('#prov-next').disabled") -and -not ((Step 'proxy').cls -match '\bdone\b')) ''
-  $null = Js "const h = document.querySelector('#prov-hostname'); h.value = 'notes.provtest.example'; h.dispatchEvent(new Event('input')); h.dispatchEvent(new Event('change')); true"
+  $null = Js "{ const h = document.querySelector('#prov-hostname'); h.value = 'notes.provtest.example'; h.dispatchEvent(new Event('input')); h.dispatchEvent(new Event('change')); true }"
   Shot 'provision-4-proxy'
   $null = Wait "!document.querySelector('#prov-next').disabled"
   $null = Click '#prov-next'
   $null = Wait "!!document.querySelector('#prov-auth')"
   $authOpts = (Js "Array.from(document.querySelectorAll('input[name=prov-auth]')).map((r) => r.value + (r.disabled ? '(off)' : '')).join(',')")
   Test-Condition "step 3: public offers authentik, Cloudflare Access and the app's own login (never 'no sign-in'); Authelia is shown as not available" ($authOpts -eq 'authentik,cloudflare-access,native,authelia(off)' -and (Js "document.querySelector('input[name=prov-auth]:checked').value") -eq 'authentik') $authOpts
-  $null = Js "const r = document.querySelector('input[name=prov-auth][value=native]'); r.checked = true; r.dispatchEvent(new Event('change')); true"
+  $null = Js "{ const r = document.querySelector('input[name=prov-auth][value=native]'); r.checked = true; r.dispatchEvent(new Event('change')); true }"
   $null = Wait "!!document.querySelector('#prov-public-native')"
   Test-Condition "step 3: the app's own login on a public address needs an explicit acknowledgement" ((Js "!!document.querySelector('#prov-ack-auth')")) ''
-  $null = Js "const r = document.querySelector('input[name=prov-auth][value=authentik]'); r.checked = true; r.dispatchEvent(new Event('change')); true"
+  $null = Js "{ const r = document.querySelector('input[name=prov-auth][value=authentik]'); r.checked = true; r.dispatchEvent(new Event('change')); true }"
   Shot 'provision-5-auth'
   $null = Wait "!document.querySelector('#prov-next').disabled"
   $null = Click '#prov-next'
@@ -184,7 +184,7 @@ try {
   Test-Condition 'review: Deploy stays disabled until the review is confirmed, the privilege allowed and the Cloudflare overwrite confirmed' ((Js "document.querySelector('#prov-deploy').disabled") -and (Js "!!document.querySelector('#prov-priv')") -and [int](Js "document.querySelectorAll('.prov-overwrite').length") -eq 1) ''
   $null = Js "['#prov-approve', '#prov-priv'].forEach((s) => { const b = document.querySelector(s); b.checked = true; b.dispatchEvent(new Event('change')); }); true"
   Test-Condition 'review: with the overwrite still unconfirmed, Deploy is still disabled' ((Js "document.querySelector('#prov-deploy').disabled")) ''
-  $null = Js "const o = document.querySelector('.prov-overwrite'); o.checked = true; o.dispatchEvent(new Event('change')); true"
+  $null = Js "{ const o = document.querySelector('.prov-overwrite'); o.checked = true; o.dispatchEvent(new Event('change')); true }"
   Test-Condition 'review: all confirmations given, Deploy is enabled' (-not (Js "document.querySelector('#prov-deploy').disabled")) ''
   Shot 'provision-6-review'
   $null = Click '#prov-deploy'
