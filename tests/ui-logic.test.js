@@ -357,6 +357,43 @@ test('wizard: resumes at the saved step if it is reachable, else at the first op
   assert.strictEqual(L.identityWizard(done).current, 'done');
 });
 
+test('wizard: protection step and summary complete from verified ForwardAuth, skips and counts', () => {
+  const owner = { config: { authentik: { owner: { verifiedAt: '2026-10-25T10:00:00' } } } };
+  const svc = (n) => ({ name: n, isIdentity: false });
+  const services = ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h'].map(svc).concat([{ name: 'authentik', isIdentity: true }]);
+  const app = (n, ch, fa) => ({ service: n, protected: true, authentik: true, enabled: true, challenge: ch === undefined ? { State: 'auth' } : ch, forwardAuth: fa || { configured: true, loaded: true } });
+  const all = wizData({ ...owner, services, apps: services.filter((s) => !s.isIdentity).map((s) => app(s.name)) });
+  const w = L.identityWizard(all);
+  const st = (x, id) => x.steps.find((s) => s.id === id);
+  assert.ok(st(w, 'apps').done, 'all eight verified: step 8 complete');
+  assert.strictEqual(st(w, 'apps').badge, '8/8 protected');
+  assert.ok(st(w, 'done').done && w.complete, 'step 9 complete from verified state');
+  assert.strictEqual(w.current, 'done');
+  // Not verified yet (no probe), or a failing route: never complete.
+  const unchecked = L.identityWizard({ ...all, apps: all.apps.map((x) => ({ ...x, challenge: null })) });
+  assert.ok(!st(unchecked, 'apps').done && !unchecked.complete && unchecked.protection.state === 'checking');
+  const failing = L.identityWizard({ ...all, apps: all.apps.map((x, i) => (i === 2 ? { ...x, challenge: { State: 'open' } } : x)) });
+  assert.ok(!st(failing, 'apps').done && !failing.complete && failing.protection.failing.join() === 'c');
+  const noMiddleware = L.identityWizard({ ...all, apps: all.apps.map((x, i) => (i === 0 ? { ...x, forwardAuth: { configured: false, loaded: false } } : x)) });
+  assert.strictEqual(noMiddleware.protection.state, 'attention', 'a stored flag without the middleware in the route is not protection');
+  // Some protected: complete, with an honest count.
+  const some = L.identityWizard({ ...all, apps: all.apps.slice(0, 3) });
+  assert.ok(st(some, 'apps').done && some.complete);
+  assert.strictEqual(st(some, 'apps').badge, '3/8 protected');
+  assert.strictEqual(some.protection.unprotected, 5);
+  // Nothing protected: open (blocks the summary) until deliberately skipped; a skip is not shown as done.
+  const none = L.identityWizard(wizData({ ...owner, services }));
+  assert.ok(!st(none, 'apps').done && !st(none, 'apps').skipped && !none.complete && none.current === 'apps');
+  const skipped = L.identityWizard(wizData({ ...owner, services, config: { ...owner.config, protectSkippedAt: '2026-10-26T09:00:00' } }));
+  assert.ok(st(skipped, 'apps').skipped && !st(skipped, 'apps').done, 'skipped, not verified');
+  assert.strictEqual(st(skipped, 'apps').badge, 'skipped');
+  assert.ok(skipped.complete, 'a deliberate skip of the optional step does not block completion');
+  // Revisiting a step changes nothing about completion.
+  const revisit = L.identityWizard({ ...all, config: { ...all.config, wizardStep: 'apps' } });
+  assert.strictEqual(revisit.current, 'apps');
+  assert.ok(st(revisit, 'apps').done && revisit.complete);
+});
+
 test('wizard: adding Google later only adds steps; the owner then also has to sign in with Google', () => {
   const local = wizData({ config: { authentik: { owner: { verifiedAt: '2026-10-25T10:00:00' } } } });
   const g = L.identityWizard({ ...local, config: { ...local.config, authMode: 'google' } });

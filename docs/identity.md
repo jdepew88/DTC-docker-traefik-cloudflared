@@ -85,7 +85,15 @@ step at a time on the right with *why* the step exists, whether it succeeded, th
 **Continue** (Continue is available once the step is done, or as *Skip for now* for optional steps). A step is complete
 only from what the manager observed, never from a click. The position is kept in the address (`#identity/<step>`) and
 in `config\identity.json`, so a refresh, a restart or coming back from Google Cloud resumes at the same step; re-entering
-detects existing infrastructure and creates nothing twice.
+detects existing infrastructure and creates nothing twice. Which step is open (the framed one) and which steps are
+complete (green check) or skipped (dash) are separate: opening a completed step never makes it look unfinished.
+
+Every load of the page verifies protection (`GET /api/identity?probe=apps`): one anonymous request per protected
+application through Traefik, plus whether its route file attaches the authentik ForwardAuth middleware and Traefik has
+loaded it. Applications protected before the wizard was opened count the same way. A stored flag alone never completes
+step 8: an application whose check fails (or whose route lost the middleware) keeps steps 8 and 9 open and is named.
+*Skip for now* on step 8, while nothing is protected, records the skip (`protectSkippedAt` in `config\identity.json`);
+step 8 then shows *skipped*, not a green check, and protecting an application later clears it.
 
 | # | Step | Complete when |
 | --- | --- | --- |
@@ -96,8 +104,8 @@ detects existing infrastructure and creates nothing twice.
 | 5 | **Register with Google** (path B): owner's Google account, values to copy, the four Google Cloud steps, client JSON import, preview and *Turn on Google sign-in*. | The Google source exists |
 | 6 | **Sign-in page** (path B, optional): Google-first sign-in page. | Applied (or skipped) |
 | 7 | **Verify the owner**: real sign-in, checked item by item. | Verified by the manager |
-| 8 | **Protect applications** (optional): checkboxes, one action. | At least one application verified protected (or skipped) |
-| 9 | **Finished**: links to manage everything in authentik. | |
+| 8 | **Protect applications** (optional): checkboxes, one action; afterwards the place to protect more or remove protection. The step list shows the count (e.g. *8/8 protected*). | Every protected application verified just now (or deliberately skipped while none is protected) |
+| 9 | **Finished**: protection summary, *Manage protection*, links to manage everything in authentik. | Every required step complete and step 8 complete or skipped, with no failing protection |
 
 Starting with A and adding Google later only adds steps 5-6 and a Google sign-in for the owner: local accounts, the
 `DTC owners` group, application rules and existing sessions are not touched. akadmin always keeps its password.
@@ -243,6 +251,13 @@ loaded by Traefik and ForwardAuth enforcement separately (sign-in verification f
 
 Each protected application shows its status, how many access rules authentik has (read only) and **Open in authentik**.
 
+**Remove protection…** (one application at a time) previews exactly what changes: the route drops the ForwardAuth
+middleware and the provider is unassigned from the embedded outpost. It also lists what stays: the container, the route
+and hostname, the authentik application with its provider, users, groups and access rules (protecting again reuses
+them), and Cloudflare Access (kept; change it on the Services page). When the application would be published without
+any sign-in, the preview says so and Remove needs an explicit *I understand that this application becomes publicly
+accessible*.
+
 Removing protection: Traefik first (the route stops asking authentik), then the outpost stops serving the provider. The
 authentik application, its provider and its access rules stay in authentik; protecting again reuses them. The preview
 says what remains in front of the application.
@@ -330,6 +345,7 @@ manifest (plain Linux containers). Debian, Arch and Unraid need a secret-store a
 | `tests\Test-IdentityLive.ps1` | Disposable instance + authentik installed through the catalog API: bootstrap, readiness, network isolation, adopt, token, sign-in route, outpost, Google source with **synthetic** credentials (redirect check, idempotency, secret never leaks), protect/unprotect, sign-ins through the real outpost (allowed, denied, wrong password, group), access evidence, loop detection, fail closed, interrupted setup, rollback, persistence, bootstrap-only-once, browser (screenshots). Removes everything it created and checks that no other container changed. |
 | `tests\Test-AuthRouting.ps1` | No Docker: browser versus internal addresses, sign-in redirects leaking 127.0.0.1, LAN or Docker-only addresses, the return address after signing in, redaction, the routing model's states for healthy and broken paths (missing or unhealthy authentication endpoint, broken router, missing network, tunnel to localhost, leftover Access), the ForwardAuth probe against a stub outpost, the public sign-in address guard, Access cleanup on turn-off (Cloudflare API mock). |
 | `tests\Test-RoutingBrowser.ps1` | No Docker: the Authentication & Routing page in headless Edge with models from the real model code: link and way back, application selection, both views, failed-stage details, help, Run checks, redaction, 1366 px and 390 px. |
+| `tests\Test-IdentityProtectBrowser.ps1` | No Docker: step 8 and 9 completion (8/8, green checks kept when revisiting), a failing check, a deliberate skip, protecting more applications and removing protection safely. |
 | `tests\Test-IdentityWizardBrowser.ps1` | No Docker, small footprint: the wizard in headless Edge with the authentik side of `/api/identity` answered in the page. Select all / Clear all / count, ticking without the page moving, already protected applications never selectable, exactly the ticked applications sent, review before apply, per-application result, 390 px. Real protection is covered by the live test. |
 | `node tests\ui-logic.test.js` | Browser-side helpers (state vocabulary, redirect URI, client ID, credential status, next step). |
 

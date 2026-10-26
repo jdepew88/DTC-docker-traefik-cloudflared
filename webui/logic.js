@@ -351,7 +351,7 @@
     const pub = String(a.publicUrl || '').replace(/\/+$/, '');
     const outpostOk = !!(outpost && pub && String(outpost.authentikHost || '').replace(/\/+$/, '') === pub);
     const owner = a.owner || {};
-    const protectedOk = (Array.isArray(data.apps) ? data.apps : []).filter((x) => x.protected && x.challenge && x.challenge.State === 'auth').length;
+    const protection = protectionSummary(data);
     const steps = [
       { id: 'mode', title: 'Choose how people sign in', done: !!mode && cfg.provider === 'authentik' },
       { id: 'authentik', title: 'Install or connect authentik', done: running && !!health.Ready && health.Setup === 'done' },
@@ -360,7 +360,10 @@
       google ? { id: 'google', title: 'Register with Google', done: !!(data.google && data.google.source) } : null,
       google ? { id: 'signin', title: 'Sign-in page', done: !!(a.loginPage && a.loginPage.appliedAt), optional: true } : null,
       { id: 'owner', title: google ? 'Verify the owner with Google' : 'Verify the owner', done: google ? !!(owner.verifiedAt && owner.subject) : !!owner.verifiedAt },
-      { id: 'apps', title: 'Protect applications', done: protectedOk > 0, optional: true },
+      // Complete only when every protected application was just verified (an anonymous request is sent to sign in);
+      // skipped only when nothing is protected and the user chose to skip. A count is shown either way.
+      { id: 'apps', title: 'Protect applications', done: protection.state === 'done', skipped: protection.state === 'skipped', optional: true, protection,
+        badge: protection.state === 'skipped' ? 'skipped' : protection.total ? `${protection.protected}/${protection.total} protected` : '' },
       { id: 'done', title: 'Finished', done: false, final: true },
     ].filter(Boolean);
     let blockedBy = null;
@@ -370,10 +373,45 @@
       s.blockedBy = blockedBy ? blockedBy.title : '';
       if (!s.done && !s.optional && !s.final && !blockedBy) blockedBy = s;
     });
+    // Finished: every required step complete (from what the server observed) and the optional ones complete or
+    // deliberately skipped, with no failing protection. Opening the summary page alone never completes it.
+    const last = steps[steps.length - 1];
+    const missing = steps.filter((s) => !s.final && !s.done && !(s.optional && (s.skipped || s.id !== 'apps')));
+    last.done = !missing.length && protection.state !== 'attention' && protection.state !== 'checking';
+    last.missing = missing.map((s) => s.title);
     const byId = Object.fromEntries(steps.map((s) => [s.id, s]));
     const saved = cfg.wizardStep && byId[cfg.wizardStep] && byId[cfg.wizardStep].available ? cfg.wizardStep : '';
-    const firstOpen = (steps.find((s) => s.available && !s.done && !s.final) || steps[steps.length - 1]).id;
-    return { steps, mode, current: saved || firstOpen, firstOpen };
+    const firstOpen = (steps.find((s) => s.available && !s.done && !s.skipped && !s.final) || last).id;
+    return { steps, mode, current: saved || firstOpen, firstOpen, protection, complete: last.done };
+  }
+
+  // Protection of one application from real evidence: the anonymous probe through Traefik (challenge) and whether the
+  // route file and Traefik carry the authentik ForwardAuth middleware. 'verified' = visitors are sent to sign in now.
+  function appProtectionState(app) {
+    if (!app) return 'none';
+    const ch = app.challenge;
+    const fa = app.forwardAuth || {};
+    if (app.enabled === false) return 'disabled';
+    if (app.authentik === false || fa.configured === false || fa.loaded === false) return 'failed';
+    if (ch && ch.State === 'auth') return 'verified';
+    if (ch && ch.State === 'misrouted') return 'misrouted';
+    if (ch) return 'failed';
+    return 'unchecked';
+  }
+  // How many applications are protected, and whether that is verified. total: applications that can be protected
+  // (the authentik sign-in page itself excluded).
+  function protectionSummary(d) {
+    const data = d || {};
+    const apps = Array.isArray(data.apps) ? data.apps : [];
+    const services = (Array.isArray(data.services) ? data.services : []).filter((s) => !s.isIdentity);
+    const states = apps.map((x) => ({ service: x.service, state: appProtectionState(x) }));
+    const count = (k) => states.filter((x) => x.state === k).length;
+    const failing = states.filter((x) => x.state === 'failed' || x.state === 'misrouted').map((x) => x.service);
+    const unchecked = count('unchecked');
+    const skippedAt = ((data.config || {}).protectSkippedAt) || '';
+    const state = !apps.length ? (skippedAt ? 'skipped' : 'open') : failing.length ? 'attention' : unchecked ? 'checking' : 'done';
+    return { total: Math.max(services.length, apps.length), protected: apps.length, verified: count('verified'), disabled: count('disabled'), unchecked, failing, skippedAt, state,
+      unprotected: Math.max(0, Math.max(services.length, apps.length) - apps.length) };
   }
   function wizardNeighbours(wiz, id) {
     const i = wiz.steps.findIndex((s) => s.id === id);
@@ -498,6 +536,7 @@
     ROUTING_STATES, routingState, routingEvidence, endpointAudience, endpointKind, ROUTING_HELP, routingHelp, journeyPath,
     DEPLOYMENT_STATES, deploymentState, statusTone, serviceGroups, terminationText, healthText, shortImage, roleSource, catalogInstallState, instanceTitle,
     IDENTITY_STATES, identityState, googleRedirectUri, isGoogleClientId, identityNextStep, identityWizard, wizardNeighbours, CREDENTIAL_STATUS, credentialStatus,
+    appProtectionState, protectionSummary,
     LEVELS, LEVEL_TITLES, DEFAULT_LEVEL, normalizeLevel, levelIndex, isVisibleAt,
     DIMENSIONS, COMPONENT_STATUS, componentStatus, firstBlocked, suggestAppName, displayNameFromLabel, choosePort, reachOptions,
     suggestLabel, suggestServiceName, autoName, autoNameFromSource, autoNameEdit, autoNameReset, isValidSubdomain, joinHostname, splitHostname,
