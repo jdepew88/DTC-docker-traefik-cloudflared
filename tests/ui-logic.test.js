@@ -398,5 +398,40 @@ test('routing: stage states never call configuration "verified"; every stage has
   assert.strictEqual(L.journeyPath('server').label, 'Server to server');
 });
 
+test('installed apps: lifecycle groups, termination and health wording', () => {
+  const lc = { services: [
+    { service: 'rocketchat', lifecycle: 'long-running', state: 'running', exitCode: null, health: 'healthy' },
+    { service: 'nats', lifecycle: 'long-running', state: 'running', exitCode: null, health: 'none' },
+    { service: 'mongodb-init', lifecycle: 'run-once', state: 'exited', exitCode: 0, expectedToExit: true, health: 'none' },
+    { service: 'tool', lifecycle: 'unknown', state: 'exited', exitCode: 0, expectedToExit: null, health: 'none' },
+  ] };
+  assert.deepStrictEqual(L.serviceGroups(lc).map((g) => `${g.id}:${g.items.length}`), ['long-running:2', 'run-once:1', 'unknown:1']);
+  assert.deepStrictEqual(L.serviceGroups({ services: [lc.services[0]] }).map((g) => g.id), ['long-running']);
+  assert.strictEqual(L.terminationText(lc.services[0]), 'Running');
+  assert.strictEqual(L.terminationText(lc.services[2]), 'Exit code 0 (expected)');
+  assert.strictEqual(L.terminationText(lc.services[3]), 'Exit code 0 (not known whether expected)');
+  assert.strictEqual(L.terminationText({ state: 'exited', exitCode: 137, expectedToExit: false }), 'Exit code 137 (not expected)');
+  assert.strictEqual(L.healthText(lc.services[1]), 'No health check');
+  assert.strictEqual(L.healthText(lc.services[0]), 'Health check: healthy');
+  assert.strictEqual(L.deploymentState('running').tone, 'ok');
+  assert.strictEqual(L.deploymentState('failed').tone, 'err');
+  assert.strictEqual(L.deploymentState('prepared').label, 'Prepared, not started');
+  assert.strictEqual(L.deploymentState('nope').tone, 'neutral');
+  assert.strictEqual(L.statusTone({ tone: 'warn' }), 'warn');
+  assert.strictEqual(L.statusTone({ tone: '<script>' }), 'neutral');
+  assert.strictEqual(L.roleSource('inferred'), 'inferred from its restart policy');
+});
+
+test('installed apps: images, catalog install state and instance titles', () => {
+  const d = 'a'.repeat(64);
+  assert.strictEqual(L.shortImage(`registry.rocket.chat/rocketchat/rocket.chat:8.9.0@sha256:${d}`), 'registry.rocket.chat/rocketchat/rocket.chat:8.9.0 @ sha256:aaaaaaaaaaaa…');
+  assert.strictEqual(L.shortImage('nats:2.11-alpine'), 'nats:2.11-alpine');
+  assert.deepStrictEqual(L.catalogInstallState({ instances: [] }), { installed: false, text: '' });
+  assert.strictEqual(L.catalogInstallState({ instances: [{ project: 'a' }] }).text, 'Installed');
+  assert.strictEqual(L.catalogInstallState({ instances: [{ project: 'a' }, { project: 'b' }] }).text, 'Installed: 2 instances');
+  assert.strictEqual(L.instanceTitle({ name: 'Rocket.Chat', label: 'Testing' }), 'Rocket.Chat (Testing)');
+  assert.strictEqual(L.instanceTitle({ name: 'Rocket.Chat', label: '' }), 'Rocket.Chat');
+});
+
 console.log(`\n${passed} passed, ${failures.length} failed`);
 process.exit(failures.length ? 1 : 0);

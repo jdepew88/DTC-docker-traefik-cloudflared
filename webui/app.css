@@ -660,3 +660,41 @@ ol.gsteps li { margin: .45rem 0; }
 .rt-help dd { margin: 0; }
 .rt-detail { margin-top: .4rem; }
 @media (max-width: 600px) { .rt-step { grid-template-columns: minmax(0, 1fr); } .rt-step-num { display: none; } .kv { grid-template-columns: minmax(0, 1fr); } }
+
+/* Installed apps: lifecycle status (long-running services vs. completed setup jobs) and service details */
+.dep-status { cursor: pointer; font: inherit; font-size: .85rem; display: inline-flex; align-items: center; gap: .35rem; max-width: 100%; text-align: left; }
+.dep-status span { overflow-wrap: anywhere; }
+.dep-status .icon:last-child { transition: transform .15s; }
+.dep-status[aria-expanded="true"] .icon:last-child { transform: rotate(90deg); }
+.dep-health { margin: .1rem 0 .5rem; color: var(--text-2); }
+.dep-health.ok { color: var(--ok); }
+.dep-details { border-top: 1px solid var(--border); margin-top: .6rem; padding-top: .4rem; }
+.dep-group { margin: .8rem 0; }
+.dep-group h3 { font-size: 1rem; margin: 0 0 .5rem; }
+.dep-services { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 21rem), 1fr)); gap: .7rem; }
+.dep-svc { border: 1px solid var(--border); border-left-width: 4px; border-radius: 10px; padding: .6rem .75rem; min-width: 0; background: var(--surface); }
+.dep-svc[data-status="healthy"], .dep-svc[data-status="completed"] { border-left-color: var(--ok); }
+.dep-svc[data-status="running-unverified"], .dep-svc[data-status="running"] { border-left-color: var(--border-strong); }
+.dep-svc[data-status="starting"], .dep-svc[data-status="missing"], .dep-svc[data-status="paused"] { border-left-color: var(--warn); }
+.dep-svc[data-status="unhealthy"], .dep-svc[data-status="job-failed"], .dep-svc[data-status="stopped-unexpectedly"], .dep-svc[data-status="exited-error"], .dep-svc[data-status="restarting"] { border-left-color: var(--err); }
+.dep-svc-head { display: flex; flex-wrap: wrap; align-items: center; gap: .4rem; margin-bottom: .2rem; }
+.dep-svc-head .grow { flex: 1; }
+.dep-svc .kv { grid-template-columns: minmax(7.5rem, max-content) minmax(0, 1fr); font-size: .85rem; }
+.dep-svc p { margin: .2rem 0; }
+.dep-table { width: 100%; border-collapse: collapse; font-size: .85rem; }
+.dep-table th, .dep-table td { text-align: left; padding: .3rem .5rem; border-bottom: 1px solid var(--border); overflow-wrap: anywhere; }
+.dep-table tr.mine td:first-child { font-weight: 600; }
+.dep-net summary .chip { margin-left: .25rem; }
+.inst-existing h2 { font-size: 1.05rem; margin: 0 0 .3rem; }
+.dep-existing-list { list-style: none; margin: .5rem 0; padding: 0; }
+.dep-existing { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: flex-start; gap: .5rem; border-top: 1px solid var(--border); padding: .5rem 0; }
+.dep-existing p { margin: .15rem 0; }
+.cat-variants ul { margin: .3rem 0; padding-left: 1.1rem; }
+@media (max-width: 640px) {
+  .dep-card .card-head .grow { display: none; }
+  .dep-status { width: 100%; justify-content: space-between; }
+  .dep-svc .kv { grid-template-columns: 1fr; gap: 0 1rem; }
+  .dep-svc .kv dt { margin-top: .3rem; }
+}
+/* An open app spans the whole row so its service and network tables have room. */
+.disc-list .dep-card.open { grid-column: 1 / -1; }

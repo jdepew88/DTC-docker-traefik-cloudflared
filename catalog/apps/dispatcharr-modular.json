@@ -1,7 +1,13 @@
 {
   "schema": 1,
+  "manifestVersion": "2026.10.25",
   "id": "dispatcharr-modular",
   "name": "Dispatcharr (modular)",
+  "variantOf": "dispatcharr",
+  "variant": {
+    "label": "Modular",
+    "reason": "Separate web, worker, PostgreSQL and Valkey containers (the official modular compose) instead of the all-in-one image. For larger installations."
+  },
   "category": "media",
   "group": "C",
   "description": "Advanced: Dispatcharr with separate web and worker containers, PostgreSQL 17 and a Valkey cache, following the official modular compose.",
@@ -27,6 +33,8 @@
   "services": {
     "web": {
       "image": "ghcr.io/dispatcharr/dispatcharr:0.32.0@sha256:b7d695c5cc98b9abd64c74a94539c1ebffc23d965021613c820c67e25dea41a3",
+      "role": "app",
+      "label": "Dispatcharr web",
       "ports": [
         {
           "container": 9191,
@@ -71,6 +79,8 @@
     },
     "celery": {
       "image": "ghcr.io/dispatcharr/dispatcharr:0.32.0@sha256:b7d695c5cc98b9abd64c74a94539c1ebffc23d965021613c820c67e25dea41a3",
+      "role": "worker",
+      "label": "Celery worker",
       "entrypoint": [
         "/app/docker/entrypoint.celery.sh"
       ],
@@ -116,6 +126,8 @@
     },
     "db": {
       "image": "postgres:17@sha256:b8faeff7712663c2773a190181e1246e37e364b887611c04658c28b44e2408fe",
+      "role": "database",
+      "label": "PostgreSQL",
       "stateful": true,
       "environment": {
         "POSTGRES_DB": "dispatcharr",
@@ -146,6 +158,8 @@
     },
     "redis": {
       "image": "valkey/valkey:9.1.2-alpine@sha256:48332870af354a799964c0012ae1194a0bf2bf894eb508f945810596dc2d8d11",
+      "role": "cache",
+      "label": "Valkey",
       "command": [
         "valkey-server",
         "--timeout",

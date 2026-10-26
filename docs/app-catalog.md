@@ -28,24 +28,96 @@ registry metadata on 2026-10-21. RAM figures are the manager's planning estimate
 | --- | --- | --- | --- | --- | --- |
 | A | Traefik Manager | `ghcr.io/chr0nzz/traefik-manager:1.15.4` | :5000 | the existing Traefik API (read-only) | No Docker socket; its routes stay in its own `config/routes` until an ownership plan is approved; admin password set via its own `flask reset-password` |
 | A | Uptime Kuma | `louislam/uptime-kuma:2.5.6` | :3001 | | SQLite in a volume; create the admin on first visit |
-| A | Portainer CE | `portainer/portainer-ce:2.45.2` (LTS) | https :9443 | Docker socket | Admin created right after start (setup token from its log); never public |
+| A | Portainer CE | `portainer/portainer-ce:2.45.2` (LTS) | https :9443 | Docker socket | Alternative to Arcane (one of the two is enough); admin created right after start (setup token from its log); never public |
 | A | Homepage | `ghcr.io/gethomepage/homepage:v2.6.0` | :3010 | | First `services.yaml` lists installed apps (links + HTTP status); `scripts\Update-HomepageConfig.ps1` refreshes it (see below); no Docker socket |
-| A | Arcane | `getarcaneapp/manager:v2.16.1` | :3552 | Docker socket | Never public |
+| A | Arcane | `getarcaneapp/manager:v2.16.1` | :3552 | Docker socket | Recommended optional Docker and Compose management (not needed by the manager); never public |
 | A | HTTP echo | `traefik/whoami:v1.12.0` | :18080 | | For testing routes, tunnel and Access |
 | B | authentik | `ghcr.io/goauthentik/server:2026.8.5` (server + worker) | :9000 | PostgreSQL 16 (`postgres:16-alpine`) | No Redis (removed in 2025.10); initial setup at `/if/flow/initial-setup/`; LDAP not required |
 | B | Authelia | `authelia/authelia:4.39.28` | :9091 | | File-backed users (argon2 hash computed by Authelia), secrets as files; needs a real domain and HTTPS; protects apps only once a forwardAuth middleware is added |
 | B | LLDAP | `lldap/lldap:v0.6.3` | :17170 (LDAP 3890 internal only) | | Not on the shared network (`web.proxy: false`): a private network of its own, local only; OpenLDAP itself is listed only (see below) |
 | C | Jellyfin | `jellyfin/jellyfin:12.2.20261005-225228` | :8096 | | Up to three read-only library folders; optional NVIDIA GPU (experimental on Docker Desktop); local only by default |
 | C | Dispatcharr | `ghcr.io/dispatcharr/dispatcharr:0.32.0` (all-in-one) | :9191 | embedded PostgreSQL/Redis | Tuners added by URL (no SSDP through Docker Desktop) |
-| C | Dispatcharr (modular) | same image, web + celery | :9192 | `postgres:17`, Valkey 9.1 | Advanced option of the official modular compose |
+| C | Dispatcharr: modular variant | same image, web + celery | :9192 | `postgres:17`, Valkey 9.1 | Listed under Dispatcharr (`variantOf`), not as a separate app |
 | C | Channels DVR | `fancybits/channels-dvr:latest` (digest) | :8089 | | Limited on Docker Desktop (no Bonjour, no `/dev/dri`, tuners by IP); subscription; native Windows server recommended |
 | D | Immich | `ghcr.io/immich-app/immich-server:v3.3.5` + machine learning (optional) | :2283 | `immich-db` (`ghcr.io/immich-app/postgres:14-vectorchord0.4.3-pgvectors0.2.0`), `immich-redis` (Valkey 9) | 6-8 GB RAM recommended; database must be a Docker volume on Windows; library in a volume or a chosen folder |
-| D | Rocket.Chat | `registry.rocket.chat/rocketchat/rocket.chat:8.9.0` | :3100 | MongoDB 8.2 (official `mongodb-community-server`, replica set), NATS 2.11 | Monitoring stack of the official compose left out; MongoDB never published |
-| E | What's Up Docker | `getwud/wud:9.5.0` | :3200 | read-only Docker socket proxy (`tecnativa/docker-socket-proxy:v0.5.0`) | Notification only (no update trigger) |
+| D | Rocket.Chat (id `rocketchat`, alias `rocket-chat`) | `registry.rocket.chat/rocketchat/rocket.chat:8.9.0` | :3100 | MongoDB 8.2 (official `mongodb-community-server`, replica set), NATS 2.11; two setup jobs (MongoDB permissions, replica-set initialization) | Monitoring stack of the official compose left out; MongoDB never published |
+| E | What's Up Docker | `getwud/wud:9.5.0` | :3200 | read-only Docker socket proxy (`tecnativa/docker-socket-proxy:v0.5.0`) | Notification only: no update trigger, and the proxy refuses POST/DELETE |
 | - | OpenLDAP | listed | | | osixia 1.5.0 is from 2021, v2 is beta; free Bitnami images are gone |
-| - | PostgreSQL, Redis/Valkey | listed | | | Bundled inside the apps that need them; never shared or published |
-| E | Diun | listed | | | Headless; What's Up Docker preferred |
-| E | Watchtower | listed, deprecated | | | Archived (2025-12), fails on current Docker; unattended updates are disabled |
+| - | PostgreSQL, Redis/Valkey | building blocks (`availability: reference`) | | | Bundled inside the apps that need them; never shared or published; never identify an installation |
+| E | Diun | no longer offered (`availability: retired`, 2026-10-25) | | | Overlaps with What's Up Docker; existing Diun containers are still recognized |
+| E | Watchtower | no longer offered (`availability: retired`, 2026-10-25) | | | Archived (2025-12), fails on current Docker; unattended updates are not recommended; existing containers are still recognized |
+
+## Applications, variants and installed instances
+
+An **application** (e.g. Rocket.Chat) has one canonical id (`rocketchat`) that is not its display name, Compose project
+name, folder, container name or hostname. `aliases` lists earlier ids and other spellings (`rocket-chat`); ids,
+aliases and names are compared ignoring case, dashes and dots, so `Rocket.Chat`, `rocket-chat` and `rocketchat` are
+the same application, and two manifests may not claim the same one. A **variant** (`variantOf`, `variant.label`,
+`variant.reason`), e.g. Dispatcharr's modular compose, installs the same application in another topology and is shown
+under it, not as another product. `choiceGroup` marks alternatives (Arcane, recommended, or Portainer: one is enough).
+`availability` is `offered` (default), `reference` (building blocks such as PostgreSQL) or `retired` (Diun,
+Watchtower: never offered again, kept so existing installations are still recognized).
+
+An **installed instance** is one deployment of an application: `config\apps.json` records its `instanceId`, the manifest
+(`appId`, resolved through aliases), the Compose project, folder, optional `label` (e.g. Production, Testing), `origin`
+(`installed` by the manager, or `adopted`), `archived`, and the fingerprint of the generated `compose.yaml`. Records
+written before instance ids get a stable id (`legacy-<project>`); nothing is rewritten.
+
+- **Duplicate detection.** Before an installation, the plan lists existing installations of the same application:
+  registered instances (any alias or variant), archived records, and unregistered Compose projects recognized by the
+  manager's `org.traefik-proxy.app` label or by the image of the application's own web service. Dependency images never
+  count (a PostgreSQL or MongoDB container inside another app identifies nothing; nor does a proxy deployment's test
+  backend). The plan is blocked until you manage, adopt or archive the existing one, or explicitly choose
+  **Install another, separate instance** (with its own project, folder, volumes, port and optional label).
+- **Archive record** hides an obsolete record (only when none of its containers runs). Nothing else changes: folder,
+  containers, volumes, routes, Cloudflare and authentik stay; *Restore* brings the record back.
+- **Adopt** registers a recognized, unregistered Compose project after a review. Nothing in it changes; the manager
+  never deletes an adopted project's data or files.
+- **Remove** first shows an inventory: containers, data volumes (volumes also used by other containers are never
+  deleted), networks (the shared proxy network and networks of other projects are kept), generated files, and the
+  Cloudflare and authentik references it leaves unchanged. Deleting data needs the project name typed again.
+
+## Service lifecycle (status of a Compose application)
+
+A Compose application may run long-running services (application, database, cache, message bus, workers) and
+one-time jobs (permissions, database initialization, migrations) that exit when done. The Installed apps page counts
+them separately, e.g. Rocket.Chat: **3/3 running · 2 setup jobs completed** (not "running 3/5"). The role of each
+service comes from, in order: the manifest (`role`: `app`, `database`, `cache`, `messaging`, `worker`, `support`,
+`proxy`, `init`, `migration`, `maintenance`; optional `lifecycle`, `label`, `purpose`); another service waiting for it
+with `depends_on: service_completed_successfully`; a restart policy that keeps it running (`always`,
+`unless-stopped`); a health check; another service waiting for it to start or be healthy; the restart policy
+`on-failure` (marked as inferred). Otherwise the role is unknown and an exit code 0 is reported neutrally, never as a
+completed job.
+
+| Status | Meaning |
+| --- | --- |
+| Running, healthy | Its health check passes |
+| Running; no health check | The container runs; readiness is not verified (e.g. NATS) |
+| Completed successfully | A one-time job exited with code 0 |
+| Failed | A one-time job exited with an error: the app's status becomes a problem |
+| Stopped unexpectedly | A long-running service exited while the app should run |
+| Stopped | The whole app was stopped |
+| Prepared, not started / No container | Nothing created yet, or removed |
+| Optional, not enabled | An optional service this installation left out |
+| Exited (code 0); role unknown | Nothing says whether it should keep running |
+
+The status opens the details: every service with its role (and where that comes from), image (tag and digest), state,
+health check, exit code and whether exiting was expected, dependencies in both directions and its logs; the networks
+it is on with the other containers there and their DNS names; published ports; data volumes; hostnames, Cloudflare
+and authentik references. No environment values or commands are read. **Tidy up completed setup containers** removes,
+after a preview and a confirmation, only containers of jobs whose role is declared (manifest or Compose) and that
+exited with code 0; the Compose definitions, volumes and data stay, nothing else is stopped or recreated, and Compose
+creates the jobs again the next time the app starts.
+
+## DTC Manifests (foundation for community and generated manifests)
+
+A **DTC Manifest** (`catalog\apps\<id>.json`) describes an application deployment: identity (`id`, `aliases`,
+`manifestVersion`, publisher/`maintainer`, `source`), platforms, images, supporting services and their roles, storage,
+inputs and generated secrets, health checks, networking, the web port, exposure (Traefik, Cloudflare, authentik) and
+update notes. The Docker services themselves are generated as an ordinary `compose.yaml`; the manifest does not replace
+Compose. `source.type` is `curated`, `community` or `generated`; all three pass through the same validation
+(`Test-AppManifest`) and the same plan, preview and confirmation. In this version only curated manifests are
+installable; there is no public registry, voting, moderation or AI builder yet.
 
 ## Installation groups and resources
 
@@ -63,7 +135,10 @@ checks memory again, downloads the pinned images and runs the app's first-start 
   consistent copy), saves `compose.yaml.bak-<time>`, changes only image lines, and recreates the containers.
 - Database services never change major version through this path; their upgrades follow the application's own
   documented procedure.
-- Watchtower is not offered; What's Up Docker (or Diun) provide notifications; nothing updates unattended.
+- Watchtower and Diun are no longer offered; What's Up Docker provides notifications; nothing updates unattended.
+- An update preview says when `compose.yaml` was changed outside the manager (Arcane, Portainer, an editor) since it
+  was written here (`composeSha256` in `config\apps.json`); the update then needs an explicit confirmation and changes
+  only the image lines, keeping those edits.
 
 ## Backups, removal and data
 
@@ -120,7 +195,8 @@ How the files are written:
 | `id`, `name`, `description`, `category`, `group`, `maintainer`, `license`, `source`, `docs` | Identity; `docs` are https links |
 | `platforms` | `windows-docker-desktop`, `linux-docker`, `unraid`, `podman`: `supported`, `limited`, `untested` or `unsupported` |
 | `installable`, `installNote`, `deprecated`, `deprecationNote`, `alternatives` | Listed-only entries explain why |
-| `services.<name>` | `image` (`name:tag@sha256:...`), `ports` (one `primary`), `volumes` (`volume` [optionally replaced by a chosen folder], `folder`, `project` [relative folder], `tmpfs`; `readOnly`, `backup`), `environment`, `command`, `entrypoint`, `user`, `dependsOn`, `healthcheck`, `shmSize`, `stateful`, `when` (boolean input), `proxy`, `dockerSocket`, `dockerSocketReadOnly`, `networkMode: host`, `devices`, `gpus` (true or a boolean input), `privileged`, `resources` |
+| `manifestVersion`, `aliases`, `variantOf` + `variant`, `choiceGroup`, `availability` + `retired` | Identity, variants, alternatives and whether new installations may use it (see above) |
+| `services.<name>` | `image` (`name:tag@sha256:...`), `role`, `lifecycle`, `label`, `purpose`, `ports` (one `primary`), `volumes` (`volume` [optionally replaced by a chosen folder], `folder`, `project` [relative folder], `tmpfs`; `readOnly`, `backup`), `environment`, `command`, `entrypoint`, `user`, `dependsOn`, `healthcheck`, `shmSize`, `stateful`, `when` (boolean input), `proxy`, `dockerSocket`, `dockerSocketReadOnly`, `networkMode: host`, `devices`, `gpus` (true or a boolean input), `privileged`, `resources` |
 | `inputs` | `text`, `secret`, `generated` (random hex), `password` (sign-in password, generated if empty, saved to credentials.txt), `folder`, `timezone`, `boolean`, `derived` (`authelia-argon2`) |
 | Templates | `{{input:<id>}}`, `{{service:<name>}}`, `{{project}}`, `{{appUrl}}`, `{{timezone}}`, `{{webPort}}`, `{{localPort}}`, `{{traefikContainer}}`, `{{proxyNetwork}}`, `{{domains}}`; in files also `{{installedApps}}` |
 | `files` | Created once in the project folder (`secret: true` = restricted ACL) |
@@ -128,6 +204,8 @@ How the files are written:
 | `privileges` | `docker-socket`, `host-network`, `device`, `gpu`, `privileged`, with an explanation the user confirms |
 | `web` (`service`, `localPort`, `status`, `proxy`: false keeps the app off the shared network), `exposure` (`default`, `allowPublic`, `warning`), `resources`, `security`, `update` | |
 
+`tests\Test-AppLifecycle.ps1` covers identity, lifecycle, instances, duplicates, archiving, removal inventories and a
+small disposable Compose project; `tests\Test-AppsBrowser.ps1` the catalog and Installed apps pages in headless Edge.
 `tests\Test-Catalog.ps1` validates every manifest, generates every installable project and runs
 `docker compose config` on it, and exercises the lifecycle with fixture apps on a disposable instance.
 

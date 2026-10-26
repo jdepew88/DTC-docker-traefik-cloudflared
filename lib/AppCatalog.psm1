@@ -17,6 +17,17 @@ $script:Categories = @('monitoring', 'media', 'management', 'authentication', 'n
 $script:RelPathPattern = '^(?!.*\.\.)[A-Za-z0-9][A-Za-z0-9_.-]*(/[A-Za-z0-9_.-]+)*$'
 # Values computed at installation time from another input (see Resolve-DerivedValue in webui.ps1).
 $script:DerivedMethods = @('authelia-argon2')
+# Whether a manifest is offered for new installations: 'offered' (default), 'reference' (listed for information, e.g.
+# building blocks bundled inside other apps) or 'retired' (no longer offered; kept so existing installations are still
+# recognized).
+$script:Availability = @('offered', 'reference', 'retired')
+# Where a manifest comes from. Only curated manifests are installable in this version; community and generated
+# manifests will pass through the same validation before they can be.
+$script:SourceTypes = @('curated', 'community', 'generated')
+# Service roles in a multi-container app, and the lifecycle each implies unless the manifest says otherwise.
+$script:ServiceRoles = [ordered]@{ app = 'long-running'; database = 'long-running'; cache = 'long-running'; messaging = 'long-running'; worker = 'long-running'
+  support = 'long-running'; proxy = 'long-running'; init = 'run-once'; migration = 'run-once'; maintenance = 'run-once' }
+$script:Lifecycles = @('long-running', 'run-once')
 
 function Get-Prop($Object, [string]$Name, $Default = $null) {
   if ($null -eq $Object) { return $Default }
@@ -45,7 +56,22 @@ function Test-AppManifest($M) {
   $platforms = Get-Prop $M 'platforms' $null
   if (-not $platforms) { & $add 'platforms is required' }
   else { foreach ($p in $platforms.PSObject.Properties) { if ($script:Platforms -notcontains $p.Name) { & $add "unknown platform '$($p.Name)'" } elseif ($p.Value -notin 'supported', 'untested', 'limited', 'unsupported') { & $add "platform '$($p.Name)' must be supported, limited, untested or unsupported" } } }
-  if (-not [bool](Get-Prop $M 'installable' $false)) { if (-not [string](Get-Prop $M 'installNote' '')) { & $add 'a manifest that is not installable needs installNote' }; return $e.ToArray() }
+  # Identity: the canonical id, earlier ids and other spellings (aliases), and variants grouped under one application.
+  if ((Get-Prop $M 'manifestVersion' '') -and [string]$M.manifestVersion -notmatch '^[0-9A-Za-z][0-9A-Za-z.+-]{0,31}$') { & $add 'manifestVersion is invalid' }
+  foreach ($a in @(Get-Prop $M 'aliases' @())) { if ([string]$a -notmatch $script:IdPattern -or [string]$a -eq $id) { & $add "alias '$a' is invalid" } }
+  $variantOf = [string](Get-Prop $M 'variantOf' '')
+  if ($variantOf -and ($variantOf -notmatch $script:IdPattern -or $variantOf -eq $id)) { & $add 'variantOf must name another application' }
+  if ($variantOf -and -not [string](Get-Prop (Get-Prop $M 'variant' $null) 'label' '')) { & $add 'a variant needs variant.label' }
+  $cg = Get-Prop $M 'choiceGroup' $null
+  if ($cg -and [string](Get-Prop $cg 'id' '') -notmatch $script:IdPattern) { & $add 'choiceGroup.id is invalid' }
+  $availability = [string](Get-Prop $M 'availability' 'offered')
+  if ($script:Availability -notcontains $availability) { & $add "availability must be one of $($script:Availability -join ', ')" }
+  if ($availability -ne 'offered' -and [bool](Get-Prop $M 'installable' $false)) { & $add "a $availability manifest cannot be installable" }
+  if ($availability -eq 'retired' -and -not [string](Get-Prop (Get-Prop $M 'retired' $null) 'note' '')) { & $add 'a retired manifest needs retired.note' }
+  $sourceType = [string](Get-Prop (Get-Prop $M 'source' $null) 'type' 'curated')
+  if ($script:SourceTypes -notcontains $sourceType) { & $add "source.type must be one of $($script:SourceTypes -join ', ')" }
+  elseif ($sourceType -ne 'curated' -and [bool](Get-Prop $M 'installable' $false)) { & $add 'only curated manifests are installable in this version' }
+  if (-not [bool](Get-Prop $M 'installable' $false)) { if (-not [string](Get-Prop $M 'installNote' '') -and $availability -ne 'retired') { & $add 'a manifest that is not installable needs installNote' }; return $e.ToArray() }
   $services = Get-Prop $M 'services' $null
   if (-not $services -or -not @($services.PSObject.Properties).Count) { & $add 'services is required'; return $e.ToArray() }
   $serviceNames = @($services.PSObject.Properties | ForEach-Object { $_.Name })
@@ -73,6 +99,9 @@ function Test-AppManifest($M) {
     $s = $sp.Value; $where = "service '$($sp.Name)'"
     if ($sp.Name -notmatch $script:IdPattern) { & $add "service name '$($sp.Name)' is invalid" }
     if ([string](Get-Prop $s 'image' '') -notmatch $script:ImagePattern) { & $add "${where}: image must be pinned by digest (name:tag@sha256:...)" }
+    if ((Get-Prop $s 'role' '') -and -not $script:ServiceRoles.Contains([string]$s.role)) { & $add "${where}: role must be one of $(@($script:ServiceRoles.Keys) -join ', ')" }
+    if ((Get-Prop $s 'lifecycle' '') -and $script:Lifecycles -notcontains [string]$s.lifecycle) { & $add "${where}: lifecycle must be long-running or run-once" }
+    if ($sp.Name -eq [string](Get-Prop (Get-Prop $M 'web' $null) 'service' '') -and (Get-ServiceDeclaredLifecycle $s).lifecycle -eq 'run-once') { & $add "${where}: the web service cannot be a run-once job" }
     $when = [string](Get-Prop $s 'when' '')
     if ($when -and -not @($inputs | Where-Object { $_.id -eq $when -and $_.type -eq 'boolean' }).Count) { & $add "${where}: when must name a boolean input" }
     foreach ($p in @(Get-Prop $s 'ports' @())) {
@@ -135,20 +164,78 @@ function Get-CatalogApps {
   param([Parameter(Mandatory = $true)][string]$CatalogDir)
   $dir = Join-Path $CatalogDir 'apps'
   if (-not (Test-Path -LiteralPath $dir)) { return @() }
-  return @(Get-ChildItem -LiteralPath $dir -Filter '*.json' -File | Sort-Object Name | ForEach-Object {
+  $list = @(Get-ChildItem -LiteralPath $dir -Filter '*.json' -File | Sort-Object Name | ForEach-Object {
       $file = $_; $m = $null
       try { $m = [IO.File]::ReadAllText($file.FullName) | ConvertFrom-Json } catch { [pscustomobject]@{ id = $file.BaseName; errors = @("invalid JSON: $($_.Exception.Message)"); manifest = $null; file = $file.Name }; return }
       $errs = @(Test-AppManifest $m)
       if ([string]$m.id -ne $file.BaseName) { $errs += "the file name must be <id>.json" }
       [pscustomobject]@{ id = [string]$m.id; errors = $errs; manifest = $m; file = $file.Name }
     })
+  # Across manifests: every id and alias names exactly one application (also ignoring case, dashes and dots), and a
+  # variant belongs to an application that is not itself a variant.
+  $owner = @{}
+  foreach ($a in $list) {
+    if (-not $a.manifest) { continue }
+    foreach ($ref in @(@($a.id) + @(Get-Prop $a.manifest 'aliases' @()))) {
+      $k = Get-AppIdentityKey $ref
+      if (-not $k) { continue }
+      if ($owner.ContainsKey($k) -and $owner[$k] -ne $a.id) { $a.errors = @($a.errors) + "'$ref' already names catalog app '$($owner[$k])'" } else { $owner[$k] = $a.id }
+    }
+  }
+  foreach ($a in $list) {
+    $v = [string](Get-Prop $a.manifest 'variantOf' '')
+    if (-not $v) { continue }
+    $base = @($list | Where-Object { $_.id -eq $v -and $_.manifest })
+    if (-not $base.Count) { $a.errors = @($a.errors) + "variantOf names no catalog app ('$v')" }
+    elseif (Get-Prop $base[0].manifest 'variantOf' '') { $a.errors = @($a.errors) + "variantOf must name an application, not another variant ('$v')" }
+  }
+  return $list
+}
+
+# Pure: the comparison key of an application reference: lowercase letters and digits only, so 'Rocket.Chat',
+# 'rocket-chat' and 'rocketchat' are the same application.
+function Get-AppIdentityKey([string]$Reference) { return ($Reference.ToLowerInvariant() -replace '[^a-z0-9]', '') }
+
+# Pure: the catalog entry an id, alias or spelling refers to (exact id first, then aliases, then the identity key of
+# ids, aliases and display names). $null when nothing matches.
+function Resolve-CatalogEntry($Apps, [string]$Reference) {
+  if (-not $Reference) { return $null }
+  $valid = @($Apps | Where-Object { $_.manifest })
+  $hit = @($valid | Where-Object { $_.id -eq $Reference })
+  if (-not $hit.Count) { $hit = @($valid | Where-Object { @(Get-Prop $_.manifest 'aliases' @()) -contains $Reference }) }
+  if (-not $hit.Count) {
+    $k = Get-AppIdentityKey $Reference
+    if ($k) { $hit = @($valid | Where-Object { $e = $_; @(@($e.id) + @(Get-Prop $e.manifest 'aliases' @()) + @([string](Get-Prop $e.manifest 'name' ''))) | Where-Object { (Get-AppIdentityKey $_) -eq $k } }) }
+  }
+  if ($hit.Count) { return $hit[0] }
+  return $null
+}
+
+# Pure: the application a manifest installs. A variant (e.g. Dispatcharr's modular compose) installs the same
+# application as its base manifest, so both count as one application for grouping and duplicate detection.
+function Get-ApplicationId($Manifest) {
+  $v = [string](Get-Prop $Manifest 'variantOf' '')
+  if ($v) { return $v }
+  return [string](Get-Prop $Manifest 'id' '')
+}
+
+# Pure: whether new installations may use this manifest ('offered'), or it is listed for reference or retired.
+function Get-ManifestAvailability($Manifest) { return [string](Get-Prop $Manifest 'availability' 'offered') }
+
+# Pure: the role and lifecycle a manifest declares for one of its services (role defaults to none; lifecycle follows
+# the role unless set). Source 'manifest' when anything is declared.
+function Get-ServiceDeclaredLifecycle($Service) {
+  $role = [string](Get-Prop $Service 'role' '')
+  $life = [string](Get-Prop $Service 'lifecycle' '')
+  if (-not $life -and $role -and $script:ServiceRoles.Contains($role)) { $life = $script:ServiceRoles[$role] }
+  return [ordered]@{ role = $role; lifecycle = $life; label = [string](Get-Prop $Service 'label' ''); purpose = [string](Get-Prop $Service 'purpose' ''); declared = [bool]($role -or $life) }
 }
 
 function Get-CatalogApp([string]$CatalogDir, [string]$Id) {
-  $a = @(Get-CatalogApps -CatalogDir $CatalogDir | Where-Object { $_.id -eq $Id })
-  if (-not $a.Count) { throw "No catalog app '$Id'." }
-  if (@($a[0].errors).Count) { throw "Catalog app '$Id' is invalid: $(@($a[0].errors) -join '; ')" }
-  return $a[0].manifest
+  $a = Resolve-CatalogEntry (Get-CatalogApps -CatalogDir $CatalogDir) $Id
+  if (-not $a) { throw "No catalog app '$Id'." }
+  if (@($a.errors).Count) { throw "Catalog app '$($a.id)' is invalid: $(@($a.errors) -join '; ')" }
+  return $a.manifest
 }
 
 # Platform support for the current host (this build: Windows with Docker Desktop).
@@ -473,5 +560,6 @@ function ConvertTo-AppCompose {
 }
 
 Export-ModuleMember -Function Test-AppManifest, Get-AppContainerName, Get-ActiveServices, New-PasswordValue, Get-AppFiles, Get-CatalogApps, Get-CatalogApp, Get-PlatformSupport, New-SecretValue, Resolve-TemplateValue, Resolve-AppValues,
+  Get-AppIdentityKey, Resolve-CatalogEntry, Get-ApplicationId, Get-ManifestAvailability, Get-ServiceDeclaredLifecycle,
   ConvertTo-HostFolder, ConvertTo-EnvFileText, ConvertTo-AppCompose, New-AppReadme, Hide-SecretValues, Read-AppEnv, Get-AppsRegistryPath, Read-AppsRegistry,
   Save-AppsRegistry, Get-ComposeServiceImages, Get-AppUpdateDiff

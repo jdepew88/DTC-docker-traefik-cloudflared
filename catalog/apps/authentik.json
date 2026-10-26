@@ -1,5 +1,6 @@
 {
   "schema": 1,
+  "manifestVersion": "2026.10.25",
   "id": "authentik",
   "name": "authentik",
   "category": "authentication",
@@ -43,6 +44,8 @@
   "services": {
     "server": {
       "image": "ghcr.io/goauthentik/server:2026.8.5@sha256:602227a86455d6772e3d16b7d852713c4f864f40df5df894abd1285bb53979a5",
+      "role": "app",
+      "label": "authentik server",
       "command": [
         "server"
       ],
@@ -97,6 +100,8 @@
     },
     "worker": {
       "image": "ghcr.io/goauthentik/server:2026.8.5@sha256:602227a86455d6772e3d16b7d852713c4f864f40df5df894abd1285bb53979a5",
+      "role": "worker",
+      "label": "authentik worker",
       "command": [
         "worker"
       ],
@@ -145,6 +150,8 @@
     },
     "postgresql": {
       "image": "postgres:16-alpine@sha256:deb28ee471183cb0c303113dac9b2433c51eeeeb678def7af9a9ec5820367815",
+      "role": "database",
+      "label": "PostgreSQL",
       "stateful": true,
       "environment": {
         "POSTGRES_DB": "authentik",

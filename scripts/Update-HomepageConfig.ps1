@@ -27,9 +27,13 @@ $ErrorActionPreference = 'Stop'
 $toolRoot = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
 if (-not $ProjectPath) { $ProjectPath = $toolRoot }
 $ProjectPath = [IO.Path]::GetFullPath($ProjectPath)
-Import-Module (Join-Path $toolRoot 'lib\TraefikProxy.psm1'), (Join-Path $toolRoot 'lib\AppCatalog.psm1'), (Join-Path $toolRoot 'lib\HomepageConfig.psm1') -Force
+Import-Module (Join-Path $toolRoot 'lib\TraefikProxy.psm1'), (Join-Path $toolRoot 'lib\AppCatalog.psm1'), (Join-Path $toolRoot 'lib\ComposeLifecycle.psm1'), (Join-Path $toolRoot 'lib\HomepageConfig.psm1') -Force
 $s = Get-StackSettings -InstallPath $ProjectPath
-$apps = @(Read-AppsRegistry $s)
+# Archived records are hidden; two installations of the same app get their label or project in the card name.
+$apps = @(Read-AppsRegistry $s | Where-Object { -not ($_.PSObject.Properties['archived'] -and $_.archived) } | ForEach-Object { $_.PSObject.Copy() })
+foreach ($a in $apps) {
+  if (@($apps | Where-Object { $_.name -eq $a.name }).Count -gt 1) { $a.name = "$($a.name) ($(if ($a.PSObject.Properties['label'] -and $a.label) { $a.label } else { $a.project }))" }
+}
 if (-not $HomepageFolder) {
   $hp = @($apps | Where-Object { $_.appId -eq 'homepage' })
   if (-not $hp.Count) { throw "Homepage is not installed by this manager ($ProjectPath\config\apps.json). Pass -HomepageFolder." }
@@ -38,18 +42,23 @@ if (-not $HomepageFolder) {
 $cfg = Join-Path $HomepageFolder 'config'
 if (-not (Test-Path -LiteralPath (Join-Path $cfg 'services.yaml'))) { throw "No Homepage configuration in $cfg." }
 
-# Container states of the manager's projects (running / total).
-$states = @{}
-# (Labels are parsed from the list: Windows PowerShell drops the quotes a {{.Label "..."}} template would need.)
-foreach ($line in @(docker ps -a --filter 'label=org.traefik-proxy.project' --format '{{.State}}|{{.Labels}}')) {
-  if ($line -notmatch '^(\w+)\|.*(?:^|,|\|)org\.traefik-proxy\.project=([^,]+)') { continue }
-  $st = $Matches[1]; $p = $Matches[2]
-  if (-not $states.ContainsKey($p)) { $states[$p] = @{ running = 0; total = 0 } }
-  $states[$p].total++
-  if ($st -eq 'running') { $states[$p].running++ }
-}
 $manifests = @{}
-foreach ($c in @(Get-CatalogApps -CatalogDir (Join-Path $toolRoot 'catalog') | Where-Object { -not @($_.errors).Count })) { $manifests[$c.id] = $c.manifest }
+foreach ($c in @(Get-CatalogApps -CatalogDir (Join-Path $toolRoot 'catalog') | Where-Object { -not @($_.errors).Count })) {
+  $manifests[$c.id] = $c.manifest
+  foreach ($al in @(if ($c.manifest.PSObject.Properties['aliases']) { $c.manifest.aliases })) { $manifests[[string]$al] = $c.manifest }
+}
+# States of the manager's projects: running / total long-running services. One-time setup jobs that completed (e.g.
+# Rocket.Chat's MongoDB initialization) are not counted as stopped containers.
+$states = @{}
+$ids = @((Invoke-Docker ps -a -q --filter 'label=com.docker.compose.project').Output | Where-Object { "$_" -match '^[0-9a-f]{12,64}$' })
+$facts = @()
+if ($ids.Count) { $r = Invoke-Docker inspect $ids; if ($r.ExitCode -eq 0) { $facts = @(foreach ($x in ((@($r.Output) -join "`n") | ConvertFrom-Json)) { ConvertFrom-ContainerInspect $x }) } }
+foreach ($a in $apps) {
+  $cs = @($facts | Where-Object { $_.project -eq $a.project })
+  if (-not $cs.Count) { continue }
+  $lc = Get-DeploymentLifecycle -Containers $cs -Manifest $manifests[[string]$a.appId]
+  $states[[string]$a.project] = @{ running = $lc.counts.running; total = $lc.counts.longRunning }
+}
 
 # The instance's Traefik container: the one of this stack's Compose project running the traefik service.
 $traefik = @(docker ps --filter "label=com.docker.compose.project=$($s.StackName)" --filter 'label=com.docker.compose.service=traefik' --format '{{.Names}}' | Where-Object { $_ })

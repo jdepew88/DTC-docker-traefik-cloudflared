@@ -1,5 +1,6 @@
 {
   "schema": 1,
+  "manifestVersion": "2026.10.25",
   "id": "portainer",
   "name": "Portainer CE",
   "category": "management",
@@ -89,6 +90,11 @@
     "warning": "Portainer controls Docker on this PC: publish it only behind Cloudflare Access."
   },
   "group": "A",
+  "choiceGroup": {
+    "id": "docker-management",
+    "recommended": false,
+    "note": "Alternative to Arcane for people who prefer Portainer's workflows. Optional; installing both is rarely useful."
+  },
   "resources": {
     "memoryMB": 150,
     "diskMB": 300

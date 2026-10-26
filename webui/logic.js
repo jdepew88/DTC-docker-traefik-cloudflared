@@ -452,8 +452,51 @@
   // Journey step path: whose request it is.
   function journeyPath(path) { return path === 'browser' ? { label: 'Browser', tone: 'info', icon: 'globe' } : { label: 'Server to server', tone: 'neutral', icon: 'server' }; }
 
+  // --- Installed apps: lifecycle of Compose services ----------------------------------------------------------
+  // The server (lib\ComposeLifecycle.psm1) decides roles and statuses; these helpers only present them. A setup job
+  // that completed is not counted as a stopped container, and a running container is not shown as verified healthy.
+  const DEPLOYMENT_STATES = {
+    running: { label: 'Running', tone: 'ok' }, warning: { label: 'Needs attention', tone: 'warn' }, failed: { label: 'Problem', tone: 'err' },
+    stopped: { label: 'Stopped', tone: 'neutral' }, prepared: { label: 'Prepared, not started', tone: 'info' }, absent: { label: 'No containers', tone: 'warn' },
+  };
+  function deploymentState(state) { return DEPLOYMENT_STATES[state] || { label: 'Unknown', tone: 'neutral' }; }
+  const TONES = ['ok', 'neutral', 'info', 'warn', 'err'];
+  function statusTone(status) { return status && TONES.includes(status.tone) ? status.tone : 'neutral'; }
+  // Services grouped for the details view (display order); empty groups are left out.
+  function serviceGroups(lifecycle) {
+    const list = (lifecycle && lifecycle.services) || [];
+    return [
+      { id: 'long-running', title: 'Long-running services', items: list.filter((s) => s.lifecycle === 'long-running') },
+      { id: 'run-once', title: 'Setup jobs (run once, then exit)', items: list.filter((s) => s.lifecycle === 'run-once') },
+      { id: 'unknown', title: 'Role unknown', items: list.filter((s) => s.lifecycle !== 'long-running' && s.lifecycle !== 'run-once') },
+    ].filter((g) => g.items.length);
+  }
+  // How a service ended: running, or its exit code and whether stopping was expected for its role.
+  function terminationText(s) {
+    if (!s) return '';
+    if (s.exitCode === null || s.exitCode === undefined) return s.state === 'running' ? 'Running' : s.state ? s.state : 'No container';
+    const expected = s.expectedToExit === true ? 'expected' : s.expectedToExit === false ? 'not expected' : 'not known whether expected';
+    return `Exit code ${s.exitCode} (${expected})`;
+  }
+  function healthText(s) { return !s ? '' : s.health === 'none' ? 'No health check' : s.health === 'not run yet' ? 'Health check not run yet' : `Health check: ${s.health}`; }
+  // repository:tag plus the start of the digest (a digest alone identifies the exact build).
+  function shortImage(ref) {
+    const m = /^(.*?)(?:@sha256:([0-9a-f]{64}))?$/.exec(String(ref || ''));
+    return m[2] ? `${m[1]} @ sha256:${m[2].slice(0, 12)}…` : m[1];
+  }
+  const ROLE_SOURCES = { manifest: 'declared by the app\'s manifest', compose: 'from its Compose settings', inferred: 'inferred from its restart policy', none: 'unknown' };
+  function roleSource(src) { return ROLE_SOURCES[src] || ROLE_SOURCES.none; }
+  // Catalog card: whether (and how often) the application is installed.
+  function catalogInstallState(app) {
+    const n = ((app && app.instances) || []).length;
+    return n === 0 ? { installed: false, text: '' } : { installed: true, text: n === 1 ? 'Installed' : `Installed: ${n} instances` };
+  }
+  // Display name of an installed instance: the application, plus its label when it has one (e.g. "Testing").
+  function instanceTitle(a) { return a && a.label ? `${a.name} (${a.label})` : (a ? a.name : ''); }
+
   return {
     ROUTING_STATES, routingState, routingEvidence, endpointAudience, endpointKind, ROUTING_HELP, routingHelp, journeyPath,
+    DEPLOYMENT_STATES, deploymentState, statusTone, serviceGroups, terminationText, healthText, shortImage, roleSource, catalogInstallState, instanceTitle,
     IDENTITY_STATES, identityState, googleRedirectUri, isGoogleClientId, identityNextStep, identityWizard, wizardNeighbours, CREDENTIAL_STATUS, credentialStatus,
     LEVELS, LEVEL_TITLES, DEFAULT_LEVEL, normalizeLevel, levelIndex, isVisibleAt,
     DIMENSIONS, COMPONENT_STATUS, componentStatus, firstBlocked, suggestAppName, displayNameFromLabel, choosePort, reachOptions,

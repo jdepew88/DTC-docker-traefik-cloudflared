@@ -1,9 +1,11 @@
 {
   "schema": 1,
+  "manifestVersion": "2026.10.25",
   "id": "redis",
   "name": "Redis / Valkey",
   "category": "tools",
   "group": "B",
+  "availability": "reference",
   "description": "In-memory cache. Added only to apps that need one (Immich, Dispatcharr modular), as Valkey (BSD-licensed, Redis-compatible).",
   "maintainer": "Valkey project (Linux Foundation)",
   "license": "BSD-3-Clause (Valkey); Redis 7.4+ is RSALv2/SSPLv1, 8.0+ also AGPLv3",

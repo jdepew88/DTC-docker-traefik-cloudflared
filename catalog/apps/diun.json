@@ -1,9 +1,18 @@
 {
   "schema": 1,
+  "manifestVersion": "2026.10.25",
   "id": "diun",
   "name": "Diun",
   "category": "updates",
   "group": "E",
+  "availability": "retired",
+  "retired": {
+    "date": "2026-10-25",
+    "note": "No longer offered: its notifications overlap with What's Up Docker. Existing Diun containers keep running and are still recognized; nothing is removed.",
+    "replacement": [
+      "whats-up-docker"
+    ]
+  },
   "description": "Docker Image Update Notifier: headless, notification-only image update checks (ntfy, mail, Discord, ...).",
   "maintainer": "CrazyMax",
   "license": "MIT",

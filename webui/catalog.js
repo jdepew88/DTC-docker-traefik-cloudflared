@@ -42,6 +42,7 @@
       resHost,
       h('div', { class: 'disc-toolbar' }, field({ id: 'cat-q', label: 'Search', control: q }), field({ id: 'cat-cat', label: 'Category', control: sel })),
       gridHost,
+      referenceSections(cat),
       gate('advanced', h('section', { class: 'card' }, h('h2', null, 'Catalog sources'),
         h('p', { class: 'muted small' }, 'Only the curated catalog can install apps in this version. Images found in registries are image discoveries, not installable templates; community templates are never executed automatically.'),
         h('ul', { class: 'checks' }, arr(cat.sources).map((s) => checkItem(s.enabled ? 'ok' : 'neutral', s.name, s.enabled ? 'enabled' : 'planned'))))),
@@ -57,19 +58,39 @@
       U.atLeast('advanced') && arr(r.containers).length ? h('details', { class: 'more' }, h('summary', null, 'Memory by container'), kv(r.containers.slice(0, 15).map((c) => [c.name, mb(c.memoryMB)]))) : null];
   }
 
+  // One card per application. Installed instances are linked (Manage), variants (e.g. a modular compose) are listed
+  // under the application instead of as separate products.
   function appCard(a) {
     const socket = arr(a.privileges).some((p) => p.kind === 'docker-socket');
-    return h('article', { class: 'card cat-card', 'aria-label': a.name },
-      h('div', { class: 'card-head' }, h('span', { class: 'xp-icon' }, brand(a.id, 'box')), h('div', null, h('h2', null, a.name), h('span', { class: 'small muted' }, CATEGORY[a.category] || a.category))),
+    const inst = L.catalogInstallState(a);
+    const cg = a.choiceGroup;
+    const canInstall = a.installable && a.platform.installable;
+    return h('article', { class: 'card cat-card', 'aria-label': a.name, 'data-app': a.id, 'data-installed': inst.installed ? 'true' : 'false' },
+      h('div', { class: 'card-head' }, h('span', { class: 'xp-icon' }, brand(a.id, 'box')), h('div', null, h('h2', null, a.name), h('span', { class: 'small muted' }, CATEGORY[a.category] || a.category)),
+        h('span', { class: 'grow' }), cg && cg.recommended ? plainChip('Recommended', 'ok') : null),
       h('p', null, a.description),
-      h('div', { class: 'chips' }, a.deprecated ? plainChip('Deprecated', 'err') : null, supportChip(a.platform), plainChip(a.license), arr(a.privileges).filter((p) => p.kind !== 'docker-socket').map((p) => plainChip(PRIV[p.kind] || p.kind, 'warn')), socket ? plainChip('Controls Docker', 'warn') : null,
-        a.resources && a.resources.memoryMB ? plainChip(`~${mb(a.resources.memoryMB)} RAM`) : null, arr(a.installedAs).length ? plainChip(`Installed: ${a.installedAs.join(', ')}`, 'ok') : null),
+      cg && cg.note ? h('p', { class: 'small hint' }, cg.note) : null,
+      h('div', { class: 'chips' }, inst.installed ? plainChip(inst.text, 'ok') : null, a.deprecated ? plainChip('Deprecated', 'err') : null, supportChip(a.platform), plainChip(a.license), arr(a.privileges).filter((p) => p.kind !== 'docker-socket').map((p) => plainChip(PRIV[p.kind] || p.kind, 'warn')), socket ? plainChip('Controls Docker', 'warn') : null,
+        a.resources && a.resources.memoryMB ? plainChip(`~${mb(a.resources.memoryMB)} RAM`) : null),
       a.deprecated && a.deprecationNote ? h('p', { class: 'small hint warn' }, a.deprecationNote) : null,
       U.gateSpan('advanced', h('p', { class: 'mono small' }, arr(a.services).map((s) => s.image.replace(/@sha256:[0-9a-f]{64}/, '@sha256:…')).join(', ') || (a.imageReference || '').replace(/@sha256:[0-9a-f]{64}/, '@sha256:…'))),
-      h('div', { class: 'actions' }, a.installable && a.platform.installable
-        ? h('a', { class: 'btn primary', href: `#install/${a.id}`, 'aria-label': `Install ${a.name}` }, icon('download'), 'Install…')
-        : h('p', { class: 'small muted' }, a.installNote || 'Not installable on this platform.'),
+      arr(a.variants).length ? h('details', { class: 'more cat-variants' }, h('summary', null, `Advanced: other ways to install (${a.variants.length})`),
+        h('ul', null, a.variants.map((v) => h('li', null, h('strong', null, v.variant ? v.variant.label : v.name), ' ', h('span', { class: 'small muted' }, v.variant ? v.variant.reason : v.description), ' ',
+          v.installable && v.platform.installable ? h('a', { href: `#install/${v.id}`, 'aria-label': `Install ${a.name} (${v.variant ? v.variant.label : v.name})` }, 'Install this variant…') : null)))) : null,
+      h('div', { class: 'actions' },
+        inst.installed ? h('a', { class: 'btn primary', href: `#apps/${encodeURIComponent(a.instances[0].project)}`, 'aria-label': `Manage ${a.name}` }, icon('box'), arr(a.instances).length > 1 ? 'Manage installations' : 'Manage') : null,
+        canInstall ? h('a', { class: `btn${inst.installed ? '' : ' primary'}`, href: `#install/${a.id}`, 'aria-label': `Install ${a.name}` }, icon('download'), inst.installed ? 'Install another…' : 'Install…')
+          : h('p', { class: 'small muted' }, a.installNote || 'Not installable on this platform.'),
         arr(a.docs)[0] ? h('a', { class: 'btn ghost', href: a.docs[0].url, target: '_blank', rel: 'noopener noreferrer', 'aria-label': `${a.name} documentation` }, 'Docs ', icon('external')) : null));
+  }
+
+  // Building blocks bundled inside other apps, and entries no longer offered (explained, never installable).
+  function referenceSections(cat) {
+    return [arr(cat.reference).length ? h('details', { class: 'more card', id: 'cat-reference' }, h('summary', null, `Building blocks, not installed on their own (${cat.reference.length})`),
+      h('ul', null, cat.reference.map((r) => h('li', { class: 'small' }, h('strong', null, r.name), `: ${r.note || r.description}`)))) : null,
+    arr(cat.retired).length ? gate('advanced', h('details', { class: 'more card', id: 'cat-retired' }, h('summary', null, `No longer offered (${cat.retired.length})`),
+      h('p', { class: 'small muted' }, 'Removed from new installations. Existing installations keep running, are still recognized, and are never removed by this change.'),
+      h('ul', null, cat.retired.map((r) => h('li', { class: 'small' }, h('strong', null, r.name), `: ${r.note}`, arr(r.replacement).length ? ` Instead: ${r.replacement.map((x) => (arr(cat.apps).find((ap) => ap.id === x) || { name: x }).name).join(', ')}.` : ''))))) : null];
   }
 
   // --- Installation wizard -------------------------------------------------------------------------------------------------
@@ -78,13 +99,14 @@
     if (!s.setup) await ctx.refresh();
     fill(main, head('Apps', 'Install an app', 'Loading…'));
     const cat = s.catalog || await loadCatalog(ctx);
-    const a = arr(cat.apps).find((x) => x.id === sub);
+    const a = arr(cat.apps).flatMap((x) => [x, ...arr(x.variants)]).find((x) => x.id === sub);
     if (!a || !a.installable) { fill(main, head('Apps', 'Install an app', ''), h('div', { class: 'callout err' }, h('p', null, a ? a.installNote : `No catalog app '${sub}'.`)), h('a', { href: '#catalog' }, '← App Catalog')); return; }
     if (!s.forms.install || s.forms.install.appId !== a.id) {
       const d = await api('GET', `/api/catalog/defaults?id=${encodeURIComponent(a.id)}`);
       const web = arr(a.services).flatMap((x) => x.ports).find((p) => p.primary) || { container: 8080 };
       const inputs = {}; arr(a.inputs).filter((i) => i.type === 'boolean').forEach((i) => { inputs[i.id] = i.default === 'true' ? 'true' : 'false'; });
-      s.forms.install = { appId: a.id, project: d.project, folder: d.folder, folderAuto: true, timezone: d.timezone, local: d.localPort > 0, localPort: String(d.localPort > 0 ? d.localPort : (web.container >= 1024 ? web.container : 18000 + web.container)), inputs, privileges: false, reviewed: false, plan: null, result: null };
+      s.forms.install = { appId: a.id, project: d.project, folder: d.folder, folderAuto: true, timezone: d.timezone, local: d.localPort > 0, localPort: String(d.localPort > 0 ? d.localPort : (web.container >= 1024 ? web.container : 18000 + web.container)), inputs, privileges: false, reviewed: false, plan: null, result: null,
+        existing: arr(d.existing), alternatives: arr(d.alternativesInstalled), anotherInstance: false, instanceLabel: '' };
     }
     renderInstall(main, ctx, a);
   };
@@ -121,7 +143,8 @@
     const preview = h('button', { type: 'button', class: 'btn', onclick: (e) => withBusy(e.currentTarget, async () => {
       err.textContent = '';
       try {
-        f.plan = await api('POST', '/api/catalog/plan', { appId: a.id, project: f.project, folder: f.folder, timezone: f.timezone, localPort: f.local ? parseInt(f.localPort, 10) || 0 : 0, inputs: f.inputs, reuseData: !!f.reuseData, startNow: !f.prepareOnly });
+        f.plan = await api('POST', '/api/catalog/plan', { appId: a.id, project: f.project, folder: f.folder, timezone: f.timezone, localPort: f.local ? parseInt(f.localPort, 10) || 0 : 0, inputs: f.inputs, reuseData: !!f.reuseData, startNow: !f.prepareOnly,
+          anotherInstance: !!f.anotherInstance, instanceLabel: f.instanceLabel || '' });
         f.reviewed = false; rerender(); const p = $('#inst-7'); if (p) p.scrollIntoView({ block: 'start' });
       } catch (x) { err.textContent = x.message; }
     }) }, icon('eye'), f.plan ? 'Preview again' : 'Preview the Compose project');
@@ -142,6 +165,8 @@
     fill(main,
       head('Apps', `Install ${a.name}`, 'Eleven steps; nothing changes on this PC until step 9.'),
       h('p', null, h('a', { href: '#catalog' }, '← App Catalog')),
+      P.installExisting ? P.installExisting(a, f, rerender) : null,
+      arr(f.alternatives).length ? h('div', { class: 'callout' }, h('p', { class: 'small' }, `${f.alternatives.map((x) => x.name).join(', ')} is already installed for the same purpose. ${a.choiceGroup && a.choiceGroup.note ? a.choiceGroup.note : 'You rarely need both.'}`)) : null,
       h('form', { class: 'card wizard', novalidate: true, 'aria-label': `Install ${a.name}`, onsubmit: (e) => e.preventDefault() },
         step(1, 'The app', h('div', { class: 'cat-head' }, h('span', { class: 'xp-icon big' }, brand(a.id, 'box')), h('div', null, h('strong', null, a.name), h('p', { class: 'small muted' }, a.description))),
           kv([['Maintainer', a.maintainer], ['Licence', a.license], ['Platform', `${a.platform.platform}: ${a.platform.support}`]]),
@@ -149,7 +174,7 @@
         step(2, 'Installation location', h('div', { class: 'grid' },
           field({ id: 'inst-project', label: 'Project name', control: project, hint: 'The Compose project and container name; also prefixes its data volumes.' }),
           field({ id: 'inst-folder', label: 'Folder', control: folder, hint: 'A new or empty folder for compose.yaml, .env and README.md.' }))),
-        step(3, 'Storage', h('ul', { class: 'checks' }, arr(a.services).flatMap((sv) => sv.volumes).filter((v) => v.kind !== 'folder').map((v) => checkItem('neutral', `${f.project}_${v.name} → ${v.target}`, `${v.description} Docker volume: kept across updates, restarts and removal unless you delete it.`))),
+        step(3, 'Storage', h('ul', { class: 'checks' }, arr(a.services).flatMap((sv) => sv.volumes).filter((v) => v.kind !== 'folder').sort((x, y) => (y.description ? 1 : 0) - (x.description ? 1 : 0)).filter((v, i, all) => all.findIndex((o) => o.name === v.name) === i).map((v) => checkItem('neutral', `${f.project}_${v.name} → ${v.target}`, `${v.description} Docker volume: kept across updates, restarts and removal unless you delete it.`))),
           folderInputs.map(inputField),
           arr(a.services).every((sv) => !sv.volumes.length) ? h('p', { class: 'muted small' }, 'This app stores no data.') : null),
         step(4, 'Networking', h('p', null, `Joins the shared network '${net}', so Traefik can reach it as `, h('code', null, `http://${container}:${webPort}`), '. It is not reachable from the Internet or your LAN until you publish it (step 11).'),
@@ -178,92 +203,5 @@
           exposureWarn ? h('div', { class: 'callout warn' }, h('p', null, exposureWarn)) : null,
           a.id === 'authentik' ? h('div', { class: 'actions' }, h('a', { class: 'btn primary', href: '#identity' }, icon('lock'), 'Continue in Identity & Access…'), h('a', { class: 'btn', href: '#apps' }, 'Installed apps'))
             : h('div', { class: 'actions' }, h('a', { class: 'btn primary', href: `#publish/${encodeURIComponent(res.container)}` }, icon('globe'), 'Publish through Traefik…'), h('a', { class: 'btn', href: '#apps' }, 'Installed apps'))] : h('p', { class: 'muted' }, 'After deploying: publish it with a hostname, behind Cloudflare Access by default, or keep it private.'))));
-  }
-
-  // --- Installed apps ------------------------------------------------------------------------------------------------------
-  P.apps = async (main, ctx) => {
-    const s = ctx.state;
-    if (!s.setup) await ctx.refresh();
-    if (!s.setup.installed) { fill(main, head('Apps', 'Installed apps', 'Available after the installation.')); return; }
-    fill(main, head('Apps', 'Installed apps', 'Loading…'));
-    const data = await api('GET', '/api/apps');
-    const reload = () => P.apps(main, ctx);
-    fill(main,
-      head('Apps', 'Installed apps', 'Apps installed from the catalog. Each is a Compose project in its own folder; external stacks are never changed here.',
-        h('a', { class: 'btn primary', href: '#catalog' }, icon('plus'), 'Install an app'), h('button', { type: 'button', class: 'btn', onclick: (e) => withBusy(e.currentTarget, reload) }, icon('refresh'), 'Refresh')),
-      arr(data.apps).length ? h('div', { class: 'disc-list' }, data.apps.map((a) => installedCard(ctx, a, reload))) : h('p', { class: 'empty' }, 'No apps installed yet. Choose one in the App Catalog.'));
-  };
-
-  function installedCard(ctx, a, reload) {
-    const out = h('div', { class: 'app-out', 'aria-live': 'polite' });
-    const up = a.running > 0 && a.running === a.total;
-    const routes = arr(a.routes);
-    const action = (verb, label, danger) => h('button', { type: 'button', class: `btn small${danger ? ' danger-outline' : ''}`, 'aria-label': `${label} ${a.name}`, onclick: (e) => withBusy(e.currentTarget, async () => {
-      if (verb !== 'start') { const ok = await U.confirmDialog({ title: `${label} ${a.name}`, okText: label, body: [verb === 'stop' ? 'The app stops until you start it again. Its data is kept.' : 'The app restarts; it is unavailable for a moment.'] }); if (!ok) return; }
-      try { const r = await api('POST', '/api/apps/action', { project: a.project, action: verb, confirm: true }); toast(r.ok ? `${a.name}: ${verb} done` : `${a.name}: ${verb} failed`, !r.ok); } catch (x) { toast(x.message, true); }
-      reload();
-    }) }, label);
-    return h('article', { class: 'card disc-card', 'aria-label': a.name },
-      h('div', { class: 'card-head' }, h('span', { class: 'xp-icon' }, brand(a.appId, 'box')), h('h2', null, a.name), plainChip(a.project), h('span', { class: 'grow' }),
-        a.prepared ? plainChip('prepared, not started', 'info') : a.total === 0 ? plainChip('no containers', 'warn') : up ? chip('healthy', `running ${a.running}/${a.total}`) : plainChip(`running ${a.running}/${a.total}`, 'err')),
-      a.updateAvailable ? h('p', null, plainChip('Update available', 'info')) : null,
-      routes.length ? h('ul', { class: 'checks' }, routes.map((r) => checkItem('ok', `Published as ${r.hostnames.join(', ')}`, r.publish ? 'Through Cloudflare' : 'Local route'))) : h('p', { class: 'small muted' }, 'Not published.'),
-      U.gateSpan('intermediate', h('p', { class: 'mono small' }, a.folder)),
-      gate('advanced', kv(arr(a.containers).map((c) => [c.name, `${c.status} · ${c.image.replace(/@sha256:[0-9a-f]{64}/, '@sha256:…')}`]))),
-      h('div', { class: 'actions' },
-        a.localUrl ? h('a', { class: 'btn small', href: a.localUrl, target: '_blank', rel: 'noopener noreferrer' }, 'Open ', icon('external')) : null,
-        routes.length ? h('a', { class: 'btn small', href: `https://${routes[0].hostnames[0]}/`, target: '_blank', rel: 'noopener noreferrer' }, 'Open site ', icon('external')) : h('a', { class: 'btn small', href: `#publish/${encodeURIComponent(arr(a.containers)[0] ? a.containers[0].name : a.project)}` }, icon('globe'), 'Publish…'),
-        up ? action('restart', 'Restart') : action('start', 'Start'), up ? action('stop', 'Stop') : null,
-        h('button', { type: 'button', class: 'btn small', 'aria-label': `Health of ${a.name}`, onclick: (e) => withBusy(e.currentTarget, async () => {
-          const r = await api('POST', '/api/apps/health', { project: a.project });
-          fill(out, h('ul', { class: 'checks' }, checkItem(r.running ? 'ok' : 'err', 'Container running', arr(r.containers).map((c) => `${c.name}: ${c.status}`).join(', ')),
-            r.http ? checkItem(r.http.result === 'http' || r.http.result === 'https' ? 'ok' : 'warn', 'Web interface answers', r.http.detail) : checkItem('neutral', 'Web interface answers', 'Not checked (not running).')));
-        }) }, icon('pulse'), 'Health'),
-        h('button', { type: 'button', class: 'btn small', 'aria-label': `Logs of ${a.name}`, onclick: (e) => withBusy(e.currentTarget, async () => {
-          const r = await api('GET', `/api/apps/logs?project=${encodeURIComponent(a.project)}&tail=200`);
-          fill(out, technical(arr(r.lines).length ? r.lines : ['(no output)'], `Logs of ${a.project} (secrets redacted)`));
-          const d = $('details', out); if (d) d.open = true;
-        }) }, icon('terminal'), 'Logs'),
-        h('button', { type: 'button', class: 'btn small', 'aria-label': `Check for updates of ${a.name}`, onclick: (e) => withBusy(e.currentTarget, () => updateFlow(a, out, reload)) }, icon('download'), 'Updates'),
-        h('button', { type: 'button', class: 'btn small', 'aria-label': `Back up ${a.name}`, onclick: (e) => withBusy(e.currentTarget, async () => {
-          const ok = await U.confirmDialog({ title: `Back up ${a.name}`, okText: 'Back up', body: ['Copies compose.yaml, .env, configuration folders and the data volumes into the app folder (backups\\<time>), readable by your Windows account only.', 'Apps with a database are stopped for a moment so the copy is consistent. Media and library folders are not copied.'] });
-          if (!ok) return;
-          const r = await api('POST', '/api/apps/backup', { project: a.project, confirm: true });
-          fill(out, h('ul', { class: 'checks' }, checkItem(r.ok ? 'ok' : 'err', 'Backup', r.folder), arr(r.volumes).map((v) => checkItem(v.ok ? 'ok' : 'err', v.volume, `${v.sizeMB} MB`)), arr(r.skipped).map((v) => checkItem('neutral', v, 'Not backed up (cache or user data).'))));
-        }) }, icon('archive'), 'Back up'),
-        h('button', { type: 'button', class: 'btn small danger-outline', 'aria-label': `Remove ${a.name}`, onclick: (e) => withBusy(e.currentTarget, () => removeFlow(a, reload)) }, 'Remove')),
-      out);
-  }
-
-  async function updateFlow(a, out, reload) {
-    const p = await api('POST', '/api/apps/update/preview', { project: a.project });
-    const blocked = arr(p.blocked).map((c) => h('li', { class: 'small' }, `${c.service}: ${c.note}`));
-    if (!arr(p.changes).length) { fill(out, h('p', { class: 'hint ok' }, icon('check'), ' No update to apply.'), blocked.length ? h('ul', null, blocked) : null); return; }
-    const ok = await U.confirmDialog({ title: `Update ${a.name}`, okText: 'Back up and update',
-      body: [h('ul', null, p.changes.map((c) => h('li', { class: 'mono small' }, `${c.service}: ${c.from || '(none)'} → ${c.to}${c.note ? ` (${c.note})` : ''}`))), blocked.length ? h('ul', null, blocked) : null, p.notes,
-        arr(p.releaseNotes).length ? h('p', null, 'Release notes: ', h('a', { href: p.releaseNotes[0].url, target: '_blank', rel: 'noopener noreferrer' }, p.releaseNotes[0].title)) : null, h('ul', null, arr(p.keeps).map((k) => h('li', { class: 'small' }, k)))],
-      checkbox: 'I read the release notes; the app restarts during the update.' });
-    if (!ok) return;
-    const r = await api('POST', '/api/apps/update/apply', { project: a.project, previewKey: p.previewKey, confirm: true });
-    toast(r.ok ? `${a.name} updated (backup ${r.backup})` : `${a.name}: update failed`, !r.ok);
-    reload();
-  }
-
-  async function removeFlow(a, reload) {
-    const vols = h('input', { type: 'checkbox', id: 'rm-vols' }); const files = h('input', { type: 'checkbox', id: 'rm-files' });
-    const typed = h('input', { id: 'rm-typed', autocomplete: 'off', spellcheck: 'false', placeholder: a.project });
-    const ok = await U.confirmDialog({ title: `Remove ${a.name}`, okText: 'Remove', danger: true,
-      body: ['Stops and removes the containers. By default the data volumes and the project folder are kept, so reinstalling with the same project name finds the data again.',
-        h('label', { class: 'check' }, vols, h('span', null, 'Also delete its data volumes (cannot be undone)')),
-        h('label', { class: 'check' }, files, h('span', null, 'Also delete compose.yaml, .env and README.md in its folder')),
-        field({ id: 'rm-typed', label: `To delete data, type the project name (${a.project})`, control: typed }),
-        h('p', { class: 'small muted' }, 'Folders you chose for media or files are never deleted.')],
-      checkbox: 'Remove the containers.' });
-    if (!ok) return;
-    try {
-      const r = await api('POST', '/api/apps/remove', { project: a.project, confirm: true, deleteVolumes: vols.checked, deleteFolder: files.checked, confirmText: typed.value.trim() });
-      toast(r.volumesDeleted ? `${a.name} removed with its data` : `${a.name} removed; data kept (${arr(r.keptVolumes).join(', ') || 'no volumes'})`);
-    } catch (x) { toast(x.message, true); }
-    reload();
   }
 })();

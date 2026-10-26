@@ -1,9 +1,11 @@
 {
   "schema": 1,
+  "manifestVersion": "2026.10.25",
   "id": "postgresql",
   "name": "PostgreSQL",
   "category": "tools",
   "group": "B",
+  "availability": "reference",
   "description": "Relational database used by authentik, Immich (with vector extensions) and Dispatcharr's modular mode. Each app runs its own PostgreSQL inside its project.",
   "maintainer": "PostgreSQL Global Development Group (Docker official image)",
   "license": "PostgreSQL License",

@@ -1,5 +1,6 @@
 {
   "schema": 1,
+  "manifestVersion": "2026.10.25",
   "id": "immich",
   "name": "Immich",
   "category": "photos",
@@ -35,6 +36,8 @@
   "services": {
     "immich-server": {
       "image": "ghcr.io/immich-app/immich-server:v3.3.5@sha256:485d546a2e31d6a8b4db8423fcba5c109de8c218d93410af115fd1ccfc4352a6",
+      "role": "app",
+      "label": "Immich server",
       "ports": [
         {
           "container": 2283,
@@ -78,6 +81,8 @@
     },
     "immich-machine-learning": {
       "image": "ghcr.io/immich-app/immich-machine-learning:v3.3.5@sha256:5b28c9352c8374b8a1ed96fbdd8d6755fea6e43510ec43fdf6538aa02ea40f56",
+      "role": "worker",
+      "label": "Machine learning",
       "when": "enableMl",
       "volumes": [
         {
@@ -95,6 +100,8 @@
     },
     "immich-redis": {
       "image": "docker.io/valkey/valkey:9@sha256:c123e3715db63d06d4ad6964884037aa0d5d4d703939b9929954112889708e1d",
+      "role": "cache",
+      "label": "Valkey",
       "healthcheck": {
         "test": [
           "CMD-SHELL",
@@ -108,6 +115,8 @@
     },
     "immich-db": {
       "image": "ghcr.io/immich-app/postgres:14-vectorchord0.4.3-pgvectors0.2.0@sha256:bcf63357191b76a916ae5eb93464d65c07511da41e3bf7a8416db519b40b1c23",
+      "role": "database",
+      "label": "PostgreSQL (vector)",
       "stateful": true,
       "environment": {
         "POSTGRES_PASSWORD": "{{input:dbPassword}}",

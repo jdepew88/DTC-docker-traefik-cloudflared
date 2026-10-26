@@ -17,7 +17,7 @@ $script:CategoryGroup = @{ management = 'Infrastructure'; proxy = 'Infrastructur
 # Icons from the dashboard-icons set Homepage resolves by file name (checked to exist), or Material Design Icons.
 $script:Icons = @{ 'traefik-manager' = 'mdi-routes'; 'uptime-kuma' = 'uptime-kuma.png'; portainer = 'portainer.png'; homepage = 'homepage.png'; arcane = 'arcane.png'
   echo = 'mdi-swap-horizontal'; authentik = 'authentik.png'; authelia = 'authelia.png'; lldap = 'lldap.png'; jellyfin = 'jellyfin.png'; dispatcharr = 'dispatcharr.png'
-  'dispatcharr-modular' = 'dispatcharr.png'; 'channels-dvr' = 'channels-dvr.png'; immich = 'immich.png'; 'rocket-chat' = 'rocket-chat.png'; 'whats-up-docker' = 'whats-up-docker.png' }
+  'dispatcharr-modular' = 'dispatcharr.png'; 'channels-dvr' = 'channels-dvr.png'; immich = 'immich.png'; 'rocket-chat' = 'rocket-chat.png'; rocketchat = 'rocket-chat.png'; 'whats-up-docker' = 'whats-up-docker.png' }
 
 function Get-Prop3($Object, [string]$Name, $Default = $null) {
   if ($null -eq $Object) { return $Default }
@@ -29,7 +29,8 @@ function Get-Prop3($Object, [string]$Name, $Default = $null) {
 function ConvertTo-HpString([string]$Value) { return '"' + $Value.Replace('\', '\\').Replace('"', '\"') + '"' }
 
 # Pure: the cards. $Apps = registry entries (project, appId, name, localUrl, prepared); $States = project ->
-# @{ running; total }; $Manifests = appId -> manifest; $Published = services.json entries, each with .verified
+# @{ running; total } of its long-running services (completed setup jobs are not counted); $Manifests = appId (and
+# alias) -> manifest; $Published = services.json entries, each with .verified
 # (hostname -> $true when the Cloudflare edge answered and Traefik routed it to a working backend); $Infra =
 # @{ traefikContainer; dashboardUrl; managerUrl; tunnelName }; $NotInstalled = catalog ids to show as not installed.
 function New-HomepageCards {
@@ -54,8 +55,10 @@ function New-HomepageCards {
     $id = [string](Get-Prop3 $a 'appId' '')
     if ($id -eq 'homepage') { $installedIds += $id; continue }
     $m = $Manifests[$id]
+    # Records written before an app's id changed (e.g. 'rocket-chat', now an alias of 'rocketchat').
+    if (-not $m) { $m = @($Manifests.Values | Where-Object { @(Get-Prop3 $_ 'aliases' @()) -contains $id })[0] }
     if (-not $m) { continue }
-    $installedIds += $id
+    $installedIds += $id; $installedIds += [string]$m.id
     $project = [string]$a.project
     $st = $States[$project]
     $running = [int](Get-Prop3 $st 'running' 0); $total = [int](Get-Prop3 $st 'total' 0)

@@ -1,7 +1,11 @@
 {
   "schema": 1,
-  "id": "rocket-chat",
+  "manifestVersion": "2026.10.25",
+  "id": "rocketchat",
   "name": "Rocket.Chat",
+  "aliases": [
+    "rocket-chat"
+  ],
   "category": "communication",
   "group": "D",
   "description": "Team chat with channels, direct messages and integrations. Follows the official rocketchat-compose architecture: Rocket.Chat, MongoDB (single-member replica set) and NATS; monitoring left out.",
@@ -35,6 +39,8 @@
   "services": {
     "rocketchat": {
       "image": "registry.rocket.chat/rocketchat/rocket.chat:8.9.0@sha256:295f7b2c38fc3542024dc404f887eb2e13276b66e5854d31d86bcd069f6ce6dc",
+      "role": "app",
+      "label": "Rocket.Chat",
       "ports": [
         {
           "container": 3000,
@@ -90,6 +96,9 @@
     },
     "mongodb-fix-permission": {
       "image": "docker.io/mongodb/mongodb-community-server:8.2-ubi8@sha256:26948caea975097b3a381ad9c2d531fccebdb826a5c65e3ca274b08d3cfdf987",
+      "role": "init",
+      "label": "MongoDB permissions",
+      "purpose": "Gives the MongoDB data volume to the database user (uid 1001) before MongoDB starts, then exits.",
       "restart": "on-failure",
       "user": "0",
       "environment": {
@@ -110,6 +119,8 @@
     },
     "mongodb": {
       "image": "docker.io/mongodb/mongodb-community-server:8.2-ubi8@sha256:26948caea975097b3a381ad9c2d531fccebdb826a5c65e3ca274b08d3cfdf987",
+      "role": "database",
+      "label": "MongoDB",
       "user": "1001",
       "stateful": true,
       "environment": {
@@ -151,6 +162,9 @@
     },
     "mongodb-init": {
       "image": "docker.io/mongodb/mongodb-community-server:8.2-ubi8@sha256:26948caea975097b3a381ad9c2d531fccebdb826a5c65e3ca274b08d3cfdf987",
+      "role": "init",
+      "label": "MongoDB replica-set initialization",
+      "purpose": "Initializes the single-member replica set rs0 that Rocket.Chat requires (once), then exits.",
       "restart": "on-failure",
       "user": "0",
       "environment": {
@@ -167,6 +181,9 @@
     },
     "nats": {
       "image": "docker.io/nats:2.11-alpine@sha256:e4bf19f15fd3218814a4e3c9e0064e1334bd8aa20d5984b9f1a0afd084f8cc00",
+      "role": "messaging",
+      "label": "NATS",
+      "purpose": "Message bus between Rocket.Chat processes. Its image has no health check.",
       "command": [
         "--http_port",
         "8222"

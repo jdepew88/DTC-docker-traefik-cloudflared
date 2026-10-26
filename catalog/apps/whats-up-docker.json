@@ -1,5 +1,6 @@
 {
   "schema": 1,
+  "manifestVersion": "2026.10.25",
   "id": "whats-up-docker",
   "name": "What's Up Docker",
   "category": "updates",
@@ -31,6 +32,8 @@
   "services": {
     "app": {
       "image": "getwud/wud:9.5.0@sha256:2dcc930828ce983b1c3b0373e3ca8ee67759835e4a7eb2f78af9ada45eb1a1f9",
+      "role": "app",
+      "label": "What's Up Docker",
       "ports": [
         {
           "container": 3000,
@@ -66,6 +69,8 @@
     },
     "socket-proxy": {
       "image": "tecnativa/docker-socket-proxy:v0.5.0@sha256:1f5038b54f06c3e18422902cf00ba21803d1c97805aae032e5e6673d532d3459",
+      "role": "support",
+      "label": "Docker socket proxy (read-only)",
       "dockerSocket": true,
       "dockerSocketReadOnly": true,
       "environment": {
@@ -115,7 +120,6 @@
     "notes": ""
   },
   "alternatives": [
-    "diun",
     "Built-in: Installed apps > Updates (registry check, backup first)"
   ],
   "web": {

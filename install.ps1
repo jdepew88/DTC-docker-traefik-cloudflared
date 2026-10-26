@@ -63,6 +63,9 @@ $InstallPath = [IO.Path]::GetFullPath($InstallPath)
 $ManifestName = '.install-manifest.json'
 $Timestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 
+# Files earlier versions installed that this version no longer ships (see "Staging files").
+$RetiredFiles = @('catalog\apps\rocket-chat.json')
+
 # Files managed by the installer (relative to the package root).
 $ManagedFiles = @(
   'compose.yaml',
@@ -93,8 +96,11 @@ $ManagedFiles = @(
   'lib\ServiceHealth.psm1',
   'lib\BackendResolver.psm1',
   'lib\AppCatalog.psm1',
+  'lib\ComposeLifecycle.psm1',
+  'lib\AppInstances.psm1',
   'lib\HomepageConfig.psm1',
   'webui\catalog.js',
+  'webui\deployments.js',
   'webui\identity.js',
   'webui\routing.js',
   'webui\credentials.js',
@@ -120,7 +126,7 @@ $ManagedFiles = @(
   'catalog\apps\openldap.json',
   'catalog\apps\postgresql.json',
   'catalog\apps\redis.json',
-  'catalog\apps\rocket-chat.json',
+  'catalog\apps\rocketchat.json',
   'catalog\apps\traefik-manager.json',
   'catalog\apps\watchtower.json',
   'catalog\apps\whats-up-docker.json',
@@ -389,6 +395,21 @@ foreach ($relative in $ManagedFiles) {
     }
   }
   $manifest[$relative] = $newHash
+}
+# Files earlier versions shipped and this one replaces (e.g. a catalog manifest renamed to its canonical id). An
+# unchanged packaged copy moves to the backup folder; a locally modified one is kept and reported.
+foreach ($relative in $RetiredFiles) {
+  if ($sameDir) { break }
+  $to = Join-Path $InstallPath $relative
+  if (-not (Test-Path -LiteralPath $to)) { continue }
+  if ($manifest.ContainsKey($relative) -and $manifest[$relative] -eq (Get-FileSha256 $to)) {
+    Invoke-Change "retire  $relative (no longer shipped; moved to backups\$Timestamp)" {
+      $saveTo = Join-Path $backupDir $relative
+      New-Item -ItemType Directory -Force -Path (Split-Path -Parent $saveTo) | Out-Null
+      Move-Item -LiteralPath $to -Destination $saveTo
+    }
+    $manifest.Remove($relative)
+  } else { Write-Warn "$relative is no longer shipped but was modified locally; it is kept. Remove it if the catalog reports a duplicate id." }
 }
 if (-not $DryRun -and -not $sameDir) {
   $manifest | ConvertTo-Json | Set-Content -LiteralPath $manifestPath -Encoding ASCII
