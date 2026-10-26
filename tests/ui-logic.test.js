@@ -470,5 +470,35 @@ test('installed apps: images, catalog install state and instance titles', () => 
   assert.strictEqual(L.instanceTitle({ name: 'Rocket.Chat', label: '' }), 'Rocket.Chat');
 });
 
+test('new app: step completion from the draft, acknowledgements, access and sign-in; untested stages never count as passed', () => {
+  const findings = [{ id: 'socket:web', severity: 'high' }, { id: 'registry:web', severity: 'review' }, { id: 'unverified', severity: 'info' }, { id: 'x', severity: 'block' }];
+  assert.deepStrictEqual(L.provisionAckIds(findings), ['socket:web', 'registry:web']);
+  const draft = { deployable: true, findings };
+  let w = L.provisionWizard({});
+  assert.strictEqual(w.current, 'container');
+  assert.ok(!w.steps[1].available, 'proxy is locked without a draft');
+  w = L.provisionWizard({ draft, acknowledged: ['socket:web'] });
+  assert.ok(!w.steps[0].done); assert.deepStrictEqual(w.pendingAcks, ['registry:web']); assert.match(w.steps[0].missing, /1 item/);
+  w = L.provisionWizard({ draft: { deployable: false, findings: [] } });
+  assert.ok(!w.steps[0].done, 'an undeployable draft never completes step 1');
+  const acked = { draft, acknowledged: ['socket:web', 'registry:web'] };
+  w = L.provisionWizard({ ...acked, access: 'local', auth: 'none' });
+  assert.deepStrictEqual(w.steps.map((s) => s.done), [true, true, true, false]); assert.strictEqual(w.current, 'review');
+  w = L.provisionWizard({ ...acked, access: 'public', hostname: 'not a host', auth: 'authentik' });
+  assert.ok(!w.steps[1].done); assert.match(w.steps[1].missing, /host name/);
+  w = L.provisionWizard({ ...acked, access: 'public', hostname: 'notes.example.com', auth: 'none' });
+  assert.ok(w.steps[1].done && !w.steps[2].done, "a public address never completes with 'no sign-in'");
+  w = L.provisionWizard({ ...acked, access: 'public', hostname: 'notes.example.com', auth: 'authentik', result: { ok: true } });
+  assert.ok(w.steps.every((s) => s.done));
+  w = L.provisionWizard({ ...acked, access: 'local', auth: 'authentik' });
+  assert.ok(!w.steps[2].done, 'authentik needs a route');
+  const v = L.provisionVerdict([{ status: 'passed' }, { status: 'not-tested' }, { status: 'not-applicable' }]);
+  assert.deepStrictEqual(v.counts, { passed: 1, failed: 0, notTested: 1, notApplicable: 1 }); assert.strictEqual(v.state, 'partial');
+  assert.strictEqual(L.provisionVerdict([{ status: 'passed' }, { status: 'failed' }]).state, 'attention');
+  assert.strictEqual(L.provisionVerdict([{ status: 'passed' }, { status: 'not-applicable' }]).state, 'verified');
+  assert.strictEqual(L.suggestProvisionHostname('Uptime Kuma', ['example.com']), 'uptime-kuma.example.com');
+  assert.strictEqual(L.suggestProvisionHostname('x', []), '');
+});
+
 console.log(`\n${passed} passed, ${failures.length} failed`);
 process.exit(failures.length ? 1 : 0);

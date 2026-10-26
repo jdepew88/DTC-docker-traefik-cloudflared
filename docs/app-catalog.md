@@ -213,8 +213,12 @@ small disposable Compose project; `tests\Test-AppsBrowser.ps1` the catalog and I
 
 | Source | Status | Treatment |
 | --- | --- | --- |
-| Curated first-party manifests | Implemented | Installable |
-| GitHub Compose repositories | Planned | Imported as a draft manifest for review; never executed automatically |
-| Docker Hub, GitHub Container Registry | Planned | Image discoveries only, not installable templates by themselves |
-| Unraid Community Applications XML | Planned | Compatible templates imported into a draft manifest; no undocumented endpoint, no Unraid code |
-| Your own Compose file | Planned | Adopted as an external project: discovered and publishable, managed only with permission |
+| Curated first-party manifests | Implemented | Installable from the catalog (highest trust) |
+| GitHub Compose repositories and files | Implemented (New app page) | Imported as a draft manifest (`source.type: imported`), reviewed, then installed through the same installer; never executed automatically |
+| Docker Hub, GitHub Container Registry, Quay, lscr.io | Implemented (New app page) | Draft from the README's Compose example or the image configuration; open questions instead of guesses |
+| Unraid Community Applications XML | Implemented (New app page) | Template links (raw XML) translated into a draft; no undocumented endpoint, no Unraid code; plugins refused |
+| awesome-selfhosted | Implemented (New app page) | Discovery index: the entry's source repository is imported, attribution kept |
+| Your own Compose file | Implemented (adoption) | Adopted as an external project: discovered and publishable, managed only with permission |
+
+Imported manifests are never written to `catalog\apps` (catalog files must be curated to be installable); see
+[provisioning.md](provisioning.md) for the engine, the security review and the identity contract.
