@@ -46,7 +46,7 @@ function ConvertTo-AppInstance($Record, $CatalogApps) {
     origin = [string](Get-InstProp $Record 'origin' 'installed'); prepared = [bool](Get-InstProp $Record 'prepared' $false)
     archived = [bool](Get-InstProp $Record 'archived' $false); archivedAt = [string](Get-InstProp $Record 'archivedAt' '')
     localPort = [int](Get-InstProp $Record 'localPort' 0); localUrl = [string](Get-InstProp $Record 'localUrl' '')
-    composeSha256 = [string](Get-InstProp $Record 'composeSha256' '')
+    composeSha256 = [string](Get-InstProp $Record 'composeSha256' ''); composeFile = [string](Get-InstProp $Record 'composeFile' '')
   }
 }
 

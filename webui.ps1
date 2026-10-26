@@ -1550,6 +1550,21 @@ function Get-CatalogView($M) {
   }
 }
 
+# Compose's standard file names, in the order docker compose itself picks them. Apps installed here use compose.yaml;
+# an adopted project keeps whichever of these it has (recorded as composeFile).
+$ComposeFileNames = @('compose.yaml', 'compose.yml', 'docker-compose.yaml', 'docker-compose.yml')
+function Find-ComposeFileName([string]$Folder) {
+  foreach ($n in $ComposeFileNames) { if ($Folder -and (Test-Path -LiteralPath (Join-Path $Folder $n))) { return $n } }
+  return ''
+}
+function Get-AppComposePath($App) {
+  $folder = [string]$(if ($App -is [System.Collections.IDictionary]) { $App['folder'] } else { $App.folder })
+  $name = [string]$(if ($App -is [System.Collections.IDictionary]) { if ($App.Contains('composeFile')) { $App['composeFile'] } } elseif ($App.PSObject.Properties['composeFile']) { $App.composeFile })
+  if (-not $name) { $name = Find-ComposeFileName $folder }
+  if (-not $name) { $name = 'compose.yaml' }
+  return (Join-Path $folder $name)
+}
+
 # --- Deployments: lifecycle, instances, duplicates ----------------------------------------------------------------
 
 # Facts (lib\ComposeLifecycle.psm1) of every Compose container on this PC, from two docker calls. No environment or
@@ -1570,7 +1585,7 @@ function Get-InstanceLifecycle($Instance, [object[]]$Facts, $Catalog) {
   $entry = Resolve-CatalogEntry $Catalog $Instance.appId
   $m = $(if ($entry) { $entry.manifest } else { $null })
   $defined = @()
-  $composePath = Join-Path $Instance.folder 'compose.yaml'
+  $composePath = Get-AppComposePath $Instance
   if ($Instance.folder -and (Test-Path -LiteralPath $composePath)) { $defined = @((Get-ComposeServiceImages ([IO.File]::ReadAllText($composePath))).Keys) }
   $inactive = @(); if ($m -and $defined.Count) { $inactive = @($m.services.PSObject.Properties | Where-Object { $defined -notcontains $_.Name } | ForEach-Object { $_.Name }) }
   return Get-DeploymentLifecycle -Containers $cs -Manifest $m -Defined $defined -Inactive $inactive -Prepared:([bool]$Instance.prepared)
@@ -2046,12 +2061,12 @@ function Find-InstalledApp([string]$Project) {
   $settings = Get-Settings
   $a = @(Read-AppsRegistry $settings | Where-Object { $_.project -eq $Project })
   if (-not $a.Count) { Stop-Request 404 "No app '$Project' was installed by this manager." }
-  $compose = Join-Path $a[0].folder 'compose.yaml'
+  $compose = Get-AppComposePath $a[0]
   if ([bool](Get-Prop2 $a[0] 'archived' $false)) { Stop-Request 409 "The record of '$Project' is archived. Restore it on the Installed apps page to manage it here." }
   if ([string](Get-Prop2 $a[0] 'origin' '') -eq 'adopted') {
     # Adopted projects were not generated here: their compose.yaml is the user's own. The folder must still be the
     # one Docker reports for the project's containers.
-    if (-not (Test-Path -LiteralPath $compose)) { Stop-Request 409 "$($a[0].folder) no longer holds compose.yaml; manage the project with docker compose directly." }
+    if (-not (Test-Path -LiteralPath $compose)) { Stop-Request 409 "$($a[0].folder) no longer holds its Compose file; manage the project with docker compose directly." }
     return $a[0]
   }
   # Only projects this manager generated are managed: an edited or foreign compose file is left alone.
@@ -2072,7 +2087,7 @@ function Get-AppsData {
   $views = @(foreach ($i in $instances) {
       $entry = Resolve-CatalogEntry $catalog $i.appId
       $m = $(if ($entry) { $entry.manifest } else { $null })
-      $composePath = Join-Path $i.folder 'compose.yaml'
+      $composePath = Get-AppComposePath $i
       $composeText = $(if ($i.folder -and (Test-Path -LiteralPath $composePath)) { [IO.File]::ReadAllText($composePath) } else { '' })
       $diff = @(); if ($m -and $composeText) { $diff = @(Get-AppUpdateDiff $m $composeText) }
       $cs = @($facts | Where-Object { $_.project -eq $i.project })
@@ -2118,7 +2133,7 @@ function Get-AppDetailData([string]$Project) {
   $cfHosts = @(); if ($cf.PSObject.Properties['managed'] -and $cf.managed) { $cfHosts = @($cf.managed.PSObject.Properties | Where-Object { @($i.hostnames) -contains $_.Name } | ForEach-Object { [ordered]@{ hostname = $_.Name; dnsRecord = [bool](Get-Prop2 $_.Value 'dnsRecordId' ''); accessApp = [bool](Get-Prop2 $_.Value 'accessAppId' '') } }) }
   $idApps = @()
   try { $id = Read-IdentityConfig -Settings $settings; $ap = Get-Prop2 (Get-Prop2 $id 'authentik' $null) 'apps' $null; if ($ap) { $idApps = @($ap.PSObject.Properties | Where-Object { @($i.routes | ForEach-Object { $_.name }) -contains $_.Name } | ForEach-Object { [ordered]@{ service = $_.Name; slug = [string](Get-Prop2 $_.Value 'slug' '') } }) } } catch { }
-  $composePath = Join-Path $i.folder 'compose.yaml'
+  $composePath = Get-AppComposePath $i
   $composeText = $(if ($i.folder -and (Test-Path -LiteralPath $composePath)) { [IO.File]::ReadAllText($composePath) } else { '' })
   return [ordered]@{
     project = $i.project; instanceId = $i.instanceId; name = $i.name; label = $i.label; appId = $i.appId; applicationId = $i.applicationId; origin = $i.origin; folder = $i.folder; archived = $i.archived
@@ -2141,7 +2156,7 @@ function Invoke-AppAction($Body) {
     # First start of a prepared project: check memory again, then create the containers (downloads the pinned images).
     try { $mm = Get-CatalogApp -CatalogDir $CatalogDir -Id $a.appId; $need = Get-AppResourceEstimate $mm @{}; $res = Get-HostResources; $free = [Math]::Min($res.dockerFreeMB, $res.windowsFreeMB)
       if ($need.memoryMB -gt $free -and -not [bool](Get-Field $Body 'force' $false)) { Stop-Request 409 "$($a.name) needs about $($need.memoryMB) MB but only $free MB is free. Stop other apps first." } } catch [System.Management.Automation.RuntimeException] { if ($_.Exception.Message -match 'needs about') { throw } }
-    $r = Invoke-Docker compose --project-directory $a.folder -f (Join-Path $a.folder 'compose.yaml') up -d
+    $r = Invoke-Docker compose --project-directory $a.folder -f (Get-AppComposePath $a) up -d
     $hp = Join-Path $a.folder '.post-install.json'
     if ($r.ExitCode -eq 0 -and (Test-Path -LiteralPath $hp)) {
       $mm = Get-CatalogApp -CatalogDir $CatalogDir -Id $a.appId
@@ -2152,7 +2167,7 @@ function Invoke-AppAction($Body) {
       if (-not @($hookSteps | Where-Object { $_.status -ne 'Done' }).Count) { Remove-Item -LiteralPath $hp -Force }
       $r.Output = @($r.Output) + @($hookSteps | ForEach-Object { "$($_.status): $($_.name) $($_.message)" })
     }
-  } else { $r = Invoke-Docker compose --project-directory $a.folder -f (Join-Path $a.folder 'compose.yaml') $action }
+  } else { $r = Invoke-Docker compose --project-directory $a.folder -f (Get-AppComposePath $a) $action }
   Write-Audit "app-$action" "$($a.project) exit=$($r.ExitCode)"
   return [ordered]@{ ok = ($r.ExitCode -eq 0); project = $a.project; action = $action; output = ((ConvertTo-RedactedText @($r.Output)) -join "`n"); containers = @(Get-ComposeProjectContainers $a.project) }
 }
@@ -2161,10 +2176,10 @@ function Get-AppLogsData([string]$Project, [int]$Tail, [string]$Service = '') {
   Assert-Installed
   $a = Find-InstalledApp $Project
   if ($Tail -lt 1 -or $Tail -gt 2000) { $Tail = 200 }
-  $logArgs = @('compose', '--project-directory', $a.folder, '-f', (Join-Path $a.folder 'compose.yaml'), 'logs', '--no-color', '--tail', $Tail)
+  $logArgs = @('compose', '--project-directory', $a.folder, '-f', (Get-AppComposePath $a), 'logs', '--no-color', '--tail', $Tail)
   # One service's logs (also of a one-time job that exited): the service must belong to this project.
   if ($Service) {
-    $known = @(@(Get-ComposeContainerFacts | Where-Object { $_.project -eq $a.project } | ForEach-Object { $_.service }) + @((Get-ComposeServiceImages ([IO.File]::ReadAllText((Join-Path $a.folder 'compose.yaml')))).Keys))
+    $known = @(@(Get-ComposeContainerFacts | Where-Object { $_.project -eq $a.project } | ForEach-Object { $_.service }) + @((Get-ComposeServiceImages ([IO.File]::ReadAllText((Get-AppComposePath $a)))).Keys))
     if ($Service -notmatch '^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}$' -or $known -notcontains $Service) { Stop-Request 404 "No service '$Service' in $($a.project)." }
     $logArgs += $Service
   }
@@ -2194,11 +2209,11 @@ function Invoke-AppBackupCore($App, $Manifest, $Settings) {
   $dir = Join-Path $App.folder ("backups\" + (Get-Date -Format 'yyyyMMdd-HHmmss'))
   New-Item -ItemType Directory -Force -Path $dir | Out-Null
   $copyFile = { param($from, $name) if (Test-Path -LiteralPath $from) { $to = Join-Path $dir $name; [IO.File]::WriteAllText($to, ''); Set-SecretFileAcl $to; [IO.File]::WriteAllBytes($to, [IO.File]::ReadAllBytes($from)) } }
-  & $copyFile (Join-Path $App.folder 'compose.yaml') 'compose.yaml'
+  & $copyFile (Get-AppComposePath $App) 'compose.yaml'
   & $copyFile (Join-Path $App.folder '.env') '.env'
   $values = @{}; foreach ($i in @(Get-Prop2 $Manifest 'inputs' @())) { if ($i.type -eq 'boolean') { $values["input:$($i.id)"] = 'true' } }
   $active = @(Get-ActiveServices $Manifest $values)
-  $compose = [IO.File]::ReadAllText((Join-Path $App.folder 'compose.yaml'))
+  $compose = [IO.File]::ReadAllText((Get-AppComposePath $App))
   $volumes = @(); $skipped = @(); $folders = @()
   foreach ($sp in $active) {
     if ($compose -notmatch "(?m)^  $([regex]::Escape($sp.Name)):\s*$") { continue }
@@ -2215,7 +2230,7 @@ function Invoke-AppBackupCore($App, $Manifest, $Settings) {
   $stateful = @($active | Where-Object { Get-Prop2 $_.Value 'stateful' $false }).Count -gt 0
   $stopped = $false
   if ($stateful -and $volumes.Count) {
-    $null = Invoke-Docker compose --project-directory $App.folder -f (Join-Path $App.folder 'compose.yaml') stop
+    $null = Invoke-Docker compose --project-directory $App.folder -f (Get-AppComposePath $App) stop
     $stopped = $true
   }
   $results = @()
@@ -2228,7 +2243,7 @@ function Invoke-AppBackupCore($App, $Manifest, $Settings) {
       $results += [ordered]@{ volume = $vn; ok = ($r.ExitCode -eq 0 -and (Test-Path -LiteralPath $file)); sizeMB = $(if (Test-Path -LiteralPath $file) { [Math]::Round((Get-Item -LiteralPath $file).Length / 1MB, 1) } else { 0 }) }
     }
   } finally {
-    if ($stopped) { $null = Invoke-Docker compose --project-directory $App.folder -f (Join-Path $App.folder 'compose.yaml') start }
+    if ($stopped) { $null = Invoke-Docker compose --project-directory $App.folder -f (Get-AppComposePath $App) start }
   }
   $info = [ordered]@{ app = $App.appId; project = $App.project; createdAt = (Get-Date -Format 's'); volumes = $results; skipped = $skipped; folders = @($folders | Select-Object -Unique); stoppedForBackup = $stopped }
   [IO.File]::WriteAllText((Join-Path $dir 'backup.json'), ($info | ConvertTo-Json -Depth 5))
@@ -2247,7 +2262,7 @@ function Invoke-AppBackup($Body) {
 # Update preview: what the catalog would change, plus a notification when the registry now has a newer build under the
 # same tag. Nothing is pulled. Database (stateful) services never change their major version through this path.
 function Get-AppUpdateItems($App, $Manifest, [switch]$Registry) {
-  $text = [IO.File]::ReadAllText((Join-Path $App.folder 'compose.yaml'))
+  $text = [IO.File]::ReadAllText((Get-AppComposePath $App))
   $installed = Get-ComposeServiceImages $text
   $items = @()
   foreach ($sp in $Manifest.services.PSObject.Properties) {
@@ -2282,7 +2297,7 @@ function Invoke-AppUpdatePreview($Body) {
   $notes = $(if ($m.PSObject.Properties['update'] -and $m.update.PSObject.Properties['notes']) { [string]$m.update.notes } else { '' })
   # compose.yaml edited outside the manager (Arcane, Portainer, an editor) since it was generated or last updated here.
   $baseline = [string](Get-Prop2 $a 'composeSha256' '')
-  $external = $(if ($baseline) { (Get-TextSha256 ([IO.File]::ReadAllText((Join-Path $a.folder 'compose.yaml')))) -ne $baseline } else { $null })
+  $external = $(if ($baseline) { (Get-TextSha256 ([IO.File]::ReadAllText((Get-AppComposePath $a)))) -ne $baseline } else { $null })
   return [ordered]@{ project = $a.project; changes = $applicable; blocked = @($items | Where-Object { $_.blocked }); previewKey = $(if ($applicable.Count) { $key } else { '' }); notes = $notes
     externalChanges = $external; externalNote = $(if ($external) { 'compose.yaml was changed outside the manager since it was written here. The update changes only the image lines and keeps those edits; review them before continuing.' } elseif ($null -eq $external) { 'No fingerprint of compose.yaml was recorded (installed by an earlier version), so changes made with other tools cannot be detected.' } else { '' })
     releaseNotes = @(@(if ($m.PSObject.Properties['docs']) { $m.docs }) | Select-Object -First 1)
@@ -2299,10 +2314,10 @@ function Invoke-AppUpdateApply($Body) {
   if (-not $items.Count -or $key -ne [string](Get-Field $Body 'previewKey' '')) { Stop-Request 409 'The installed project, the catalog or the registry changed since the preview. Preview again.' }
   $settings = Get-Settings
   $baseline = [string](Get-Prop2 $a 'composeSha256' '')
-  if ($baseline -and (Get-TextSha256 ([IO.File]::ReadAllText((Join-Path $a.folder 'compose.yaml')))) -ne $baseline -and -not [bool](Get-Field $Body 'acknowledgeExternalChanges' $false)) { Stop-Request 409 'compose.yaml was changed outside the manager. Review the changes and confirm that the update may proceed (only image lines change; your edits are kept).' }
+  if ($baseline -and (Get-TextSha256 ([IO.File]::ReadAllText((Get-AppComposePath $a)))) -ne $baseline -and -not [bool](Get-Field $Body 'acknowledgeExternalChanges' $false)) { Stop-Request 409 'compose.yaml was changed outside the manager. Review the changes and confirm that the update may proceed (only image lines change; your edits are kept).' }
   $backup = Invoke-AppBackupCore $a $m $settings
   if (-not $backup.ok) { Stop-Request 500 "The backup before the update failed ($($backup.folder)); nothing was updated." }
-  $path = Join-Path $a.folder 'compose.yaml'
+  $path = Get-AppComposePath $a
   $text = [IO.File]::ReadAllText($path)
   $bak = "$path.bak-$(Get-Date -Format 'yyyyMMdd-HHmmss')"
   Copy-Item -LiteralPath $path -Destination $bak
@@ -2338,7 +2353,7 @@ function Invoke-AppRemove($Body) {
   $cs = @(Get-ComposeProjectContainers $a.project | ForEach-Object { $_.name })
   $routes = @((Read-ServiceRegistry -Settings $settings).services | Where-Object { $_.target.type -eq 'docker' -and $cs -contains $_.target.host } | ForEach-Object { $_.name })
   if ($routes.Count) { Stop-Request 409 "Remove the service route(s) $($routes -join ', ') on the Services page first, so the hostname does not answer 502." }
-  $args2 = @('compose', '--project-directory', $a.folder, '-f', (Join-Path $a.folder 'compose.yaml'), 'down')
+  $args2 = @('compose', '--project-directory', $a.folder, '-f', (Get-AppComposePath $a), 'down')
   if ($deleteVolumes) { $args2 += '-v' }
   $r = Invoke-Docker @args2
   if ($r.ExitCode -ne 0) { Stop-Request 500 "docker compose down failed: $((ConvertTo-RedactedText @($r.Output)) -join ' ')" }
@@ -2439,12 +2454,13 @@ function Get-AppAdoptPlan($Body) {
   & $check 'Recognized application' 'ok' "$($u.name): $($u.reason)"
   if ($u.availability -eq 'retired') { & $check 'Catalog status' 'warning' "$($u.name) is no longer offered for new installations; adopting it only lets you manage this existing one." }
   & $check 'Project folder' $(if ($folder -and (Test-Path -LiteralPath $folder)) { 'ok' } else { 'failed' }) $(if ($folder) { $folder } else { "Docker reports $($folders.Count) folders for this project's containers." })
-  $hasCompose = $folder -and (Test-Path -LiteralPath (Join-Path $folder 'compose.yaml'))
-  & $check 'compose.yaml' $(if ($hasCompose) { 'ok' } else { 'failed' }) $(if ($hasCompose) { 'Found; it stays exactly as it is.' } else { 'The manager manages projects whose file is named compose.yaml. This one is not; keep managing it with docker compose or your tool.' })
+  $composeName = Find-ComposeFileName $folder
+  $hasCompose = [bool]$composeName
+  & $check 'Compose file' $(if ($hasCompose) { 'ok' } else { 'failed' }) $(if ($hasCompose) { "$composeName found; it stays exactly as it is." } else { "No $($ComposeFileNames -join ', ') in the folder; keep managing it with docker compose or your tool." })
   $entry = Resolve-CatalogEntry $catalog $u.appId
   $lc = Get-DeploymentLifecycle -Containers $cs -Manifest $entry.manifest
   $key = Get-TextSha256 ("$project|$folder|" + (@($cs | ForEach-Object { "$($_.id):$($_.image)" } | Sort-Object) -join ','))
-  return [ordered]@{ project = $project; appId = $u.appId; name = $u.name; folder = $folder; lifecycle = $lc; checks = $checks.ToArray(); canAdopt = -not @($checks | Where-Object { $_.state -eq 'failed' }).Count; reviewKey = $key
+  return [ordered]@{ project = $project; appId = $u.appId; name = $u.name; folder = $folder; composeFile = $composeName; lifecycle = $lc; checks = $checks.ToArray(); canAdopt = -not @($checks | Where-Object { $_.state -eq 'failed' }).Count; reviewKey = $key
     keeps = @('Nothing in the project changes: compose.yaml, .env, containers, volumes and networks stay as they are.', 'The manager never deletes data or files of an adopted project; removing it here removes its containers only.', 'Changes made later with Arcane, Portainer or an editor are noticed before the manager changes anything.') }
 }
 
@@ -2456,8 +2472,8 @@ function Invoke-AppAdopt($Body) {
   if (-not $plan.canAdopt) { Stop-Request 409 'This project cannot be adopted; see the review.' }
   if ($plan.reviewKey -ne [string](Get-Field $Body 'reviewKey' '')) { Stop-Request 409 'The project changed since the review. Review it again.' }
   $label = ([string](Get-Field $Body 'label' '')).Trim(); if ($label.Length -gt 40 -or $label -match '[\r\n<>"]') { Stop-Request 400 'The instance label may have at most 40 characters, without quotes or angle brackets.' }
-  $compose = [IO.File]::ReadAllText((Join-Path $plan.folder 'compose.yaml'))
-  $record = [ordered]@{ instanceId = ('i-' + (New-SecretValue 6)); project = $plan.project; appId = $plan.appId; name = $plan.name; label = $label; origin = 'adopted'; folder = $plan.folder
+  $compose = [IO.File]::ReadAllText((Get-AppComposePath $plan))
+  $record = [ordered]@{ instanceId = ('i-' + (New-SecretValue 6)); project = $plan.project; appId = $plan.appId; name = $plan.name; label = $label; origin = 'adopted'; folder = $plan.folder; composeFile = $plan.composeFile
     installedAt = (Get-Date -Format 's'); images = @($plan.lifecycle.services | ForEach-Object { $_.image } | Where-Object { $_ }); localPort = 0; localUrl = ''; prepared = $false; composeSha256 = (Get-TextSha256 $compose) }
   Save-AppsRegistry $settings (@(Read-AppsRegistry $settings) + [pscustomobject]$record)
   Write-Audit 'app-adopt' "$($plan.appId) project=$($plan.project) folder=$($plan.folder)"

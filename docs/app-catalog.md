@@ -71,7 +71,7 @@ written before instance ids get a stable id (`legacy-<project>`); nothing is rew
   **Install another, separate instance** (with its own project, folder, volumes, port and optional label).
 - **Archive record** hides an obsolete record (only when none of its containers runs). Nothing else changes: folder,
   containers, volumes, routes, Cloudflare and authentik stay; *Restore* brings the record back.
-- **Adopt** registers a recognized, unregistered Compose project after a review. Nothing in it changes; the manager
+- **Adopt** registers a recognized, unregistered Compose project after a review; its file may have any of the standard names (`compose.yaml`, `compose.yml`, `docker-compose.yaml`, `docker-compose.yml`, picked in that order, as docker compose does) and is recorded as `composeFile`. Nothing in it changes; the manager
   never deletes an adopted project's data or files.
 - **Remove** first shows an inventory: containers, data volumes (volumes also used by other containers are never
   deleted), networks (the shared proxy network and networks of other projects are kept), generated files, and the

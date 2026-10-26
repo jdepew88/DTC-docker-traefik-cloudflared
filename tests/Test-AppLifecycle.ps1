@@ -189,7 +189,7 @@ Test-Condition 'removal inventory: an adopted project''s volumes and files are n
 $id = [Guid]::NewGuid().ToString('N').Substring(0, 6)
 $work = Join-Path ([IO.Path]::GetTempPath()) "tpm-alc-$id"
 New-Item -ItemType Directory -Force -Path $work | Out-Null
-$ui = $null; $mock = $null; $fixProject = "tpm-alc-$id"; $fixDir = Join-Path $work 'fixture'; $dockerUp = $false
+$ui = $null; $mock = $null; $fixProject = "tpm-alcfx-$id"; $fixDir = Join-Path $work 'fixture'; $dockerUp = $false
 $apiToken = 'mockTok_' + [Guid]::NewGuid().ToString('N')
 try {
   $install = New-TestInstance -Repo $repo -Path (Join-Path $work 'instance') -StackName "tpm-alc-$id"
@@ -265,7 +265,7 @@ services:
     depends_on:
       migrate: { condition: service_completed_successfully }
       bus: { condition: service_started }
-    labels: { org.traefik-proxy.project: $fixProject }
+    labels: { org.traefik-proxy.project: $fixProject, org.traefik-proxy.app: echo }
   bus:
     image: $img
     entrypoint: ['sh', '-c', 'exec sleep 100000']
@@ -287,8 +287,8 @@ services:
     restart: on-failure:1
     labels: { org.traefik-proxy.project: $fixProject }
 "@
-      [IO.File]::WriteAllText((Join-Path $fixDir 'compose.yaml'), $yaml)
-      $up = Invoke-Docker compose --project-directory $fixDir -f (Join-Path $fixDir 'compose.yaml') up -d
+      [IO.File]::WriteAllText((Join-Path $fixDir 'docker-compose.yml'), $yaml)
+      $up = Invoke-Docker compose --project-directory $fixDir -f (Join-Path $fixDir 'docker-compose.yml') up -d
       $dockerUp = $true
       Test-Condition 'docker: the disposable project starts (images already on this PC)' ($up.ExitCode -eq 0) (@($up.Output) -join ' ')
       $deadline = (Get-Date).AddSeconds(90)
@@ -304,9 +304,12 @@ services:
       Test-Condition 'docker: real inspect facts: app healthy, bus running without a health check' ($st['app'].status.key -eq 'healthy' -and $st['bus'].status.key -eq 'running-unverified') "app=$($st['app'].status.key) bus=$($st['bus'].status.key)"
       Test-Condition 'docker: migrate is a completed job because app waits for it (Compose), perms is inferred from on-failure' ($st['migrate'].status.key -eq 'completed' -and $st['migrate'].roleSource -eq 'compose' -and $st['perms'].status.key -eq 'completed' -and $st['perms'].roleSource -eq 'inferred') "migrate=$($st['migrate'].roleSource) perms=$($st['perms'].roleSource)"
       Test-Condition 'docker: a setup job that failed (exit 3 after its retry) is reported as failed' ($st['seed'].status.key -eq 'job-failed' -and $st['seed'].exitCode -eq 3 -and $lr.state -eq 'failed' -and $lr.headline -match "2/2 running $dot 2 setup jobs completed $dot 1 setup job failed") $lr.headline
-      # Register it (adopted: the manager did not generate it) and use the API.
-      $recs = @(([IO.File]::ReadAllText((Join-Path $install 'config\apps.json')) | ConvertFrom-Json).apps) + [pscustomobject]@{ instanceId = 'i-fixture0001'; project = $fixProject; appId = 'echo'; name = 'Fixture'; folder = $fixDir; origin = 'adopted'; prepared = $false }
-      [IO.File]::WriteAllText((Join-Path $install 'config\apps.json'), (([ordered]@{ version = 1; apps = $recs }) | ConvertTo-Json -Depth 5))
+      # Adopt it through the API (review, then adopt): the manager did not generate it, and its file is
+      # docker-compose.yml, one of the four standard Compose file names.
+      $ap = Invoke-WebUi $ui POST '/api/apps/adopt/plan' @{ project = $fixProject }
+      $ad = Invoke-WebUi $ui POST '/api/apps/adopt' @{ project = $fixProject; reviewKey = $(if ($ap.Status -eq 200) { $ap.Data.reviewKey } else { '' }); label = 'Fixture'; confirm = $true }
+      $rec = @(([IO.File]::ReadAllText((Join-Path $install 'config\apps.json')) | ConvertFrom-Json).apps | Where-Object { $_.project -eq $fixProject })[0]
+      Test-Condition 'adopt: a project whose file is docker-compose.yml is recognized (label), reviewed and adopted; the file name is recorded' ($ap.Status -eq 200 -and $ad.Status -eq 200 -and $ap.Data.canAdopt -and $ap.Data.composeFile -eq 'docker-compose.yml' -and $rec -and $rec.origin -eq 'adopted' -and $rec.composeFile -eq 'docker-compose.yml' -and $rec.label -eq 'Fixture') ("$($ap.Status) $($ap.Body) / $($ad.Status) $($ad.Body)")
       $det = Invoke-WebUi $ui GET "/api/apps/detail?project=$fixProject"
       Test-Condition 'api detail: services, networks with DNS names and dependencies; no environment value or secret anywhere' ($det.Status -eq 200 -and @($det.Data.lifecycle.services).Count -eq 5 -and @($det.Data.networks | Where-Object { $_.name -eq "${fixProject}_default" -and @($_.members | Where-Object { @($_.dnsNames) -contains 'app' }).Count }).Count -eq 1 -and $det.Body -notmatch [regex]::Escape($secret) -and $det.Body -notmatch 'APP_SECRET') ($det.Body.Substring(0, [Math]::Min(400, $det.Body.Length)))
       $lgs = Invoke-WebUi $ui GET "/api/apps/logs?project=$fixProject&service=seed&tail=20"
@@ -314,12 +317,12 @@ services:
       $cp = Invoke-WebUi $ui POST '/api/apps/cleanup/plan' @{ project = $fixProject }
       Test-Condition 'tidy up: the preview offers only the completed job with a declared role (migrate), not perms (inferred) or seed (failed)' ($cp.Status -eq 200 -and (@($cp.Data.candidates | ForEach-Object { $_.service }) -join ',') -eq 'migrate') ($cp.Body)
       $keep = @{}; foreach ($n2 in 'app', 'bus', 'perms', 'seed') { $keep[$n2] = ((Invoke-Docker inspect "$fixProject-$n2-1" --format '{{.Id}} {{.State.StartedAt}}').Output -join '').Trim() }
-      $composeBefore = (Get-FileHash (Join-Path $fixDir 'compose.yaml')).Hash
+      $composeBefore = (Get-FileHash (Join-Path $fixDir 'docker-compose.yml')).Hash
       $bad = Invoke-WebUi $ui POST '/api/apps/cleanup' @{ project = $fixProject; key = 'wrong'; confirm = $true }
       $go = Invoke-WebUi $ui POST '/api/apps/cleanup' @{ project = $fixProject; key = $cp.Data.key; confirm = $true }
       $gone = (Invoke-Docker inspect "$fixProject-migrate-1").ExitCode -ne 0
       $same = -not @($keep.Keys | Where-Object { ((Invoke-Docker inspect "$fixProject-$_-1" --format '{{.Id}} {{.State.StartedAt}}').Output -join '').Trim() -ne $keep[$_] }).Count
-      Test-Condition 'tidy up: a stale preview is refused; applying removes only that container; others not restarted; compose.yaml unchanged' ($bad.Status -eq 409 -and $go.Status -eq 200 -and $go.Data.ok -and $gone -and $same -and (Get-FileHash (Join-Path $fixDir 'compose.yaml')).Hash -eq $composeBefore) $go.Body
+      Test-Condition 'tidy up: a stale preview is refused; applying removes only that container; others not restarted; compose.yaml unchanged' ($bad.Status -eq 409 -and $go.Status -eq 200 -and $go.Data.ok -and $gone -and $same -and (Get-FileHash (Join-Path $fixDir 'docker-compose.yml')).Hash -eq $composeBefore) $go.Body
       $det2 = Invoke-WebUi $ui GET "/api/apps/detail?project=$fixProject"
       $mg = @($det2.Data.lifecycle.services | Where-Object { $_.service -eq 'migrate' })[0]
       Test-Condition 'tidy up: afterwards the job shows "No container" (definition kept), and the app keeps running' ($mg.status.key -eq 'job-not-run' -and @($det2.Data.lifecycle.services | Where-Object { $_.service -eq 'app' -and $_.state -eq 'running' }).Count -eq 1) ''
@@ -331,7 +334,7 @@ services:
   if ($ui) { Stop-TestServer $ui }
   if ($mock) { Stop-TestServer $mock }
   if ($dockerUp) {
-    $null = Invoke-Docker compose --project-directory $fixDir -f (Join-Path $fixDir 'compose.yaml') down -v --remove-orphans
+    $null = Invoke-Docker compose --project-directory $fixDir -f (Join-Path $fixDir 'docker-compose.yml') down -v --remove-orphans
     $left = @((Invoke-Docker ps -a -q --filter "label=com.docker.compose.project=$fixProject").Output | Where-Object { $_ })
     Test-Condition 'cleanup: the disposable project is gone' ($left.Count -eq 0) ''
     $engineAfter = & $snap
