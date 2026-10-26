@@ -47,6 +47,8 @@ function ConvertTo-AppInstance($Record, $CatalogApps) {
     archived = [bool](Get-InstProp $Record 'archived' $false); archivedAt = [string](Get-InstProp $Record 'archivedAt' '')
     localPort = [int](Get-InstProp $Record 'localPort' 0); localUrl = [string](Get-InstProp $Record 'localUrl' '')
     composeSha256 = [string](Get-InstProp $Record 'composeSha256' ''); composeFile = [string](Get-InstProp $Record 'composeFile' '')
+    # Applications imported by the provisioning engine keep their manifest next to compose.yaml.
+    manifestFile = [string](Get-InstProp $Record 'manifestFile' ''); source = [string](Get-InstProp $Record 'source' '')
   }
 }
 

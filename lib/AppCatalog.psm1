@@ -21,9 +21,10 @@ $script:DerivedMethods = @('authelia-argon2')
 # building blocks bundled inside other apps) or 'retired' (no longer offered; kept so existing installations are still
 # recognized).
 $script:Availability = @('offered', 'reference', 'retired')
-# Where a manifest comes from. Only curated manifests are installable in this version; community and generated
-# manifests will pass through the same validation before they can be.
-$script:SourceTypes = @('curated', 'community', 'generated')
+# Where a manifest comes from. Catalog files (catalog\apps) must be curated to be installable. 'imported' manifests
+# (lib\AppSources.psm1: Docker Hub, GitHub, Unraid, directories) are installable only through the provisioning engine,
+# which validates them with -AllowImported after its security review (lib\ProvisionPolicy.psm1).
+$script:SourceTypes = @('curated', 'community', 'generated', 'imported')
 # Service roles in a multi-container app, and the lifecycle each implies unless the manifest says otherwise.
 $script:ServiceRoles = [ordered]@{ app = 'long-running'; database = 'long-running'; cache = 'long-running'; messaging = 'long-running'; worker = 'long-running'
   support = 'long-running'; proxy = 'long-running'; init = 'run-once'; migration = 'run-once'; maintenance = 'run-once' }
@@ -39,8 +40,9 @@ function Get-Prop($Object, [string]$Name, $Default = $null) {
 
 # --- Manifests ------------------------------------------------------------------------------------------------------------
 
-# Every rule a curated manifest must satisfy. Returns error strings (empty = valid).
-function Test-AppManifest($M) {
+# Every rule a curated manifest must satisfy. Returns error strings (empty = valid). -AllowImported: the same rules,
+# but a non-curated manifest may be installable (the provisioning engine's drafts).
+function Test-AppManifest($M, [switch]$AllowImported) {
   $e = New-Object System.Collections.ArrayList
   $add = { param($t) $null = $e.Add($t) }
   if ((Get-Prop $M 'schema' 0) -ne $script:SchemaVersion) { & $add "schema must be $($script:SchemaVersion)" }
@@ -70,7 +72,7 @@ function Test-AppManifest($M) {
   if ($availability -eq 'retired' -and -not [string](Get-Prop (Get-Prop $M 'retired' $null) 'note' '')) { & $add 'a retired manifest needs retired.note' }
   $sourceType = [string](Get-Prop (Get-Prop $M 'source' $null) 'type' 'curated')
   if ($script:SourceTypes -notcontains $sourceType) { & $add "source.type must be one of $($script:SourceTypes -join ', ')" }
-  elseif ($sourceType -ne 'curated' -and [bool](Get-Prop $M 'installable' $false)) { & $add 'only curated manifests are installable in this version' }
+  elseif ($sourceType -ne 'curated' -and [bool](Get-Prop $M 'installable' $false) -and -not $AllowImported) { & $add 'only curated manifests are installable from the catalog' }
   if (-not [bool](Get-Prop $M 'installable' $false)) { if (-not [string](Get-Prop $M 'installNote' '') -and $availability -ne 'retired') { & $add 'a manifest that is not installable needs installNote' }; return $e.ToArray() }
   $services = Get-Prop $M 'services' $null
   if (-not $services -or -not @($services.PSObject.Properties).Count) { & $add 'services is required'; return $e.ToArray() }
@@ -128,7 +130,7 @@ function Test-AppManifest($M) {
         & $checkTemplates $where ([string]$ev.Value) @()
       } }
     foreach ($c in @(Get-Prop $s 'command' @())) { & $checkTemplates $where ([string]$c) @() }
-    if ((Get-Prop $s 'user' '') -and [string](Get-Prop $s 'user' '') -notmatch '^\d{1,6}(:\d{1,6})?$') { & $add "${where}: user must be uid[:gid]" }
+    if ((Get-Prop $s 'user' '') -and [string](Get-Prop $s 'user' '') -notmatch '^(\d{1,6}(:\d{1,6})?|[a-z_][a-z0-9_-]{0,31}(:[a-z_][a-z0-9_-]{0,31})?)$') { & $add "${where}: user must be uid[:gid] or a user name" }
     $needs = @()
     if (Get-Prop $s 'dockerSocket' $false) { $needs += 'docker-socket' }
     if ([string](Get-Prop $s 'networkMode' '') -eq 'host') { $needs += 'host-network' } elseif (Get-Prop $s 'networkMode' '') { & $add "${where}: networkMode may only be host" }
