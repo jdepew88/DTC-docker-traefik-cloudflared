@@ -1,0 +1,120 @@
+{
+  "schema": 1,
+  "manifestVersion": "2026.10.25",
+  "id": "arcane",
+  "name": "Arcane",
+  "category": "management",
+  "description": "Modern web interface to manage Docker containers, images and Compose projects.",
+  "maintainer": "getarcaneapp",
+  "license": "BSD-3-Clause",
+  "source": {
+    "type": "curated",
+    "url": "https://github.com/getarcaneapp/arcane"
+  },
+  "docs": [
+    {
+      "title": "Arcane documentation",
+      "url": "https://getarcane.app/docs"
+    },
+    {
+      "title": "Compose examples",
+      "url": "https://github.com/getarcaneapp/arcane/tree/main/docker/examples"
+    }
+  ],
+  "platforms": {
+    "windows-docker-desktop": "supported",
+    "linux-docker": "untested",
+    "unraid": "untested",
+    "podman": "untested"
+  },
+  "installable": true,
+  "services": {
+    "app": {
+      "image": "getarcaneapp/manager:v2.16.1@sha256:e211067a6808c1598175141cd19c48eab874a24b5b649be3ddcb3894db7e73cd",
+      "ports": [
+        {
+          "container": 3552,
+          "protocol": "http",
+          "primary": true
+        }
+      ],
+      "volumes": [
+        {
+          "name": "data",
+          "target": "/app/data",
+          "kind": "volume",
+          "description": "Arcane's database and settings."
+        }
+      ],
+      "dockerSocket": true,
+      "environment": {
+        "APP_URL": "{{appUrl}}",
+        "ENCRYPTION_KEY": "{{input:encryptionKey}}",
+        "JWT_SECRET": "{{input:jwtSecret}}",
+        "TZ": "{{timezone}}"
+      },
+      "healthcheck": {
+        "test": [
+          "CMD",
+          "./arcane",
+          "health",
+          "--timeout",
+          "2s"
+        ],
+        "interval": "10s",
+        "timeout": "3s",
+        "retries": 5,
+        "start_period": "15s"
+      }
+    }
+  },
+  "inputs": [
+    {
+      "id": "encryptionKey",
+      "type": "generated",
+      "bytes": 32,
+      "label": "Encryption key"
+    },
+    {
+      "id": "jwtSecret",
+      "type": "generated",
+      "bytes": 32,
+      "label": "Session signing secret"
+    }
+  ],
+  "privileges": [
+    {
+      "kind": "docker-socket",
+      "explain": "Arcane mounts the Docker socket. Anyone who can sign in to Arcane controls every container on this PC and, through Docker, the PC itself."
+    }
+  ],
+  "dependencies": [],
+  "security": [
+    "Change the default administrator password on first sign-in (see Arcane's documentation).",
+    "Never publish it without Cloudflare Access in front of its own login."
+  ],
+  "update": {
+    "strategy": "pinned-digest",
+    "notes": "Back up the data volume before updating; downgrades are blocked by Arcane."
+  },
+  "web": {
+    "service": "app",
+    "path": "/",
+    "localPort": 3552
+  },
+  "exposure": {
+    "default": "access",
+    "allowPublic": false,
+    "warning": "Arcane controls Docker on this PC: publish it only behind Cloudflare Access."
+  },
+  "group": "A",
+  "choiceGroup": {
+    "id": "docker-management",
+    "recommended": true,
+    "note": "Recommended for everyday container, image, network and Compose management. Optional: the manager does not need it. Portainer is the alternative; one of the two is enough."
+  },
+  "resources": {
+    "memoryMB": 200,
+    "diskMB": 400
+  }
+}

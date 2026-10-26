@@ -1,0 +1,3944 @@
+#requires -version 5.1
+<#
+.SYNOPSIS
+  Local web interface for the Traefik + Cloudflare Tunnel proxy: guided setup, service management, Cloudflare
+  DNS / Tunnel / Access automation, backups, logs and diagnostics.
+
+.DESCRIPTION
+  Listens on 127.0.0.1 only (a loopback socket, unreachable from the LAN). Access needs the one-time link printed
+  at startup, which sets a session cookie; every API call is also checked for the Host header (DNS-rebinding
+  protection), and every change for the Origin header and a per-session CSRF token. Nothing is changed without a
+  preview and an explicit confirmation in the browser, and overwriting existing Cloudflare resources needs a
+  separate confirmation per resource.
+
+  The server is a thin layer over lib\TraefikProxy.psm1 (the same code services.ps1 and install.ps1 use) and
+  lib\CloudflareApi.psm1. The Cloudflare API token is stored with Windows DPAPI (current user) in
+  secrets\cloudflare_api.dpapi and is never sent back to the browser.
+
+  Stop the server with Ctrl+C.
+
+.EXAMPLE
+  powershell -ExecutionPolicy Bypass -File .\webui.ps1
+  powershell -ExecutionPolicy Bypass -File .\webui.ps1 -Port 8190 -InstallPath D:\proxy -NoBrowser
+#>
+[CmdletBinding()]
+param(
+  [ValidateRange(1024, 65535)][int]$Port = 8190,
+  [string]$InstallPath,
+  [switch]$NoBrowser,
+  # Tests only: a loopback Cloudflare API mock (http://127.0.0.1:<port>). Real use always talks to api.cloudflare.com.
+  [string]$CloudflareApiBase,
+  # Tests only: write the launch link here instead of printing/opening it, and stop when StopFile appears.
+  [string]$LaunchUrlFile,
+  [string]$StopFile,
+  # Where the last used install folder and the recent projects are remembered (default: %LOCALAPPDATA%\TraefikProxy\webui.json).
+  [string]$StateFile,
+  # Folder whose subfolders are offered as existing deployments (default: %USERPROFILE%\.docker\projects).
+  [string]$ProjectsRoot,
+  # Launcher mode (Start-DeploymentManager.ps1): the sign-in link is written to -LaunchUrlFile only (never printed),
+  # works once and is replaced by a new one after use; -OpenBrowser opens it.
+  [switch]$SingleUseLaunch,
+  [switch]$OpenBrowser,
+  # App Catalog manifests (default: catalog\ next to this script; tests use a fixture folder).
+  [string]$CatalogDir
+)
+
+$ErrorActionPreference = 'Stop'
+Set-StrictMode -Version 2.0
+$here = Split-Path -Parent $MyInvocation.MyCommand.Path
+Import-Module (Join-Path $here 'lib\TraefikProxy.psm1') -Force
+Import-Module (Join-Path $here 'lib\CloudflareApi.psm1') -Force
+Import-Module (Join-Path $here 'lib\Dashboard.psm1') -Force
+Import-Module (Join-Path $here 'lib\ConfigBackup.psm1') -Force
+Import-Module (Join-Path $here 'lib\ProjectDiscovery.psm1') -Force
+Import-Module (Join-Path $here 'lib\Infrastructure.psm1') -Force
+Import-Module (Join-Path $here 'lib\DockerDiscovery.psm1') -Force
+Import-Module (Join-Path $here 'lib\ServiceHealth.psm1') -Force
+Import-Module (Join-Path $here 'lib\BackendResolver.psm1') -Force
+Import-Module (Join-Path $here 'lib\AppCatalog.psm1') -Force
+Import-Module (Join-Path $here 'lib\ComposeLifecycle.psm1') -Force
+Import-Module (Join-Path $here 'lib\AppInstances.psm1') -Force
+Import-Module (Join-Path $here 'lib\SecretStore.psm1') -Force
+Import-Module (Join-Path $here 'lib\CredentialManager.psm1') -Force
+Import-Module (Join-Path $here 'lib\RoutingModel.psm1') -Force
+Import-Module (Join-Path $here 'lib\Authentik.psm1') -Force
+Import-Module (Join-Path $here 'lib\IdentityProvider.psm1') -Force
+if (-not $CatalogDir) { $CatalogDir = Join-Path $here 'catalog' }
+Import-Module (Join-Path $here 'lib\LocalHttp.psm1') -Force
+Set-CloudflareApiBase $CloudflareApiBase
+
+if (-not $StateFile) { $StateFile = Join-Path $env:LOCALAPPDATA 'TraefikProxy\webui.json' }
+if (-not $ProjectsRoot) { $ProjectsRoot = Join-Path $env:USERPROFILE '.docker\projects' }
+# With an explicit -InstallPath the deployment is chosen; otherwise the website starts on the project chooser.
+$ProjectChosen = $PSBoundParameters.ContainsKey('InstallPath')
+# Install folder: -InstallPath, else this folder when it is an installation, else the folder chosen last time in the
+# setup wizard, else the default.
+if (-not $InstallPath) {
+  if ((Test-Path -LiteralPath (Join-Path $here '.env')) -or (Test-Path -LiteralPath (Join-Path $here '.install-manifest.json'))) { $InstallPath = $here }
+  else {
+    $InstallPath = Join-Path $env:USERPROFILE '.docker\projects\traefik-proxy'
+    try {
+      if (Test-Path -LiteralPath $StateFile) {
+        $remembered = [string](([IO.File]::ReadAllText($StateFile) | ConvertFrom-Json).installPath)
+        if ($remembered -match '^[A-Za-z]:\\' -and (Test-Path -LiteralPath $remembered)) { $InstallPath = $remembered }
+      }
+    } catch { }
+  }
+}
+$InstallPath = [IO.Path]::GetFullPath($InstallPath)
+$StaticRoot = Join-Path $here 'webui'
+
+function New-RandomKey([int]$Bytes = 32) {
+  $b = New-Object byte[] $Bytes
+  $rng = [Security.Cryptography.RandomNumberGenerator]::Create()
+  $rng.GetBytes($b)
+  return ([Convert]::ToBase64String($b)).TrimEnd('=').Replace('+', '-').Replace('/', '_')
+}
+
+$State = @{
+  LaunchKey = New-RandomKey
+  Sessions  = @{}
+  Plans     = @{}
+  Imports   = @{}
+  Chosen    = $ProjectChosen
+  Upgrades  = @{}
+  AppPlans  = @{}
+  IdpPlans  = @{}
+  IdpChecks = @{}
+  Cookie    = "tpx_session_$Port"
+  Origins   = @("http://127.0.0.1:$Port", "http://localhost:$Port")
+  Hosts     = @("127.0.0.1:$Port", "localhost:$Port")
+}
+
+$SecurityHeaders = @{
+  'Content-Security-Policy'      = "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'"
+  'X-Content-Type-Options'       = 'nosniff'
+  'X-Frame-Options'              = 'DENY'
+  'Referrer-Policy'              = 'no-referrer'
+  'Cache-Control'                = 'no-store'
+  'Cross-Origin-Opener-Policy'   = 'same-origin'
+  'Cross-Origin-Resource-Policy' = 'same-origin'
+  'Permissions-Policy'           = 'camera=(), microphone=(), geolocation=(), payment=(), usb=()'
+}
+$StaticFiles = @{
+  '/'           = @('index.html', 'text/html; charset=utf-8')
+  '/index.html' = @('index.html', 'text/html; charset=utf-8')
+  '/app.js'     = @('app.js', 'text/javascript; charset=utf-8')
+  '/ui.js'      = @('ui.js', 'text/javascript; charset=utf-8')
+  '/logic.js'   = @('logic.js', 'text/javascript; charset=utf-8')
+  '/setup.js'   = @('setup.js', 'text/javascript; charset=utf-8')
+  '/pages.js'   = @('pages.js', 'text/javascript; charset=utf-8')
+  '/backend.js' = @('backend.js', 'text/javascript; charset=utf-8')
+  '/projects.js' = @('projects.js', 'text/javascript; charset=utf-8')
+  '/brands.js' = @('brands.js', 'text/javascript; charset=utf-8')
+  '/explorer.js' = @('explorer.js', 'text/javascript; charset=utf-8')
+  '/discover.js' = @('discover.js', 'text/javascript; charset=utf-8')
+  '/catalog.js' = @('catalog.js', 'text/javascript; charset=utf-8')
+  '/credentials.js' = @('credentials.js', 'text/javascript; charset=utf-8')
+  '/identity.js' = @('identity.js', 'text/javascript; charset=utf-8')
+  '/routing.js' = @('routing.js', 'text/javascript; charset=utf-8')
+  '/deployments.js' = @('deployments.js', 'text/javascript; charset=utf-8')
+  '/learn.json' = @('learn.json', 'application/json; charset=utf-8')
+  '/app.css'    = @('app.css', 'text/css; charset=utf-8')
+  '/icon.svg'   = @('icon.svg', 'image/svg+xml')
+}
+$EmailPattern = '^[A-Za-z0-9._%+''-]{1,64}@[A-Za-z0-9.-]{1,253}\.[A-Za-z]{2,63}$'
+
+# --- Helpers -------------------------------------------------------------------------------------------------
+
+function Stop-Request([int]$Status, [string]$Message, $Extra) {
+  $ex = New-Object System.Exception $Message
+  $ex.Data['status'] = $Status
+  if ($Extra) { $ex.Data['extra'] = $Extra }
+  throw $ex
+}
+
+function Get-Field($Object, [string]$Name, $Default = $null) {
+  if ($null -ne $Object -and $Object.PSObject.Properties[$Name] -and $null -ne $Object.$Name) { return $Object.$Name }
+  return $Default
+}
+
+function New-JsonResponse($Data, [int]$Status = 200, [hashtable]$Headers = @{}) {
+  $h = @{} + $SecurityHeaders
+  foreach ($k in $Headers.Keys) { $h[$k] = $Headers[$k] }
+  return @{ Status = $Status; ContentType = 'application/json; charset=utf-8'; Body = (ConvertTo-Json -InputObject $Data -Depth 14 -Compress); Headers = $h }
+}
+
+# Instance settings: the installed .env, else the setup wizard's draft, else the packaged defaults.
+function Get-Settings {
+  if (Test-Path -LiteralPath (Join-Path $InstallPath '.env')) { return Get-StackSettings -InstallPath $InstallPath }
+  $draft = Read-SetupDraft
+  $values = Read-DotEnv (Join-Path $here '.env.example')
+  if ($draft.settings) { foreach ($p in $draft.settings.PSObject.Properties) { $values[$p.Name] = [string]$p.Value } }
+  return ConvertTo-StackSettings -InstallPath $InstallPath -Values $values
+}
+
+# The .env values the installer writes: the instance keys plus TRAEFIK_LOG_LEVEL / TRAEFIK_READ_TIMEOUT when the setup
+# draft has them (a restored backup).
+function Get-EnvValues($Settings) {
+  $values = ConvertTo-InstanceValues $Settings
+  $draft = Read-SetupDraft
+  foreach ($k in @('TRAEFIK_LOG_LEVEL', 'TRAEFIK_READ_TIMEOUT')) {
+    if ($draft.settings -and $draft.settings.PSObject.Properties[$k] -and [string]$draft.settings.$k -match '^[A-Za-z0-9_.:-]{1,32}$') { $values[$k] = [string]$draft.settings.$k }
+  }
+  return $values
+}
+
+function Get-SettingsSource {
+  if (Test-Path -LiteralPath (Join-Path $InstallPath '.env')) { return 'env' }
+  if ((Read-SetupDraft).settings) { return 'draft' }
+  return 'defaults'
+}
+
+# Setup wizard choices that are not secret and not yet installed: config\setup.json in the install folder.
+function Read-SetupDraft { return Read-SetupDraftFile $InstallPath }
+
+function Save-SetupDraft($Draft) {
+  Write-TextFileAtomic (Join-Path $InstallPath 'config\setup.json') (ConvertTo-SetupDraftJson $Draft)
+  Save-RememberedPath
+}
+
+# A protected recovery point (backups\recovery\) before a configuration change. A change is refused when the
+# recovery point cannot be written.
+function New-ChangeRecoveryPoint([string]$Reason) {
+  try { return New-RecoveryPoint -Settings (Get-Settings) -Reason $Reason -SourceRoot $here }
+  catch { Stop-Request 500 "No change was made: the recovery point could not be written ($($_.Exception.Message))." }
+}
+
+# A file download (not JSON). Invoke-Request sends it as-is with Content-Disposition: attachment.
+function New-Download([string]$FileName, [string]$ContentType, $Body) {
+  return [pscustomobject]@{ IsDownload = $true; FileName = $FileName; ContentType = $ContentType; Body = $Body }
+}
+
+# Manager state outside every deployment: the last used folder and the recent projects (paths and names only).
+function Read-ManagerState {
+  $st = [ordered]@{ installPath = ''; recent = @() }
+  try {
+    if (Test-Path -LiteralPath $StateFile) {
+      $j = [IO.File]::ReadAllText($StateFile) | ConvertFrom-Json
+      if ($j.PSObject.Properties['installPath']) { $st.installPath = [string]$j.installPath }
+      if ($j.PSObject.Properties['recent'] -and $j.recent) {
+        $st.recent = @($j.recent | Where-Object { $_ -and $_.PSObject.Properties['path'] -and [string]$_.path -match '^[A-Za-z]:\\' } | ForEach-Object {
+            [ordered]@{ path = [string]$_.path; stackName = [string](Get-Field $_ 'stackName' ''); lastOpened = [string](Get-Field $_ 'lastOpened' '') } })
+      }
+    }
+  } catch { }
+  if ($st.installPath -and @($st.recent | Where-Object { Test-SamePath $_.path $st.installPath }).Count -eq 0) { $st.recent = @([ordered]@{ path = $st.installPath; stackName = ''; lastOpened = '' }) + @($st.recent) }
+  return $st
+}
+
+function Save-ManagerState($St) {
+  try { Write-TextFileAtomic $StateFile ((ConvertTo-Json -InputObject $St -Depth 4) + "`n") } catch { }
+}
+
+# Remembers the install folder for the next start and puts it on top of the recent projects (nothing secret).
+function Save-RememberedPath {
+  $st = Read-ManagerState
+  $name = ''
+  try { $name = (Get-Settings).StackName } catch { }
+  $st.installPath = $InstallPath
+  $st.recent = @(@([ordered]@{ path = $InstallPath; stackName = $name; lastOpened = (Get-Date -Format 's') }) + @($st.recent | Where-Object { -not (Test-SamePath $_.path $InstallPath) }) | Select-Object -First 20)
+  Save-ManagerState $st
+}
+
+function Test-Installed { return (Test-Path -LiteralPath (Join-Path $InstallPath 'compose.yaml')) }
+
+# Code (modules, scripts, static files) always comes from $here, the folder webui.ps1 runs from; $InstallPath
+# holds only the instance's configuration and runtime files and may not exist before the first install.
+function Get-NotInstalledMessage { return "Not installed: no Traefik installation at $InstallPath yet. Finish the Traefik step on the Setup page first." }
+function Assert-Installed { if (-not (Test-Installed)) { Stop-Request 409 (Get-NotInstalledMessage) } }
+
+function Write-Audit([string]$Action, [string]$Detail) {
+  if (-not (Test-Path -LiteralPath $InstallPath)) { return }
+  $dir = Join-Path $InstallPath 'logs'
+  if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir | Out-Null }
+  $line = '{0} {1} {2}' -f (Get-Date -Format 's'), $Action, ((ConvertTo-RedactedText @($Detail)) -join ' ')
+  [IO.File]::AppendAllText((Join-Path $dir 'webui-audit.log'), $line + "`r`n")
+}
+
+function Get-Cookie($Request, [string]$Name) {
+  if (-not $Request.Headers.ContainsKey('cookie')) { return $null }
+  foreach ($part in $Request.Headers['cookie'].Split(';')) {
+    $kv = $part.Trim().Split('=', 2)
+    if ($kv.Count -eq 2 -and $kv[0] -eq $Name) { return $kv[1] }
+  }
+  return $null
+}
+
+function Test-ConstantTimeEqual([string]$A, [string]$B) {
+  if ($null -eq $A -or $null -eq $B -or $A.Length -ne $B.Length) { return $false }
+  $diff = 0
+  for ($i = 0; $i -lt $A.Length; $i++) { $diff = $diff -bor ([int][char]$A[$i] -bxor [int][char]$B[$i]) }
+  return $diff -eq 0
+}
+
+function Invoke-PowerShellFile([string]$File, [string[]]$Arguments) {
+  $previous = $ErrorActionPreference
+  $ErrorActionPreference = 'Continue'
+  try { $out = & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $File @Arguments 2>&1 | ForEach-Object { "$_" }; $code = $LASTEXITCODE }
+  finally { $ErrorActionPreference = $previous }
+  return [pscustomobject]@{ ExitCode = $code; Lines = @(ConvertTo-RedactedText @($out)) }
+}
+
+function Assert-Confirmed($Body) {
+  if (-not [bool](Get-Field $Body 'confirm' $false)) { Stop-Request 400 'This action needs explicit confirmation.' }
+}
+
+# --- Status ----------------------------------------------------------------------------------------------------
+
+function Get-StatusData {
+  $settings = Get-Settings
+  $docker = Get-DockerStatus
+  $stack = Get-StackStatus -Settings $settings -SkipDocker:(-not $docker.EngineRunning)
+  $services = @()
+  $drift = 0
+  if (Test-Installed) {
+    try {
+      $registry = Read-ServiceRegistry -Settings $settings
+      $services = @($registry.services)
+      $drift = (Get-ServicePlan -Settings $settings -Services $services).FileChanges
+    } catch { }
+  }
+  $cfConfig = Read-CloudflareConfig -Settings $settings
+  $token = Get-CloudflareApiTokenInfo -Settings $settings
+  return [ordered]@{
+    instance   = [ordered]@{ installPath = $InstallPath; installed = (Test-Installed); stackName = $settings.StackName; httpPort = $settings.HttpPort; dashboardPort = $settings.DashboardPort; proxyNetwork = $settings.ProxyNetwork; tunnelSubnet = $settings.TunnelSubnet; sourcePath = $here; canInstall = (Test-Path -LiteralPath (Join-Path $here 'install.ps1')) }
+    docker     = $docker
+    stack      = $stack
+    services   = [ordered]@{ total = $services.Count; enabled = @($services | Where-Object { $_.enabled }).Count; drift = $drift }
+    cloudflare = [ordered]@{ tokenStored = $token.Stored; tokenReadable = $token.Readable; tokenSavedAt = $token.SavedAt; accountId = $cfConfig.accountId; accountName = $cfConfig.accountName; tunnelId = $cfConfig.tunnelId; tunnelName = $cfConfig.tunnelName; apiBase = (Get-CloudflareApiBase) }
+  }
+}
+
+# --- Services --------------------------------------------------------------------------------------------------
+
+function ConvertTo-ServiceView($Service, $Routers, $Managed) {
+  $router = @($Routers | Where-Object { $null -ne $_ -and $_.name -eq "svc-$($Service.name)@file" })
+  $cf = @()
+  foreach ($h in $Service.hostnames) {
+    if ($Managed -and $Managed.PSObject.Properties[$h]) { $cf += [ordered]@{ hostname = $h; dns = [bool]$Managed.$h.dnsRecordId; access = [bool]$Managed.$h.accessAppId } }
+  }
+  return [ordered]@{
+    service   = $Service
+    url       = Get-ServiceUrl $Service
+    rule      = Get-ServiceRule $Service
+    router    = $(if ($router.Count -gt 0) { [string]$router[0].status } elseif ($null -eq $Routers) { 'unknown' } else { 'not loaded' })
+    exposure  = $(if (-not $Service.cloudflare.publish) { 'local' } elseif ($Service.cloudflare.access) { 'access' } else { 'public' })
+    cloudflareManaged = $cf
+  }
+}
+
+function Get-ServicesData {
+  if (-not (Test-Installed)) {
+    return [ordered]@{ installed = $false; message = (Get-NotInstalledMessage); services = @(); middlewares = @(); drift = @(); issues = @(); traefikUp = $false }
+  }
+  $settings = Get-Settings
+  $registry = Read-ServiceRegistry -Settings $settings
+  $routers = Get-TraefikApi $settings '/api/http/routers'
+  $plan = Get-ServicePlan -Settings $settings -Services $registry.services
+  $cf = Read-CloudflareConfig -Settings $settings
+  return [ordered]@{
+    installed   = $true
+    services    = @($registry.services | ForEach-Object { ConvertTo-ServiceView $_ $routers $cf.managed })
+    middlewares = @(Get-AvailableMiddlewares $settings | ForEach-Object { "$_@file" })
+    drift       = @($plan.Changes | Where-Object { $_.Action -ne 'unchanged' } | ForEach-Object { [ordered]@{ file = $_.File; action = $_.Action } })
+    issues      = @($plan.Issues)
+    traefikUp   = ($null -ne $routers)
+  }
+}
+
+# Suggests docker / host / lan from what the user typed as backend host.
+function Resolve-Target($Target) {
+  $hostValue = ([string](Get-Field $Target 'host' '')).Trim()
+  $type = ([string](Get-Field $Target 'type' 'auto')).Trim().ToLowerInvariant()
+  $note = ''
+  if ($type -eq 'auto' -or -not $type) {
+    if ($hostValue -match '^(localhost|127\.\d+\.\d+\.\d+|host\.docker\.internal|::1)$') {
+      $type = 'host'
+      if ($hostValue -ne 'host.docker.internal') { $note = "'$hostValue' inside a container means the container itself; this PC is reached as host.docker.internal." }
+      $hostValue = 'host.docker.internal'
+    } elseif ((Test-IPv4Address $hostValue) -or $hostValue.Contains('.')) { $type = 'lan' }
+    else { $type = 'docker' }
+  }
+  return [pscustomobject]@{ Type = $type; Host = $hostValue; Note = $note }
+}
+
+function Get-ServiceFromBody($Body) {
+  $svc = Get-Field $Body 'service' $null
+  if ($null -eq $svc) { Stop-Request 400 'Missing service definition.' }
+  $target = Get-Field $svc 'target' $null
+  $resolved = Resolve-Target $target
+  $hostnames = @(Get-Field $svc 'hostnames' @())
+  if ($hostnames.Count -gt 20) { Stop-Request 400 'At most 20 hostnames per service.' }
+  $displayName = ([string](Get-Field $svc 'displayName' '')).Trim()
+  $def = @{
+    name = Get-Field $svc 'name' ''; displayName = $displayName.Substring(0, [Math]::Min(80, $displayName.Length)); description = ([string](Get-Field $svc 'description' '')).Substring(0, [Math]::Min(200, ([string](Get-Field $svc 'description' '')).Length))
+    enabled = [bool](Get-Field $svc 'enabled' $true); hostnames = $hostnames; pathPrefix = Get-Field $svc 'pathPrefix' ''
+    stripPrefix = [bool](Get-Field $svc 'stripPrefix' $false); middlewares = @(Get-Field $svc 'middlewares' @('default-headers@file'))
+    target = @{ type = $resolved.Type; host = $resolved.Host; port = (Get-Field $target 'port' 0); protocol = (Get-Field $target 'protocol' 'http'); tlsSkipVerify = [bool](Get-Field $target 'tlsSkipVerify' $false) }
+    cloudflare = @{ publish = [bool](Get-Field (Get-Field $svc 'cloudflare' $null) 'publish' $true); access = [bool](Get-Field (Get-Field $svc 'cloudflare' $null) 'access' $true) }
+  }
+  # Sign-in (ForwardAuth): only when the request names it. A form that does not send 'auth' keeps whatever the
+  # service had (Build-ChangePlan), so editing a protected service never silently removes its protection.
+  $hasAuth = [bool]($svc.PSObject.Properties['auth'])
+  if ($hasAuth -and $null -ne $svc.auth) { $def.auth = @{ provider = [string](Get-Field $svc.auth 'provider' ''); endpoint = [string](Get-Field $svc.auth 'endpoint' '') } }
+  $definition = ConvertTo-ServiceDefinition $def
+  return [pscustomobject]@{ Service = $definition; Note = $resolved.Note; HasAuth = $hasAuth }
+}
+
+function Find-RegistryService($Services, [string]$Name) {
+  $found = @($Services | Where-Object { $_.name -eq ([string]$Name).ToLowerInvariant() })
+  if ($found.Count -eq 0) { Stop-Request 404 "No service named '$Name'." }
+  return $found[0]
+}
+
+# Extra live checks of the target (read-only): container membership of the shared network, what a LAN address means
+# inside Docker, then one real request from Traefik's network namespace with the public Host header. Returns the notes
+# for the preview and the verification verdict, which is the readiness check: an apply re-runs it right before writing.
+function Get-TargetCheck($Settings, $Service) {
+  $warnings = @()
+  $verdict = $null
+  if ($null -eq $Service -or $Service.target.host -notmatch '^[A-Za-z0-9][A-Za-z0-9_.-]*$') { return [pscustomobject]@{ Warnings = $warnings; Verdict = $verdict } }
+  $probe = $Service.enabled
+  $knownPorts = @()
+  if ($Service.target.type -eq 'docker') {
+    $r = Invoke-Docker inspect $Service.target.host --format '{{json .Config.ExposedPorts}}|{{json .NetworkSettings.Networks}}'
+    if ($r.ExitCode -ne 0) {
+      $warnings += "No container named '$($Service.target.host)' exists right now. The route will answer 502 until it does."; $probe = $false
+      $verdict = [ordered]@{ result = 'dns'; state = 'failed'; label = 'DNS resolution failure'; message = "No container named '$($Service.target.host)' exists on this Docker engine."; url = ''; evidence = @() }
+    } else {
+      $parts = (@($r.Output) -join '').Trim().Split([char[]]'|', 2)
+      $ep = $parts[0] | ConvertFrom-Json
+      if ($ep) { $knownPorts = @($ep.PSObject.Properties | Where-Object { $_.Name -match '^\d+/tcp$' } | ForEach-Object { [int]$_.Name.Split('/')[0] }) }
+      $nets = $parts[1] | ConvertFrom-Json
+      if (-not $nets.PSObject.Properties[$Settings.ProxyNetwork]) {
+        $warnings += "Container '$($Service.target.host)' is not attached to the '$($Settings.ProxyNetwork)' network, so Traefik cannot reach it. Add it in its compose file (networks: [$($Settings.ProxyNetwork)], external) or run: docker network connect $($Settings.ProxyNetwork) $($Service.target.host)"; $probe = $false
+        $verdict = [ordered]@{ result = 'dns'; state = 'failed'; label = 'DNS resolution failure'; message = "Container '$($Service.target.host)' is not attached to '$($Settings.ProxyNetwork)', so its name does not resolve from Traefik's network."; url = ''; evidence = @() }
+      }
+    }
+  } elseif ($Service.target.type -eq 'lan') {
+    $warnings += @(Get-LanTargetIssues $Service.target.host (Get-LocalIPv4Addresses) (Get-DockerSubnets) | ForEach-Object { $_.message })
+  }
+  if ($probe) {
+    $verdict = Add-BackendVerdictCause (Get-BackendVerdict (Test-BackendFromTraefik -Settings $Settings -Service $Service -CompareHostHeader) $Service $Settings.ProxyNetwork $knownPorts) $Service.target
+    if ($verdict.state -in 'failed', 'warning') { $warnings += "Backend test from Traefik's network: $($verdict.message)" }
+  }
+  return [pscustomobject]@{ Warnings = $warnings; Verdict = $verdict }
+}
+
+# A timeout to an address inside a Docker network's subnet has a known cause: say so instead of guessing.
+function Add-BackendVerdictCause($Verdict, $Target) {
+  if ($Verdict -and $Verdict.result -in @('timeout', 'error') -and $Target.type -eq 'lan' -and (Test-IPv4Address ([string]$Target.host))) {
+    $cap = @(Get-LanTargetIssues ([string]$Target.host) (Get-LocalIPv4Addresses) (Get-DockerSubnets) | Where-Object { $_.Contains('cause') -and $_['cause'] -eq 'subnet-overlap' })
+    if ($cap.Count) { $Verdict.cause = 'subnet-overlap'; $Verdict.message = "Traefik could not connect to $($Target.host):$($Target.port). $($cap[0].message)" }
+  }
+  return $Verdict
+}
+
+# Where an application runs and what the user typed -> the backend address Traefik should use, with the reasons, the
+# containers to choose from and, on request, one verification of a target from Traefik's network. Read-only.
+function Invoke-BackendResolve($Body) {
+  Assert-Installed
+  $settings = Get-Settings
+  $envr = Get-BackendEnvironment -Settings $settings -Fresh:([bool](Get-Field $Body 'fresh' $false))
+  $inv = @(); try { $inv = @(Get-DockerContainerInventory -ProxyNetwork $settings.ProxyNetwork) } catch { }
+  $own = @((Get-StackContainerNames $settings).Values) + @($settings.WhoamiContainer)
+  $port = 0; $null = [int]::TryParse([string](Get-Field $Body 'port' ''), [ref]$port)
+  $address = ([string](Get-Field $Body 'address' '')).Trim()
+  if ($address.Length -gt 300) { Stop-Request 400 'The address is too long.' }
+  $res = Resolve-BackendAddress -Location ([string](Get-Field $Body 'location' 'auto')) -Address $address -Port $port -Protocol ([string](Get-Field $Body 'protocol' '')) `
+    -Container ([string](Get-Field $Body 'container' '')) -Override:([bool](Get-Field $Body 'override' $false)) -Environment $envr -Containers @($inv | Where-Object { $own -notcontains $_.name })
+  $containers = @($inv | Where-Object { $_.state -eq 'running' -and -not $_.infrastructure -and $own -notcontains $_.name } | ForEach-Object {
+      [ordered]@{ name = $_.name; image = ($_.image -replace '@sha256:[0-9a-f]+', ''); project = $_.compose.project; private = [bool]$_.privateService
+        networks = @($_.networks | ForEach-Object { [ordered]@{ name = $_.name; ipv4 = $_.ipv4; aliases = @($_.aliases) } }); sharesTraefikNetwork = [bool](@($_.networks | Where-Object { @($envr.traefikNetworks) -contains $_.name }).Count)
+        ports = @($_.ports | ForEach-Object { [ordered]@{ port = $_.port; proto = $_.proto; guess = $_.guess; reason = $_.reason; hostPort = $_.hostPort; hostIp = $_.hostIp } }) } })
+  $hostname = ([string](Get-Field $Body 'hostname' '')).Trim().ToLowerInvariant()
+  if ($hostname -notmatch '^(?=.{1,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$') { $hostname = '' }
+  $verification = $null; $yaml = ''; $verifications = @()
+  $toTarget = { param($t) if ($null -eq $t) { return $null } [ordered]@{ type = [string](Get-Field $t 'type' ''); host = [string](Get-Field $t 'host' ''); port = [int](Get-Field $t 'port' 0); protocol = [string](Get-Field $t 'protocol' 'http'); tlsSkipVerify = [bool](Get-Field $t 'tlsSkipVerify' $false) } }
+  $valid = { param($x) [bool]($x -and $x.host -match '^[A-Za-z0-9][A-Za-z0-9_.-]{0,252}$' -and $x.port -ge 1 -and $x.port -le 65535 -and $x.protocol -in @('http', 'https', 'h2c') -and $x.type -in @('docker', 'host', 'lan') -and -not (Test-LoopbackHost $x.host)) }
+  # One verification of exactly this target from Traefik's network: never a substitute address.
+  $verify = {
+    param($x)
+    $svc = [pscustomobject]@{ name = 'backend-test'; enabled = $true; hostnames = @($(if ($hostname) { $hostname } else { $x.host })); pathPrefix = ''; stripPrefix = $false; target = [pscustomobject]$x }
+    $known = @(); $tc = @($inv | Where-Object { $_.name -eq $x.host }); if ($tc.Count) { $known = @($tc[0].exposed | Where-Object { $_.proto -eq 'tcp' } | ForEach-Object { [int]$_.port }) }
+    $vr = Add-BackendVerdictCause (Get-BackendVerdict (Test-BackendFromTraefik -Settings $settings -Service $svc -CompareHostHeader:([bool]$hostname)) $svc $settings.ProxyNetwork $known) $x
+    $vr.target = $x; $vr.targetUrl = "$($x.protocol)://$($x.host):$($x.port)"; $vr.testedAt = (Get-Date -Format 's')
+    Write-Audit 'backend-test' "$($vr.targetUrl) $($vr.result)"
+    return $vr
+  }
+  $target = & $toTarget (Get-Field $Body 'target' $null)
+  $pick = $(if ($res.custom -and $res.override) { $res.custom } else { $res.recommended })
+  if (-not $target -and $pick) { $target = [ordered]@{ type = $pick.type; host = $pick.host; port = $pick.port; protocol = $pick.protocol; tlsSkipVerify = $false } }
+  if (& $valid $target) {
+    try { $yaml = ConvertTo-TraefikRouteYaml (ConvertTo-ServiceDefinition @{ name = 'preview'; hostnames = @($(if ($hostname) { $hostname } else { 'app.example.com' })); middlewares = @('default-headers@file'); target = @{ type = $target.type; host = $target.host; port = $target.port; protocol = $target.protocol; tlsSkipVerify = $target.tlsSkipVerify } }) } catch { $yaml = '' }
+    if ([bool](Get-Field $Body 'test' $false)) { $verification = & $verify $target }
+  }
+  # "Test every address": each candidate on its own, one after another (at most four).
+  $many = @(Get-Field $Body 'targets' @())
+  if ($many.Count -gt 4) { Stop-Request 400 'At most four addresses are tested at once.' }
+  foreach ($m in $many) { $x = & $toTarget $m; if (& $valid $x) { $verifications += & $verify $x } }
+  return [ordered]@{ resolution = $res; environment = $envr; containers = $containers; verification = $verification; verifications = @($verifications); traefikYaml = $yaml }
+}
+
+# Builds the Traefik + Cloudflare plan for a change request. Pure read: nothing is written.
+function Build-ChangePlan($Body) {
+  Assert-Installed
+  $settings = Get-Settings
+  $registry = Read-ServiceRegistry -Settings $settings
+  $services = @($registry.services)
+  $op = [string](Get-Field $Body 'op' '')
+  $name = [string](Get-Field $Body 'name' '')
+  $notes = @()
+  $previous = $null; $new = $null
+  switch ($op) {
+    'add' {
+      $parsed = Get-ServiceFromBody $Body
+      $new = $parsed.Service
+      if ($parsed.Note) { $notes += $parsed.Note }
+      $list = @($services) + $new
+      $summary = "Add service '$($new.name)'"
+    }
+    'update' {
+      $previous = Find-RegistryService $services $name
+      $parsed = Get-ServiceFromBody $Body
+      $new = $parsed.Service
+      if ($parsed.Note) { $notes += $parsed.Note }
+      if ($new.name -ne $previous.name) { Stop-Request 400 'A service cannot be renamed; remove it and add it again.' }
+      if (-not $parsed.HasAuth -and $previous.PSObject.Properties['auth']) { $new | Add-Member -NotePropertyName auth -NotePropertyValue $previous.auth -Force }
+      $list = @($services | ForEach-Object { if ($_.name -eq $previous.name) { $new } else { $_ } })
+      $summary = "Update service '$($new.name)'"
+    }
+    { $_ -in @('enable', 'disable') } {
+      $previous = Find-RegistryService $services $name
+      $new = ConvertTo-ServiceDefinition ($previous | ConvertTo-Json -Depth 6 | ConvertFrom-Json)
+      $new.enabled = ($op -eq 'enable')
+      $list = @($services | ForEach-Object { if ($_.name -eq $previous.name) { $new } else { $_ } })
+      $summary = "$((Get-Culture).TextInfo.ToTitleCase($op)) service '$($new.name)'"
+      if ($op -eq 'disable') { $notes += 'Disabling removes the Traefik route but keeps the definition and the Cloudflare records (the hostname answers 404 until you enable it again).' }
+    }
+    'remove' {
+      $previous = Find-RegistryService $services $name
+      $list = @($services | Where-Object { $_.name -ne $previous.name })
+      $summary = "Remove service '$($previous.name)'"
+    }
+    default { Stop-Request 400 "Unknown operation '$op'." }
+  }
+  $cfOptions = Get-Field $Body 'cloudflare' $null
+  $automate = [bool](Get-Field $cfOptions 'automate' $true)
+  $cleanup = [bool](Get-Field $cfOptions 'cleanup' $true)
+  $emails = @(@(Get-Field $cfOptions 'accessEmails' @()) | ForEach-Object { ([string]$_).Trim() } | Where-Object { $_ })
+  if ($emails.Count -gt 50) { Stop-Request 400 'At most 50 Access emails.' }
+  foreach ($e in $emails) { if ($e -notmatch $EmailPattern) { Stop-Request 400 "'$e' is not a valid email address." } }
+
+  # The public dashboard's hostname belongs to the dashboard: no service may route it, and its Cloudflare records are
+  # never cleaned up by a service change.
+  $dash = Read-DashboardConfig -Settings $settings
+  if ($dash.hostname -and $new -and @($new.hostnames) -contains $dash.hostname) { Stop-Request 400 "$($dash.hostname) is the public Traefik dashboard's hostname. Choose another hostname." }
+  $traefik = Get-ServicePlan -Settings $settings -Services $list
+  $others = @($list | Where-Object { $null -eq $new -or $_.name -ne $new.name })
+  if ($dash.hostname) { $others += Get-DashboardPseudoService $settings $dash.hostname }
+  $cf = $null
+  if ($automate) {
+    try { $cf = Get-CloudflareServicePlan -Settings $settings -Service $new -PreviousService $previous -OtherServices $others -AccessEmails $emails -Cleanup:$cleanup }
+    catch { $cf = [pscustomobject]@{ Connected = $true; Actions = @(); Notes = @(); Errors = @($_.Exception.Message); ManualSteps = @(); Fingerprint = 'error' } }
+  } else {
+    $cfg = Read-CloudflareConfig -Settings $settings
+    $cf = [pscustomobject]@{ Connected = $false; Actions = @(); Notes = @('Cloudflare automation is off for this change; only Traefik is changed.'); Errors = @(); ManualSteps = @(Get-CloudflareManualSteps $new $cfg.tunnelId); Fingerprint = '' }
+  }
+  # One owner per hostname: a hostname another router in this Traefik (hand-written file, Docker labels) or a
+  # container's labels already claim blocks the change; the user resolves the other definition first.
+  if ($new -and $new.enabled) {
+    $claimRouters = Get-TraefikApi $settings '/api/http/routers'
+    $labelled = @(); try { $labelled = @(Get-DockerContainerInventory -ProxyNetwork $settings.ProxyNetwork | Where-Object { @($_.traefik.routers).Count }) } catch { }
+    foreach ($hn in @($new.hostnames)) {
+      foreach ($c in @(Find-HostnameClaims -Hostname $hn -Routers $claimRouters -Containers $labelled -OwnService $new.name)) {
+        if ($c.level -eq 'error') { $traefik.Issues = @($traefik.Issues) + (New-Issue 'Error' $new.name 'hostnames' "$hn is already routed elsewhere: $($c.detail) Remove or change that definition first, so one configuration owns the hostname.") }
+        else { $notes += "$hn`: $($c.detail) Make sure only one Traefik publishes it." }
+      }
+    }
+  }
+  $traefikKey = $traefik.RegistryJson + '|' + ((@($traefik.Changes | ForEach-Object { "$($_.File):$($_.Action):$($_.OldContent)" })) -join '|')
+  $check = Get-TargetCheck $settings $new
+  # Generic "make sure it is reachable" reminders are dropped once a real request from Traefik's network succeeded.
+  if ($check.Verdict -and $check.Verdict.state -in 'ok', 'auth') {
+    $traefik.Issues = @($traefik.Issues | Where-Object { -not ($_.Level -eq 'Warning' -and $_.Field -eq 'target.host' -and $_.Message -match '^(The container .+ must be attached|The Windows app must listen)') })
+  }
+  return [pscustomobject]@{
+    Op = $op; Summary = $summary; Settings = $settings; Traefik = $traefik; Cloudflare = $cf; New = $new; Previous = $previous
+    Notes = @($notes + @($check.Warnings)); Backend = $check.Verdict; TraefikKey = $traefikKey
+  }
+}
+
+function ConvertTo-PlanView($Plan, [string]$PlanId) {
+  $t = $Plan.Traefik
+  $cf = $Plan.Cloudflare
+  $errors = @($t.Issues | Where-Object { $_.Level -eq 'Error' }).Count + @($cf.Errors).Count
+  $changes = @($t.Changes | Where-Object { $_.Action -ne 'unchanged' } | ForEach-Object { [ordered]@{ file = "traefik\dynamic\$($_.File)"; action = $_.Action; diff = @(Get-LineDiff $_.OldContent $_.NewContent) } })
+  $cfActions = @($cf.Actions | ForEach-Object { [ordered]@{ id = $_.Id; step = $_.Step; kind = $_.Kind; hostname = $_.Hostname; summary = $_.Summary; detail = $_.Detail; overwrite = $_.Overwrite } })
+  $hasWork = ($t.FileChanges -gt 0) -or $t.RegistryChanged -or (@($cfActions | Where-Object { $_.kind -ne 'none' }).Count -gt 0)
+  return [ordered]@{
+    planId     = $PlanId
+    summary    = $Plan.Summary
+    notes      = @($Plan.Notes)
+    traefik    = [ordered]@{ changes = $changes; issues = @($t.Issues); registryChanged = $t.RegistryChanged; fileChanges = $t.FileChanges }
+    cloudflare = [ordered]@{ connected = $cf.Connected; actions = $cfActions; notes = @($cf.Notes); errors = @($cf.Errors); manualSteps = @($cf.ManualSteps) }
+    canApply   = ($errors -eq 0 -and $hasWork)
+    hasWork    = $hasWork
+    # The connection test from Traefik's network; when it failed, applying needs an explicit acknowledgment.
+    backend    = $Plan.Backend
+    # The exact backend URL this plan writes into the Traefik service (the user's choice, never a substitute).
+    backendUrl = $(if ($Plan.New) { Get-ServiceUrl $Plan.New } else { '' })
+    needsBackendAck = [bool]($Plan.Backend -and $Plan.Backend.state -eq 'failed')
+  }
+}
+
+function Invoke-PlanRequest($Body) {
+  $plan = Build-ChangePlan $Body
+  # Expired plans are dropped; a plan is valid for 15 minutes and can be applied once.
+  foreach ($k in @($State.Plans.Keys)) { if (((Get-Date) - $State.Plans[$k].Created).TotalMinutes -gt 15) { $State.Plans.Remove($k) } }
+  $id = New-RandomKey 12
+  $State.Plans[$id] = [pscustomobject]@{ Created = (Get-Date); Body = ($Body | ConvertTo-Json -Depth 10 -Compress); TraefikKey = $plan.TraefikKey; CfFingerprint = $plan.Cloudflare.Fingerprint }
+  return ConvertTo-PlanView $plan $id
+}
+
+function Invoke-ApplyRequest($Body) {
+  Assert-Confirmed $Body
+  $id = [string](Get-Field $Body 'planId' '')
+  if (-not $id -or -not $State.Plans.ContainsKey($id)) { Stop-Request 409 'This preview has expired or was already applied. Preview the change again.' }
+  $stored = $State.Plans[$id]
+  $State.Plans.Remove($id)
+  if (((Get-Date) - $stored.Created).TotalMinutes -gt 15) { Stop-Request 409 'This preview has expired. Preview the change again.' }
+  # Recompute against the current state and refuse if anything changed since the preview.
+  $plan = Build-ChangePlan ($stored.Body | ConvertFrom-Json)
+  if ($plan.TraefikKey -ne $stored.TraefikKey -or $plan.Cloudflare.Fingerprint -ne $stored.CfFingerprint) {
+    Stop-Request 409 'The configuration or Cloudflare changed since the preview. Preview the change again.'
+  }
+  $view = ConvertTo-PlanView $plan $id
+  if (-not $view.canApply) { Stop-Request 400 'This plan has errors or nothing to change.' }
+  $confirmed = @(@(Get-Field $Body 'confirmOverwrites' @()) | ForEach-Object { [string]$_ })
+  $needed = @($plan.Cloudflare.Actions | Where-Object { $_.Overwrite } | ForEach-Object { $_.Id })
+  $missing = @($needed | Where-Object { $confirmed -notcontains $_ })
+  if ($missing.Count -gt 0) { Stop-Request 400 ('Confirm each overwrite of an existing Cloudflare resource: ' + ($missing -join ', ')) }
+  # The backend was verified again just now (Build-ChangePlan). A route to a backend that fails is only saved on request.
+  if ($view.needsBackendAck -and -not [bool](Get-Field $Body 'acceptUnverifiedBackend' $false)) {
+    $State.Plans[$id] = $stored
+    Stop-Request 409 "The backend did not pass the connection test from Traefik's network: $($plan.Backend.message) Fix the backend, or confirm that you want to save the route anyway." @{ needsBackendAck = $true; backend = $plan.Backend }
+  }
+  return Invoke-ChangePlanSteps $plan $confirmed
+}
+
+# Executes a verified change plan: recovery point, Traefik validation in a throwaway container, backup + write + reload,
+# backend readiness step, then the approved Cloudflare actions. Shared by service changes and identity protection.
+function Invoke-ChangePlanSteps($plan, [string[]]$confirmed) {
+  $settings = $plan.Settings
+  $steps = New-Object System.Collections.ArrayList
+  $result = [ordered]@{ ok = $true; steps = $null; backup = ''; recoveryPoint = ''; warnings = @() }
+  $result.recoveryPoint = New-ChangeRecoveryPoint $plan.Summary
+  $t = $plan.Traefik
+  if ($t.FileChanges -gt 0 -or $t.RegistryChanged) {
+    if ($t.FileChanges -gt 0) {
+      $deep = Test-TraefikDynamicConfig -Settings $settings -Plan $t
+      $result.warnings += @($deep.Warnings)
+      if (-not $deep.Ok) {
+        $null = $steps.Add([ordered]@{ name = 'Validate in a throwaway Traefik container'; status = 'Failed'; message = (@($deep.Errors) -join ' | ') })
+        $result.ok = $false; $result.steps = $steps.ToArray()
+        Write-Audit 'apply-rejected' "$($plan.Summary): Traefik validation failed"
+        return $result
+      }
+      $null = $steps.Add([ordered]@{ name = 'Validate in a throwaway Traefik container'; status = 'Done'; message = "$(@($deep.Routers).Count) generated router(s) accepted" })
+    }
+    $applied = Invoke-ServicePlan -Settings $settings -Plan $t
+    $result.backup = [string](Split-Path -Leaf ([string]$applied.Backup))
+    $null = $steps.Add([ordered]@{ name = 'Write Traefik configuration'; status = 'Done'; message = "Backup $($result.backup)" })
+    if ($applied.ReloadWarning) { $result.warnings += $applied.ReloadWarning }
+    if ($applied.Reloaded) {
+      $wait = Wait-ServiceRouters -Settings $settings -Services $t.Services
+      if ($wait.Ok) { $null = $steps.Add([ordered]@{ name = 'Traefik reload'; status = 'Done'; message = 'Every enabled service route is loaded.' }) }
+      else { $null = $steps.Add([ordered]@{ name = 'Traefik reload'; status = 'Warning'; message = 'Not loaded yet: ' + ($wait.Missing -join ', ') }) }
+    } elseif (-not (Test-ContainerRunning $settings.TraefikContainer)) {
+      $null = $steps.Add([ordered]@{ name = 'Traefik reload'; status = 'Warning'; message = 'Traefik is not running; routes load when it starts.' })
+    }
+  }
+  # The route is ready only when Traefik's network reaches the backend: the verification made right before writing,
+  # reported as its own step (a failed one was saved only because the user confirmed it).
+  if ($plan.New -and $plan.New.enabled -and $plan.Backend) {
+    $b = $plan.Backend
+    $null = $steps.Add([ordered]@{ name = 'Backend reachable from Traefik'; status = $(switch ($b.state) { 'ok' { 'Done' } 'auth' { 'Done' } 'skipped' { 'Skipped' } default { 'Warning' } })
+        message = "$($b.label): $($b.message)$(if ($b.state -eq 'failed') { ' Saved anyway, as you confirmed: the route is not ready until the backend answers.' })" })
+  }
+  $serviceName = if ($plan.New) { $plan.New.name } else { $plan.Previous.name }
+  foreach ($r in @(Invoke-CloudflareServicePlan -Settings $settings -Plan $plan.Cloudflare -ServiceName $serviceName -ConfirmedOverwrites $confirmed)) {
+    if ($r.Status -eq 'Unchanged') { continue }
+    $null = $steps.Add([ordered]@{ name = $r.Summary; status = $r.Status; message = $r.Message })
+    if ($r.Status -eq 'Failed') { $result.ok = $false }
+  }
+  $result.steps = $steps.ToArray()
+  Write-Audit 'apply' ("$($plan.Summary): " + ((@($result.steps | ForEach-Object { "$($_.name)=$($_.status)" })) -join '; '))
+  return $result
+}
+
+# --- Backups ---------------------------------------------------------------------------------------------------
+
+function Get-BackupData {
+  $settings = Get-Settings
+  return @(Get-ServiceBackups $settings | Select-Object -First 50 | ForEach-Object {
+      [ordered]@{ id = $_.Id; createdAt = $_.CreatedAt; files = @($_.Files); restored = $_.Restored; preRollback = $_.PreRollback }
+    })
+}
+
+function Get-BackupPreview($Body) {
+  $settings = Get-Settings
+  $id = [string](Get-Field $Body 'id' '')
+  $snap = @(Get-ServiceBackups $settings | Where-Object { $_.Id -eq $id })
+  if ($snap.Count -eq 0) { Stop-Request 404 "No backup '$id'." }
+  $dir = $snap[0].Path
+  $changes = @()
+  $current = @{}
+  foreach ($f in @(Get-ChildItem -LiteralPath $settings.DynamicDir -File -Filter 'svc-*.yml' -ErrorAction SilentlyContinue)) { $current[$f.Name] = [IO.File]::ReadAllText($f.FullName) }
+  $saved = @{}
+  foreach ($n in $snap[0].Files) { $saved[$n] = [IO.File]::ReadAllText((Join-Path (Join-Path $dir 'dynamic') $n)) }
+  foreach ($n in @(@($current.Keys) + @($saved.Keys) | Select-Object -Unique | Sort-Object)) {
+    $old = if ($current.ContainsKey($n)) { $current[$n] } else { $null }
+    $new = if ($saved.ContainsKey($n)) { $saved[$n] } else { $null }
+    if ($old -eq $new) { continue }
+    $action = if ($null -eq $old) { 'add' } elseif ($null -eq $new) { 'remove' } else { 'update' }
+    $changes += [ordered]@{ file = "traefik\dynamic\$n"; action = $action; diff = @(Get-LineDiff $old $new) }
+  }
+  $regOld = if (Test-Path -LiteralPath $settings.RegistryPath) { [IO.File]::ReadAllText($settings.RegistryPath) } else { $null }
+  $regNew = if (Test-Path -LiteralPath (Join-Path $dir 'services.json')) { [IO.File]::ReadAllText((Join-Path $dir 'services.json')) } else { $null }
+  if ($regOld -ne $regNew) { $changes += [ordered]@{ file = 'config\services.json'; action = $(if ($null -eq $regNew) { 'remove' } else { 'update' }); diff = @(Get-LineDiff $regOld $regNew) } }
+  return [ordered]@{ id = $id; changes = $changes; note = 'Rollback restores Traefik routes and the service registry only. Cloudflare DNS, tunnel routes and Access apps are not rolled back.' }
+}
+
+# --- Portable backups and restore ---------------------------------------------------------------------------------
+
+function Get-AccessEmailsFromBody($Body) {
+  $emails = @(@(Get-Field $Body 'accessEmails' @()) | ForEach-Object { ([string]$_).Trim() } | Where-Object { $_ } | Select-Object -Unique)
+  if ($emails.Count -gt 50) { Stop-Request 400 'At most 50 Access emails.' }
+  foreach ($e in $emails) { if ($e -notmatch $EmailPattern) { Stop-Request 400 "'$e' is not a valid email address." } }
+  return $emails
+}
+
+function ConvertTo-CheckReview($Check) {
+  $items = @()
+  if (-not $Check) { return $items }
+  if (-not $Check.Connected) { return @(New-ReviewItem 'validated' 'pending' 'Cloudflare resources not verified' $Check.Message) }
+  $map = @{ verified = 'ok'; none = 'info'; missing = 'warning'; mismatch = 'warning'; unknown = 'warning' }
+  foreach ($x in @($Check.Account, $Check.Tunnel)) { if ($x) { $items += New-ReviewItem 'validated' $map[$x.state] $(if ($x -eq $Check.Account) { 'Cloudflare account' } else { 'Cloudflare tunnel' }) $x.message } }
+  foreach ($d in $Check.Domains) { $items += New-ReviewItem 'validated' $map[$d.state] "Allowed domain $($d.name)" $d.message }
+  foreach ($h in $Check.Hostnames) {
+    foreach ($x in @($h.dns, $h.access)) { if ($x.state -ne 'none') { $items += New-ReviewItem 'validated' $map[$x.state] "$(if ($x -eq $h.dns) { 'DNS record' } else { 'Access application' }) of $($h.hostname)" $x.message } }
+  }
+  return $items
+}
+
+# What the browser sees of a restore plan.
+function ConvertTo-RestoreView($Backup, $Plan, [string]$ImportId) {
+  $m = $Backup.Manifest
+  $review = New-Object System.Collections.ArrayList
+  $add = { param($Stage, $State, $Label, $Message) $null = $review.Add((New-ReviewItem $Stage $State $Label $Message)) }
+  $kindText = @{ zip = 'Full backup (.zip)'; json = 'Configuration export (.json)'; 'legacy-services' = 'Service registry from an earlier version' }[$Backup.Kind]
+  & $add 'prepared' 'ok' 'Backup read' "$kindText of instance '$($m.sourceStackName)', created $($m.createdAt)$(if ($m.managerVersion) { " by manager $($m.managerVersion)" }); $(@($m.services).Count) service(s)."
+  $localCount = @($Plan.Local.Items | Where-Object { $_.action -in @('create', 'update', 'delete') }).Count
+  & $add 'prepared' $(if ($localCount) { 'ok' } else { 'info' }) 'Local configuration' $(if ($localCount) { "$localCount change(s) prepared." } else { 'Already matches the backup.' })
+  & $add 'validated' 'ok' 'Format and version' "Schema $($m.schemaVersion); this manager ($(Get-ManagerVersion)) reads schema 1 and earlier service registries."
+  & $add 'validated' 'ok' 'No credentials in the backup' 'The file was scanned for tokens, keys and secrets.'
+  foreach ($w in $Backup.Warnings) { & $add 'validated' 'warning' 'Backup contents' $w }
+  $svcErrors = @($Plan.Local.Errors)
+  & $add 'validated' $(if ($svcErrors.Count) { 'failed' } else { 'ok' }) 'Configuration checks' $(if ($svcErrors.Count) { $svcErrors -join ' ' } else { 'Instance settings and service definitions are valid.' })
+  foreach ($i in @(ConvertTo-CheckReview $Plan.Cloudflare.Check)) { $null = $review.Add($i) }
+  & $add 'applied' 'pending' 'Local configuration' $(if ($Plan.Local.CanApply) { 'Waiting for your approval.' } else { 'Nothing to apply.' })
+  & $add 'applied' 'pending' 'Cloudflare' $(if ($Plan.Cloudflare.CanApply) { 'Waiting for your separate approval.' } elseif ($Plan.Cloudflare.Message) { $Plan.Cloudflare.Message } else { 'Nothing to change in Cloudflare.' })
+  foreach ($a in $Plan.ActionsNeeded) { & $add 'action' 'warning' 'Requires your action' $a }
+  foreach ($e in @($Plan.Cloudflare.Errors)) { & $add 'action' 'failed' 'Cloudflare' $e }
+  foreach ($c in $Plan.Credentials) { & $add 'action' $(if ($c.present) { 'info' } else { 'warning' }) "$($c.label) ($(if ($c.present) { 'present on this PC' } else { 'missing on this PC' }))" $c.recover }
+  $cf = $Plan.Cloudflare
+  return [ordered]@{
+    importId    = $ImportId
+    source      = [ordered]@{ fileName = $Backup.FileName; kind = $Backup.Kind; schemaVersion = $m.schemaVersion; managerVersion = $m.managerVersion; createdAt = $m.createdAt; stackName = $m.sourceStackName; services = @($m.services).Count; sha256 = $Backup.Sha256; installPath = $InstallPath }
+    warnings    = @($Backup.Warnings)
+    local       = [ordered]@{ items = @($Plan.Local.Items); errors = @($Plan.Local.Errors); canApply = $Plan.Local.CanApply; hasWork = $Plan.Local.HasWork }
+    cloudflare  = [ordered]@{
+      connected = $cf.Connected; message = $cf.Message; needsLocal = $cf.NeedsLocal; canApply = $cf.CanApply; hasWork = $cf.HasWork
+      actions = @($cf.Actions); errors = @($cf.Errors); notes = @($cf.Notes | Select-Object -Unique)
+    }
+    credentials = @($Plan.Credentials)
+    actions     = @($Plan.ActionsNeeded)
+    review      = $review.ToArray()
+  }
+}
+
+function Get-ImportBackup($Body) {
+  $recoveryId = [string](Get-Field $Body 'recoveryId' '')
+  if ($recoveryId) {
+    try { $bytes = Get-RecoveryPointBytes -Settings (Get-Settings) -Id $recoveryId } catch { Stop-Request 404 $_.Exception.Message }
+    return [pscustomobject]@{ Bytes = $bytes; FileName = $recoveryId }
+  }
+  $b64 = [string](Get-Field $Body 'contentBase64' '')
+  if (-not $b64) { Stop-Request 400 'Choose a backup file.' }
+  try { $bytes = [Convert]::FromBase64String($b64) } catch { Stop-Request 400 'The file could not be read.' }
+  $name = ([string](Get-Field $Body 'fileName' 'backup')) -replace '[^A-Za-z0-9._ -]', ''
+  return [pscustomobject]@{ Bytes = $bytes; FileName = $name.Substring(0, [Math]::Min(100, $name.Length)) }
+}
+
+function Get-RestoreState([string]$ImportId, $Emails) {
+  foreach ($k in @($State.Imports.Keys)) { if (((Get-Date) - $State.Imports[$k].Created).TotalMinutes -gt 30) { $State.Imports.Remove($k) } }
+  if (-not $ImportId -or -not $State.Imports.ContainsKey($ImportId)) { Stop-Request 409 'This restore preview has expired. Choose the backup file again.' }
+  $entry = $State.Imports[$ImportId]
+  $backup = Read-ConfigBackup -Bytes $entry.Bytes -FileName $entry.FileName
+  $plan = Get-RestorePlan -Settings (Get-Settings) -Backup $backup -SourceRoot $here -AccessEmails $Emails
+  return [pscustomobject]@{ Entry = $entry; Backup = $backup; Plan = $plan }
+}
+
+# Reads and validates an uploaded backup (or a recovery point) and returns the restore preview. Writes nothing.
+function Invoke-ImportPreview($Body) {
+  $file = Get-ImportBackup $Body
+  $emails = Get-AccessEmailsFromBody $Body
+  $backup = Read-ConfigBackup -Bytes $file.Bytes -FileName $file.FileName
+  if (@($backup.Errors).Count -gt 0) { Stop-Request 400 (@($backup.Errors) -join ' ') }
+  while ($State.Imports.Count -ge 5) { $oldest = @($State.Imports.Keys | Sort-Object { $State.Imports[$_].Created })[0]; $State.Imports.Remove($oldest) }
+  $id = New-RandomKey 12
+  $State.Imports[$id] = [pscustomobject]@{ Created = (Get-Date); Bytes = $file.Bytes; FileName = $file.FileName; Emails = $emails }
+  $plan = Get-RestorePlan -Settings (Get-Settings) -Backup $backup -SourceRoot $here -AccessEmails $emails
+  $State.Imports[$id] | Add-Member -NotePropertyName LocalKey -NotePropertyValue $plan.Local.Key
+  $State.Imports[$id] | Add-Member -NotePropertyName CfFingerprint -NotePropertyValue $plan.Cloudflare.Fingerprint
+  return ConvertTo-RestoreView $backup $plan $id
+}
+
+# Applies one part of a previewed restore: 'local' (configuration files, Traefik reload) or 'cloudflare'.
+# Each part needs its own confirmation and is refused if the state changed since the preview.
+function Invoke-ImportApply($Body) {
+  Assert-Confirmed $Body
+  $part = [string](Get-Field $Body 'part' '')
+  if ($part -notin @('local', 'cloudflare')) { Stop-Request 400 "Unknown restore part '$part'." }
+  $importId = [string](Get-Field $Body 'importId' '')
+  $emails = Get-AccessEmailsFromBody $Body
+  $r = Get-RestoreState $importId $emails
+  $entry = $r.Entry
+  $settings = Get-Settings
+  $steps = @()
+  $ok = $true
+  if ($part -eq 'local') {
+    if ($r.Plan.Local.Key -ne $entry.LocalKey) { Stop-Request 409 'The configuration changed since the preview. Preview the restore again.' }
+    if (-not $r.Plan.Local.CanApply) { Stop-Request 400 'The local part has errors or nothing to change.' }
+    $recovery = New-ChangeRecoveryPoint "before restore of $($entry.FileName)"
+    $res = Invoke-RestoreLocal -Settings $settings -Plan $r.Plan
+    $steps = @($res.Steps); $ok = $res.Ok
+    Save-RememberedPath
+    Write-Audit 'restore-local' "file=$($entry.FileName) ok=$ok recovery=$recovery"
+  } else {
+    if ($r.Plan.Cloudflare.Fingerprint -ne $entry.CfFingerprint) {
+      Stop-Request 409 'Cloudflare changed since the preview. Preview the restore again.'
+    }
+    if (-not $r.Plan.Cloudflare.CanApply) { Stop-Request 400 $(if ($r.Plan.Cloudflare.NeedsLocal) { 'Apply the local configuration first.' } elseif ($r.Plan.Cloudflare.Message) { $r.Plan.Cloudflare.Message } else { 'The Cloudflare part has errors or nothing to change.' }) }
+    $confirmed = @(@(Get-Field $Body 'confirmOverwrites' @()) | ForEach-Object { [string]$_ })
+    $missing = @($r.Plan.Cloudflare.Actions | Where-Object { $_.overwrite -and $confirmed -notcontains $_.id } | ForEach-Object { $_.id })
+    if ($missing.Count -gt 0) { Stop-Request 400 ('Confirm each overwrite of an existing Cloudflare resource: ' + ($missing -join ', ')) }
+    $recovery = New-ChangeRecoveryPoint "before cloudflare restore of $($entry.FileName)"
+    $res = Invoke-RestoreCloudflare -Settings $settings -Plan $r.Plan -ConfirmedOverwrites $confirmed
+    $steps = @($res.Steps); $ok = $res.Ok
+    Write-Audit 'restore-cloudflare' ("file=$($entry.FileName) ok=$ok recovery=$recovery " + ((@($steps | ForEach-Object { "$($_.name)=$($_.status)" })) -join '; '))
+  }
+  # The next part is previewed against the new state.
+  $after = Get-RestoreState $importId $emails
+  $entry.LocalKey = $after.Plan.Local.Key
+  $entry.CfFingerprint = $after.Plan.Cloudflare.Fingerprint
+  $view = ConvertTo-RestoreView $after.Backup $after.Plan $importId
+  $view['result'] = [ordered]@{ part = $part; ok = $ok; steps = $steps; recoveryPoint = $recovery }
+  return $view
+}
+
+function Get-BackupsData {
+  $settings = Get-Settings
+  return [ordered]@{
+    installed      = (Test-Installed)
+    backups        = @(Get-BackupData)
+    recoveryPoints = @(Get-RecoveryPoints -Settings $settings)
+    credentials    = @(Get-CredentialInventory $settings)
+  }
+}
+
+# --- Public Traefik dashboard ---------------------------------------------------------------------------------------
+
+function Get-DashboardData {
+  $settings = Get-Settings
+  $dash = Read-DashboardConfig -Settings $settings
+  $cf = Read-CloudflareConfig -Settings $settings
+  $token = Get-CloudflareApiTokenInfo -Settings $settings
+  $suggestZone = if ($dash.zoneId) { $dash.zoneId } elseif (@($cf.domains).Count -gt 0) { @($cf.domains)[0].id } else { '' }
+  return [ordered]@{
+    installed    = (Test-Installed)
+    localUrl     = "http://127.0.0.1:$($settings.DashboardPort)/dashboard/"
+    enabled      = $dash.enabled
+    hostname     = $dash.hostname
+    publicUrl    = $(if ($dash.enabled -and $dash.hostname) { "https://$($dash.hostname)/dashboard/" } else { '' })
+    # Follows the instance name until the user edits it (or it was published / restored with another name).
+    subdomain    = $(if ($dash.enabled -and $dash.subdomain) { $dash.subdomain } elseif ($dash.subdomainCustom -and $dash.subdomain) { $dash.subdomain } else { Get-DashboardDefaultSubdomain $settings })
+    subdomainCustom = [bool]($dash.subdomainCustom -and $dash.subdomain)
+    defaultSubdomain = Get-DashboardDefaultSubdomain $settings
+    publish      = [bool]$dash.publish
+    configured   = (Test-Path -LiteralPath (Join-Path $InstallPath 'config\dashboard.json'))
+    zoneId       = $suggestZone
+    accessEmails = @($dash.accessEmails)
+    contactEmail = (Read-SetupDraft).contactEmail
+    domains      = @($cf.domains)
+    cloudflareReady = [bool]($token.Stored -and $token.Readable -and $cf.accountId -and $cf.tunnelId)
+    tunnelName   = $cf.tunnelName
+  }
+}
+
+function ConvertTo-DashboardPlanView($Plan, [string]$PlanId) {
+  $cf = $Plan.Cloudflare
+  $changes = @()
+  if ($Plan.FileAction -ne 'unchanged') { $changes += [ordered]@{ file = "traefik\dynamic\$(Get-DashboardRouteFile)"; action = $Plan.FileAction; diff = @(Get-LineDiff $Plan.OldContent $Plan.NewContent) } }
+  $cfActions = @(); if ($cf) { $cfActions = @($cf.Actions | ForEach-Object { [ordered]@{ id = $_.Id; step = $_.Step; kind = $_.Kind; hostname = $_.Hostname; summary = $_.Summary; detail = $_.Detail; overwrite = $_.Overwrite } }) }
+  $hasWork = $changes.Count -gt 0 -or @($cfActions | Where-Object { $_.kind -ne 'none' }).Count -gt 0
+  $errors = @($Plan.Errors)
+  $review = @(
+    New-ReviewItem 'prepared' 'ok' $(if ($Plan.Disable) { 'Remove the public dashboard' } else { 'Public dashboard' }) $(if ($Plan.Hostname) { "https://$($Plan.Hostname)/dashboard/ (and /api), through tunnel '$((Read-CloudflareConfig -Settings (Get-Settings)).tunnelName)'." } else { '' })
+    New-ReviewItem 'validated' $(if ($errors.Count) { 'failed' } else { 'ok' }) 'Checks' $(if ($errors.Count) { $errors -join ' ' } else { 'Hostname, allowed domain and Cloudflare state checked.' })
+  )
+  if (-not $Plan.Disable) {
+    $access = @($cfActions | Where-Object { $_.step -eq 'access' })
+    $review += New-ReviewItem 'validated' $(if ($access.Count -and -not $errors.Count) { 'ok' } else { 'failed' }) 'Cloudflare Access (required)' $(if ($access.Count) { $access[0].summary } else { 'Access cannot be ensured, so nothing will be published (fail closed).' })
+  }
+  $review += New-ReviewItem 'applied' 'pending' 'Changes' $(if ($hasWork -and -not $errors.Count) { 'Waiting for your confirmation.' } elseif (-not $hasWork) { 'Nothing to change.' } else { 'Blocked.' })
+  return [ordered]@{
+    planId = $PlanId; summary = $(if ($Plan.Disable) { "Remove the public dashboard $($Plan.Hostname)" } else { "Publish the Traefik dashboard as $($Plan.Hostname)" })
+    hostname = $Plan.Hostname; url = $(if ($Plan.Hostname) { "https://$($Plan.Hostname)/dashboard/" } else { '' })
+    notes = @($(if (-not $Plan.Disable) { 'Order: Cloudflare Access first; the Traefik route, tunnel route and DNS record are only created once Access protects the hostname.' }))
+    traefik = [ordered]@{ changes = $changes; issues = @(); registryChanged = $false; fileChanges = $changes.Count }
+    cloudflare = [ordered]@{ connected = [bool]($cf -and $cf.Connected); actions = $cfActions; notes = @($(if ($cf) { $cf.Notes })); errors = $errors; manualSteps = @() }
+    canApply = ($errors.Count -eq 0 -and $hasWork); hasWork = $hasWork; review = $review
+  }
+}
+
+# Dashboard choices made during setup (before or after installation). Nothing in Traefik or Cloudflare changes.
+function Save-DashboardSettingsRequest($Body) {
+  $settings = Get-Settings
+  $cfg = Read-DashboardConfig -Settings $settings
+  $cf = Read-CloudflareConfig -Settings $settings
+  $custom = [bool](Get-Field $Body 'subdomainCustom' $false)
+  $sub = ([string](Get-Field $Body 'subdomain' '')).Trim().ToLowerInvariant().TrimEnd('.')
+  if ($custom -and -not (Test-DashboardSubdomain $sub)) { Stop-Request 400 "'$sub' is not a valid subdomain (letters, digits and dashes)." }
+  $zoneId = [string](Get-Field $Body 'zoneId' '')
+  $zone = @($cf.domains | Where-Object { $_.id -eq $zoneId })
+  if ($zoneId -and $zone.Count -eq 0) { Stop-Request 400 'Choose one of the allowed Cloudflare domains.' }
+  $emails = Get-AccessEmailsFromBody $Body
+  if ($cfg.enabled -and (($custom -and $sub -ne $cfg.subdomain) -or ($zoneId -and $zoneId -ne $cfg.zoneId))) { Stop-Request 409 "The dashboard is published as $($cfg.hostname). Remove it first to change its name." }
+  if (-not $cfg.enabled) {
+    $cfg.subdomainCustom = $custom
+    $cfg.subdomain = $(if ($custom) { $sub } else { '' })
+    if ($zone.Count -gt 0) { $cfg.zoneId = $zone[0].id; $cfg.zoneName = $zone[0].name }
+  }
+  $cfg.accessEmails = @($emails)
+  $cfg.publish = [bool](Get-Field $Body 'publish' $cfg.publish)
+  Save-DashboardConfig -Settings $settings -Config $cfg
+  Save-RememberedPath
+  Write-Audit 'dashboard-settings' "publish=$($cfg.publish) custom=$custom"
+  return Get-DashboardData
+}
+
+function Get-DashboardPlanFromBody($Body) {
+  $settings = Get-Settings
+  $registry = Read-ServiceRegistry -Settings $settings
+  $disable = [bool](Get-Field $Body 'disable' $false)
+  $emails = Get-AccessEmailsFromBody $Body
+  # Before installation the chosen existing tunnel is only in the setup draft; plan against it (read-only).
+  $cfConfig = Read-CloudflareConfig -Settings $settings
+  $draft = Read-SetupDraft
+  if (-not (Test-Installed) -and -not $cfConfig.tunnelId -and $draft.deployment.mode -eq 'tunnel' -and $draft.deployment.tunnelChoice -eq 'existing' -and $draft.deployment.tunnelId) {
+    $cfConfig.tunnelId = $draft.deployment.tunnelId; $cfConfig.tunnelName = $draft.deployment.tunnelName
+  }
+  return Get-DashboardPlan -Settings $settings -Subdomain ([string](Get-Field $Body 'subdomain' '')) -ZoneId ([string](Get-Field $Body 'zoneId' '')) -AccessEmails $emails -Disable:$disable -Services @($registry.services) -CloudflareConfig $cfConfig
+}
+
+function Invoke-DashboardPlanRequest($Body) {
+  $plan = Get-DashboardPlanFromBody $Body
+  foreach ($k in @($State.Plans.Keys)) { if (((Get-Date) - $State.Plans[$k].Created).TotalMinutes -gt 15) { $State.Plans.Remove($k) } }
+  $id = New-RandomKey 12
+  $State.Plans[$id] = [pscustomobject]@{ Created = (Get-Date); Kind = 'dashboard'; Body = ($Body | ConvertTo-Json -Depth 6 -Compress); Key = $plan.Key }
+  return ConvertTo-DashboardPlanView $plan $id
+}
+
+function Invoke-DashboardApplyRequest($Body) {
+  Assert-Confirmed $Body
+  Assert-Installed
+  $id = [string](Get-Field $Body 'planId' '')
+  if (-not $id -or -not $State.Plans.ContainsKey($id) -or -not $State.Plans[$id].PSObject.Properties['Kind']) { Stop-Request 409 'This preview has expired or was already applied. Preview again.' }
+  $stored = $State.Plans[$id]
+  $State.Plans.Remove($id)
+  if (((Get-Date) - $stored.Created).TotalMinutes -gt 15) { Stop-Request 409 'This preview has expired. Preview again.' }
+  $plan = Get-DashboardPlanFromBody ($stored.Body | ConvertFrom-Json)
+  if ($plan.Key -ne $stored.Key) { Stop-Request 409 'Traefik or Cloudflare changed since the preview. Preview again.' }
+  $view = ConvertTo-DashboardPlanView $plan $id
+  if (-not $view.canApply) { Stop-Request 400 'This plan has errors or nothing to change.' }
+  $confirmed = @(@(Get-Field $Body 'confirmOverwrites' @()) | ForEach-Object { [string]$_ })
+  $missing = @($plan.Cloudflare.Actions | Where-Object { $_.Overwrite -and $confirmed -notcontains $_.Id } | ForEach-Object { $_.Id })
+  if ($missing.Count -gt 0) { Stop-Request 400 ('Confirm each overwrite of an existing Cloudflare resource: ' + ($missing -join ', ')) }
+  $recovery = New-ChangeRecoveryPoint $(if ($plan.Disable) { 'before removing the public dashboard' } else { 'before publishing the dashboard' })
+  $settings = Get-Settings
+  $r = Invoke-DashboardPlan -Settings $settings -Plan $plan -ConfirmedOverwrites $confirmed
+  Write-Audit 'dashboard' ("$($view.summary): ok=$($r.Ok) failClosed=$($r.FailClosed) " + ((@($r.Steps | ForEach-Object { "$($_.name)=$($_.status)" })) -join '; '))
+  $review = @($r.Steps | ForEach-Object { New-ReviewItem 'applied' $(@{ Done = 'ok'; Unchanged = 'info'; Warning = 'warning'; Skipped = 'warning'; 'Not run' = 'info'; Failed = 'failed' }[$_.status]) $_.name $_.message })
+  if ($r.FailClosed) { $review += New-ReviewItem 'action' 'failed' 'Nothing was published (fail closed)' 'Fix the Cloudflare Access problem above, then preview again. The local dashboard keeps working.' }
+  return [ordered]@{
+    ok = $r.Ok; failClosed = $r.FailClosed; steps = @($r.Steps); recoveryPoint = $recovery; warnings = @()
+    url = $(if (-not $plan.Disable -and $r.Ok) { "https://$($plan.Hostname)/dashboard/" } else { '' }); review = $review
+  }
+}
+
+function Invoke-DashboardVerifyRequest($Body) {
+  Assert-Installed
+  $v = Get-DashboardVerification -Settings (Get-Settings) -Public:([bool](Get-Field $Body 'public' $false))
+  $map = @{ ok = 'ok'; failed = 'failed'; warning = 'warning'; skipped = 'info' }
+  return [ordered]@{
+    hostname = $v.Hostname; localUrl = $v.LocalUrl; publicUrl = $v.PublicUrl; checks = @($v.Checks)
+    review = @($v.Checks | ForEach-Object { New-ReviewItem $(if ($_.state -eq 'failed') { 'action' } else { 'verified' }) $map[$_.state] $_.label $_.message })
+  }
+}
+
+# --- Cloudflare ------------------------------------------------------------------------------------------------
+
+function Assert-CloudflareReady([switch]$NeedTunnel) {
+  $settings = Get-Settings
+  if (-not (Get-CloudflareApiTokenInfo -Settings $settings).Stored) { Stop-Request 409 'Save a Cloudflare API token first.' }
+  $config = Read-CloudflareConfig -Settings $settings
+  if (-not $config.accountId) { Stop-Request 409 'Select a Cloudflare account first.' }
+  if ($NeedTunnel -and -not $config.tunnelId) { Stop-Request 409 'Select or create a tunnel first.' }
+  return $config
+}
+
+function Get-CloudflareData {
+  $settings = Get-Settings
+  $config = Read-CloudflareConfig -Settings $settings
+  $managed = @()
+  foreach ($p in $config.managed.PSObject.Properties) { $managed += [ordered]@{ hostname = $p.Name; service = $p.Value.service; dns = [bool]$p.Value.dnsRecordId; access = [bool]$p.Value.accessAppId } }
+  return [ordered]@{
+    token     = Get-CloudflareApiTokenInfo -Settings $settings
+    config    = [ordered]@{ accountId = $config.accountId; accountName = $config.accountName; tunnelId = $config.tunnelId; tunnelName = $config.tunnelName; domains = @($config.domains) }
+    managed   = $managed
+    connector = [ordered]@{ tokenFile = (Test-TunnelTokenFile $settings); container = $settings.CloudflaredContainer; running = $(if (Test-Installed) { Test-ContainerRunning $settings.CloudflaredContainer } else { $false }) }
+    apiBase   = Get-CloudflareApiBase
+  }
+}
+
+# What the browser sees of a discovery run (never the token).
+function ConvertTo-DiscoveryView($Discovery, $Config) {
+  $allowed = @($Config.domains | ForEach-Object { $_.id })
+  return [ordered]@{
+    valid       = [bool]$Discovery.Valid
+    status      = $Discovery.Status
+    message     = $Discovery.Message
+    accounts    = @($Discovery.Accounts)
+    accountId   = $Discovery.AccountId
+    accountName = $Discovery.AccountName
+    zones       = @($Discovery.Zones | ForEach-Object { [ordered]@{ id = $_.id; name = $_.name; status = $_.status; accountId = $_.accountId; dns = $_.dns; allowed = ($allowed -contains $_.id) } })
+    tunnels     = @($Discovery.Tunnels)
+    permissions = @($Discovery.Permissions)
+    domains     = @($Config.domains)
+    profileEmail = $(if ($Discovery.PSObject.Properties['ProfileEmail']) { $Discovery.ProfileEmail } else { '' })
+  }
+}
+
+# Verifies a pasted token, then stores it (DPAPI) and records what it can reach. Allowed before installation: the
+# token goes to secrets\ in the install folder, which is created if needed. Nothing in Cloudflare is changed.
+function Save-TokenRequest($Body) {
+  $settings = Get-Settings
+  $token = ([string](Get-Field $Body 'token' '')).Trim()
+  if (-not (Test-CloudflareApiToken $token)) { Stop-Request 400 'That does not look like a Cloudflare API token (it should be a long string of letters, digits, - and _).' }
+  $info = Get-CloudflareApiTokenInfo -Settings $settings
+  if ($info.Stored -and -not [bool](Get-Field $Body 'confirmReplace' $false)) { Stop-Request 409 'A token is already stored. Confirm that you want to replace it.' @{ needsConfirm = 'replace' } }
+  $config = Read-CloudflareConfig -Settings $settings
+  $discovery = Get-CloudflareDiscovery -Settings $settings -Token $token -AccountId $config.accountId
+  if (-not $discovery.Valid) { $token = $null; Stop-Request 400 ('The token was not saved. ' + $discovery.Message) }
+  Save-CloudflareApiToken -Settings $settings -Token $token
+  $token = $null
+  Save-RememberedPath
+  if ($discovery.AccountId) { $config.accountId = $discovery.AccountId; $config.accountName = $discovery.AccountName }
+  # Keep allowed domains the new token can still see; with exactly one visible domain, allow it automatically.
+  $visible = @($discovery.Zones | ForEach-Object { $_.id })
+  $config.domains = @($config.domains | Where-Object { $visible -contains $_.id })
+  if (@($config.domains).Count -eq 0 -and @($discovery.Zones).Count -eq 1) {
+    $z = $discovery.Zones[0]
+    $config.domains = @([pscustomobject][ordered]@{ id = $z.id; name = $z.name; accountId = $z.accountId })
+  }
+  Save-CloudflareConfig -Settings $settings -Config $config
+  Write-Audit 'cloudflare-token-saved' "accounts=$(@($discovery.Accounts).Count) zones=$(@($discovery.Zones).Count) allowed=$(@($config.domains).Count)"
+  $view = ConvertTo-DiscoveryView $discovery $config
+  $view['saved'] = $true
+  return $view
+}
+
+function Get-DiscoveryRequest {
+  $settings = Get-Settings
+  if (-not (Get-CloudflareApiTokenInfo -Settings $settings).Stored) { Stop-Request 409 'Save a Cloudflare API token first.' }
+  $config = Read-CloudflareConfig -Settings $settings
+  $discovery = Get-CloudflareDiscovery -Settings $settings -AccountId $config.accountId -ZoneIds @($config.domains | ForEach-Object { $_.id })
+  return ConvertTo-DiscoveryView $discovery $config
+}
+
+# The application-level allowlist: services can only be published under these domains.
+function Set-DomainsRequest($Body) {
+  $settings = Get-Settings
+  if (-not (Get-CloudflareApiTokenInfo -Settings $settings).Stored) { Stop-Request 409 'Save a Cloudflare API token first.' }
+  $ids = @(@(Get-Field $Body 'zoneIds' @()) | ForEach-Object { [string]$_ } | Where-Object { $_ } | Select-Object -Unique)
+  foreach ($id in $ids) { if (-not (Test-CloudflareId $id)) { Stop-Request 400 "Invalid zone id '$id'." } }
+  $zones = @(Invoke-CloudflareApi -Settings $settings -Path '/zones' -All)
+  $selected = @()
+  foreach ($id in $ids) {
+    $z = @($zones | Where-Object { $_.id -eq $id })
+    if ($z.Count -eq 0) { Stop-Request 400 "The API token cannot see zone '$id'." }
+    $acct = ''; if ($z[0].PSObject.Properties['account'] -and $z[0].account) { $acct = [string]$z[0].account.id }
+    $selected += [pscustomobject][ordered]@{ id = [string]$z[0].id; name = [string]$z[0].name; accountId = $acct }
+  }
+  $config = Read-CloudflareConfig -Settings $settings
+  $config.domains = $selected
+  Save-CloudflareConfig -Settings $settings -Config $config
+  Write-Audit 'cloudflare-domains' (($selected | ForEach-Object { $_.name }) -join ',')
+  return [ordered]@{ domains = @($selected) }
+}
+
+# --- Setup wizard ----------------------------------------------------------------------------------------------
+
+$DeploymentModes = @(
+  [ordered]@{ id = 'tunnel'; supported = $true; title = 'Cloudflare Tunnel'; detail = 'Publishes apps through an outbound tunnel from this PC. No router ports, no public IP needed. Cloudflare provides HTTPS.' }
+  [ordered]@{ id = 'local'; supported = $true; title = 'Local only'; detail = 'Traefik on this PC only (127.0.0.1). Nothing is published and Cloudflare is not needed. You can add a tunnel later.' }
+  [ordered]@{ id = 'public-ip'; supported = $false; title = 'Public IP with port forwarding'; detail = 'Not supported by this version: Traefik only listens on 127.0.0.1 and has no HTTPS entry point or certificate resolver. Use Cloudflare Tunnel instead.' }
+)
+$TlsInfo = [ordered]@{
+  letsEncryptSupported = $false
+  detail = "Let's Encrypt is not available in this version and no ACME email is needed. With Cloudflare Tunnel, Cloudflare issues and renews the HTTPS certificates for your hostnames at its edge; the tunnel itself is encrypted. In local-only mode Traefik serves plain HTTP on 127.0.0.1."
+}
+
+function Get-SetupData {
+  $settings = Get-Settings
+  $draft = Read-SetupDraft
+  $token = Get-CloudflareApiTokenInfo -Settings $settings
+  $cfConfig = Read-CloudflareConfig -Settings $settings
+  $installed = Test-Installed
+  $mode = $draft.deployment.mode
+  if ($installed -and -not $mode) { $mode = $(if (Test-TunnelTokenFile $settings) { 'tunnel' } else { 'local' }) }
+  return [ordered]@{
+    installPath    = $InstallPath
+    installed      = $installed
+    sourcePath     = $here
+    canInstall     = (Test-Path -LiteralPath (Join-Path $here 'install.ps1'))
+    canChangePath  = -not $installed
+    settingsSource = Get-SettingsSource
+    settings       = ConvertTo-InstanceValues $settings
+    deployment     = [ordered]@{ mode = $mode; tunnelChoice = $draft.deployment.tunnelChoice; tunnelId = $draft.deployment.tunnelId; tunnelName = $draft.deployment.tunnelName; newTunnelName = $draft.deployment.newTunnelName }
+    installedAt    = $draft.installedAt
+    contactEmail   = $draft.contactEmail
+    defaultInstallPath = (Join-Path $env:USERPROFILE '.docker\projects\traefik-proxy')
+    modes          = $DeploymentModes
+    tls            = $TlsInfo
+    cloudflare     = [ordered]@{
+      tokenStored = $token.Stored; tokenReadable = $token.Readable; tokenSavedAt = $token.SavedAt
+      accountId = $cfConfig.accountId; accountName = $cfConfig.accountName; tunnelId = $cfConfig.tunnelId; tunnelName = $cfConfig.tunnelName
+      domains = @($cfConfig.domains)
+      tokenLink = Get-CloudflareTokenTemplateUrl; tokenLinkWithAccess = Get-CloudflareTokenTemplateUrl -IncludeAccess
+      permissions = @(Get-CloudflareTokenPermissions | ForEach-Object { [ordered]@{ id = $_.Id; label = $_.Label; optional = $_.Optional; purpose = $_.Purpose } })
+    }
+  }
+}
+
+function Assert-NotInstalled([string]$What) {
+  if (Test-Installed) { Stop-Request 409 "$What cannot be changed here after installation. Edit $InstallPath\.env by hand (and re-run the installer), or install a second instance into another folder." }
+}
+
+# Settings from a request body: only the instance keys, as plain strings.
+function Get-SettingsFromBody($Body) {
+  $raw = Get-Field $Body 'settings' $null
+  if ($null -eq $raw) { Stop-Request 400 'Missing settings.' }
+  $values = Read-DotEnv (Join-Path $here '.env.example')
+  foreach ($k in @('STACK_NAME', 'TRAEFIK_HTTP_PORT', 'TRAEFIK_DASHBOARD_PORT', 'PROXY_NETWORK', 'TUNNEL_SUBNET', 'TUNNEL_IP_RANGE', 'CLOUDFLARED_IP')) {
+    $v = ([string](Get-Field $raw $k '')).Trim()
+    if (-not $v) { Stop-Request 400 "$k is required." }
+    if ($v.Length -gt 64 -or $v -notmatch '^[A-Za-z0-9_./-]+$') { Stop-Request 400 "$k contains characters that are not allowed." }
+    $values[$k] = $v
+  }
+  foreach ($k in @('TRAEFIK_HTTP_PORT', 'TRAEFIK_DASHBOARD_PORT')) { if ($values[$k] -notmatch '^\d{2,5}$') { Stop-Request 400 "$k must be a number." } }
+  try { $settings = ConvertTo-StackSettings -InstallPath $InstallPath -Values $values } catch { Stop-Request 400 $_.Exception.Message }
+  $errors = @(Test-StackSettings $settings)
+  if ($errors.Count -gt 0) { Stop-Request 400 ($errors -join ' ') }
+  return $settings
+}
+
+function Save-SettingsRequest($Body) {
+  Assert-NotInstalled 'The instance settings'
+  $settings = Get-SettingsFromBody $Body
+  $draft = Read-SetupDraft
+  $keep = Get-EnvValues $settings
+  $draft.settings = [pscustomobject]$keep
+  Save-SetupDraft $draft
+  Write-Audit 'setup-settings' (($draft.settings.PSObject.Properties | ForEach-Object { "$($_.Name)=$($_.Value)" }) -join ' ')
+  return [ordered]@{ settings = ConvertTo-InstanceValues $settings; conflicts = @(Get-StackConflicts -Settings $settings) }
+}
+
+# Moves the install folder before anything is installed. Files the wizard already wrote (API token, Cloudflare
+# selections, setup draft) move along; an existing installation at the new path is managed as it is.
+function Set-InstallPathRequest($Body) {
+  Assert-NotInstalled 'The install folder'
+  $path = ([string](Get-Field $Body 'path' '')).Trim()
+  if ($path -notmatch '^[A-Za-z]:\\[^<>:"|?*]+$') { Stop-Request 400 'Enter a full local path such as C:\Users\you\traefik-proxy or D:\proxy.' }
+  try { $full = [IO.Path]::GetFullPath($path).TrimEnd('\') } catch { Stop-Request 400 'That is not a valid folder path.' }
+  if ($full -match '^[A-Za-z]:$') { Stop-Request 400 'Choose a folder, not the root of a drive.' }
+  if ($env:windir -and $full.StartsWith($env:windir, [StringComparison]::OrdinalIgnoreCase)) { Stop-Request 400 'Choose a folder outside the Windows directory.' }
+  if ($full -eq $InstallPath) { return Get-SetupData }
+  $moves = @('secrets\cloudflare_api.dpapi', 'config\cloudflare.json', 'config\setup.json') | Where-Object { Test-Path -LiteralPath (Join-Path $InstallPath $_) }
+  $targetInstalled = Test-Path -LiteralPath (Join-Path $full 'compose.yaml')
+  if (-not $targetInstalled) {
+    foreach ($rel in $moves) { if (Test-Path -LiteralPath (Join-Path $full $rel)) { Stop-Request 409 "$full already contains $rel. Choose another folder." } }
+  }
+  if (-not $targetInstalled) {
+    foreach ($rel in $moves) {
+      $to = Join-Path $full $rel
+      New-Item -ItemType Directory -Force -Path (Split-Path -Parent $to) | Out-Null
+      Move-Item -LiteralPath (Join-Path $InstallPath $rel) -Destination $to
+      if ($rel -like 'secrets\*') { Set-SecretFileAcl $to }
+    }
+    foreach ($dir in @('secrets', 'config', 'logs', '')) {
+      $d = Join-Path $InstallPath $dir
+      if ((Test-Path -LiteralPath $d) -and @(Get-ChildItem -LiteralPath $d -Force).Count -eq 0) { Remove-Item -LiteralPath $d -Force }
+    }
+  }
+  $old = $InstallPath
+  $script:InstallPath = $full
+  Save-RememberedPath
+  Write-Audit 'setup-path' "from=$old to=$full moved=$(@($moves).Count) existingInstallation=$targetInstalled"
+  return Get-SetupData
+}
+
+function Set-DeploymentRequest($Body) {
+  Assert-NotInstalled 'The deployment method'
+  $mode = [string](Get-Field $Body 'mode' '')
+  $def = @($DeploymentModes | Where-Object { $_.id -eq $mode })
+  if ($def.Count -eq 0) { Stop-Request 400 "Unknown deployment method '$mode'." }
+  if (-not $def[0].supported) { Stop-Request 400 $def[0].detail }
+  $draft = Read-SetupDraft
+  $d = $draft.deployment
+  $d.mode = $mode
+  $d.tunnelChoice = ''; $d.tunnelId = ''; $d.tunnelName = ''; $d.newTunnelName = ''
+  if ($mode -eq 'tunnel') {
+    $config = Assert-CloudflareReady
+    $settings = Get-Settings
+    $choice = [string](Get-Field $Body 'tunnelChoice' '')
+    if ($choice -eq 'existing') {
+      $id = [string](Get-Field $Body 'tunnelId' '')
+      if (-not (Test-CloudflareId $id)) { Stop-Request 400 'Choose a tunnel.' }
+      $t = @(Get-CloudflareTunnels -Settings $settings -AccountId $config.accountId | Where-Object { $_.id -eq $id })
+      if ($t.Count -eq 0) { Stop-Request 400 'That tunnel does not exist in the selected account.' }
+      if (-not $t[0].remotelyManaged) { Stop-Request 400 "Tunnel '$($t[0].name)' is locally managed (config file). Only dashboard/API-managed tunnels can be automated; create a new tunnel instead." }
+      $d.tunnelChoice = 'existing'; $d.tunnelId = $id; $d.tunnelName = [string]$t[0].name
+    } elseif ($choice -eq 'new') {
+      $name = ([string](Get-Field $Body 'newTunnelName' '')).Trim()
+      if ($name -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$') { Stop-Request 400 'Tunnel name: use letters, digits, dot, dash or underscore (max 63).' }
+      if (@(Get-CloudflareTunnels -Settings $settings -AccountId $config.accountId | Where-Object { $_.name -eq $name }).Count -gt 0) { Stop-Request 400 "A tunnel named '$name' already exists; choose it as an existing tunnel instead." }
+      $d.tunnelChoice = 'new'; $d.newTunnelName = $name
+    } else { Stop-Request 400 'Choose an existing tunnel or name a new one.' }
+  }
+  Save-SetupDraft $draft
+  Write-Audit 'setup-deployment' "mode=$mode tunnel=$($d.tunnelChoice) $($d.tunnelName)$($d.newTunnelName)"
+  return Get-SetupData
+}
+
+# Everything the installation would do, and what blocks it. Read-only (the installer runs with -DryRun).
+function Get-InstallPlan([switch]$NoDryRun) {
+  $settings = Get-Settings
+  $draft = Read-SetupDraft
+  $mode = $draft.deployment.mode
+  $installed = Test-Installed
+  $blockers = @(); $warnings = @(); $steps = @()
+  $docker = Get-DockerStatus
+  if (-not ($docker.CliFound -and $docker.EngineRunning -and $docker.OsType -eq 'linux' -and $docker.ComposeOk)) { $blockers += 'Docker Desktop is not ready (see the Docker Desktop step).' }
+  if (-not (Test-Path -LiteralPath (Join-Path $here 'install.ps1'))) { $blockers += 'install.ps1 is missing next to webui.ps1.' }
+  if (-not $mode) { $blockers += 'Choose a deployment method.' }
+  $conflicts = @()
+  if (-not $installed) {
+    $conflicts = @(Get-StackConflicts -Settings $settings)
+    foreach ($c in $conflicts) { if ($c.Level -eq 'error') { $blockers += $c.Message } elseif ($c.Level -eq 'warning') { $warnings += $c.Message } }
+  }
+  $config = Read-CloudflareConfig -Settings $settings
+  $tunnelLabel = ''
+  if ($mode -eq 'tunnel') {
+    $token = Get-CloudflareApiTokenInfo -Settings $settings
+    if (-not ($token.Stored -and $token.Readable)) { $blockers += 'Tunnel mode needs the Cloudflare API token (Connect Cloudflare).' }
+    if (-not $config.accountId) { $blockers += 'Choose the Cloudflare account.' }
+    if (@($config.domains).Count -eq 0) { $warnings += 'No allowed domain is selected yet; services cannot be published until you choose one.' }
+    $choice = $draft.deployment.tunnelChoice
+    if ($choice -eq 'existing') {
+      $tunnelLabel = $draft.deployment.tunnelName
+      $other = Find-ConnectorForTunnel -Settings $settings -TunnelId $draft.deployment.tunnelId
+      if ($other) { $blockers += "Container '$other' already runs a connector for tunnel '$tunnelLabel'. Use a separate tunnel for this instance." }
+    } elseif ($choice -eq 'new') { $tunnelLabel = $draft.deployment.newTunnelName }
+    else { $blockers += 'Choose the tunnel (existing or new).' }
+  }
+
+  $envPath = Join-Path $InstallPath '.env'
+  if (Test-Path -LiteralPath $envPath) { $steps += [ordered]@{ kind = 'local'; text = "Keep the existing $envPath." } }
+  else {
+    $v = ConvertTo-InstanceValues $settings
+    $steps += [ordered]@{ kind = 'local'; text = "Write $envPath (instance '$($v.STACK_NAME)', ports 127.0.0.1:$($v.TRAEFIK_HTTP_PORT)/$($v.TRAEFIK_DASHBOARD_PORT), network '$($v.PROXY_NETWORK)', tunnel subnet $($v.TUNNEL_SUBNET))." }
+  }
+  if ($mode -eq 'tunnel' -and $draft.deployment.tunnelChoice -eq 'new') {
+    $steps += [ordered]@{ kind = 'cloudflare'; text = "Create the Cloudflare tunnel '$tunnelLabel' in account '$($config.accountName)' (remotely managed). No DNS record or route is created yet." }
+  }
+  if ($mode -eq 'tunnel') {
+    $steps += [ordered]@{ kind = 'local'; text = "Download the connector token of tunnel '$tunnelLabel' into secrets\cloudflare_tunnel_token (read-only API call)." }
+  }
+  $containers = "$($settings.TraefikContainer), $($settings.SocketProxyContainer)"
+  if ($mode -eq 'tunnel') { $containers += ", $($settings.CloudflaredContainer)" }
+  $steps += [ordered]@{ kind = 'docker'; text = "Run install.ps1 -Start$(if ($mode -eq 'tunnel') { ' -EnableTunnel' }): copy the stack files, create the Docker network '$($settings.ProxyNetwork)' if it does not exist, and start this instance's containers only ($containers)." }
+
+  $lines = @()
+  $dryExit = $null
+  $composeOk = $null
+  $composeLines = @()
+  if (-not $NoDryRun -and (Test-Path -LiteralPath (Join-Path $here 'install.ps1')) -and $docker.EngineRunning) {
+    $installArgs = @('-InstallPath', $InstallPath, '-DryRun')
+    $tmp = $null
+    $envFile = $envPath
+    if (-not (Test-Path -LiteralPath $envPath)) {
+      $tmp = Join-Path ([IO.Path]::GetTempPath()) ("tpx-draft-{0}.env" -f [Guid]::NewGuid().ToString('N').Substring(0, 8))
+      [IO.File]::WriteAllText($tmp, (New-DotEnvContent ([IO.File]::ReadAllText((Join-Path $here '.env.example'))) (Get-EnvValues $settings)))
+      $installArgs += @('-EnvFile', $tmp)
+      $envFile = $tmp
+    }
+    try {
+      $r = Invoke-PowerShellFile (Join-Path $here 'install.ps1') $installArgs
+      $lines = $r.Lines; $dryExit = $r.ExitCode
+      # Compose syntax and variable check of the file that will be installed (offline: docker compose config).
+      $composeFile = if ($installed) { Join-Path $InstallPath 'compose.yaml' } else { Join-Path $here 'compose.yaml' }
+      $projectDir = if (Test-Path -LiteralPath $InstallPath) { $InstallPath } else { $here }
+      $ccArgs = @('compose', '-f', $composeFile, '--project-directory', $projectDir, '--env-file', $envFile)
+      if ($mode -eq 'tunnel') { $ccArgs += @('--profile', 'tunnel') }
+      $cc = Invoke-Docker @($ccArgs + @('config', '--quiet'))
+      $composeOk = ($cc.ExitCode -eq 0)
+      $composeLines = @(ConvertTo-RedactedText @($cc.Output))
+    } finally { if ($tmp) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue } }
+  }
+  $keyText = (ConvertTo-Json -Compress -Depth 5 -InputObject @((ConvertTo-InstanceValues $settings), $draft.deployment, $InstallPath, @($config.domains | ForEach-Object { $_.id }), $config.accountId))
+  $sha = [Security.Cryptography.SHA256]::Create()
+  $planKey = [BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($keyText))).Replace('-', '').Substring(0, 32)
+
+  # Readable review: what is prepared, what was validated, and what still needs the user.
+  $review = New-Object System.Collections.ArrayList
+  $add = { param($Stage, $State, $Label, $Message) $null = $review.Add((New-ReviewItem $Stage $State $Label $Message)) }
+  $v = ConvertTo-InstanceValues $settings
+  & $add 'prepared' $(if ((Get-SettingsSource) -eq 'defaults') { 'info' } else { 'ok' }) 'Instance settings' "'$($v.STACK_NAME)', ports 127.0.0.1:$($v.TRAEFIK_HTTP_PORT)/$($v.TRAEFIK_DASHBOARD_PORT), network '$($v.PROXY_NETWORK)', tunnel subnet $($v.TUNNEL_SUBNET)$(if ((Get-SettingsSource) -eq 'defaults') { ' (defaults: not saved yet)' })."
+  & $add 'prepared' $(if ($mode) { 'ok' } else { 'failed' }) 'Deployment method' $(if ($mode -eq 'tunnel') { "Cloudflare Tunnel$(if ($tunnelLabel) { ": $(if ($draft.deployment.tunnelChoice -eq 'new') { "new tunnel '$tunnelLabel', created when you confirm" } else { "existing tunnel '$tunnelLabel'" })" })" } elseif ($mode) { 'Local only (nothing is published).' } else { 'Not chosen yet (step 4).' })
+  & $add 'validated' $(if ($docker.CliFound -and $docker.EngineRunning -and $docker.OsType -eq 'linux' -and $docker.ComposeOk) { 'ok' } else { 'failed' }) 'Docker Desktop' $(if ($docker.EngineRunning) { "Engine $($docker.ServerVersion), Compose $($docker.ComposeVersion)." } else { 'Not running.' })
+  if (-not $installed) {
+    $errs = @($conflicts | Where-Object { $_.Level -eq 'error' })
+    & $add 'validated' $(if ($errs.Count) { 'failed' } else { 'ok' }) 'Names, ports and networks' $(if ($errs.Count) { "$($errs.Count) conflict(s) with what already runs on this PC." } else { 'No conflict with existing containers, ports or networks.' })
+  }
+  if ($mode -eq 'tunnel') {
+    $token = Get-CloudflareApiTokenInfo -Settings $settings
+    & $add 'validated' $(if ($token.Stored -and $token.Readable) { 'ok' } else { 'failed' }) 'Cloudflare API token' $(if ($token.Stored -and $token.Readable) { "Stored (encrypted) for account '$($config.accountName)'." } else { 'Not connected (step 1).' })
+  }
+  if ($null -eq $composeOk) { & $add 'validated' 'pending' 'Compose configuration' $(if ($NoDryRun) { '' } else { 'Not checked: Docker is not running.' }) }
+  else { & $add 'validated' $(if ($composeOk) { 'ok' } else { 'failed' }) 'Compose configuration' $(if ($composeOk) { 'docker compose config accepts the configuration.' } else { 'docker compose config reported errors (see technical output).' }) }
+  if ($null -eq $dryExit) { & $add 'validated' 'pending' 'Installer dry run' $(if ($NoDryRun) { '' } else { 'Not run: Docker is not running.' }) }
+  else { & $add 'validated' $(if ($dryExit -eq 0) { 'ok' } else { 'failed' }) 'Installer dry run' $(if ($dryExit -eq 0) { 'install.ps1 -DryRun finished without errors; nothing was changed.' } else { "install.ps1 -DryRun stopped with exit code $dryExit (see technical output)." }) }
+  & $add 'applied' $(if ($installed) { 'ok' } else { 'pending' }) 'Installation' $(if ($installed) { 'Already installed.' } else { 'Nothing has been changed yet. Docker and Cloudflare change only after you confirm.' })
+  & $add 'verified' 'pending' 'Runtime checks' 'Containers, Traefik API and the tunnel connector are checked after the installation.'
+  foreach ($b in $blockers) { & $add 'action' 'failed' 'Blocking' $b }
+  foreach ($w in $warnings) { & $add 'action' 'warning' 'Note' $w }
+  $diagnostics = @()
+  if ($lines.Count) { $diagnostics += @('== install.ps1 -DryRun ==') + @($lines) }
+  if ($null -ne $composeOk) { $diagnostics += @('', "== docker compose config --quiet (exit $(if ($composeOk) { 0 } else { 'non-zero' })) ==") + @($(if ($composeLines.Count) { $composeLines } else { '(no output)' })) }
+  return [ordered]@{
+    installed = $installed; mode = $mode; steps = $steps; blockers = $blockers; warnings = $warnings
+    conflicts = $conflicts; dryRun = $lines; canInstall = ($blockers.Count -eq 0 -and ($null -eq $dryExit -or $dryExit -eq 0) -and $composeOk -ne $false); planKey = $planKey
+    review = $review.ToArray(); diagnostics = $diagnostics
+  }
+}
+
+# Runtime review after an installation (read-only).
+function Get-RuntimeReview($Settings, [string]$Mode) {
+  $items = @()
+  $st = Get-StackStatus -Settings $Settings
+  foreach ($c in @($st.Containers | Where-Object { $_.Role -ne 'cloudflared' -or $Mode -eq 'tunnel' })) {
+    $healthy = $c.State -eq 'running' -and ($c.Health -in @('', 'healthy'))
+    $items += New-ReviewItem $(if ($healthy) { 'verified' } else { 'action' }) $(if ($healthy) { 'ok' } elseif ($c.State -eq 'running') { 'warning' } else { 'failed' }) "Container $($c.Name)" "$($c.State)$(if ($c.Health) { " ($($c.Health))" })"
+  }
+  $items += New-ReviewItem $(if ($st.TraefikApi) { 'verified' } else { 'action' }) $(if ($st.TraefikApi) { 'ok' } else { 'failed' }) 'Traefik API (local dashboard)' $(if ($st.TraefikApi) { "Traefik $($st.TraefikVersion) answers on http://127.0.0.1:$($Settings.DashboardPort)/dashboard/" } else { 'Not answering.' })
+  return $items
+}
+
+# Runs the previewed installation. The only place where the setup wizard changes Docker or Cloudflare.
+function Invoke-InstallRequest($Body) {
+  Assert-Confirmed $Body
+  $plan = Get-InstallPlan -NoDryRun
+  if (-not $plan.canInstall) { Stop-Request 409 ('Installation is blocked: ' + ($plan.blockers -join ' ')) }
+  if ([string](Get-Field $Body 'planKey' '') -ne $plan.planKey) { Stop-Request 409 'The settings changed since the preview. Preview the installation again.' }
+  # Local and Cloudflare changes are approved separately (setup steps 5 and 6).
+  if (@($plan.steps | Where-Object { $_.kind -eq 'cloudflare' }).Count -gt 0 -and -not [bool](Get-Field $Body 'confirmCloudflare' $false)) {
+    Stop-Request 400 'This installation creates a resource in your Cloudflare account. Approve the Cloudflare changes separately.' @{ needsConfirm = 'cloudflare' }
+  }
+  $settings = Get-Settings
+  $draft = Read-SetupDraft
+  $mode = $draft.deployment.mode
+  $results = New-Object System.Collections.ArrayList
+  $step = { param($Name, $Status, $Message) $null = $results.Add([ordered]@{ name = $Name; status = $Status; message = $Message }) }
+  $lines = @()
+  $ok = $true
+  try {
+    $envPath = Join-Path $InstallPath '.env'
+    if (-not (Test-Path -LiteralPath $envPath)) {
+      Write-TextFileAtomic $envPath (New-DotEnvContent ([IO.File]::ReadAllText((Join-Path $here '.env.example'))) (Get-EnvValues $settings))
+      & $step 'Write .env' 'Done' $envPath
+    }
+    Save-RememberedPath
+    if ($mode -eq 'tunnel') {
+      $config = Read-CloudflareConfig -Settings $settings
+      if ($draft.deployment.tunnelChoice -eq 'new') {
+        $t = New-CloudflareTunnel -Settings $settings -AccountId $config.accountId -Name $draft.deployment.newTunnelName
+        $config.tunnelId = $t.id; $config.tunnelName = $t.name
+        $draft.deployment.tunnelChoice = 'existing'; $draft.deployment.tunnelId = $t.id; $draft.deployment.tunnelName = $t.name; $draft.deployment.newTunnelName = ''
+        Save-SetupDraft $draft
+        Write-Audit 'cloudflare-tunnel-created' "name=$($t.name) id=$($t.id)"
+        & $step 'Create Cloudflare tunnel' 'Done' "$($t.name) ($($t.id))"
+      } else {
+        $config.tunnelId = $draft.deployment.tunnelId; $config.tunnelName = $draft.deployment.tunnelName
+      }
+      Save-CloudflareConfig -Settings $settings -Config $config
+      $null = Install-CloudflareTunnelToken -Settings $settings -AccountId $config.accountId -TunnelId $config.tunnelId
+      Write-Audit 'tunnel-token-installed' "tunnel=$($config.tunnelId)"
+      & $step 'Install connector token' 'Done' 'secrets\cloudflare_tunnel_token'
+    }
+    $installArgs = @('-InstallPath', $InstallPath, '-Start')
+    if ($mode -eq 'tunnel') { $installArgs += '-EnableTunnel' }
+    $r = Invoke-PowerShellFile (Join-Path $here 'install.ps1') $installArgs
+    $lines = $r.Lines
+    if ($r.ExitCode -ne 0) { $ok = $false; & $step 'Run the installer' 'Failed' 'See the installer output.' }
+    else { & $step 'Run the installer' 'Done' "install.ps1 $($installArgs -join ' ')" }
+  } catch {
+    $ok = $false
+    & $step 'Installation' 'Failed' $_.Exception.Message
+  }
+  if ($ok) { $draft = Read-SetupDraft; $draft.installedAt = (Get-Date -Format 's'); Save-SetupDraft $draft }
+  Write-Audit 'setup-install' "ok=$ok mode=$mode"
+  $review = @($results | ForEach-Object { New-ReviewItem 'applied' $(if ($_.status -eq 'Done') { 'ok' } else { 'failed' }) $_.name $_.message })
+  if ($ok) {
+    $review += @(Get-RuntimeReview $settings $mode)
+    $review += New-ReviewItem 'action' 'info' 'Next' 'Check Traefik itself on the Traefik dashboard step before you publish applications.'
+  } else { $review += New-ReviewItem 'action' 'failed' 'Installation failed' 'See the technical output, fix the cause and preview again.' }
+  return [ordered]@{ ok = $ok; steps = $results.ToArray(); lines = $lines; review = $review }
+}
+
+function Select-CloudflareRequest($Body) {
+  $settings = Get-Settings
+  $config = Read-CloudflareConfig -Settings $settings
+  $accountId = [string](Get-Field $Body 'accountId' $config.accountId)
+  $tunnelId = [string](Get-Field $Body 'tunnelId' '')
+  if (-not (Test-CloudflareId $accountId)) { Stop-Request 400 'Invalid account id.' }
+  $accounts = @(Invoke-CloudflareApi -Settings $settings -Path '/accounts' -All)
+  $acct = @($accounts | Where-Object { $_.id -eq $accountId })
+  if ($acct.Count -eq 0) { Stop-Request 400 'The API token cannot see that account.' }
+  if ($accountId -ne $config.accountId) { $config.tunnelId = ''; $config.tunnelName = '' }
+  $config.accountId = $accountId; $config.accountName = [string]$acct[0].name
+  if ($tunnelId) {
+    if (-not (Test-CloudflareId $tunnelId)) { Stop-Request 400 'Invalid tunnel id.' }
+    $tunnel = @(Get-CloudflareTunnels -Settings $settings -AccountId $accountId | Where-Object { $_.id -eq $tunnelId })
+    if ($tunnel.Count -eq 0) { Stop-Request 400 'That tunnel does not exist in the selected account.' }
+    if (-not $tunnel[0].remotelyManaged) { Stop-Request 400 "Tunnel '$($tunnel[0].name)' is locally managed (config file). Only dashboard/API-managed tunnels can be automated; create a new tunnel instead." }
+    $config.tunnelId = $tunnelId; $config.tunnelName = $tunnel[0].name
+  }
+  Save-CloudflareConfig -Settings $settings -Config $config
+  Write-Audit 'cloudflare-select' "account=$($config.accountName) tunnel=$($config.tunnelName)"
+  return Get-CloudflareData
+}
+
+function New-TunnelRequest($Body) {
+  Assert-Confirmed $Body
+  $config = Assert-CloudflareReady
+  $settings = Get-Settings
+  $name = ([string](Get-Field $Body 'name' '')).Trim()
+  $t = New-CloudflareTunnel -Settings $settings -AccountId $config.accountId -Name $name
+  $config.tunnelId = $t.id; $config.tunnelName = $t.name
+  Save-CloudflareConfig -Settings $settings -Config $config
+  Write-Audit 'cloudflare-tunnel-created' "name=$($t.name) id=$($t.id)"
+  return Get-CloudflareData
+}
+
+function Install-ConnectorRequest($Body) {
+  Assert-Confirmed $Body
+  $config = Assert-CloudflareReady -NeedTunnel
+  $settings = Get-Settings
+  Assert-Installed
+  if ((Test-TunnelTokenFile $settings) -and -not [bool](Get-Field $Body 'confirmReplace' $false)) {
+    Stop-Request 409 'secrets\cloudflare_tunnel_token already exists. Confirm that it should be replaced with the token of the selected tunnel.' @{ needsConfirm = 'replace' }
+  }
+  $wasRunning = Test-ContainerRunning $settings.CloudflaredContainer
+  $installed = Install-CloudflareTunnelToken -Settings $settings -AccountId $config.accountId -TunnelId $config.tunnelId
+  Write-Audit 'tunnel-token-installed' "tunnel=$($config.tunnelId)"
+  $start = Start-TunnelConnector -Settings $settings -Recreate:$wasRunning
+  Write-Audit 'cloudflared-start' "ok=$($start.Ok) $($start.Message)"
+  return [ordered]@{ ok = $start.Ok; message = $start.Message; output = @($start.Output | Select-Object -Last 20); previousTokenBackedUp = [bool]$installed.PreviousTokenBackup }
+}
+
+# --- Environment, overview, expert view -------------------------------------------------------------------------
+
+# Whether the install folder can be created/written: the nearest existing folder on the path gets a temporary file
+# that is deleted when closed.
+function Test-InstallPathAccess([string]$Path) {
+  $probe = $Path
+  while ($probe -and -not (Test-Path -LiteralPath $probe)) { $probe = Split-Path -Parent $probe }
+  if (-not $probe) { return [ordered]@{ ok = $false; exists = $false; message = 'No part of this path exists (is the drive present?).' } }
+  $exists = Test-Path -LiteralPath $Path
+  try {
+    $f = [IO.File]::Create((Join-Path $probe ('.tpx-write-check-' + [Guid]::NewGuid().ToString('N').Substring(0, 8))), 1, [IO.FileOptions]::DeleteOnClose)
+    $f.Dispose()
+    return [ordered]@{ ok = $true; exists = $exists; message = $(if ($exists) { "$Path exists and is writable." } else { "$Path will be created inside $probe (writable)." }) }
+  } catch { return [ordered]@{ ok = $false; exists = $exists; message = "Windows refused to write in $probe. Choose a folder in your user profile." } }
+}
+
+# Everything setup step 2 checks, read-only (apart from the deleted write probe).
+function Get-EnvironmentData {
+  $settings = Get-Settings
+  $docker = Get-DockerStatus
+  $installed = Test-Installed
+  # Before the user saved any settings, check (and offer) values that collide with nothing on this PC rather than
+  # the packaged defaults, which often clash with an existing stack.
+  $suggested = $false
+  if (-not $installed -and (Get-SettingsSource) -eq 'defaults' -and $docker.EngineRunning) { $settings = Get-SuggestedStackSettings -InstallPath $InstallPath; $suggested = $true }
+  $conflicts = @()
+  if (-not $installed) { $conflicts = @(Get-StackConflicts -Settings $settings) }
+  $others = 0
+  if ($docker.EngineRunning) { $others = @((Invoke-Docker ps -a --format '{{.Names}}').Output | Where-Object { $_ -and -not $_.StartsWith("$($settings.StackName)-") }).Count }
+  return [ordered]@{
+    docker = $docker; installed = $installed; path = (Test-InstallPathAccess $InstallPath); conflicts = $conflicts
+    otherContainers = $others; settings = ConvertTo-InstanceValues $settings; suggested = $suggested
+  }
+}
+
+function Set-ContactEmailRequest($Body) {
+  $email = ([string](Get-Field $Body 'email' '')).Trim()
+  if ($email -and $email -notmatch $EmailPattern) { Stop-Request 400 "'$email' is not a valid email address." }
+  $draft = Read-SetupDraft
+  $draft.contactEmail = $email
+  Save-SetupDraft $draft
+  return [ordered]@{ contactEmail = $email }
+}
+
+# --- App Catalog and installed apps ---------------------------------------------------------------------------
+
+function Get-CatalogView($M) {
+  $services = @(foreach ($sp in @($(if ($M.PSObject.Properties['services'] -and $M.services) { $M.services.PSObject.Properties } else { @() }))) {
+      [ordered]@{ name = $sp.Name; image = [string]$sp.Value.image
+        ports = @(@(if ($sp.Value.PSObject.Properties['ports']) { $sp.Value.ports }) | ForEach-Object { [ordered]@{ container = [int]$_.container; protocol = [string]$_.protocol; primary = [bool]($_.PSObject.Properties['primary'] -and $_.primary) } })
+        volumes = @(@(if ($sp.Value.PSObject.Properties['volumes']) { $sp.Value.volumes }) | ForEach-Object { [ordered]@{ name = [string]$_.name; target = [string]$_.target; kind = $(if ($_.PSObject.Properties['kind']) { [string]$_.kind } else { 'volume' }); readOnly = [bool]($_.PSObject.Properties['readOnly'] -and $_.readOnly); description = $(if ($_.PSObject.Properties['description']) { [string]$_.description } else { '' }); input = $(if ($_.PSObject.Properties['input']) { [string]$_.input } else { '' }) } })
+        dockerSocket = [bool]($sp.Value.PSObject.Properties['dockerSocket'] -and $sp.Value.dockerSocket); stateful = [bool](Get-Prop2 $sp.Value 'stateful' $false); when = [string](Get-Prop2 $sp.Value 'when' ''); networkMode = [string](Get-Prop2 $sp.Value 'networkMode' '')
+        environment = @(if ($sp.Value.PSObject.Properties['environment'] -and $sp.Value.environment) { $sp.Value.environment.PSObject.Properties | ForEach-Object { $_.Name } })
+        declared = (Get-ServiceDeclaredLifecycle $sp.Value) }
+    })
+  $field = { param($n, $d) if ($M.PSObject.Properties[$n] -and $null -ne $M.$n) { $M.$n } else { $d } }
+  return [ordered]@{
+    id = [string]$M.id; name = [string]$M.name; description = [string]$M.description; category = [string]$M.category; license = [string]$M.license; maintainer = [string]$M.maintainer
+    source = (& $field 'source' $null); docs = @(& $field 'docs' @()); installable = [bool](& $field 'installable' $false); installNote = [string](& $field 'installNote' '')
+    platform = (Get-PlatformSupport $M); privileges = @(& $field 'privileges' @()); security = @(& $field 'security' @()); dependencies = @(& $field 'dependencies' @())
+    exposure = (& $field 'exposure' $null); web = (& $field 'web' $null); update = (& $field 'update' $null); imageReference = [string](& $field 'imageReference' '')
+    inputs = @(@(& $field 'inputs' @()) | ForEach-Object { [ordered]@{ id = [string]$_.id; type = [string]$_.type; label = [string]$_.label; required = [bool]($_.PSObject.Properties['required'] -and $_.required); help = $(if ($_.PSObject.Properties['help']) { [string]$_.help } else { '' }); default = $(if ($_.PSObject.Properties['default']) { [string]$_.default } else { '' }) } })
+    services = $services; group = [string](& $field 'group' ''); deprecated = [bool](& $field 'deprecated' $false); deprecationNote = [string](& $field 'deprecationNote' '')
+    resources = $(if ($M.PSObject.Properties['services'] -and $M.services) { $bv = @{}; foreach ($i in @(& $field 'inputs' @())) { if ($i.type -eq 'boolean') { $bv["input:$($i.id)"] = $(if ([string](Get-Prop2 $i 'default' 'false') -eq 'true') { 'true' } else { 'false' }) } }; Get-AppResourceEstimate $M $bv } else { & $field 'resources' $null })
+    files = @(@(& $field 'files' @()) | ForEach-Object { [string]$_.path }); alternatives = @(& $field 'alternatives' @()); requirements = @(& $field 'requirements' @())
+    aliases = @(& $field 'aliases' @()); manifestVersion = [string](& $field 'manifestVersion' ''); availability = (Get-ManifestAvailability $M)
+    variantOf = [string](& $field 'variantOf' ''); variant = (& $field 'variant' $null); choiceGroup = (& $field 'choiceGroup' $null)
+  }
+}
+
+# Compose's standard file names, in the order docker compose itself picks them. Apps installed here use compose.yaml;
+# an adopted project keeps whichever of these it has (recorded as composeFile).
+$ComposeFileNames = @('compose.yaml', 'compose.yml', 'docker-compose.yaml', 'docker-compose.yml')
+function Find-ComposeFileName([string]$Folder) {
+  foreach ($n in $ComposeFileNames) { if ($Folder -and (Test-Path -LiteralPath (Join-Path $Folder $n))) { return $n } }
+  return ''
+}
+function Get-AppComposePath($App) {
+  $folder = [string]$(if ($App -is [System.Collections.IDictionary]) { $App['folder'] } else { $App.folder })
+  $name = [string]$(if ($App -is [System.Collections.IDictionary]) { if ($App.Contains('composeFile')) { $App['composeFile'] } } elseif ($App.PSObject.Properties['composeFile']) { $App.composeFile })
+  if (-not $name) { $name = Find-ComposeFileName $folder }
+  if (-not $name) { $name = 'compose.yaml' }
+  return (Join-Path $folder $name)
+}
+
+# --- Deployments: lifecycle, instances, duplicates ----------------------------------------------------------------
+
+# Facts (lib\ComposeLifecycle.psm1) of every Compose container on this PC, from two docker calls. No environment or
+# command line is kept.
+function Get-ComposeContainerFacts {
+  $ids = @((Invoke-Docker ps -a -q --filter 'label=com.docker.compose.project').Output | Where-Object { "$_" -match '^[0-9a-f]{12,64}$' })
+  if (-not $ids.Count) { return @() }
+  $r = Invoke-Docker inspect $ids
+  if ($r.ExitCode -ne 0) { return @() }
+  $parsed = (@($r.Output) -join "`n") | ConvertFrom-Json
+  return @(foreach ($x in $parsed) { ConvertFrom-ContainerInspect $x })
+}
+
+# Lifecycle of one installed instance: its containers, the services its compose.yaml defines and, for catalog apps,
+# the roles the manifest declares and the optional services this installation left out.
+function Get-InstanceLifecycle($Instance, [object[]]$Facts, $Catalog) {
+  $cs = @($Facts | Where-Object { $_.project -eq $Instance.project })
+  $entry = Resolve-CatalogEntry $Catalog $Instance.appId
+  $m = $(if ($entry) { $entry.manifest } else { $null })
+  $defined = @()
+  $composePath = Get-AppComposePath $Instance
+  if ($Instance.folder -and (Test-Path -LiteralPath $composePath)) { $defined = @((Get-ComposeServiceImages ([IO.File]::ReadAllText($composePath))).Keys) }
+  $inactive = @(); if ($m -and $defined.Count) { $inactive = @($m.services.PSObject.Properties | Where-Object { $defined -notcontains $_.Name } | ForEach-Object { $_.Name }) }
+  return Get-DeploymentLifecycle -Containers $cs -Manifest $m -Defined $defined -Inactive $inactive -Prepared:([bool]$Instance.prepared)
+}
+
+# Registry instances with their lifecycle, hostnames and container count (for duplicate detection and the apps page).
+function Get-InstalledInstances($Settings, $Catalog, [object[]]$Facts) {
+  $registry = @((Read-ServiceRegistry -Settings $Settings).services)
+  return @(Read-AppsRegistry $Settings | ForEach-Object {
+      $i = ConvertTo-AppInstance $_ $Catalog
+      $lc = Get-InstanceLifecycle $i $Facts $Catalog
+      $names = @($Facts | Where-Object { $_.project -eq $i.project } | ForEach-Object { $_.name })
+      $i.lifecycle = $lc; $i.state = $lc.state; $i.headline = $lc.headline; $i.containerCount = $names.Count
+      $i.routes = @($registry | Where-Object { $_.target.type -eq 'docker' -and $names -contains $_.target.host } | ForEach-Object { [ordered]@{ name = $_.name; hostnames = @($_.hostnames); publish = [bool]$_.cloudflare.publish; authProvider = $(if ($_.PSObject.Properties['auth'] -and $_.auth) { [string]$_.auth.provider } else { '' }) } })
+      $i.hostnames = @($i.routes | ForEach-Object { $_.hostnames })
+      $i
+    })
+}
+
+# Existing installations of the application a manifest installs (registered, archived and unregistered ones).
+function Get-ExistingInstallations($Manifest, $Settings) {
+  $catalog = @(Get-CatalogApps -CatalogDir $CatalogDir | Where-Object { -not @($_.errors).Count })
+  $facts = @(Get-ComposeContainerFacts)
+  $instances = @(Get-InstalledInstances $Settings $catalog $facts)
+  $un = @(Get-UnregisteredInstallations $facts $catalog (@($instances | ForEach-Object { $_.project }) + $Settings.StackName))
+  return @(Find-AppInstallations (Get-ApplicationId $Manifest) $instances $un)
+}
+
+# The catalog as the browser sees it: one entry per application (variants listed under it), each with the instances
+# installed on this PC. Reference entries (building blocks) are listed apart; retired entries are not offered at all
+# and only named so the page can explain where they went.
+function Get-CatalogData {
+  $apps = @(Get-CatalogApps -CatalogDir $CatalogDir)
+  $valid = @($apps | Where-Object { -not @($_.errors).Count })
+  $instances = @()
+  if (Test-Installed) { $instances = @(Read-AppsRegistry (Get-Settings) | ForEach-Object { ConvertTo-AppInstance $_ $valid }) }
+  $offered = @($valid | Where-Object { (Get-ManifestAvailability $_.manifest) -eq 'offered' })
+  $instanceList = { param($appId) @($instances | Where-Object { $_.applicationId -eq $appId -and -not $_.archived } | ForEach-Object { [ordered]@{ project = $_.project; instanceId = $_.instanceId; label = $_.label; manifestId = $_.appId; prepared = $_.prepared; origin = $_.origin } }) }
+  return [ordered]@{
+    apps = @(foreach ($e in @($offered | Where-Object { -not (Get-Prop2 $_.manifest 'variantOf' '') })) {
+        $v = Get-CatalogView $e.manifest
+        $v.applicationId = $e.id
+        $v.variants = @($offered | Where-Object { [string](Get-Prop2 $_.manifest 'variantOf' '') -eq $e.id } | ForEach-Object { $vv = Get-CatalogView $_.manifest; $vv.applicationId = $e.id; $vv })
+        $v.instances = @(& $instanceList $e.id)
+        $v.archivedInstances = @($instances | Where-Object { $_.applicationId -eq $e.id -and $_.archived }).Count
+        $v.installedAs = @($v.instances | ForEach-Object { $_.project })
+        $v
+      })
+    reference = @($valid | Where-Object { (Get-ManifestAvailability $_.manifest) -eq 'reference' } | ForEach-Object { [ordered]@{ id = $_.id; name = [string]$_.manifest.name; description = [string]$_.manifest.description; note = [string](Get-Prop2 $_.manifest 'installNote' '') } })
+    retired = @($valid | Where-Object { (Get-ManifestAvailability $_.manifest) -eq 'retired' } | ForEach-Object { [ordered]@{ id = $_.id; name = [string]$_.manifest.name; date = [string](Get-Prop2 $_.manifest.retired 'date' ''); note = [string]$_.manifest.retired.note; replacement = @(Get-Prop2 $_.manifest.retired 'replacement' @()); installed = @(& $instanceList $_.id).Count } })
+    invalid = @($apps | Where-Object { @($_.errors).Count } | ForEach-Object { [ordered]@{ file = $_.file; errors = @($_.errors) } })
+    sources = @([ordered]@{ type = 'curated'; name = 'Curated catalog (this manager)'; enabled = $true },
+      [ordered]@{ type = 'github-compose'; name = 'GitHub Compose repositories'; enabled = $false }, [ordered]@{ type = 'docker-hub'; name = 'Docker Hub (image discovery only)'; enabled = $false },
+      [ordered]@{ type = 'ghcr'; name = 'GitHub Container Registry (image discovery only)'; enabled = $false }, [ordered]@{ type = 'unraid-xml'; name = 'Unraid templates (import)'; enabled = $false },
+      [ordered]@{ type = 'user-compose'; name = 'Your own Compose file'; enabled = $false })
+  }
+}
+
+function Get-ComposeProjectContainers([string]$Project) {
+  $r = Invoke-Docker ps -a --filter "label=com.docker.compose.project=$Project" --format '{{.Names}}|{{.State}}|{{.Status}}|{{.Image}}'
+  return @(@($r.Output) | Where-Object { $_ -match '\|' } | ForEach-Object { $p = ([string]$_).Split('|'); [ordered]@{ name = $p[0]; state = $p[1]; status = $p[2]; image = $p[3]; health = $(if ($p[2] -match '\((healthy|unhealthy|health: starting)\)') { $Matches[1] } else { '' }) } })
+}
+
+function Get-AppDefaults($Manifest, $Settings) {
+  $base = [string]$Manifest.id
+  $root = Split-Path -Parent $InstallPath
+  $existing = @(Read-AppsRegistry $Settings | ForEach-Object { $_.project })
+  $n = 1; $project = $base
+  while ($existing -contains $project -or (Test-Path -LiteralPath (Join-Path $root $project)) -or @(Get-ComposeProjectContainers $project).Count -or $project -eq $Settings.StackName) { $n++; $project = "$base-$n" }
+  # Admin interfaces open on 127.0.0.1 by default: the manifest's port, or the next free one.
+  $lp = 0
+  if ($Manifest.PSObject.Properties['web'] -and $Manifest.web.PSObject.Properties['localPort'] -and [int]$Manifest.web.localPort) {
+    $lp = [int]$Manifest.web.localPort
+    $usedByApps = @(Read-AppsRegistry $Settings | ForEach-Object { if ($_.PSObject.Properties['localPort']) { [int]$_.localPort } })
+    while ((Get-PortUser $lp) -or $usedByApps -contains $lp) { $lp++ }
+  }
+  # Existing installations of the same application (any variant, alias or project name) and of the other members of
+  # its choice group (e.g. Portainer when installing Arcane), so the page offers them before a second installation.
+  $existing = @(Get-ExistingInstallations $Manifest $Settings)
+  $alternatives = @()
+  $cg = [string](Get-Prop2 (Get-Prop2 $Manifest 'choiceGroup' $null) 'id' '')
+  if ($cg) {
+    $catalog = @(Get-CatalogApps -CatalogDir $CatalogDir | Where-Object { -not @($_.errors).Count })
+    $others = @($catalog | Where-Object { $_.id -ne $Manifest.id -and [string](Get-Prop2 (Get-Prop2 $_.manifest 'choiceGroup' $null) 'id' '') -eq $cg } | ForEach-Object { $_.id })
+    $alternatives = @(Read-AppsRegistry $Settings | ForEach-Object { ConvertTo-AppInstance $_ $catalog } | Where-Object { $others -contains $_.applicationId -and -not $_.archived } | ForEach-Object { [ordered]@{ project = $_.project; name = $_.name } })
+  }
+  return [ordered]@{ project = $project; folder = (Join-Path $root $project); timezone = (Get-IanaTimeZone); localPort = $lp; existing = $existing; alternativesInstalled = $alternatives }
+}
+
+function Get-IanaTimeZone {
+  try { $id = [TimeZoneInfo]::Local.Id; $map = @{ 'W. Europe Standard Time' = 'Europe/Berlin'; 'GMT Standard Time' = 'Europe/London'; 'Pacific Standard Time' = 'America/Los_Angeles'; 'Mountain Standard Time' = 'America/Denver'; 'Central Standard Time' = 'America/Chicago'; 'Eastern Standard Time' = 'America/New_York'; 'Romance Standard Time' = 'Europe/Paris'; 'Central European Standard Time' = 'Europe/Warsaw'; 'AUS Eastern Standard Time' = 'Australia/Sydney'; 'Tokyo Standard Time' = 'Asia/Tokyo'; 'UTC' = 'UTC' }; if ($map.ContainsKey($id)) { return $map[$id] } } catch { }
+  return 'UTC'
+}
+
+function Get-AppSecretKeys($Manifest) {
+  $secretInputs = @(@(if ($Manifest.PSObject.Properties['inputs']) { $Manifest.inputs }) | Where-Object { $_.type -in 'generated', 'secret' } | ForEach-Object { [string]$_.id })
+  $keys = @()
+  foreach ($sp in $Manifest.services.PSObject.Properties) {
+    if (-not ($sp.Value.PSObject.Properties['environment'] -and $sp.Value.environment)) { continue }
+    foreach ($ev in $sp.Value.environment.PSObject.Properties) { foreach ($sid in $secretInputs) { if ([string]$ev.Value -match "\{\{\s*input:$sid\s*\}\}") { $keys += $ev.Name } } }
+  }
+  return @($keys | Select-Object -Unique)
+}
+
+# Validated preview of an installation: compose.yaml, configuration files and the .env with secrets masked, plus
+# every check (names, folder, volumes, port, network, memory, disk, docker compose config). Writes nothing except a
+# temporary copy for `docker compose config` (removed again).
+function Invoke-AppPlan($Body) {
+  Assert-Installed
+  $settings = Get-Settings
+  $appId = [string](Get-Field $Body 'appId' '')
+  try { $m = Get-CatalogApp -CatalogDir $CatalogDir -Id $appId } catch { Stop-Request 404 $_.Exception.Message }
+  if ((Get-ManifestAvailability $m) -eq 'retired') { Stop-Request 410 "$($m.name) is no longer offered for new installations: $($m.retired.note)" }
+  $platform = Get-PlatformSupport $m
+  if (-not $platform.installable) { Stop-Request 409 "$($m.name) cannot be installed here: $(if ($m.PSObject.Properties['installNote']) { $m.installNote } else { $platform.support })" }
+  $defaults = Get-AppDefaults $m $settings
+  $project = ([string](Get-Field $Body 'project' $defaults.project)).Trim().ToLowerInvariant()
+  $checks = New-Object System.Collections.ArrayList
+  $check = { param($label, $ok, $message, $state = $null) $null = $checks.Add([ordered]@{ label = $label; state = $(if ($state) { $state } elseif ($ok) { 'ok' } else { 'failed' }); message = $message }) }
+  if ($project -notmatch '^[a-z0-9]([a-z0-9-]{0,30}[a-z0-9])?$') { Stop-Request 400 'The project name may use lowercase letters, digits and dashes (at most 32 characters).' }
+  $folderRaw = [string](Get-Field $Body 'folder' $defaults.folder)
+  try { $folder = ConvertTo-ProjectPath $folderRaw } catch { Stop-Request 400 "Installation folder: $($_.Exception.Message)" }
+  $taken = @(Get-ComposeProjectContainers $project).Count -gt 0 -or $project -eq $settings.StackName -or @(Read-AppsRegistry $settings | Where-Object { $_.project -eq $project }).Count
+  & $check 'Project name is free' (-not $taken) $(if ($taken) { "A Compose project or app named '$project' already exists." } else { "Compose project '$project'." })
+  # Never a silent second installation: an existing one (registered, archived or found running) must be managed,
+  # adopted or archived instead, unless the user asks for another, separate instance.
+  $another = [bool](Get-Field $Body 'anotherInstance' $false)
+  $instanceLabel = ([string](Get-Field $Body 'instanceLabel' '')).Trim()
+  if ($instanceLabel.Length -gt 40 -or $instanceLabel -match '[\r\n<>"]') { Stop-Request 400 'The instance label may have at most 40 characters, without quotes or angle brackets.' }
+  $existing = @($defaults.existing)
+  $current = @($existing | Where-Object { -not $_.archived })
+  if ($current.Count) {
+    $list = ($current | ForEach-Object { "$($_.project)$(if ($_.source -eq 'docker') { ' (not registered)' })" }) -join ', '
+    if ($another) { & $check 'Another instance' $true "$($m.name) is already installed ($list). This creates a second, separate instance$(if ($instanceLabel) { " labelled '$instanceLabel'" }) with its own project, folder, volumes and port; nothing is shared or merged." 'warning' }
+    else { & $check 'Not already installed' $false "$($m.name) is already installed: $list. Manage, adopt or archive the existing installation, or choose to install another, separate instance." }
+  } elseif (@($existing | Where-Object { $_.archived }).Count) { & $check 'Not already installed' $true "An archived record of $($m.name) exists ($(@($existing | Where-Object { $_.archived } | ForEach-Object { $_.project }) -join ', ')); this is a new installation." 'warning' }
+  if (@($defaults.alternativesInstalled).Count) { & $check 'Choice of tools' $true "$(@($defaults.alternativesInstalled | ForEach-Object { $_.name }) -join ', ') is already installed for the same purpose; you rarely need both." 'warning' }
+  # A folder holding only the backups of an earlier installation counts as empty: the backups are kept.
+  $folderOk = -not (Test-Path -LiteralPath $folder) -or -not @(Get-ChildItem -LiteralPath $folder -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -ne 'backups' }).Count
+  & $check 'Installation folder is new or empty' $folderOk $(if ($folderOk) { $folder } else { "$folder already contains files; choose another folder." })
+  $insideDeployment = $folder.StartsWith($InstallPath.TrimEnd('\') + '\', [StringComparison]::OrdinalIgnoreCase) -or $folder -ieq $InstallPath
+  if ($insideDeployment) { & $check 'Installation folder is outside the proxy deployment' $false 'Apps get their own folder, not one inside the proxy deployment.' }
+  $hostNet = @($m.services.PSObject.Properties | Where-Object { [string](Get-Prop2 $_.Value 'networkMode' '') -eq 'host' }).Count -gt 0
+  $localPort = 0
+  if (-not $hostNet -and [int]::TryParse([string](Get-Field $Body 'localPort' $defaults.localPort), [ref]$localPort) -and $localPort -ne 0) {
+    if ($localPort -lt 1024 -or $localPort -gt 65535) { Stop-Request 400 'The local port must be between 1024 and 65535.' }
+    $user = Get-PortUser $localPort
+    & $check "Local port 127.0.0.1:$localPort is free" (-not $user) $(if ($user) { "In use by $user. Choose another local port." } else { 'Only this PC can open it.' })
+  }
+  $tz = ([string](Get-Field $Body 'timezone' $defaults.timezone)).Trim()
+  $appUrl = ([string](Get-Field $Body 'appUrl' '')).Trim()
+  if ($appUrl -and $appUrl -notmatch '^https?://[A-Za-z0-9.-]+(:\d+)?/?$') { Stop-Request 400 'The app address must look like https://app.example.com.' }
+  if (-not $appUrl) { $appUrl = $(if ($localPort) { "http://127.0.0.1:$localPort" } else { "http://$project" }) }
+  $inputs = @{}
+  $bodyInputs = Get-Field $Body 'inputs' $null
+  if ($bodyInputs) { foreach ($p in $bodyInputs.PSObject.Properties) { $inputs[$p.Name] = [string]$p.Value } }
+  $cfDomains = @((Read-CloudflareConfig -Settings $settings).domains | ForEach-Object { $_.name })
+  $context = @{ traefikContainer = $settings.TraefikContainer; proxyNetwork = $settings.ProxyNetwork; domains = $(if ($cfDomains.Count) { $cfDomains -join ',' } else { 'localhost' }) }
+  $resolved = Resolve-AppValues -Manifest $m -Inputs $inputs -Project $project -AppUrl $appUrl -TimeZone $tz -LocalPort $localPort -Context $context
+  foreach ($err in $resolved.Errors) { & $check 'Settings' $false $err }
+  $active = @(Get-ActiveServices $m $resolved.Values)
+  $net = Get-DockerNetworkFacts $settings.ProxyNetwork
+  & $check "Shared network '$($settings.ProxyNetwork)' exists" $net.exists $(if ($net.exists) { 'The web service joins it so Traefik can reach it by name; nothing is published yet.' } else { 'Start the proxy deployment first.' })
+  $volumes = @()
+  foreach ($sp in $active) { foreach ($v in @(Get-Prop2 $sp.Value 'volumes' @())) { if ((Get-Prop2 $v 'kind' 'volume') -eq 'volume' -and -not ((Get-Prop2 $v 'input' '') -and [string]$resolved.Values["input:$($v.input)"])) { $volumes += "${project}_$($v.name)" } } }
+  $volumes = @($volumes | Select-Object -Unique)
+  $reuse = [bool](Get-Field $Body 'reuseData' $false)
+  foreach ($vn in $volumes) {
+    $exists = (Invoke-Docker volume inspect $vn).ExitCode -eq 0
+    if ($exists -and $reuse) { & $check "Data volume $vn" $true 'Exists already: the app will use the data in it (as you chose).' 'warning' }
+    else { & $check "Data volume $vn" (-not $exists) $(if ($exists) { 'A volume with this name already exists (kept from an earlier installation?). Choose another project name, or choose to reuse its data.' } else { 'Will be created; it survives updates, restarts and removal unless you delete it explicitly.' }) }
+  }
+  # Resources: the app's estimate against what Docker and Windows have free right now. When the project is only
+  # prepared (not started), a shortfall is a warning: nothing runs until Start, which checks again.
+  $startNow = [bool](Get-Field $Body 'startNow' $true)
+  $res = Get-HostResources
+  $need = Get-AppResourceEstimate $m $resolved.Values
+  if ($need.memoryMB -gt 0) {
+    $free = [Math]::Min($res.dockerFreeMB, $res.windowsFreeMB)
+    $memState = $(if ($need.memoryMB -gt $free) { $(if ($startNow) { 'failed' } else { 'warning' }) } elseif ($need.memoryMB * 1.5 -gt $free) { 'warning' } else { 'ok' })
+    & $check 'Memory' ($memState -ne 'failed') "Needs about $($need.memoryMB) MB; free now: $($res.dockerFreeMB) MB for Docker (of $($res.dockerTotalMB) MB), $($res.windowsFreeMB) MB in Windows.$(if ($memState -eq 'failed') { ' Stop other apps or give Docker Desktop more memory first.' })" $memState
+  }
+  if ($need.diskMB -gt 0) {
+    $freeDisk = [Math]::Min($res.projectsDiskFreeMB, $res.dockerDiskFreeMB)
+    & $check 'Disk space' ($need.diskMB -lt $freeDisk) "Needs about $($need.diskMB) MB (images and first data); free: $freeDisk MB." $(if ($need.diskMB -ge $freeDisk) { $(if ($startNow) { 'failed' } else { 'warning' }) } elseif ($need.diskMB * 3 -gt $freeDisk) { 'warning' } else { 'ok' })
+  }
+  $compose = $null; $envText = $null; $envAll = [ordered]@{}
+  if (-not @($resolved.Errors).Count) {
+    try {
+      $compose = ConvertTo-AppCompose -Manifest $m -Project $project -Resolved $resolved -ProxyNetwork $settings.ProxyNetwork -LocalPort $localPort
+      foreach ($svc in $resolved.Env.Keys) { foreach ($k in $resolved.Env[$svc].Keys) { $envAll[$k] = $resolved.Env[$svc][$k] } }
+      $envText = ConvertTo-EnvFileText $envAll
+    } catch { & $check 'Compose file' $false $_.Exception.Message }
+  }
+  $filesPreview = @()
+  if ($compose) {
+    $extra = $resolved.Values.Clone(); $extra['installedApps'] = (Get-InstalledAppsYaml $settings)
+    try { $filesPreview = @(Get-AppFiles $m $extra | ForEach-Object { [ordered]@{ path = $_.path; content = $(if ($_.secret) { '(contains secrets: written to the project folder, readable by your account only)' } else { $_.content -replace '__derived:[A-Za-z0-9]+', '<computed during installation>' }) } }) } catch { & $check 'Configuration files' $false $_.Exception.Message }
+    $tmp = Join-Path ([IO.Path]::GetTempPath()) ("tpm-app-" + [Guid]::NewGuid().ToString('N').Substring(0, 8))
+    New-Item -ItemType Directory -Force -Path $tmp | Out-Null
+    try {
+      [IO.File]::WriteAllText((Join-Path $tmp 'compose.yaml'), $compose); [IO.File]::WriteAllText((Join-Path $tmp '.env'), $envText)
+      Set-SecretFileAcl (Join-Path $tmp '.env')
+      $v = Invoke-Docker compose --project-directory $tmp -f (Join-Path $tmp 'compose.yaml') config -q
+      & $check 'docker compose config' ($v.ExitCode -eq 0) $(if ($v.ExitCode -eq 0) { 'The Compose file is valid.' } else { (Hide-SecretValues @($v.Output) @($envAll.Values)) -join ' ' })
+    } finally { Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue }
+  }
+  $images = @(foreach ($sp in $active) { $present = (Invoke-Docker image inspect $sp.Value.image).ExitCode -eq 0; [ordered]@{ service = $sp.Name; image = [string]$sp.Value.image; present = $present } })
+  foreach ($i in $images) { & $check "Image $($i.image -replace '@sha256:.*', '')" $true $(if ($i.present) { 'Already on this PC.' } else { 'Will be downloaded during the installation (pinned by digest).' }) 'info' }
+  $privileged = @($m.privileges).Count -gt 0
+  $secretKeys = @($resolved.Secrets)
+  $preview = $(if ($envText) { (($envText -split "`n") | ForEach-Object { if ($_ -match '^([A-Z][A-Z0-9_]*)=' -and $secretKeys -contains $Matches[1]) { "$($Matches[1])=<secret, stored only in .env>" } else { $_ } }) -join "`n" } else { '' })
+  $canApply = $compose -and -not @($checks | Where-Object { $_.state -eq 'failed' }).Count
+  foreach ($k in @($State.AppPlans.Keys)) { if (((Get-Date) - $State.AppPlans[$k].Created).TotalMinutes -gt 15) { $State.AppPlans.Remove($k) } }
+  $planId = New-RandomKey 12
+  if ($canApply) { $State.AppPlans[$planId] = [pscustomobject]@{ Created = (Get-Date); AppId = $m.id; Project = $project; Folder = $folder; Compose = $compose; EnvAll = $envAll; Values = $resolved.Values; Derived = @($resolved.Derived); Privileged = $privileged; Images = $images; LocalPort = $localPort; StartNow = $startNow; Label = $instanceLabel } }
+  return [ordered]@{
+    planId = $(if ($canApply) { $planId } else { '' }); canApply = [bool]$canApply; appId = $m.id; name = $m.name; project = $project; folder = $folder
+    container = (Get-AppContainerName $m $project $m.web.service)
+    services = @($active | ForEach-Object { [ordered]@{ name = $_.Name; container = (Get-AppContainerName $m $project $_.Name); image = [string]$_.Value.image; stateful = [bool](Get-Prop2 $_.Value 'stateful' $false) } })
+    compose = $compose; envPreview = $preview; files = $filesPreview; checks = $checks.ToArray(); existingVolumes = @($volumes | Where-Object { (Invoke-Docker volume inspect $_).ExitCode -eq 0 })
+    privileges = @($m.privileges); security = @($m.security); volumes = $volumes; images = $images; resources = [ordered]@{ need = $need; host = $res }
+    localUrl = $(if ($localPort) { "http://127.0.0.1:$localPort/" } else { '' }); startNow = $startNow; existing = $existing; anotherInstance = $another; instanceLabel = $instanceLabel
+  }
+}
+
+function Get-Prop2($Object, [string]$Name, $Default = $null) {
+  if ($null -eq $Object) { return $Default }
+  $p = $Object.PSObject.Properties[$Name]
+  if ($p -and $null -ne $p.Value) { return $p.Value }
+  return $Default
+}
+
+# Memory and disk an installation needs: per-service estimates of the services it runs, else the app's estimate.
+function Get-AppResourceEstimate($Manifest, [hashtable]$Values) {
+  $mem = 0; $disk = 0; $per = $false
+  foreach ($sp in (Get-ActiveServices $Manifest $Values)) {
+    $r = Get-Prop2 $sp.Value 'resources' $null
+    if ($r) { $per = $true; $mem += [int](Get-Prop2 $r 'memoryMB' 0); $disk += [int](Get-Prop2 $r 'diskMB' 0) }
+  }
+  $app = Get-Prop2 $Manifest 'resources' $null
+  if (-not $per -and $app) { $mem = [int](Get-Prop2 $app 'memoryMB' 0); $disk = [int](Get-Prop2 $app 'diskMB' 0) }
+  return [ordered]@{ memoryMB = $mem; diskMB = $disk }
+}
+
+# What this PC and Docker Desktop have free right now (read-only).
+function Get-HostResources {
+  $out = [ordered]@{ dockerTotalMB = 0; dockerUsedMB = 0; dockerFreeMB = 0; cpus = 0; windowsTotalMB = 0; windowsFreeMB = 0; projectsDiskFreeMB = 0; dockerDiskFreeMB = 0; running = 0; containers = @() }
+  try { $os = Get-CimInstance Win32_OperatingSystem; $out.windowsTotalMB = [int]($os.TotalVisibleMemorySize / 1024); $out.windowsFreeMB = [int]($os.FreePhysicalMemory / 1024) } catch { }
+  $i = Invoke-Docker info --format '{{.MemTotal}}|{{.NCPU}}'
+  $line = @($i.Output | Where-Object { $_ -match '^\d+\|\d+$' })[0]
+  if ($line) { $p = $line.Split('|'); $out.dockerTotalMB = [int]([int64]$p[0] / 1MB); $out.cpus = [int]$p[1] }
+  $st = Invoke-Docker stats --no-stream --format '{{.Name}}|{{.MemUsage}}'
+  $used = 0.0
+  $list = @(foreach ($l in @($st.Output)) {
+      if ($l -notmatch '^([^|]+)\|([\d.]+)\s*([KMG]i?B)') { continue }
+      $mb = [double]$Matches[2] * @{ KiB = 1 / 1024; KB = 1 / 1024; MiB = 1; MB = 1; GiB = 1024; GB = 1024 }[$Matches[3]]
+      $used += $mb
+      [ordered]@{ name = $Matches[1]; memoryMB = [int]$mb }
+    })
+  $out.containers = @($list | Sort-Object { $_.memoryMB } -Descending)
+  $out.running = $list.Count
+  $out.dockerUsedMB = [int]$used
+  $out.dockerFreeMB = [Math]::Max(0, $out.dockerTotalMB - $out.dockerUsedMB)
+  try { $out.projectsDiskFreeMB = [int]((Get-PSDrive ((Split-Path -Qualifier $InstallPath).TrimEnd(':'))).Free / 1MB) } catch { }
+  try { $out.dockerDiskFreeMB = [int]((Get-PSDrive ($env:SystemDrive.TrimEnd(':'))).Free / 1MB) } catch { }
+  return $out
+}
+
+# A YAML list of the installed apps for Homepage's services.yaml: links to their local addresses and an internal status
+# check over the shared network. No widgets, API keys or Docker access.
+function Get-InstalledAppsYaml($Settings) {
+  $apps = @(Read-AppsRegistry $Settings)
+  $catalog = @(Get-CatalogApps -CatalogDir $CatalogDir | Where-Object { -not @($_.errors).Count })
+  $lines = @('- Apps:')
+  $n = 0
+  foreach ($a in @($apps | Where-Object { -not ($_.PSObject.Properties['archived'] -and $_.archived) })) {
+    $m = @(@(Resolve-CatalogEntry $catalog ([string]$a.appId)) | Where-Object { $_ } | ForEach-Object { $_.manifest })
+    if (-not $m.Count -or $a.appId -eq 'homepage') { continue }
+    $web = $m[0].web.service
+    $port = [int](@(@($m[0].services.$web.ports) | Where-Object { $_.PSObject.Properties['primary'] -and $_.primary })[0].container)
+    $scheme = $(if (@(@($m[0].services.$web.ports) | Where-Object { $_.PSObject.Properties['primary'] -and $_.primary -and $_.protocol -eq 'https' }).Count) { 'https' } else { 'http' })
+    $href = $(if ($a.PSObject.Properties['localUrl'] -and $a.localUrl) { [string]$a.localUrl } elseif ($a.PSObject.Properties['localPort'] -and [int]$a.localPort) { "http://127.0.0.1:$($a.localPort)/" } else { '' })
+    $name = ([string]$a.name).Replace('"', "'")
+    $lines += "    - ""$name"":"
+    # A prepared app has no container yet: no link and no status check, so it is never shown as up.
+    if ($a.PSObject.Properties['prepared'] -and $a.prepared) { $lines += '        description: "prepared, not started"'; $n++; continue }
+    if ($href) { $lines += "        href: $href" }
+    $lines += "        description: ""$(([string]$m[0].category))"""
+    if ($m[0].web.PSObject.Properties['status']) { $port = [int]$m[0].web.status.port; $scheme = [string]$m[0].web.status.scheme }
+    # Apps kept off the shared network (web.proxy false) cannot be checked from Homepage.
+    if (-not ($m[0].web.PSObject.Properties['proxy'] -and -not $m[0].web.proxy)) { $lines += "        siteMonitor: ${scheme}://$(Get-AppContainerName $m[0] $a.project $web):$port" }
+    $n++
+  }
+  if (-not $n) { return "- Apps: []`n" }
+  return ($lines -join "`n") + "`n"
+}
+
+# Post-install steps with their templates resolved (values include generated passwords): kept in memory, or for a
+# prepared app in a restricted .post-install.json until its first start.
+function Get-ResolvedPostInstall($Manifest, [hashtable]$Values) {
+  return @(foreach ($h in @(if ($Manifest.PSObject.Properties['postInstall']) { $Manifest.postInstall })) {
+      $o = [ordered]@{ service = [string]$h.service; label = [string]$h.label }
+      if ($h.PSObject.Properties['http']) {
+        $o.http = [ordered]@{ path = [string]$h.http.path; body = (Resolve-TemplateValue ([string]$h.http.body) $Values) }
+        if ($h.http.PSObject.Properties['tokenFromLog']) { $o.http.tokenFromLog = [ordered]@{ pattern = [string]$h.http.tokenFromLog.pattern; header = [string]$h.http.tokenFromLog.header } }
+      } else { $o.command = @($h.command | ForEach-Object { Resolve-TemplateValue ([string]$_) $Values }) }
+      [pscustomobject]$o
+    })
+}
+
+function Invoke-AppPostInstall($Manifest, [string]$Project, [int]$LocalPort, $Hooks, $Health, [string[]]$Secrets) {
+  $out = New-Object System.Collections.ArrayList
+  $scheme = $(if (@(@($Manifest.services.($Manifest.web.service).ports) | Where-Object { $_.PSObject.Properties['primary'] -and $_.primary -and $_.protocol -eq 'https' }).Count) { 'https' } else { 'http' })
+  foreach ($hook in @($Hooks)) {
+    if (-not $hook) { continue }
+    $name = "Post-install: $($hook.label)"
+    if (-not ($Health -and $Health.running)) { $null = $out.Add([ordered]@{ name = $name; status = 'Skipped'; message = 'The app is not running.' }); continue }
+    $container = Get-AppContainerName $Manifest $Project $hook.service
+    if ($hook.PSObject.Properties['http'] -and $hook.http) {
+      if (-not $LocalPort) { $null = $out.Add([ordered]@{ name = $name; status = 'Skipped'; message = 'The app has no local port.' }); continue }
+      $code = 0; $msg = ''; $headers = @{}
+      for ($try = 0; $try -lt 6; $try++) {
+        # Some apps print a one-time setup token in their log that must accompany the first call (Portainer 2.45+).
+        if ($hook.http.PSObject.Properties['tokenFromLog'] -and $hook.http.tokenFromLog) {
+          $log = ((Invoke-Docker logs $container).Output | Out-String)
+          $tm = [regex]::Matches($log, [string]$hook.http.tokenFromLog.pattern)
+          if ($tm.Count) { $headers[[string]$hook.http.tokenFromLog.header] = $tm[$tm.Count - 1].Groups[1].Value } else { Start-Sleep -Seconds 5; continue }
+        }
+        $hr = Invoke-LoopbackPost "${scheme}://127.0.0.1:$LocalPort$($hook.http.path)" ([string]$hook.http.body) $headers; $code = $hr.Status; $msg = $hr.Error
+        if ($code -ge 200 -and $code -lt 300) { break }; Start-Sleep -Seconds 5
+      }
+      $null = $out.Add([ordered]@{ name = $name; status = $(if ($code -ge 200 -and $code -lt 300) { 'Done' } else { 'Failed' }); message = "HTTP $code $msg" })
+      continue
+    }
+    $hr = $null
+    for ($try = 0; $try -lt 5; $try++) { $hr = Invoke-Docker @(@('exec', $container) + @($hook.command)); if ($hr.ExitCode -eq 0) { break }; Start-Sleep -Seconds 4 }
+    $null = $out.Add([ordered]@{ name = $name; status = $(if ($hr.ExitCode -eq 0) { 'Done' } else { 'Failed' }); message = ((Hide-SecretValues @(ConvertTo-RedactedText @($hr.Output | Select-Object -Last 3)) $Secrets) -join ' ') })
+  }
+  return $out.ToArray()
+}
+
+# POST JSON to an app on 127.0.0.1 only. A self-signed certificate is accepted for loopback addresses only.
+function Invoke-LoopbackPost([string]$Url, [string]$Json, [hashtable]$Headers = @{}) {
+  $res = [pscustomobject]@{ Status = 0; Error = '' }
+  if (([Uri]$Url).Host -ne '127.0.0.1') { $res.Error = 'not a loopback address'; return $res }
+  $prev = [Net.ServicePointManager]::ServerCertificateValidationCallback
+  try {
+    [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+    [Net.ServicePointManager]::ServerCertificateValidationCallback = { param($s, $c, $ch, $e) ([Net.HttpWebRequest]$s).Address.IsLoopback }
+    $req = [Net.HttpWebRequest]::Create($Url); $req.Method = 'POST'; $req.ContentType = 'application/json'; $req.Timeout = 15000; $req.Proxy = $null
+    foreach ($k in $Headers.Keys) { $req.Headers.Add($k, [string]$Headers[$k]) }
+    $bytes = [Text.Encoding]::UTF8.GetBytes($Json); $req.ContentLength = $bytes.Length
+    $st = $req.GetRequestStream(); $st.Write($bytes, 0, $bytes.Length); $st.Close()
+    try { $r = $req.GetResponse() } catch [Net.WebException] { if ($_.Exception.Response) { $r = $_.Exception.Response } else { throw } }
+    $res.Status = [int]$r.StatusCode; $r.Close()
+  } catch { $res.Error = $_.Exception.Message } finally { [Net.ServicePointManager]::ServerCertificateValidationCallback = $prev }
+  return $res
+}
+
+# Values computed at installation time (never in the plan): e.g. an Authelia argon2 password hash, computed with the
+# app's own image so the hash format is exactly what that version expects.
+function Resolve-DerivedValue($Manifest, [string]$Id, [hashtable]$Values) {
+  $i = @($Manifest.inputs | Where-Object { $_.id -eq $Id })[0]
+  switch ([string]$i.method) {
+    'authelia-argon2' {
+      $image = [string]@($Manifest.services.PSObject.Properties | Where-Object { $_.Value.image -match '^authelia/authelia' })[0].Value.image
+      $r = Invoke-Docker run --rm --pull missing --network none $image authelia crypto hash generate argon2 --password ([string]$Values["input:$($i.from)"])
+      $hash = @($r.Output | ForEach-Object { if ([string]$_ -match '(\$argon2id\$\S+)') { $Matches[1] } })[0]
+      if ($r.ExitCode -ne 0 -or -not $hash) { throw 'Could not compute the Authelia password hash.' }
+      return $hash
+    }
+  }
+  throw "Unknown derived method '$($i.method)'."
+}
+
+function Invoke-AppApply($Body) {
+  Assert-Installed
+  Assert-Confirmed $Body
+  $settings = Get-Settings
+  $planId = [string](Get-Field $Body 'planId' '')
+  if (-not $State.AppPlans.ContainsKey($planId)) { Stop-Request 409 'This preview has expired or was already used. Preview again.' }
+  $plan = $State.AppPlans[$planId]; $State.AppPlans.Remove($planId)
+  if ($plan.Privileged -and -not [bool](Get-Field $Body 'confirmPrivileges' $false)) { Stop-Request 400 'This app needs elevated privileges: confirm them explicitly.' }
+  if ((Test-Path -LiteralPath $plan.Folder) -and @(Get-ChildItem -LiteralPath $plan.Folder -Force | Where-Object { $_.Name -ne 'backups' }).Count) { Stop-Request 409 "$($plan.Folder) is no longer empty. Preview again." }
+  $m = Get-CatalogApp -CatalogDir $CatalogDir -Id $plan.AppId
+  $steps = New-Object System.Collections.ArrayList
+  $step = { param($name, $status, $message) $null = $steps.Add([ordered]@{ name = $name; status = $status; message = $message }) }
+  $values = $plan.Values.Clone()
+  foreach ($d in $plan.Derived) {
+    try { $values["input:$d"] = Resolve-DerivedValue $m $d $values; & $step "Compute $d" 'Done' 'Computed on this PC.' }
+    catch { & $step "Compute $d" 'Failed' $_.Exception.Message; return [ordered]@{ ok = $false; steps = $steps.ToArray(); project = $plan.Project; folder = $plan.Folder; health = $null; container = '' } }
+  }
+  New-Item -ItemType Directory -Force -Path $plan.Folder | Out-Null
+  [IO.File]::WriteAllText((Join-Path $plan.Folder 'compose.yaml'), $plan.Compose)
+  $envPath = Join-Path $plan.Folder '.env'
+  [IO.File]::WriteAllText($envPath, '')
+  Set-SecretFileAcl $envPath
+  [IO.File]::WriteAllText($envPath, (ConvertTo-EnvFileText $plan.EnvAll))
+  [IO.File]::WriteAllText((Join-Path $plan.Folder 'README.md'), (New-AppReadme $m $plan.Project $plan.Folder))
+  foreach ($sp in (Get-ActiveServices $m $values)) {
+    foreach ($v in @(Get-Prop2 $sp.Value 'volumes' @())) { if ((Get-Prop2 $v 'kind' 'volume') -eq 'project') { New-Item -ItemType Directory -Force -Path (Join-Path $plan.Folder ($v.source -replace '/', '\')) | Out-Null } }
+  }
+  $values['installedApps'] = Get-InstalledAppsYaml $settings
+  foreach ($f in (Get-AppFiles $m $values)) {
+    $target = Join-Path $plan.Folder ($f.path -replace '/', '\')
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $target) | Out-Null
+    if ($f.secret) { [IO.File]::WriteAllText($target, ''); Set-SecretFileAcl $target }
+    [IO.File]::WriteAllText($target, $f.content)
+  }
+  # Sign-in passwords a person needs (generated or typed) go to credentials.txt, readable by this account only.
+  $creds = @(@($m.inputs) | Where-Object { $_ -and $_.type -eq 'password' } | ForEach-Object { "$($_.label): $($values["input:$($_.id)"])" })
+  if ($creds.Count) {
+    $cp = Join-Path $plan.Folder 'credentials.txt'; [IO.File]::WriteAllText($cp, ''); Set-SecretFileAcl $cp
+    [IO.File]::WriteAllText($cp, ((@("Sign-in details for $($m.name) ($($plan.Project)). Keep this file private; change the passwords after the first sign-in if you like.", '') + $creds) -join "`r`n") + "`r`n")
+  }
+  & $step 'Write the Compose project' 'Done' $(if ($creds.Count) { "$($plan.Folder) (sign-in details: credentials.txt)" } else { $plan.Folder })
+  $webScheme = $(if (@(@($m.services.($m.web.service).ports) | Where-Object { $_.PSObject.Properties['primary'] -and $_.primary -and $_.protocol -eq 'https' }).Count) { 'https' } else { 'http' })
+  $localUrl = $(if ($plan.LocalPort) { "${webScheme}://127.0.0.1:$($plan.LocalPort)/" } else { '' })
+  # The instance: its own id, the manifest it came from, who created its resources (origin 'installed': the manager
+  # created the folder, containers, named volumes and private network) and a fingerprint of the generated compose.yaml,
+  # so later edits made with other tools (Arcane, Portainer, an editor) are noticed before the manager changes it.
+  $record = [ordered]@{ instanceId = ('i-' + (New-SecretValue 6)); project = $plan.Project; appId = $plan.AppId; name = [string]$m.name; label = [string]$plan.Label; origin = 'installed'
+    folder = $plan.Folder; installedAt = (Get-Date -Format 's'); images = @($plan.Images | ForEach-Object { $_.image }); localPort = $plan.LocalPort; localUrl = $localUrl; prepared = (-not $plan.StartNow)
+    composeSha256 = (Get-TextSha256 $plan.Compose) }
+  Save-AppsRegistry $settings (@(Read-AppsRegistry $settings | Where-Object { $_.project -ne $plan.Project }) + [pscustomobject]$record)
+  $hooks = @(Get-ResolvedPostInstall $m $values)
+  if (-not $plan.StartNow) {
+    if ($hooks.Count) { $hp = Join-Path $plan.Folder '.post-install.json'; [IO.File]::WriteAllText($hp, ''); Set-SecretFileAcl $hp; [IO.File]::WriteAllText($hp, (ConvertTo-Json -InputObject @($hooks) -Depth 6)) }
+    Write-Audit 'app-prepare' "$($plan.AppId) project=$($plan.Project) folder=$($plan.Folder)"
+    & $step 'Prepared, not started' 'Done' 'No app container was created or started. Use Start on the Installed apps page when resources allow: it checks memory again and downloads the pinned images.'
+    return [ordered]@{ ok = $true; prepared = $true; steps = $steps.ToArray(); project = $plan.Project; folder = $plan.Folder; health = $null; container = (Get-AppContainerName $m $plan.Project $m.web.service); output = ''; localUrl = $localUrl; credentialsFile = $(if ($creds.Count) { Join-Path $plan.Folder 'credentials.txt' } else { '' }) }
+  }
+  $up = Invoke-Docker compose --project-directory $plan.Folder -f (Join-Path $plan.Folder 'compose.yaml') up -d
+  $secrets = @(@((Read-AppEnv $envPath).Values) + @($values.Keys | Where-Object { $_ -like 'input:*' } | ForEach-Object { [string]$values[$_] }) | Where-Object { $_ -and $_.Length -ge 8 -and $_ -notmatch '^(true|false)$' -and $_ -notmatch '^[A-Za-z]:\\' })
+  $upText = (Hide-SecretValues @(ConvertTo-RedactedText @($up.Output)) $secrets) -join "`n"
+  & $step 'Download images and start (docker compose up -d)' $(if ($up.ExitCode -eq 0) { 'Done' } else { 'Failed' }) ($upText -split "`n" | Select-Object -Last 6 | Out-String).Trim()
+  Write-Audit 'app-install' "$($plan.AppId) project=$($plan.Project) folder=$($plan.Folder) exit=$($up.ExitCode)"
+  $health = $null
+  if ($up.ExitCode -eq 0) { $health = Get-AppHealth $plan.Project $m $settings 90 }
+  # Commands the app's own tools run once it is up (e.g. setting the first administrator password).
+  foreach ($x in (Invoke-AppPostInstall $m $plan.Project $plan.LocalPort $hooks $health $secrets)) { $null = $steps.Add($x) }
+  return [ordered]@{ ok = ($up.ExitCode -eq 0); steps = $steps.ToArray(); project = $plan.Project; folder = $plan.Folder; health = $health
+    container = (Get-AppContainerName $m $plan.Project $m.web.service); output = $upText; localUrl = $localUrl; credentialsFile = $(if ($creds.Count) { Join-Path $plan.Folder 'credentials.txt' } else { '' }) }
+}
+
+# Running state of every container and a real HTTP request to the web interface (probe container on the shared network).
+function Get-AppHealth([string]$Project, $Manifest, $Settings, [int]$WaitSeconds = 0) {
+  $web = Get-AppContainerName $Manifest $Project $Manifest.web.service
+  $deadline = (Get-Date).AddSeconds($WaitSeconds)
+  do {
+    $cs = @(Get-ComposeProjectContainers $Project)
+    $w = @($cs | Where-Object { $_.name -eq $web })
+    $starting = @($cs | Where-Object { $_.health -eq 'health: starting' -or $_.state -in 'created', 'restarting' }).Count
+    $ready = $w.Count -and $w[0].state -eq 'running' -and -not $starting
+    if ($ready -or (Get-Date) -ge $deadline) { break }
+    Start-Sleep -Seconds 3
+  } while ($true)
+  $out = [ordered]@{ containers = $cs; web = $web; running = [bool]($w.Count -and $w[0].state -eq 'running'); allRunning = (-not @($cs | Where-Object { $_.state -ne 'running' -and $_.status -notmatch 'Exited \(0\)' }).Count); http = $null }
+  if ($out.running) {
+    $primary = @(@($Manifest.services.($Manifest.web.service).ports) | Where-Object { $_.PSObject.Properties['primary'] -and $_.primary })[0]
+    $c = @(Get-DockerContainerInventory -ProxyNetwork $Settings.ProxyNetwork | Where-Object { $_.name -eq $web })
+    if ($c.Count) {
+      $probe = $null
+      for ($i = 0; $i -lt 10; $i++) { $probe = Test-ContainerPort -Container $c[0] -Port ([int]$primary.container) -ProxyNetwork $Settings.ProxyNetwork -Image $Settings.TraefikImage -NamePrefix $Settings.StackName -Schemes $(if ($primary.protocol -eq 'https') { @('https') } else { @('http', 'https') }); if ($probe.result -in 'http', 'https') { break }; Start-Sleep -Seconds 4 }
+      $out.http = $probe
+    }
+  }
+  return $out
+}
+
+function Find-InstalledApp([string]$Project) {
+  $settings = Get-Settings
+  $a = @(Read-AppsRegistry $settings | Where-Object { $_.project -eq $Project })
+  if (-not $a.Count) { Stop-Request 404 "No app '$Project' was installed by this manager." }
+  $compose = Get-AppComposePath $a[0]
+  if ([bool](Get-Prop2 $a[0] 'archived' $false)) { Stop-Request 409 "The record of '$Project' is archived. Restore it on the Installed apps page to manage it here." }
+  if ([string](Get-Prop2 $a[0] 'origin' '') -eq 'adopted') {
+    # Adopted projects were not generated here: their compose.yaml is the user's own. The folder must still be the
+    # one Docker reports for the project's containers.
+    if (-not (Test-Path -LiteralPath $compose)) { Stop-Request 409 "$($a[0].folder) no longer holds its Compose file; manage the project with docker compose directly." }
+    return $a[0]
+  }
+  # Only projects this manager generated are managed: an edited or foreign compose file is left alone.
+  if (-not (Test-Path -LiteralPath $compose) -or ([IO.File]::ReadAllText($compose) -notmatch "org\.traefik-proxy\.project: $([regex]::Escape($Project))")) { Stop-Request 409 "$($a[0].folder) no longer holds the Compose project this manager created; manage it with docker compose directly." }
+  return $a[0]
+}
+
+# Installed apps: every registered instance with the lifecycle of its services (long-running services, completed or
+# failed one-time jobs), its routes, and whether its compose.yaml changed outside the manager. Archived records are
+# listed apart; Compose projects that look like catalog apps but are not registered are listed as discovered.
+# running / total are raw container counts (kept for scripts); the page uses lifecycle.
+function Get-AppsData {
+  Assert-Installed
+  $settings = Get-Settings
+  $catalog = @(Get-CatalogApps -CatalogDir $CatalogDir | Where-Object { -not @($_.errors).Count })
+  $facts = @(Get-ComposeContainerFacts)
+  $instances = @(Get-InstalledInstances $settings $catalog $facts)
+  $views = @(foreach ($i in $instances) {
+      $entry = Resolve-CatalogEntry $catalog $i.appId
+      $m = $(if ($entry) { $entry.manifest } else { $null })
+      $composePath = Get-AppComposePath $i
+      $composeText = $(if ($i.folder -and (Test-Path -LiteralPath $composePath)) { [IO.File]::ReadAllText($composePath) } else { '' })
+      $diff = @(); if ($m -and $composeText) { $diff = @(Get-AppUpdateDiff $m $composeText) }
+      $cs = @($facts | Where-Object { $_.project -eq $i.project })
+      $siblings = @($instances | Where-Object { $_.applicationId -eq $i.applicationId -and $_.project -ne $i.project -and -not $_.archived } | ForEach-Object { $_.project })
+      [ordered]@{ project = $i.project; instanceId = $i.instanceId; appId = $i.appId; recordedAppId = $i.recordedAppId; applicationId = $i.applicationId; availability = $i.availability
+        name = $i.name; label = $i.label; origin = $i.origin; archived = $i.archived; archivedAt = $i.archivedAt; folder = $i.folder; installedAt = $i.installedAt; folderExists = [bool]$composeText
+        containers = @($cs | ForEach-Object { [ordered]@{ name = $_.name; state = $_.state; status = "$($_.state)$(if ($_.state -ne 'running') { " (exit $($_.exitCode))" })$(if ($_.health) { " ($($_.health))" })"; image = $_.image; health = $_.health } })
+        running = @($cs | Where-Object { $_.state -eq 'running' }).Count; total = $cs.Count
+        lifecycle = $i.lifecycle; siblings = $siblings
+        localUrl = $(if ($i.localUrl) { $i.localUrl } elseif ($i.localPort) { "http://127.0.0.1:$($i.localPort)/" } else { '' })
+        routes = $i.routes; prepared = [bool]($i.prepared -and $cs.Count -eq 0)
+        composeChanged = $(if (-not $composeText -or -not $i.composeSha256) { $null } else { (Get-TextSha256 $composeText) -ne $i.composeSha256 })
+        updateAvailable = ($diff.Count -gt 0); updates = $diff; catalog = $(if ($m) { [ordered]@{ web = $m.web; exposure = $m.exposure } } else { $null }) }
+    })
+  $discovered = @(Get-UnregisteredInstallations $facts $catalog (@($instances | ForEach-Object { $_.project }) + $settings.StackName))
+  return [ordered]@{ apps = @($views | Where-Object { -not $_.archived }); archived = @($views | Where-Object { $_.archived }); discovered = $discovered; checkedAt = (Get-Date -Format 's') }
+}
+
+# Details of one instance for inspection: services with roles and lifecycle, images, dependencies, health, exit codes,
+# networks (with the other containers on them and their DNS names), published ports, volumes, hostnames, and the
+# Cloudflare and authentik references. Read-only; no environment values, commands or secrets.
+function Get-AppDetailData([string]$Project) {
+  Assert-Installed
+  $settings = Get-Settings
+  $catalog = @(Get-CatalogApps -CatalogDir $CatalogDir | Where-Object { -not @($_.errors).Count })
+  $facts = @(Get-ComposeContainerFacts)
+  $i = @(Get-InstalledInstances $settings $catalog $facts | Where-Object { $_.project -eq $Project })
+  if (-not $i.Count) { Stop-Request 404 "No app '$Project' is registered in this manager." }
+  $i = $i[0]
+  $cs = @($facts | Where-Object { $_.project -eq $Project })
+  # Every container on this PC (also outside Compose) for the network membership.
+  $all = @($facts)
+  $known = @($facts | ForEach-Object { $_.id })
+  $loose = @((Invoke-Docker ps -a -q).Output | Where-Object { "$_" -match '^[0-9a-f]{12,64}$' -and $known -notcontains "$_".Substring(0, 12) })
+  if ($loose.Count) { $r = Invoke-Docker inspect $loose; if ($r.ExitCode -eq 0) { $all += @(foreach ($x in ((@($r.Output) -join "`n") | ConvertFrom-Json)) { ConvertFrom-ContainerInspect $x }) } }
+  $netNames = @($cs | ForEach-Object { @($_.networks) | ForEach-Object { $_.name } } | Select-Object -Unique)
+  $networks = @(foreach ($n in $netNames) {
+      $members = @($all | Where-Object { @($_.networks | Where-Object { $_.name -eq $n }).Count } | ForEach-Object { $c = $_; $e = @($c.networks | Where-Object { $_.name -eq $n })[0]
+          [ordered]@{ container = $c.name; project = $c.project; service = $c.service; inThisApp = ($c.project -eq $Project); ip = $e.ip; dnsNames = @($e.dnsNames) } })
+      [ordered]@{ name = $n; shared = ($n -eq $settings.ProxyNetwork); private = ($n -like "$Project`_*"); members = $members }
+    })
+  $cf = Read-CloudflareConfig -Settings $settings
+  $cfHosts = @(); if ($cf.PSObject.Properties['managed'] -and $cf.managed) { $cfHosts = @($cf.managed.PSObject.Properties | Where-Object { @($i.hostnames) -contains $_.Name } | ForEach-Object { [ordered]@{ hostname = $_.Name; dnsRecord = [bool](Get-Prop2 $_.Value 'dnsRecordId' ''); accessApp = [bool](Get-Prop2 $_.Value 'accessAppId' '') } }) }
+  $idApps = @()
+  try { $id = Read-IdentityConfig -Settings $settings; $ap = Get-Prop2 (Get-Prop2 $id 'authentik' $null) 'apps' $null; if ($ap) { $idApps = @($ap.PSObject.Properties | Where-Object { @($i.routes | ForEach-Object { $_.name }) -contains $_.Name } | ForEach-Object { [ordered]@{ service = $_.Name; slug = [string](Get-Prop2 $_.Value 'slug' '') } }) } } catch { }
+  $composePath = Get-AppComposePath $i
+  $composeText = $(if ($i.folder -and (Test-Path -LiteralPath $composePath)) { [IO.File]::ReadAllText($composePath) } else { '' })
+  return [ordered]@{
+    project = $i.project; instanceId = $i.instanceId; name = $i.name; label = $i.label; appId = $i.appId; applicationId = $i.applicationId; origin = $i.origin; folder = $i.folder; archived = $i.archived
+    lifecycle = $i.lifecycle; cleanup = @(Get-JobCleanupCandidates $i.lifecycle); routes = $i.routes; networks = $networks
+    published = @($cs | ForEach-Object { $c = $_; @($c.ports | Where-Object { $_.hostPort }) | ForEach-Object { [ordered]@{ container = $c.name; port = $_.container; hostIp = $_.hostIp; hostPort = $_.hostPort; localOnly = ($_.hostIp -in '127.0.0.1', '::1') } } })
+    volumes = @($cs | ForEach-Object { $c = $_; @($c.mounts | Where-Object { $_.type -eq 'volume' }) | ForEach-Object { [ordered]@{ container = $c.name; name = $_.name; target = $_.target; readOnly = $_.readOnly; anonymous = [bool]($_.name -match '^[0-9a-f]{64}$') } } })
+    cloudflare = $cfHosts; authentik = $idApps
+    composeChanged = $(if (-not $composeText -or -not $i.composeSha256) { $null } else { (Get-TextSha256 $composeText) -ne $i.composeSha256 })
+    checkedAt = (Get-Date -Format 's')
+  }
+}
+
+function Invoke-AppAction($Body) {
+  Assert-Installed
+  Assert-Confirmed $Body
+  $a = Find-InstalledApp ([string](Get-Field $Body 'project' ''))
+  $action = [string](Get-Field $Body 'action' '')
+  if ($action -notin 'start', 'stop', 'restart') { Stop-Request 400 "Unknown action '$action'." }
+  if ($action -eq 'start' -and -not @(Get-ComposeProjectContainers $a.project).Count) {
+    # First start of a prepared project: check memory again, then create the containers (downloads the pinned images).
+    try { $mm = Get-CatalogApp -CatalogDir $CatalogDir -Id $a.appId; $need = Get-AppResourceEstimate $mm @{}; $res = Get-HostResources; $free = [Math]::Min($res.dockerFreeMB, $res.windowsFreeMB)
+      if ($need.memoryMB -gt $free -and -not [bool](Get-Field $Body 'force' $false)) { Stop-Request 409 "$($a.name) needs about $($need.memoryMB) MB but only $free MB is free. Stop other apps first." } } catch [System.Management.Automation.RuntimeException] { if ($_.Exception.Message -match 'needs about') { throw } }
+    $r = Invoke-Docker compose --project-directory $a.folder -f (Get-AppComposePath $a) up -d
+    $hp = Join-Path $a.folder '.post-install.json'
+    if ($r.ExitCode -eq 0 -and (Test-Path -LiteralPath $hp)) {
+      $mm = Get-CatalogApp -CatalogDir $CatalogDir -Id $a.appId
+      $stored = @([IO.File]::ReadAllText($hp) | ConvertFrom-Json)
+      $health = Get-AppHealth $a.project $mm (Get-Settings) 90
+      $lp = $(if ($a.PSObject.Properties['localPort']) { [int]$a.localPort } else { 0 })
+      $hookSteps = @(Invoke-AppPostInstall $mm $a.project $lp $stored $health @((Read-AppEnv (Join-Path $a.folder '.env')).Values))
+      if (-not @($hookSteps | Where-Object { $_.status -ne 'Done' }).Count) { Remove-Item -LiteralPath $hp -Force }
+      $r.Output = @($r.Output) + @($hookSteps | ForEach-Object { "$($_.status): $($_.name) $($_.message)" })
+    }
+  } else { $r = Invoke-Docker compose --project-directory $a.folder -f (Get-AppComposePath $a) $action }
+  Write-Audit "app-$action" "$($a.project) exit=$($r.ExitCode)"
+  return [ordered]@{ ok = ($r.ExitCode -eq 0); project = $a.project; action = $action; output = ((ConvertTo-RedactedText @($r.Output)) -join "`n"); containers = @(Get-ComposeProjectContainers $a.project) }
+}
+
+function Get-AppLogsData([string]$Project, [int]$Tail, [string]$Service = '') {
+  Assert-Installed
+  $a = Find-InstalledApp $Project
+  if ($Tail -lt 1 -or $Tail -gt 2000) { $Tail = 200 }
+  $logArgs = @('compose', '--project-directory', $a.folder, '-f', (Get-AppComposePath $a), 'logs', '--no-color', '--tail', $Tail)
+  # One service's logs (also of a one-time job that exited): the service must belong to this project.
+  if ($Service) {
+    $known = @(@(Get-ComposeContainerFacts | Where-Object { $_.project -eq $a.project } | ForEach-Object { $_.service }) + @((Get-ComposeServiceImages ([IO.File]::ReadAllText((Get-AppComposePath $a)))).Keys))
+    if ($Service -notmatch '^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}$' -or $known -notcontains $Service) { Stop-Request 404 "No service '$Service' in $($a.project)." }
+    $logArgs += $Service
+  }
+  $r = Invoke-Docker @logArgs
+  $secrets = @((Read-AppEnv (Join-Path $a.folder '.env')).Values)
+  return [ordered]@{ project = $a.project; service = $Service; lines = @(Hide-SecretValues @(ConvertTo-RedactedText @($r.Output)) $secrets) }
+}
+
+function Invoke-AppHealthRequest($Body) {
+  Assert-Installed
+  $a = Find-InstalledApp ([string](Get-Field $Body 'project' ''))
+  try { $m = Get-CatalogApp -CatalogDir $CatalogDir -Id $a.appId } catch { Stop-Request 409 $_.Exception.Message }
+  return Get-AppHealth $a.project $m (Get-Settings) 0
+}
+
+function Get-ImageMajor([string]$Image) {
+  if ($Image -match ':([^@]+)@') { $t = $Matches[1] } elseif ($Image -match ':([^:/@]+)$') { $t = $Matches[1] } else { return '' }
+  if ($t -match '(\d+)') { return $Matches[1] }
+  return $t
+}
+
+# Backs up an app's configuration: compose.yaml, .env, its configuration folders and its named volumes (as .tar.gz),
+# into <app folder>\backups\<time>\ (readable by the current user, SYSTEM and Administrators only). Apps with a database
+# are stopped for the copy and started again, so the database files are consistent. Media and other volumes marked
+# backup:false (caches, libraries, recordings) are skipped: they are the user's data, not configuration.
+function Invoke-AppBackupCore($App, $Manifest, $Settings) {
+  $dir = Join-Path $App.folder ("backups\" + (Get-Date -Format 'yyyyMMdd-HHmmss'))
+  New-Item -ItemType Directory -Force -Path $dir | Out-Null
+  $copyFile = { param($from, $name) if (Test-Path -LiteralPath $from) { $to = Join-Path $dir $name; [IO.File]::WriteAllText($to, ''); Set-SecretFileAcl $to; [IO.File]::WriteAllBytes($to, [IO.File]::ReadAllBytes($from)) } }
+  & $copyFile (Get-AppComposePath $App) 'compose.yaml'
+  & $copyFile (Join-Path $App.folder '.env') '.env'
+  $values = @{}; foreach ($i in @(Get-Prop2 $Manifest 'inputs' @())) { if ($i.type -eq 'boolean') { $values["input:$($i.id)"] = 'true' } }
+  $active = @(Get-ActiveServices $Manifest $values)
+  $compose = [IO.File]::ReadAllText((Get-AppComposePath $App))
+  $volumes = @(); $skipped = @(); $folders = @()
+  foreach ($sp in $active) {
+    if ($compose -notmatch "(?m)^  $([regex]::Escape($sp.Name)):\s*$") { continue }
+    foreach ($v in @(Get-Prop2 $sp.Value 'volumes' @())) {
+      $kind = Get-Prop2 $v 'kind' 'volume'
+      if ($kind -eq 'project' -and (Get-Prop2 $v 'backup' $true)) { $folders += [string]$v.source }
+      elseif ($kind -eq 'volume') { if (Get-Prop2 $v 'backup' $true) { $volumes += "$($App.project)_$($v.name)" } else { $skipped += "$($App.project)_$($v.name)" } }
+    }
+  }
+  foreach ($f in ($folders | Select-Object -Unique)) {
+    $src = Join-Path $App.folder ($f -replace '/', '\')
+    if (Test-Path -LiteralPath $src) { Copy-Item -LiteralPath $src -Destination (Join-Path $dir ($f -replace '/', '_')) -Recurse }
+  }
+  $stateful = @($active | Where-Object { Get-Prop2 $_.Value 'stateful' $false }).Count -gt 0
+  $stopped = $false
+  if ($stateful -and $volumes.Count) {
+    $null = Invoke-Docker compose --project-directory $App.folder -f (Get-AppComposePath $App) stop
+    $stopped = $true
+  }
+  $results = @()
+  try {
+    foreach ($vn in ($volumes | Select-Object -Unique)) {
+      if ((Invoke-Docker volume inspect $vn).ExitCode -ne 0) { continue }
+      $r = Invoke-Docker run --rm --pull never --network none -v "${vn}:/v:ro" -v "${dir}:/b" --entrypoint tar $Settings.TraefikImage czf "/b/$vn.tar.gz" -C /v .
+      $file = Join-Path $dir "$vn.tar.gz"
+      if (Test-Path -LiteralPath $file) { Set-SecretFileAcl $file }
+      $results += [ordered]@{ volume = $vn; ok = ($r.ExitCode -eq 0 -and (Test-Path -LiteralPath $file)); sizeMB = $(if (Test-Path -LiteralPath $file) { [Math]::Round((Get-Item -LiteralPath $file).Length / 1MB, 1) } else { 0 }) }
+    }
+  } finally {
+    if ($stopped) { $null = Invoke-Docker compose --project-directory $App.folder -f (Get-AppComposePath $App) start }
+  }
+  $info = [ordered]@{ app = $App.appId; project = $App.project; createdAt = (Get-Date -Format 's'); volumes = $results; skipped = $skipped; folders = @($folders | Select-Object -Unique); stoppedForBackup = $stopped }
+  [IO.File]::WriteAllText((Join-Path $dir 'backup.json'), ($info | ConvertTo-Json -Depth 5))
+  Write-Audit 'app-backup' "$($App.project) $dir volumes=$(@($results).Count)"
+  return [ordered]@{ ok = -not @($results | Where-Object { -not $_.ok }).Count; folder = $dir; volumes = $results; skipped = $skipped; folders = $info.folders; stopped = $stopped }
+}
+
+function Invoke-AppBackup($Body) {
+  Assert-Installed
+  Assert-Confirmed $Body
+  $a = Find-InstalledApp ([string](Get-Field $Body 'project' ''))
+  try { $m = Get-CatalogApp -CatalogDir $CatalogDir -Id $a.appId } catch { Stop-Request 409 $_.Exception.Message }
+  return Invoke-AppBackupCore $a $m (Get-Settings)
+}
+
+# Update preview: what the catalog would change, plus a notification when the registry now has a newer build under the
+# same tag. Nothing is pulled. Database (stateful) services never change their major version through this path.
+function Get-AppUpdateItems($App, $Manifest, [switch]$Registry) {
+  $text = [IO.File]::ReadAllText((Get-AppComposePath $App))
+  $installed = Get-ComposeServiceImages $text
+  $items = @()
+  foreach ($sp in $Manifest.services.PSObject.Properties) {
+    if (-not $installed.Contains($sp.Name)) { continue }
+    $from = [string]$installed[$sp.Name]; $to = [string]$sp.Value.image
+    $stateful = [bool](Get-Prop2 $sp.Value 'stateful' $false)
+    if ($from -ne $to) {
+      $major = (Get-ImageMajor $from) -ne (Get-ImageMajor $to)
+      $items += [ordered]@{ service = $sp.Name; kind = 'catalog'; from = $from; to = $to; stateful = $stateful; majorChange = $major; blocked = ($stateful -and $major)
+        note = $(if ($stateful -and $major) { 'Database major-version upgrades need the application''s own migration procedure; not applied here.' } else { '' }) }
+    }
+    if ($Registry -and $from -match '^(.+:[^@]+)@(sha256:[0-9a-f]{64})$') {
+      $tagRef = $Matches[1]; $pinned = $Matches[2]
+      $r = Invoke-Docker buildx imagetools inspect $tagRef --format '{{json .Manifest.Digest}}'
+      $now = ((@($r.Output) -join '') -replace '"', '').Trim()
+      if ($r.ExitCode -eq 0 -and $now -match '^sha256:[0-9a-f]{64}$' -and $now -ne $pinned) {
+        $items += [ordered]@{ service = $sp.Name; kind = 'registry'; from = $from; to = "$tagRef@$now"; stateful = $stateful; majorChange = $false; blocked = $stateful
+          note = $(if ($stateful) { 'A newer build of the same tag exists. Database images are only changed together with a catalog update.' } else { 'A newer build of the same tag exists (security fixes are usually published this way).' }) }
+      }
+    }
+  }
+  return $items
+}
+
+function Invoke-AppUpdatePreview($Body) {
+  Assert-Installed
+  $a = Find-InstalledApp ([string](Get-Field $Body 'project' ''))
+  try { $m = Get-CatalogApp -CatalogDir $CatalogDir -Id $a.appId } catch { Stop-Request 409 $_.Exception.Message }
+  $items = @(Get-AppUpdateItems $a $m -Registry:([bool](Get-Field $Body 'registry' $true)))
+  $applicable = @($items | Where-Object { -not $_.blocked })
+  $key = Get-TextSha256 (($applicable | ForEach-Object { "$($_.service)|$($_.from)|$($_.to)" }) -join "`n")
+  $notes = $(if ($m.PSObject.Properties['update'] -and $m.update.PSObject.Properties['notes']) { [string]$m.update.notes } else { '' })
+  # compose.yaml edited outside the manager (Arcane, Portainer, an editor) since it was generated or last updated here.
+  $baseline = [string](Get-Prop2 $a 'composeSha256' '')
+  $external = $(if ($baseline) { (Get-TextSha256 ([IO.File]::ReadAllText((Get-AppComposePath $a)))) -ne $baseline } else { $null })
+  return [ordered]@{ project = $a.project; changes = $applicable; blocked = @($items | Where-Object { $_.blocked }); previewKey = $(if ($applicable.Count) { $key } else { '' }); notes = $notes
+    externalChanges = $external; externalNote = $(if ($external) { 'compose.yaml was changed outside the manager since it was written here. The update changes only the image lines and keeps those edits; review them before continuing.' } elseif ($null -eq $external) { 'No fingerprint of compose.yaml was recorded (installed by an earlier version), so changes made with other tools cannot be detected.' } else { '' })
+    releaseNotes = @(@(if ($m.PSObject.Properties['docs']) { $m.docs }) | Select-Object -First 1)
+    keeps = @('A backup of the configuration and data volumes is made first (apps with a database are stopped for it).', 'compose.yaml is saved as compose.yaml.bak-<time>; only image lines change; your other edits stay.', 'Data volumes, media and library folders are never deleted by an update.') }
+}
+
+function Invoke-AppUpdateApply($Body) {
+  Assert-Installed
+  Assert-Confirmed $Body
+  $a = Find-InstalledApp ([string](Get-Field $Body 'project' ''))
+  $m = Get-CatalogApp -CatalogDir $CatalogDir -Id $a.appId
+  $items = @(Get-AppUpdateItems $a $m -Registry:([bool](Get-Field $Body 'registry' $true)) | Where-Object { -not $_.blocked })
+  $key = Get-TextSha256 (($items | ForEach-Object { "$($_.service)|$($_.from)|$($_.to)" }) -join "`n")
+  if (-not $items.Count -or $key -ne [string](Get-Field $Body 'previewKey' '')) { Stop-Request 409 'The installed project, the catalog or the registry changed since the preview. Preview again.' }
+  $settings = Get-Settings
+  $baseline = [string](Get-Prop2 $a 'composeSha256' '')
+  if ($baseline -and (Get-TextSha256 ([IO.File]::ReadAllText((Get-AppComposePath $a)))) -ne $baseline -and -not [bool](Get-Field $Body 'acknowledgeExternalChanges' $false)) { Stop-Request 409 'compose.yaml was changed outside the manager. Review the changes and confirm that the update may proceed (only image lines change; your edits are kept).' }
+  $backup = Invoke-AppBackupCore $a $m $settings
+  if (-not $backup.ok) { Stop-Request 500 "The backup before the update failed ($($backup.folder)); nothing was updated." }
+  $path = Get-AppComposePath $a
+  $text = [IO.File]::ReadAllText($path)
+  $bak = "$path.bak-$(Get-Date -Format 'yyyyMMdd-HHmmss')"
+  Copy-Item -LiteralPath $path -Destination $bak
+  foreach ($c in $items) { $text = $text.Replace("    image: $($c.from)", "    image: $($c.to)") }
+  Write-TextFileAtomic $path $text
+  # The updated file is the new baseline for detecting edits made with other tools.
+  $records = @(Read-AppsRegistry $settings)
+  foreach ($rec in @($records | Where-Object { $_.project -eq $a.project })) { $rec | Add-Member -NotePropertyName composeSha256 -NotePropertyValue (Get-TextSha256 $text) -Force }
+  Save-AppsRegistry $settings $records
+  $up = Invoke-Docker compose --project-directory $a.folder -f $path up -d
+  Write-Audit 'app-update' "$($a.project) $(($items | ForEach-Object { $_.to }) -join ',') exit=$($up.ExitCode)"
+  return [ordered]@{ ok = ($up.ExitCode -eq 0); project = $a.project; backup = (Split-Path -Leaf $bak); dataBackup = $backup.folder; changes = $items
+    output = ((Hide-SecretValues @(ConvertTo-RedactedText @($up.Output)) @((Read-AppEnv (Join-Path $a.folder '.env')).Values)) -join "`n")
+    health = $(if ($up.ExitCode -eq 0) { Get-AppHealth $a.project $m $settings 60 } else { $null }) }
+}
+
+# Removes an app's containers. Data volumes and the project folder are kept unless explicitly chosen (with the project
+# name typed as confirmation); folders you chose for bind mounts are never touched.
+function Invoke-AppRemove($Body) {
+  Assert-Installed
+  Assert-Confirmed $Body
+  $settings = Get-Settings
+  $a = Find-InstalledApp ([string](Get-Field $Body 'project' ''))
+  $deleteVolumes = [bool](Get-Field $Body 'deleteVolumes' $false)
+  $deleteFolder = [bool](Get-Field $Body 'deleteFolder' $false)
+  if (($deleteVolumes -or $deleteFolder) -and [string](Get-Field $Body 'confirmText' '') -ne $a.project) { Stop-Request 400 "Type the project name ($($a.project)) to delete data." }
+  if (($deleteVolumes -or $deleteFolder) -and [string](Get-Prop2 $a 'origin' '') -eq 'adopted') { Stop-Request 400 'This project was adopted: the manager did not create its data or files and never deletes them. Only its containers can be removed here.' }
+  if ($deleteVolumes) {
+    $inv = Get-AppRemovalInventory $a $settings
+    $shared = @($inv.volumes | Where-Object { @($_.sharedWith).Count })
+    if ($shared.Count) { Stop-Request 409 "Data volumes $(@($shared | ForEach-Object { $_.name }) -join ', ') are also used by other containers; they are never deleted with this app. Remove without deleting data." }
+  }
+  $cs = @(Get-ComposeProjectContainers $a.project | ForEach-Object { $_.name })
+  $routes = @((Read-ServiceRegistry -Settings $settings).services | Where-Object { $_.target.type -eq 'docker' -and $cs -contains $_.target.host } | ForEach-Object { $_.name })
+  if ($routes.Count) { Stop-Request 409 "Remove the service route(s) $($routes -join ', ') on the Services page first, so the hostname does not answer 502." }
+  $args2 = @('compose', '--project-directory', $a.folder, '-f', (Get-AppComposePath $a), 'down')
+  if ($deleteVolumes) { $args2 += '-v' }
+  $r = Invoke-Docker @args2
+  if ($r.ExitCode -ne 0) { Stop-Request 500 "docker compose down failed: $((ConvertTo-RedactedText @($r.Output)) -join ' ')" }
+  $folderRemoved = $false
+  if ($deleteFolder) {
+    foreach ($f in @(Get-ChildItem -LiteralPath $a.folder -Force -File)) { if ($f.Name -in 'compose.yaml', '.env', 'README.md', 'credentials.txt', '.post-install.json' -or $f.Name -like 'compose.yaml.bak-*') { $f.IsReadOnly = $false; Remove-Item -LiteralPath $f.FullName -Force } }
+    if (-not @(Get-ChildItem -LiteralPath $a.folder -Force).Count) { Remove-Item -LiteralPath $a.folder -Force; $folderRemoved = $true }
+  }
+  Save-AppsRegistry $settings @(Read-AppsRegistry $settings | Where-Object { $_.project -ne $a.project })
+  Write-Audit 'app-remove' "$($a.project) volumes=$deleteVolumes folder=$deleteFolder"
+  $kept = @((Invoke-Docker volume ls -q --filter "name=$($a.project)_").Output | Where-Object { $_ })
+  return [ordered]@{ removed = $true; project = $a.project; volumesDeleted = $deleteVolumes; keptVolumes = @($kept); folderRemoved = $folderRemoved; folder = $a.folder }
+}
+
+# Every container on this PC as facts (Compose and others), for shared volume and network checks.
+function Get-AllContainerFacts {
+  $facts = @(Get-ComposeContainerFacts)
+  $known = @($facts | ForEach-Object { $_.id })
+  $loose = @((Invoke-Docker ps -a -q).Output | Where-Object { "$_" -match '^[0-9a-f]{12,64}$' -and $known -notcontains "$_".Substring(0, 12) })
+  if ($loose.Count) { $r = Invoke-Docker inspect $loose; if ($r.ExitCode -eq 0) { $facts += @(foreach ($x in ((@($r.Output) -join "`n") | ConvertFrom-Json)) { ConvertFrom-ContainerInspect $x }) } }
+  return $facts
+}
+
+# What removing a registered app would touch and what it leaves alone (lib\AppInstances.psm1 Get-RemovalInventory).
+function Get-AppRemovalInventory($Record, $Settings) {
+  $catalog = @(Get-CatalogApps -CatalogDir $CatalogDir | Where-Object { -not @($_.errors).Count })
+  $inst = ConvertTo-AppInstance $Record $catalog
+  $all = @(Get-AllContainerFacts)
+  $cs = @($all | Where-Object { $_.project -eq $inst.project })
+  $names = @($cs | ForEach-Object { $_.name })
+  $routes = @((Read-ServiceRegistry -Settings $Settings).services | Where-Object { $_.target.type -eq 'docker' -and $names -contains $_.target.host })
+  $hosts = @($routes | ForEach-Object { @($_.hostnames) })
+  $cf = Read-CloudflareConfig -Settings $Settings
+  $cfHosts = @(); if ($cf.PSObject.Properties['managed'] -and $cf.managed) { $cfHosts = @($cf.managed.PSObject.Properties | Where-Object { $hosts -contains $_.Name } | ForEach-Object { $_.Name }) }
+  $idApps = @(); try { $ap = Get-Prop2 (Get-Prop2 (Read-IdentityConfig -Settings $Settings) 'authentik' $null) 'apps' $null; if ($ap) { $idApps = @($ap.PSObject.Properties | Where-Object { @($routes | ForEach-Object { $_.name }) -contains $_.Name } | ForEach-Object { [string](Get-Prop2 $_.Value 'slug' $_.Name) }) } } catch { }
+  $files = @(); if ($inst.folder -and (Test-Path -LiteralPath $inst.folder)) { $files = @(Get-ChildItem -LiteralPath $inst.folder -Force -File | Where-Object { $_.Name -in 'compose.yaml', '.env', 'README.md', 'credentials.txt', '.post-install.json' -or $_.Name -like 'compose.yaml.bak-*' } | ForEach-Object { $_.Name }) }
+  return Get-RemovalInventory -Instance $inst -Containers $cs -All $all -Routes $routes -CloudflareHosts $cfHosts -IdentityApps $idApps -ProxyNetwork $Settings.ProxyNetwork -FolderFiles $files
+}
+
+function Get-AppRemovePlan($Body) {
+  Assert-Installed
+  $a = Find-InstalledApp ([string](Get-Field $Body 'project' ''))
+  return Get-AppRemovalInventory $a (Get-Settings)
+}
+
+# Archives the record of an obsolete installation: the manager hides it, and nothing on the PC changes (containers,
+# volumes, folder, routes, Cloudflare and authentik stay as they are). Refused while one of its containers runs.
+function Invoke-AppArchive($Body) {
+  Assert-Installed
+  Assert-Confirmed $Body
+  $settings = Get-Settings
+  $project = [string](Get-Field $Body 'project' '')
+  $records = @(Read-AppsRegistry $settings)
+  $r = @($records | Where-Object { $_.project -eq $project })
+  if (-not $r.Count) { Stop-Request 404 "No app '$project' is registered in this manager." }
+  if ([bool](Get-Prop2 $r[0] 'archived' $false)) { Stop-Request 409 "The record of '$project' is already archived." }
+  $running = @(Get-ComposeProjectContainers $project | Where-Object { $_.state -in 'running', 'restarting', 'paused' })
+  if ($running.Count) { Stop-Request 409 "$project still runs ($(@($running | ForEach-Object { $_.name }) -join ', ')). Archive only records of installations that are not in use; stop it first if it is obsolete." }
+  $r[0] | Add-Member -NotePropertyName archived -NotePropertyValue $true -Force
+  $r[0] | Add-Member -NotePropertyName archivedAt -NotePropertyValue (Get-Date -Format 's') -Force
+  Save-AppsRegistry $settings $records
+  Write-Audit 'app-archive' "$project (record only; nothing else changed)"
+  return [ordered]@{ ok = $true; project = $project; archived = $true; unchanged = @('containers', 'volumes', 'folder', 'routes', 'Cloudflare', 'authentik') }
+}
+
+function Invoke-AppRestoreRecord($Body) {
+  Assert-Installed
+  Assert-Confirmed $Body
+  $settings = Get-Settings
+  $project = [string](Get-Field $Body 'project' '')
+  $records = @(Read-AppsRegistry $settings)
+  $r = @($records | Where-Object { $_.project -eq $project -and [bool](Get-Prop2 $_ 'archived' $false) })
+  if (-not $r.Count) { Stop-Request 404 "No archived record '$project'." }
+  $r[0].PSObject.Properties.Remove('archived'); $r[0].PSObject.Properties.Remove('archivedAt')
+  Save-AppsRegistry $settings $records
+  Write-Audit 'app-restore-record' $project
+  return [ordered]@{ ok = $true; project = $project; archived = $false }
+}
+
+# Review of a Compose project found on this PC that looks like a catalog app but is not registered. Adopting it only
+# registers it (origin 'adopted'); nothing in the project changes, and the manager never deletes its data or files.
+function Get-AppAdoptPlan($Body) {
+  Assert-Installed
+  $settings = Get-Settings
+  $project = [string](Get-Field $Body 'project' '')
+  $catalog = @(Get-CatalogApps -CatalogDir $CatalogDir | Where-Object { -not @($_.errors).Count })
+  $facts = @(Get-ComposeContainerFacts)
+  $registered = @(Read-AppsRegistry $settings | ForEach-Object { $_.project })
+  if ($registered -contains $project) { Stop-Request 409 "'$project' is already registered." }
+  $u = @(Get-UnregisteredInstallations $facts $catalog (@($registered) + $settings.StackName) | Where-Object { $_.project -eq $project })
+  if (-not $u.Count) { Stop-Request 404 "No unregistered Compose project '$project' that matches a catalog app was found." }
+  $u = $u[0]
+  $cs = @($facts | Where-Object { $_.project -eq $project })
+  $folders = @($cs | ForEach-Object { $_.workingDir } | Where-Object { $_ } | Select-Object -Unique)
+  $folder = $(if ($folders.Count -eq 1) { [string]$folders[0] } else { '' })
+  $checks = New-Object System.Collections.ArrayList
+  $check = { param($label, $state, $message) $null = $checks.Add([ordered]@{ label = $label; state = $state; message = $message }) }
+  & $check 'Recognized application' 'ok' "$($u.name): $($u.reason)"
+  if ($u.availability -eq 'retired') { & $check 'Catalog status' 'warning' "$($u.name) is no longer offered for new installations; adopting it only lets you manage this existing one." }
+  & $check 'Project folder' $(if ($folder -and (Test-Path -LiteralPath $folder)) { 'ok' } else { 'failed' }) $(if ($folder) { $folder } else { "Docker reports $($folders.Count) folders for this project's containers." })
+  $composeName = Find-ComposeFileName $folder
+  $hasCompose = [bool]$composeName
+  & $check 'Compose file' $(if ($hasCompose) { 'ok' } else { 'failed' }) $(if ($hasCompose) { "$composeName found; it stays exactly as it is." } else { "No $($ComposeFileNames -join ', ') in the folder; keep managing it with docker compose or your tool." })
+  $entry = Resolve-CatalogEntry $catalog $u.appId
+  $lc = Get-DeploymentLifecycle -Containers $cs -Manifest $entry.manifest
+  $key = Get-TextSha256 ("$project|$folder|" + (@($cs | ForEach-Object { "$($_.id):$($_.image)" } | Sort-Object) -join ','))
+  return [ordered]@{ project = $project; appId = $u.appId; name = $u.name; folder = $folder; composeFile = $composeName; lifecycle = $lc; checks = $checks.ToArray(); canAdopt = -not @($checks | Where-Object { $_.state -eq 'failed' }).Count; reviewKey = $key
+    keeps = @('Nothing in the project changes: compose.yaml, .env, containers, volumes and networks stay as they are.', 'The manager never deletes data or files of an adopted project; removing it here removes its containers only.', 'Changes made later with Arcane, Portainer or an editor are noticed before the manager changes anything.') }
+}
+
+function Invoke-AppAdopt($Body) {
+  Assert-Installed
+  Assert-Confirmed $Body
+  $settings = Get-Settings
+  $plan = Get-AppAdoptPlan $Body
+  if (-not $plan.canAdopt) { Stop-Request 409 'This project cannot be adopted; see the review.' }
+  if ($plan.reviewKey -ne [string](Get-Field $Body 'reviewKey' '')) { Stop-Request 409 'The project changed since the review. Review it again.' }
+  $label = ([string](Get-Field $Body 'label' '')).Trim(); if ($label.Length -gt 40 -or $label -match '[\r\n<>"]') { Stop-Request 400 'The instance label may have at most 40 characters, without quotes or angle brackets.' }
+  $compose = [IO.File]::ReadAllText((Get-AppComposePath $plan))
+  $record = [ordered]@{ instanceId = ('i-' + (New-SecretValue 6)); project = $plan.project; appId = $plan.appId; name = $plan.name; label = $label; origin = 'adopted'; folder = $plan.folder; composeFile = $plan.composeFile
+    installedAt = (Get-Date -Format 's'); images = @($plan.lifecycle.services | ForEach-Object { $_.image } | Where-Object { $_ }); localPort = 0; localUrl = ''; prepared = $false; composeSha256 = (Get-TextSha256 $compose) }
+  Save-AppsRegistry $settings (@(Read-AppsRegistry $settings) + [pscustomobject]$record)
+  Write-Audit 'app-adopt' "$($plan.appId) project=$($plan.project) folder=$($plan.folder)"
+  return [ordered]@{ ok = $true; project = $plan.project; instanceId = $record.instanceId }
+}
+
+# Completed one-time job containers (e.g. Rocket.Chat's MongoDB permission and replica-set setup) that may be removed
+# to tidy up. Their Compose definitions, volumes and data stay; Compose creates them again (and they exit again) the
+# next time the app is started or recreated. Nothing runs automatically.
+function Get-AppCleanupPlan($Body) {
+  Assert-Installed
+  $settings = Get-Settings
+  $a = Find-InstalledApp ([string](Get-Field $Body 'project' ''))
+  $catalog = @(Get-CatalogApps -CatalogDir $CatalogDir | Where-Object { -not @($_.errors).Count })
+  $inst = ConvertTo-AppInstance $a $catalog
+  $lc = Get-InstanceLifecycle $inst @(Get-ComposeContainerFacts) $catalog
+  $c = @(Get-JobCleanupCandidates $lc)
+  return [ordered]@{ project = $a.project; candidates = $c; key = (Get-TextSha256 ((@($c | ForEach-Object { "$($_.container)|$($_.finishedAt)" }) -join ','))); lifecycle = $lc.headline
+    notes = @('Only containers of one-time jobs that completed successfully (exit code 0) and whose role is declared by the app or by Compose.', 'compose.yaml, the job definitions, volumes and data are not changed: the jobs run again the next time the app is started or recreated.', 'No other container is stopped, restarted or recreated.') }
+}
+
+function Invoke-AppCleanup($Body) {
+  Assert-Installed
+  Assert-Confirmed $Body
+  $plan = Get-AppCleanupPlan $Body
+  if (-not @($plan.candidates).Count) { Stop-Request 409 'There is nothing to tidy up.' }
+  if ($plan.key -ne [string](Get-Field $Body 'key' '')) { Stop-Request 409 'The containers changed since the preview. Preview again.' }
+  $results = @(foreach ($c in $plan.candidates) {
+      $now = @(Get-ComposeContainerFacts | Where-Object { $_.name -eq $c.container })
+      if (-not $now.Count -or $now[0].state -ne 'exited' -or $now[0].exitCode -ne 0) { [ordered]@{ container = $c.container; ok = $false; message = 'Its state changed; left alone.' }; continue }
+      $r = Invoke-Docker rm $c.container
+      [ordered]@{ container = $c.container; ok = ($r.ExitCode -eq 0); message = $(if ($r.ExitCode -eq 0) { 'Removed (definition and data kept).' } else { (@($r.Output) -join ' ') }) }
+    })
+  Write-Audit 'app-cleanup' "$($plan.project) $(@($results | Where-Object { $_.ok } | ForEach-Object { $_.container }) -join ',')"
+  return [ordered]@{ ok = -not @($results | Where-Object { -not $_.ok }).Count; project = $plan.project; results = $results }
+}
+
+# --- Docker discovery and publishing ----------------------------------------------------------------------
+
+function Get-DockerContainersData {
+  Assert-Installed
+  $settings = Get-Settings
+  if (-not (Get-DockerStatus).EngineRunning) { Stop-Request 503 'The Docker engine is not reachable. Start Docker Desktop.' }
+  $registry = @((Read-ServiceRegistry -Settings $settings).services)
+  $own = @((Get-StackContainerNames $settings).Values) + @($settings.WhoamiContainer)
+  $list = @(Get-DockerContainerInventory -ProxyNetwork $settings.ProxyNetwork | ForEach-Object {
+      $name = $_.name
+      $_.ownInstance = $own -contains $name
+      $_.services = @($registry | Where-Object { $_.target.type -eq 'docker' -and $_.target.host -eq $name } | ForEach-Object { [ordered]@{ name = $_.name; hostnames = @($_.hostnames); port = $_.target.port } })
+      $_
+    })
+  return [ordered]@{ proxyNetwork = $settings.ProxyNetwork; containers = $list; checkedAt = (Get-Date -Format 's') }
+}
+
+function Find-InventoryContainer([string]$Name) {
+  if ($Name -notmatch '^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$') { Stop-Request 400 'Invalid container name.' }
+  $settings = Get-Settings
+  $c = @(Get-DockerContainerInventory -ProxyNetwork $settings.ProxyNetwork | Where-Object { $_.name -eq $Name })
+  if (-not $c.Count) { Stop-Request 404 "No container named '$Name'." }
+  return $c[0]
+}
+
+function Get-HostnameClaimsData([string]$Hostname, [string]$ServiceName) {
+  Assert-Installed
+  $h = $Hostname.Trim().ToLowerInvariant()
+  if ($h -notmatch '^(?=.{1,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$') { Stop-Request 400 'Enter a valid hostname.' }
+  $settings = Get-Settings
+  $containers = @(); try { $containers = @(Get-DockerContainerInventory -ProxyNetwork $settings.ProxyNetwork) } catch { }
+  $dash = Read-DashboardConfig -Settings $settings
+  $claims = Find-HostnameClaims -Hostname $h -Services @((Read-ServiceRegistry -Settings $settings).services) -Routers (Get-TraefikApi $settings '/api/http/routers') -Containers $containers -OwnService $ServiceName -DashboardHostname $(if ($dash.enabled) { $dash.hostname } else { '' })
+  return [ordered]@{ hostname = $h; claims = @($claims); free = -not @($claims | Where-Object { $_.level -eq 'error' }).Count }
+}
+
+# Probes one container port with a short-lived probe container (see Test-ContainerPort). Changes nothing.
+function Invoke-PortProbe($Body) {
+  Assert-Installed
+  $settings = Get-Settings
+  $c = Find-InventoryContainer ([string](Get-Field $Body 'container' ''))
+  $port = 0
+  if (-not [int]::TryParse([string](Get-Field $Body 'port' ''), [ref]$port) -or $port -lt 1 -or $port -gt 65535) { Stop-Request 400 'Enter a port from 1 to 65535.' }
+  if ($port -in 2375, 2376) { Stop-Request 400 'The Docker Engine API port is never probed or published.' }
+  $r = Test-ContainerPort -Container $c -Port $port -ProxyNetwork $settings.ProxyNetwork -Image $settings.TraefikImage -NamePrefix $settings.StackName
+  Write-Audit 'port-probe' "$($c.name):$port $($r.method) $($r.result)"
+  return $r
+}
+
+# Attaches a container to the shared network (docker network connect): a Docker change, so it needs confirm. The
+# attachment lasts until the container is recreated; the response carries the Compose lines that make it permanent.
+function Invoke-NetworkConnect($Body) {
+  Assert-Installed
+  Assert-Confirmed $Body
+  $settings = Get-Settings
+  $c = Find-InventoryContainer ([string](Get-Field $Body 'container' ''))
+  $own = @((Get-StackContainerNames $settings).Values)
+  if ($own -contains $c.name) { Stop-Request 400 'The containers of this deployment are managed by its compose.yaml.' }
+  if ($c.infrastructure) { Stop-Request 400 "$($c.name) looks like proxy or tunnel infrastructure; it is not attached automatically." }
+  if ($c.Contains('privateService') -and $c.privateService) { Stop-Request 400 "$($c.name) is a database, cache, message broker or directory server: it stays on its private network and is not attached to '$($settings.ProxyNetwork)'." }
+  $snippet = @("services:", "  $(if ($c.compose.service) { $c.compose.service } else { $c.name }):", '    networks:', "      - $($settings.ProxyNetwork)", 'networks:', "  $($settings.ProxyNetwork):", '    external: true')
+  if ($c.onProxyNetwork) { return [ordered]@{ connected = $true; changed = $false; message = "$($c.name) is already attached to '$($settings.ProxyNetwork)'."; composeSnippet = $snippet } }
+  $r = Invoke-Docker network connect $settings.ProxyNetwork $c.name
+  Write-Audit 'network-connect' "$($c.name) -> $($settings.ProxyNetwork) exit=$($r.ExitCode)"
+  if ($r.ExitCode -ne 0) { Stop-Request 500 "docker network connect failed: $((@($r.Output) -join ' ').Trim())" }
+  return [ordered]@{ connected = $true; changed = $true; message = "$($c.name) is now attached to '$($settings.ProxyNetwork)'. It stays attached until the container is recreated; add the lines below to its compose file to keep it."; composeSnippet = $snippet; workingDir = $c.compose.workingDir }
+}
+
+# --- Authentication & Routing (read-only) -------------------------------------------------------------------------------
+# Facts about one service for lib\RoutingModel.psm1. Without -Probe only configuration is read: route files, Docker,
+# Traefik's API and GET requests to the authentik and Cloudflare APIs. -Probe adds real requests: one anonymous GET
+# through Traefik (no cookies, never follows a sign-in), the backend from Traefik's container, and GETs to the public
+# addresses through Cloudflare. Nothing is changed and no credential is sent to an application.
+function Get-RouteFileFacts([string]$Path, [string]$Name) {
+  $f = [ordered]@{ fileExists = $false; rule = ''; entryPoints = @(); middlewares = @(); forwardAuthAddress = ''; outpostRouter = $false; backendUrl = '' }
+  if (-not (Test-Path -LiteralPath $Path)) { return $f }
+  $f.fileExists = $true
+  $lines = [IO.File]::ReadAllLines($Path)
+  $section = ''; $block = ''
+  foreach ($l in $lines) {
+    if ($l -match '^  (routers|middlewares|services):\s*$') { $section = $Matches[1]; $block = ''; continue }
+    if ($l -match '^    ([A-Za-z0-9@._-]+):\s*$') { $block = $Matches[1]; continue }
+    if ($section -eq 'routers' -and $block -eq "svc-$Name") {
+      if ($l -match "^\s+rule:\s*'(.*)'\s*$") { $f.rule = $Matches[1].Replace("''", "'") }
+      elseif ($l -match '^\s+entryPoints:\s*\[(.*)\]') { $f.entryPoints = @($Matches[1].Split(',') | ForEach-Object { $_.Trim() } | Where-Object { $_ }) }
+      elseif ($l -match '^\s+middlewares:\s*\[(.*)\]') { $f.middlewares = @($Matches[1].Split(',') | ForEach-Object { $_.Trim() } | Where-Object { $_ }) }
+    }
+    if ($section -eq 'routers' -and $block -eq "svc-$Name-outpost") { $f.outpostRouter = $true }
+    if ($section -eq 'middlewares' -and $block -eq "svc-$Name-authentik" -and $l -match '^\s+address:\s*(\S+)') { $f.forwardAuthAddress = $Matches[1] }
+    if ($section -eq 'services' -and $block -eq "svc-$Name" -and $l -match '^\s+-\s*url:\s*(\S+)' -and -not $f.backendUrl) { $f.backendUrl = $Matches[1] }
+  }
+  return $f
+}
+
+function Get-ContainerNetworkNames([string]$Container) {
+  if (-not $Container) { return @() }
+  $r = Invoke-Docker inspect $Container --format '{{json .NetworkSettings.Networks}}'
+  if ($r.ExitCode -ne 0) { return @() }
+  try { return @(((@($r.Output) -join '') | ConvertFrom-Json).PSObject.Properties | ForEach-Object { $_.Name }) } catch { return @() }
+}
+
+function Get-RoutingFacts($Settings, $Svc, [switch]$Probe) {
+  $cfg = Read-IdentityConfig -Settings $Settings
+  $h = [string]@($Svc.hostnames)[0]
+  $authP = $(if ($Svc.PSObject.Properties['auth'] -and $Svc.auth -and $Svc.auth.PSObject.Properties['provider']) { [string]$Svc.auth.provider } else { '' })
+  $route = Get-RouteFileFacts (Join-Path $InstallPath "traefik\dynamic\svc-$($Svc.name).yml") $Svc.name
+  $routers = $null
+  $tr = Get-TraefikApi $Settings '/api/http/routers'
+  if ($null -ne $tr) { $routers = @{}; foreach ($r in $tr) { if ($r -and $r.name -like "svc-$($Svc.name)*") { $routers[[string]$r.name] = [string]$r.status } } }
+  $server = [string]$cfg.authentik.serverContainer
+  $akNets = @(Get-ContainerNetworkNames $server)
+  $identity = [ordered]@{ publicUrl = [string]$cfg.authentik.publicUrl; authHostname = [string]$cfg.authentik.hostname; serverContainer = $(if ($server) { $server } else { 'authentik-server' })
+    onProxyNetwork = $(if ($server) { $akNets -contains $Settings.ProxyNetwork } else { $true }); googleConfigured = [bool]$cfg.authentik.google.clientId
+    appVerifiedAt = [string](Get-IdProp2 (Get-IdentityApp $cfg $Svc.name) 'verifiedAt' '') }
+
+  # authentik objects (GET only), when the manager is connected.
+  $ak = $null
+  if ($authP -eq 'authentik') {
+    $ak = [ordered]@{ connected = $false; error = '' }
+    $base = [string]$cfg.authentik.localUrl
+    if ($base) {
+      try {
+        $credArgs = Get-IdentityCredentialArgs $Settings $base
+        $cred = Test-StoredCredential @credArgs -IfOlderThanMinutes 2
+        if ($cred.ok) {
+          $conn = New-AuthentikConnection -BaseUrl $base -Token (Read-ProtectedSecret -Settings $Settings -Name (Get-IdentityTokenSecretName))
+          $slug = "dm-$($Svc.name)"
+          $out = @(Get-AuthentikList $conn '/outposts/instances/' | Where-Object { [string](Get-IdProp2 $_ 'managed' '') -eq 'goauthentik.io/outposts/embedded' })[0]
+          $prov = @(Get-AuthentikList $conn "/providers/proxy/?name=$([Uri]::EscapeDataString($slug))" | Where-Object { [string]$_.name -eq $slug })[0]
+          $app = $null; try { $app = Invoke-AuthentikApi $conn GET "/core/applications/$slug/" } catch { }
+          $rules = $null; if ($app) { try { $rules = @(Get-AuthentikList $conn "/policies/bindings/?target=$([string](Get-IdProp2 $app 'pbm_uuid' $app.pk))").Count } catch { } }
+          $ak = [ordered]@{ connected = $true; error = ''; outpostName = [string](Get-IdProp2 $out 'name' '')
+            outpostHost = [string](Get-IdProp2 (Get-IdProp2 $out 'config' $null) 'authentik_host' ''); outpostBrowserHost = [string](Get-IdProp2 (Get-IdProp2 $out 'config' $null) 'authentik_host_browser' '')
+            providerFound = [bool]$prov; providerExternalHost = [string](Get-IdProp2 $prov 'external_host' ''); providerMode = [string](Get-IdProp2 $prov 'mode' '')
+            providerAssigned = [bool]($prov -and $out -and @($out.providers | ForEach-Object { [int]$_ }) -contains [int]$prov.pk); applicationFound = [bool]$app; rules = $rules }
+        } else { $ak.error = [string]$cred.message }
+      } catch { $ak.error = $_.Exception.Message }
+    } else { $ak.error = 'authentik is not set up in the manager.' }
+  }
+
+  # Cloudflare (configuration only here; the health checks below read the API).
+  $cf = Read-CloudflareConfig -Settings $Settings
+  $accId = [string](Get-ManagedResource $cf $h 'accessAppId')
+  $accName = ''
+  if ($accId -and -not $Svc.cloudflare.access) {
+    try { $a = Invoke-CloudflareApi -Settings $Settings -Path "/accounts/$($cf.accountId)/access/apps/$accId"; $accName = [string]$a.name } catch { if ((Get-CfErrorStatus $_) -ne 404) { $accName = "(id $accId)" } }
+  }
+  $backendNets = $null
+  if ($Svc.target.type -eq 'docker') { $backendNets = @(Get-ContainerNetworkNames $Svc.target.host) }
+
+  $facts = [ordered]@{
+    service = [ordered]@{ name = $Svc.name; displayName = $(if ($Svc.PSObject.Properties['displayName'] -and $Svc.displayName) { $Svc.displayName } else { $Svc.name }); hostname = $h; enabled = [bool]$Svc.enabled
+      publish = [bool]$Svc.cloudflare.publish; access = [bool]$Svc.cloudflare.access; authProvider = $authP; targetUrl = (Get-ServiceUrl $Svc); targetType = [string]$Svc.target.type; targetHost = [string]$Svc.target.host }
+    route = $route; traefik = [ordered]@{ apiOk = ($null -ne $routers); routers = $routers }; identity = $identity; authentik = $ak
+    cloudflare = [ordered]@{ connected = [bool]$cf.tunnelId; tunnelName = [string]$cf.tunnelName; accessAppName = $accName; accessAppByDtc = [bool]$accName }
+    networks = [ordered]@{ proxy = $Settings.ProxyNetwork; traefik = @(Get-ContainerNetworkNames "$($Settings.StackName)-traefik"); authentik = $akNets; backend = $backendNets }
+    health = $null; challenge = $null; publicAuth = $null; checkedAt = (Get-Date -Format 's')
+  }
+  if ($Probe) {
+    $facts.health = Get-ServiceHealth -Settings $Settings -Service $Svc -Public:([bool]$Svc.cloudflare.publish)
+    if ($authP -eq 'authentik' -and $Svc.enabled) { $facts.challenge = Test-ForwardAuthChallenge -TraefikPort $Settings.HttpPort -Hostname $h -AuthHostname ([string]$cfg.authentik.hostname) }
+    if ($authP -eq 'authentik' -and $cfg.authentik.publicUrl) {
+      $pr = Invoke-ProbeRequest "$(([string]$cfg.authentik.publicUrl).TrimEnd('/'))/-/health/live/"
+      $facts.publicAuth = [ordered]@{ status = $pr.Status; location = (Get-RedactedUrl $pr.Location); error = $pr.Error }
+    }
+  }
+  return $facts
+}
+
+# GET /api/routing[?service=<name>][&probe=1]: the applications that can be shown and the request path of one of them.
+function Get-RoutingView($Query) {
+  Assert-Installed
+  $settings = Get-Settings
+  $all = @((Read-ServiceRegistry -Settings $settings).services | Where-Object { $_ -and @($_.hostnames).Count })
+  $list = @($all | ForEach-Object { [ordered]@{ name = $_.name; displayName = $(if ($_.PSObject.Properties['displayName'] -and $_.displayName) { $_.displayName } else { $_.name }); hostname = [string]@($_.hostnames)[0]
+        protected = [bool]($_.PSObject.Properties['auth'] -and $_.auth -and [string]$_.auth.provider -eq 'authentik'); publish = [bool]$_.cloudflare.publish; enabled = [bool]$_.enabled } })
+  $want = [string]$Query['service']
+  $svc = $(if ($want) { @($all | Where-Object { $_.name -eq $want.ToLowerInvariant() })[0] } else { $null })
+  if ($want -and -not $svc) { Stop-Request 404 "No service named '$want'." }
+  if (-not $svc) { $svc = @($all | Where-Object { $_.PSObject.Properties['auth'] -and $_.auth -and [string]$_.auth.provider -eq 'authentik' })[0] }
+  if (-not $svc) { $svc = @($all)[0] }
+  $model = $null
+  if ($svc) { $model = Get-RoutingModel -Facts (Get-RoutingFacts $settings $svc -Probe:([string]$Query['probe'] -eq '1')) }
+  return [ordered]@{ mode = 'guided'; services = $list; selected = $(if ($svc) { $svc.name } else { '' }); model = $model }
+}
+
+function Invoke-ServiceHealth($Body) {
+  Assert-Installed
+  $settings = Get-Settings
+  $svc = Find-RegistryService @((Read-ServiceRegistry -Settings $settings).services) ([string](Get-Field $Body 'name' ''))
+  return Get-ServiceHealth -Settings $settings -Service $svc -Public:([bool](Get-Field $Body 'public' $false))
+}
+
+# The recorded tunnel as Cloudflare reports it (one read-only GET), or $null without a readable token.
+function Get-TunnelInfo($Settings, $Status, $Cf) {
+  if (-not ($Status.cloudflare.tokenStored -and $Status.cloudflare.tokenReadable -and $Cf.accountId -and $Cf.tunnelId)) { return $null }
+  try {
+    $t = Invoke-CloudflareApi -Settings $Settings -Path "/accounts/$($Cf.accountId)/cfd_tunnel/$($Cf.tunnelId)"
+    return [ordered]@{ name = [string]$t.name; status = [string]$t.status; connections = @($(if ($t.PSObject.Properties['connections']) { $t.connections } else { @() })).Count; error = '' }
+  } catch { return [ordered]@{ name = $Cf.tunnelName; status = 'unknown'; connections = 0; error = $_.Exception.Message } }
+}
+
+# Infrastructure Explorer: every component of the request path with what has actually been established about it.
+# Read-only (Docker inspect, Traefik's local API, one Cloudflare GET for the tunnel).
+function Get-InfrastructureData {
+  $status = Get-StatusData
+  $settings = Get-Settings
+  $installed = Test-Installed
+  $cf = Read-CloudflareConfig -Settings $settings
+  $mode = (Read-SetupDraft).deployment.mode
+  if (-not $mode -and $installed) { $mode = $(if (Test-TunnelTokenFile $settings) { 'tunnel' } else { 'local' }) }
+  $services = @()
+  if ($installed) { try { $services = @((Read-ServiceRegistry -Settings $settings).services) } catch { } }
+  $dash = Read-DashboardConfig -Settings $settings
+  $base = [ordered]@{
+    mode = $mode; installed = $installed; stackName = $settings.StackName; httpPort = $settings.HttpPort; dashboardPort = $settings.DashboardPort
+    proxyNetwork = $settings.ProxyNetwork; cloudflaredIp = $settings.CloudflaredIp; docker = $status.docker; stack = $status.stack
+    services = $services; cloudflare = $cf; token = (Get-CloudflareApiTokenInfo -Settings $settings); tunnel = (Get-TunnelInfo $settings $status $cf)
+    tunnelTokenPresent = [bool]$status.stack.TunnelTokenPresent; dashboard = [ordered]@{ enabled = [bool]$dash.enabled; hostname = [string]$dash.hostname; router = (Get-DashboardRouterName) }
+    identity = (Get-IdentityExplorerFacts $settings)
+  }
+  $facts = Get-InfrastructureFacts -Settings $settings -Base $base
+  $model = ConvertTo-InfrastructureModel -Facts $facts
+  $model.instance = [ordered]@{ stackName = $settings.StackName; installPath = $InstallPath; httpPort = $settings.HttpPort; dashboardPort = $settings.DashboardPort; proxyNetwork = $settings.ProxyNetwork; tunnelNetwork = $settings.TunnelNetwork }
+  $model.dashboard = [ordered]@{ localUrl = "http://127.0.0.1:$($settings.DashboardPort)/dashboard/"; publicUrl = $(if ($dash.enabled -and $dash.hostname) { "https://$($dash.hostname)/dashboard/" } else { '' }) }
+  $model.checkedAt = (Get-Date -Format 's')
+  return $model
+}
+
+# Identity facts for the Explorer: local only (identity.json and one docker inspect), no authentik API call.
+function Get-IdentityExplorerFacts($Settings) {
+  if (-not (Test-Installed)) { return $null }
+  try { $cfg = Read-IdentityConfig -Settings $Settings } catch { return $null }
+  $srv = $null
+  if ($cfg.authentik.serverContainer) {
+    $r = Invoke-Docker inspect $cfg.authentik.serverContainer --format '{{.State.Status}}|{{if .State.Health}}{{.State.Health.Status}}{{end}}|{{json .NetworkSettings.Networks}}'
+    if ($r.ExitCode -eq 0) {
+      $parts = (@($r.Output) -join '').Split([char[]]'|', 3)
+      $nets = $parts[2] | ConvertFrom-Json
+      $srv = [ordered]@{ name = $cfg.authentik.serverContainer; state = $parts[0]; health = $parts[1]; onProxyNetwork = [bool]$nets.PSObject.Properties[$Settings.ProxyNetwork] }
+    }
+  }
+  $verified = @($cfg.authentik.apps.PSObject.Properties | Where-Object { $_.Value.PSObject.Properties['verifiedAt'] -and $_.Value.verifiedAt } | ForEach-Object { $_.Name })
+  return [ordered]@{ provider = $cfg.provider; hostname = $cfg.authentik.hostname; server = $srv; verified = $verified; googleVerified = [bool]$cfg.authentik.google.verifiedAt }
+}
+
+function Get-OverviewData {
+  $status = Get-StatusData
+  $settings = Get-Settings
+  $installed = Test-Installed
+  $dash = Get-DashboardData
+  $services = @(); $issues = @()
+  if ($installed) { try { $reg = Read-ServiceRegistry -Settings $settings; $services = @($reg.services); $issues = @((Get-ServicePlan -Settings $settings -Services $services).Issues | Where-Object { $_.Level -eq 'Error' }) } catch { } }
+  $cf = Read-CloudflareConfig -Settings $settings
+  $mode = (Read-SetupDraft).deployment.mode
+  if (-not $mode -and $installed) { $mode = $(if (Test-TunnelTokenFile $settings) { 'tunnel' } else { 'local' }) }
+  $tunnel = Get-TunnelInfo $settings $status $cf
+  $warnings = @()
+  $c = @{}; foreach ($x in @($status.stack.Containers)) { $c[$x.Role] = $x }
+  if ($installed) {
+    foreach ($role in @('traefik', 'socket-proxy')) { if ($c[$role].State -ne 'running') { $warnings += "Container $($c[$role].Name) is $($c[$role].State)." } }
+    if ($mode -eq 'tunnel' -and $c['cloudflared'].State -ne 'running') { $warnings += "The tunnel connector ($($c['cloudflared'].Name)) is $($c['cloudflared'].State)." }
+    if ($c['traefik'].State -eq 'running' -and -not $status.stack.TraefikApi) { $warnings += 'Traefik is running but its API does not answer.' }
+    if ($status.services.drift -gt 0) { $warnings += "$($status.services.drift) route file(s) differ from the service registry." }
+    if (@($issues).Count -gt 0) { $warnings += "$(@($issues).Count) service definition error(s)." }
+  }
+  if ($status.cloudflare.tokenStored -and -not $status.cloudflare.tokenReadable) { $warnings += 'The stored Cloudflare API token cannot be decrypted by this Windows account.' }
+  if ($tunnel -and $tunnel.status -ne 'healthy' -and $mode -eq 'tunnel') { $warnings += "Cloudflare reports the tunnel as '$($tunnel.status)'." }
+  $recent = @()
+  $file = Join-Path $InstallPath 'logs\webui-audit.log'
+  if (Test-Path -LiteralPath $file) {
+    $fs = [IO.File]::Open($file, 'Open', 'Read', 'ReadWrite')
+    try { $null = $fs.Seek([Math]::Max(0, $fs.Length - 32768), 'Begin'); $text = (New-Object IO.StreamReader($fs, [Text.Encoding]::UTF8)).ReadToEnd() } finally { $fs.Dispose() }
+    $recent = @($text -split "`r?`n" | Where-Object { $_ -match '^\d{4}-' } | Select-Object -Last 8)
+    [array]::Reverse($recent)
+  }
+  $upgrade = $null
+  if ($installed) { try { $upgrade = Get-UpgradeStatus -Path $InstallPath -SourceRoot $here } catch { } }
+  return [ordered]@{
+    installed = $installed; mode = $mode; status = $status; dashboard = $dash; tunnel = $tunnel; upgrade = $upgrade; path = $InstallPath
+    domains = @($cf.domains); services = [ordered]@{ total = $services.Count; enabled = @($services | Where-Object { $_.enabled }).Count; published = @($services | Where-Object { $_.enabled -and $_.cloudflare.publish }).Count }
+    warnings = $warnings; recent = $recent
+  }
+}
+
+# Expert view: the generated configuration of this instance and the commands the tool runs. Non-secret files only;
+# anything credential-like is withheld.
+function Get-ExpertConfigData {
+  $settings = Get-Settings
+  $files = New-Object System.Collections.ArrayList
+  $envPath = Join-Path $InstallPath '.env'
+  if (Test-Path -LiteralPath $envPath) { $null = $files.Add([ordered]@{ path = '.env (known keys)'; content = (Get-FilteredEnv $envPath) }) }
+  else { $null = $files.Add([ordered]@{ path = '.env (would be written)'; content = (New-DotEnvContent ([IO.File]::ReadAllText((Join-Path $here '.env.example'))) (Get-EnvValues $settings)) }) }
+  $rels = @('config\setup.json', 'config\cloudflare.json', 'config\dashboard.json', 'config\services.json')
+  if (Test-Path -LiteralPath $settings.DynamicDir) { $rels += @(Get-ChildItem -LiteralPath $settings.DynamicDir -File | Where-Object { $_.Extension -in '.yml', '.yaml' } | ForEach-Object { "traefik\dynamic\$($_.Name)" }) }
+  foreach ($rel in $rels) {
+    $p = Join-Path $InstallPath $rel
+    if (-not (Test-Path -LiteralPath $p)) { continue }
+    $text = ([IO.File]::ReadAllText($p)).Replace("`r`n", "`n")
+    $hit = Find-CredentialPattern $text
+    if (-not $hit -and (Test-TextContainsApiToken -Settings $settings -Text $text)) { $hit = 'the API token' }
+    $null = $files.Add([ordered]@{ path = $rel; content = $(if ($hit) { "(withheld: contains what looks like $hit)" } else { $text }) })
+  }
+  $mode = (Read-SetupDraft).deployment.mode
+  $compose = (@('docker') + @(Get-ComposeArgs -Settings $settings -Profiles @($(if ($mode -eq 'tunnel') { 'tunnel' }) | Where-Object { $_ })) + @('up', '-d', '--wait')) | ForEach-Object { if ("$_" -match '\s') { "`"$_`"" } else { "$_" } }
+  return [ordered]@{
+    installPath = $InstallPath; sourcePath = $here; managerVersion = Get-ManagerVersion
+    commands = @(
+      [ordered]@{ purpose = 'Preview the installation (changes nothing)'; command = "powershell -ExecutionPolicy Bypass -File `"$here\install.ps1`" -InstallPath `"$InstallPath`" -DryRun" }
+      [ordered]@{ purpose = 'Install and start'; command = "powershell -ExecutionPolicy Bypass -File `"$here\install.ps1`" -InstallPath `"$InstallPath`" -Start$(if ($mode -eq 'tunnel') { ' -EnableTunnel' })" }
+      [ordered]@{ purpose = 'What the installer runs to start this instance'; command = ($compose -join ' ') }
+      [ordered]@{ purpose = 'Re-read traefik\dynamic without a restart'; command = "powershell -ExecutionPolicy Bypass -File `"$InstallPath\install.ps1`" -InstallPath `"$InstallPath`" -Reload" }
+      [ordered]@{ purpose = 'Stop this instance only'; command = "powershell -ExecutionPolicy Bypass -File `"$InstallPath\install.ps1`" -InstallPath `"$InstallPath`" -Stop" }
+    )
+    images = Get-ComposeImages $(if (Test-Installed) { Join-Path $InstallPath 'compose.yaml' } else { Join-Path $here 'compose.yaml' })
+    containers = Get-StackContainerNames $settings
+    networks = [ordered]@{ proxy = $settings.ProxyNetwork; tunnel = $settings.TunnelNetwork; tunnelSubnet = $settings.TunnelSubnet; tunnelIpRange = $settings.TunnelIpRange; cloudflaredIp = $settings.CloudflaredIp }
+    files = $files.ToArray()
+  }
+}
+
+# --- Projects: discover, attach, start new, upgrade --------------------------------------------------------------
+# Attach opens an existing deployment as it is: nothing in its folder, in Docker or in Cloudflare changes. Upgrade
+# updates its application files (a separate, confirmed step). Restore (Backups page) recovers configuration from a file.
+
+function Get-ProjectPathFromBody($Body) {
+  try { return ConvertTo-ProjectPath ([string](Get-Field $Body 'path' '')) } catch { Stop-Request 400 $_.Exception.Message }
+}
+
+function Get-ProjectsData {
+  $st = Read-ManagerState
+  $remembered = @($st.recent | ForEach-Object { $_.path })
+  $candidates = @(Find-ProjectCandidates -Remembered $remembered -SourceRoot $here -ProjectsRoot $ProjectsRoot)
+  $list = @(foreach ($c in $candidates) {
+      $sum = Get-ProjectSummary -Path $c.path -SourceRoot $here
+      if ($sum.kind -in @('other', 'package') -and @($c.sources) -notcontains 'recent') { continue }
+      $rec = @($st.recent | Where-Object { Test-SamePath $_.path $c.path })
+      [ordered]@{ summary = $sum; sources = @($c.sources); recent = ($rec.Count -gt 0); lastOpened = $(if ($rec.Count) { $rec[0].lastOpened } else { '' }); active = ((Test-SamePath $c.path $InstallPath) -and $State.Chosen) }
+    })
+  $list = @($list | Sort-Object @{ e = { -not $_.active } }, @{ e = { -not $_.recent } }, @{ e = { $_.lastOpened }; Descending = $true })
+  return [ordered]@{
+    chosen = [bool]$State.Chosen; activePath = $InstallPath; activeInstalled = (Test-Installed)
+    projects = $list; projectsRoot = $ProjectsRoot; sourcePath = $here
+    suggestedNewPath = (Get-NewProjectSuggestion)
+  }
+}
+
+# A free folder name under the Docker projects folder for a new deployment.
+function Get-NewProjectSuggestion {
+  $base = Join-Path $ProjectsRoot 'traefik-proxy'
+  if (-not (Test-Path -LiteralPath $base)) { return $base }
+  for ($i = 2; $i -le 50; $i++) { $p = "$base-$i"; if (-not (Test-Path -LiteralPath $p)) { return $p } }
+  return "$base-new"
+}
+
+function Invoke-ProjectInspect($Body) {
+  $path = Get-ProjectPathFromBody $Body
+  $r = Get-ProjectInspection -Path $path -SourceRoot $here -Cloudflare:([bool](Get-Field $Body 'cloudflare' $true))
+  return $r
+}
+
+# Makes the folder the active project. Reads only; resets previews that belonged to the previous project.
+function Set-ActiveProject([string]$Path) {
+  $script:InstallPath = $Path
+  $State.Chosen = $true
+  $State.Plans.Clear(); $State.Imports.Clear(); $State.Upgrades.Clear(); $State.AppPlans.Clear()
+  Save-RememberedPath
+}
+
+function Invoke-ProjectAttach($Body) {
+  $path = Get-ProjectPathFromBody $Body
+  $kind = Get-ProjectKind $path
+  if ($kind -eq 'missing') { Stop-Request 404 "The folder $path does not exist (moved or deleted). Remove it from the list or choose its new location." }
+  if ($kind -eq 'legacy') { Stop-Request 409 'This folder uses the earlier single-app layout, which this manager does not manage. It was left unchanged. See "Migrating from the earlier single-app layout" in the README.' }
+  if ($kind -in @('other', 'package')) { Stop-Request 409 "$path is not a deployment of this tool. Choose the folder that contains its .env and compose.yaml, or start a new deployment." }
+  $i = Get-ProjectInspection -Path $path -SourceRoot $here -NoDocker
+  if (-not $i.usable) { Stop-Request 409 ('This deployment cannot be opened: ' + (@($i.blockers) -join ' ')) }
+  Set-ActiveProject $path
+  return [ordered]@{ attached = $true; path = $path; installed = (Test-Installed); stackName = (Get-Settings).StackName }
+}
+
+# A new deployment in a folder without one. Nothing is written until the setup journey saves its first choice.
+function Invoke-ProjectNew($Body) {
+  $path = Get-ProjectPathFromBody $Body
+  $kind = Get-ProjectKind $path
+  if ($kind -in @('manager', 'legacy')) { Stop-Request 409 "$path already contains a deployment. Open it instead (Continue where you left off); starting a new deployment there is refused." @{ needsAttach = $true } }
+  if ($kind -eq 'package') { Stop-Request 409 'That is a copy of the manager itself. Choose an empty folder for the new deployment.' }
+  if ($kind -eq 'other' -and @(Get-ChildItem -LiteralPath $path -Force -ErrorAction SilentlyContinue).Count -gt 0) { Stop-Request 409 "$path is not empty. Choose an empty or new folder for the deployment." }
+  Set-ActiveProject $path
+  return [ordered]@{ path = $path; draft = ($kind -eq 'draft') }
+}
+
+function Invoke-ProjectForget($Body) {
+  $path = Get-ProjectPathFromBody $Body
+  $st = Read-ManagerState
+  $st.recent = @($st.recent | Where-Object { -not (Test-SamePath $_.path $path) })
+  if (Test-SamePath $st.installPath $path) { $st.installPath = '' }
+  Save-ManagerState $st
+  return [ordered]@{ removed = $path }
+}
+
+function Get-FolderBrowseData([string]$Path) {
+  $roots = @(Get-FolderRoots)
+  if (-not $Path) { $Path = $(if (Test-Path -LiteralPath $ProjectsRoot) { $ProjectsRoot } else { $env:USERPROFILE }) }
+  try { $l = Get-FolderListing -Path $Path } catch { Stop-Request 400 $_.Exception.Message }
+  return [ordered]@{ path = $l.path; parent = $l.parent; kind = $l.kind; entries = @($l.entries); roots = $roots }
+}
+
+# install.ps1 -DryRun for a deployment folder: which application files an upgrade would update (changes nothing).
+function Invoke-UpgradePreview($Body) {
+  $path = Get-ProjectPathFromBody $Body
+  if ((Get-ProjectKind $path) -ne 'manager') { Stop-Request 409 'Only an installed deployment of this tool can be upgraded.' }
+  $u = Get-UpgradeStatus -Path $path -SourceRoot $here
+  $r = Invoke-PowerShellFile (Join-Path $here 'install.ps1') @('-InstallPath', $path, '-DryRun')
+  $files = @($r.Lines | ForEach-Object {
+      if ($_ -match '^\s+\[dry-run\] (update|add)\s+(\S+)') { [ordered]@{ action = $Matches[1]; file = $Matches[2] } }
+      elseif ($_ -match '^\s+\[dry-run\] keep\s+(\S+)') { [ordered]@{ action = 'keep'; file = $Matches[1] } } })
+  $key = Get-TextSha256 ((ConvertTo-Json -Compress -Depth 4 -InputObject @($path, $u.changed, $u.added, $u.modified)))
+  $State.Upgrades[$key] = [pscustomobject]@{ Path = $path; Created = (Get-Date) }
+  return [ordered]@{
+    path = $path; upgrade = $u; ok = ($r.ExitCode -eq 0); files = $files; lines = $r.Lines; previewKey = $key
+    notes = @(
+      'Only application files (scripts, web pages, packaged Traefik files) are updated. .env, config\, secrets\, generated routes, backups and logs are kept.'
+      'Files you edited by hand are kept; the new version is written next to them as <file>.dist.'
+      $(if ($u.composeChanged) { 'compose.yaml changes: the running containers keep their current settings until you restart the instance (install.ps1 -Start). Nothing is restarted by the upgrade.' } else { 'compose.yaml is unchanged: no container needs a restart.' })
+      'The previous copies are saved in backups\<time>\ and can be restored with install.ps1 -Rollback.'
+    )
+  }
+}
+
+function Invoke-UpgradeApply($Body) {
+  Assert-Confirmed $Body
+  $path = Get-ProjectPathFromBody $Body
+  $key = [string](Get-Field $Body 'previewKey' '')
+  if (-not $key -or -not $State.Upgrades.ContainsKey($key) -or -not (Test-SamePath $State.Upgrades[$key].Path $path)) { Stop-Request 409 'Preview the upgrade first.' }
+  $u = Get-UpgradeStatus -Path $path -SourceRoot $here
+  $now = Get-TextSha256 ((ConvertTo-Json -Compress -Depth 4 -InputObject @($path, $u.changed, $u.added, $u.modified)))
+  if ($now -ne $key) { Stop-Request 409 'The files changed since the preview. Preview the upgrade again.' }
+  $State.Upgrades.Remove($key)
+  $recovery = $null
+  try { $recovery = New-RecoveryPoint -Settings (Get-ProjectSettings $path) -Reason 'before upgrade' -SourceRoot $here } catch { Stop-Request 500 "No change was made: the recovery point could not be written ($($_.Exception.Message))." }
+  $r = Invoke-PowerShellFile (Join-Path $here 'install.ps1') @('-InstallPath', $path)
+  if (Test-SamePath $path $InstallPath) { Write-Audit 'upgrade' "exit=$($r.ExitCode) recovery=$recovery" }
+  return [ordered]@{ ok = ($r.ExitCode -eq 0); lines = $r.Lines; recoveryPoint = $recovery; upgrade = (Get-UpgradeStatus -Path $path -SourceRoot $here) }
+}
+
+function Invoke-ManagerStop($Body) {
+  Assert-Confirmed $Body
+  if (-not $StopFile) { Stop-Request 409 'This manager was started without a stop file. Close its PowerShell window (or press Ctrl+C there) to stop it.' }
+  [IO.File]::WriteAllText($StopFile, 'stop')
+  return [ordered]@{ stopping = $true }
+}
+
+# --- Identity & Access (authentik) ---------------------------------------------------------------------------------
+# Thin request handlers over lib\IdentityProvider.psm1 (state, model) and lib\Authentik.psm1 (API, sync). Every change
+# in authentik is previewed first (the sync functions' dry run), applied once after confirmation, and recomputed right
+# before applying; the Traefik side goes through the same plan/validate/backup/apply path as every service change.
+
+function Get-IdentityContext([switch]$Deep) {
+  $settings = Get-Settings
+  $cfg = Read-IdentityConfig -Settings $settings
+  $inv = @(); try { $inv = @(Get-DockerContainerInventory -ProxyNetwork $settings.ProxyNetwork) } catch { }
+  $apps = @(); if (Test-Installed) { $apps = @(Read-AppsRegistry $settings) }
+  $installs = @(Find-AuthentikInstallations -Containers $inv -Apps $apps -ProxyNetwork $settings.ProxyNetwork)
+  $install = $null
+  if ($cfg.authentik.project) { $install = @($installs | Where-Object { $_.project -eq $cfg.authentik.project })[0] }
+  elseif ($cfg.authentik.serverContainer) { $install = @($installs | Where-Object { $_.serverContainer -eq $cfg.authentik.serverContainer })[0] }
+  $baseUrl = $(if ($install -and $install.localUrl) { $install.localUrl } else { $cfg.authentik.localUrl })
+  $running = [bool]($install -and $install.server -and $install.server.state -eq 'running')
+  $health = $null; if ($running -and $baseUrl) { $health = Get-AuthentikHealth -BaseUrl $baseUrl }
+  # The API token is a managed credential (lib\CredentialManager.psm1): validated at most every two minutes on page
+  # loads, immediately on -Deep ("Run checks"), and again whenever authentik refuses it.
+  $credential = $null
+  $conn = $null; $overview = $null; $overviewError = ''
+  $credArgs = Get-IdentityCredentialArgs $settings $baseUrl
+  if ($health -and $health.Live) {
+    $credential = Test-StoredCredential @credArgs -IfOlderThanMinutes $(if ($Deep) { 0 } else { 2 })
+    if ($credential.ok) {
+      $plain = Read-ProtectedSecret -Settings $settings -Name (Get-IdentityTokenSecretName)
+      $conn = New-AuthentikConnection -BaseUrl $baseUrl -Token $plain
+      $plain = $null
+      try { $overview = Get-AuthentikOverview $conn }
+      catch {
+        $overviewError = $_.Exception.Message
+        if ($_.Exception.Data['Status'] -in 401, 403) { $credential = Test-StoredCredential @credArgs; $conn = $null; $overviewError = '' }
+      }
+    }
+  } else {
+    $credential = Get-CredentialView -Settings $settings -Id 'authentik-api' -SecretName (Get-IdentityTokenSecretName) -Label 'authentik API token'
+    if ($credential.stored -and $credential.readable) { $credential.status = 'unreachable'; $credential.ok = $false; $credential.message = 'authentik is not reachable, so the token was not checked. It is kept as it is.' }
+  }
+  $token = [ordered]@{ stored = $credential.stored; readable = $credential.readable; savedAt = $credential.savedAt; user = $credential.savedBy; ok = [bool]$credential.ok; username = $credential.account
+    superuser = [bool]$credential.ok; message = $credential.message; status = $credential.status }
+  $services = @(); if (Test-Installed) { try { $services = @((Read-ServiceRegistry -Settings $settings).services) } catch { } }
+  $routers = $null; if (Test-Installed) { $routers = Get-TraefikApi $settings '/api/http/routers' }
+  $route = $null
+  $svc = $(if ($cfg.authentik.service) { @($services | Where-Object { $_.name -eq $cfg.authentik.service })[0] } else { $null })
+  if ($svc) {
+    $rt = @($routers | Where-Object { $null -ne $_ -and $_.name -eq "svc-$($svc.name)@file" })
+    $route = [ordered]@{ exists = $true; enabled = [bool]$svc.enabled; service = $svc.name; publish = [bool]$svc.cloudflare.publish; access = [bool]$svc.cloudflare.access
+      router = $(if ($rt.Count) { [string]$rt[0].status } elseif ($null -eq $routers) { 'unknown' } else { 'not loaded' }); target = (Get-ServiceUrl $svc) }
+  }
+  $cf = Read-CloudflareConfig -Settings $settings
+  $cfFacts = $null
+  if ($cfg.authentik.hostname) { $dnsId = Get-ManagedResource $cf $cfg.authentik.hostname 'dnsRecordId'; $cfFacts = [ordered]@{ connected = [bool]$cf.tunnelId; dns = [bool]$dnsId; tunnel = [bool]($dnsId -and $cf.tunnelId); access = [bool](Get-ManagedResource $cf $cfg.authentik.hostname 'accessAppId') } }
+  $google = [ordered]@{ clientId = $cfg.authentik.google.clientId; source = $null; redirect = $null; logins = @(); verifiedAt = $cfg.authentik.google.verifiedAt; verifiedBy = $cfg.authentik.google.verifiedBy }
+  $changed = $false
+  if ($overview) {
+    $google.source = @($overview.OAuthSources | Where-Object { $_.Slug -eq $cfg.authentik.google.slug })[0]
+    if ($google.source -and $cfg.authentik.hostname) { $google.redirect = Test-AuthentikGoogleRedirect -BaseUrl $baseUrl -PublicHost $cfg.authentik.hostname -Slug $cfg.authentik.google.slug -ExpectClientId $google.source.ConsumerKey }
+    if ($google.source -and -not $cfg.authentik.google.verifiedAt) {
+      $since = $(if ($cfg.authentik.google.configuredAt) { [datetime]$cfg.authentik.google.configuredAt } else { [datetime]::MinValue })
+      try { $google.logins = @(Get-AuthentikSourceLogins -Conn $conn -Slug $cfg.authentik.google.slug -Since $since) } catch { }
+      if ($google.logins.Count) {
+        # Evidence of a real Google sign-in: a user connected to the Google source signed in after it was configured.
+        $cfg.authentik.google.verifiedAt = $google.logins[0].LastLogin; $cfg.authentik.google.verifiedBy = $google.logins[0].Username
+        $google.verifiedAt = $cfg.authentik.google.verifiedAt; $google.verifiedBy = $cfg.authentik.google.verifiedBy; $changed = $true
+      }
+    }
+  }
+  $appFacts = @()
+  foreach ($s in @($services | Where-Object { $_.PSObject.Properties['auth'] -and $_.auth.provider -eq 'authentik' })) {
+    $known = Get-IdentityApp $cfg $s.name
+    $exists = $false; $appPk = ''
+    $rules = $null; $ownerOnly = $false
+    if ($conn) {
+      try {
+        $a = Invoke-AuthentikApi $conn GET "/core/applications/dm-$($s.name)/"; $exists = [bool]$a.provider; $appPk = [string]$a.pk
+        # Read only: who may open it is authentik's business; the manager only shows how many rules there are.
+        $b = @(Get-AuthentikList $conn "/policies/bindings/?target=$([string]$a.pbm_uuid)"); $rules = $b.Count
+        $og = Get-AuthentikGroup $conn (Get-AuthentikOwnersGroupName); $ownerOnly = [bool]($og -and $b.Count -eq 1 -and [string]$b[0].group -eq [string]$og.pk)
+      } catch { }
+    }
+    $verifiedAt = [string](Get-IdProp2 $known 'verifiedAt' '')
+    if ($conn -and $appPk -and -not $verifiedAt) {
+      $since = $(if ($known -and (Get-IdProp2 $known 'protectedAt' '')) { [datetime](Get-IdProp2 $known 'protectedAt' '') } else { [datetime]::MinValue })
+      try { $ev = Get-AuthentikAppAccessEvidence -Conn $conn -ApplicationPk $appPk -Since $since; if ($ev) { $verifiedAt = $ev.At; Set-IdentityApp $cfg $s.name (Merge-IdentityApp $known @{ verifiedAt = $ev.At; verifiedBy = $ev.Username }); $changed = $true } } catch { }
+    }
+    $check = $(if ($State.IdpChecks.ContainsKey($s.name)) { $State.IdpChecks[$s.name] } else { $null })
+    if ($Deep -and $s.enabled) { $check = Test-ForwardAuthChallenge -TraefikPort $settings.HttpPort -Hostname @($s.hostnames)[0] -AuthHostname $cfg.authentik.hostname; $State.IdpChecks[$s.name] = $check }
+    $appFacts += [ordered]@{ service = $s.name; displayName = $(if ($s.PSObject.Properties['displayName']) { $s.displayName } else { $s.name }); hostname = @($s.hostnames)[0]; protected = $true; authentik = $exists; challenge = $check; verifiedAt = $verifiedAt
+      verifiedBy = [string](Get-IdProp2 (Get-IdentityApp $cfg $s.name) 'verifiedBy' ''); rules = $rules; ownerOnly = $ownerOnly; cloudflareAccess = [bool]$s.cloudflare.access; publish = [bool]$s.cloudflare.publish; slug = "dm-$($s.name)" }
+  }
+  if ($changed) { Save-IdentityConfig -Settings $settings -Config $cfg }
+  $pub = $(if ($State.IdpChecks.ContainsKey('__public')) { $State.IdpChecks['__public'] } else { $null })
+  if ($Deep -and $cfg.authentik.hostname -and $route -and $route.publish) {
+    $r = Invoke-ProbeRequest "https://$($cfg.authentik.hostname)/-/health/live/"
+    $pub = [ordered]@{ state = $(if ($r.Status -eq 200) { 'ok' } else { 'failed' }); message = $(if ($r.Status -eq 200) { "https://$($cfg.authentik.hostname) answers through Cloudflare (authentik is live)." } elseif ($r.Status -in 301, 302 -and $r.Location -match 'cloudflareaccess\.com') { 'Cloudflare Access asks for a login before the sign-in page: visitors would log in twice.' } elseif ($r.Status) { "https://$($cfg.authentik.hostname) answered HTTP $($r.Status) (DNS may still be propagating)." } else { "Not reachable yet: $($r.Error) (DNS may still be propagating)." }); checkedAt = (Get-Date -Format 's') }
+    if ($r.Status -in 301, 302) { $pub.state = 'failed' }
+    $State.IdpChecks['__public'] = $pub
+  }
+  $facts = [ordered]@{ provider = $cfg.provider; install = $install; health = $health; token = $token; overview = $overview; hostname = $cfg.authentik.hostname; publicUrl = $cfg.authentik.publicUrl; owner = $cfg.authentik.owner; authMode = $cfg.authMode
+    route = $route; cloudflare = $cfFacts; publicCheck = $pub; google = $google; apps = $appFacts }
+  return [pscustomobject]@{ Settings = $settings; Config = $cfg; Installs = $installs; Install = $install; BaseUrl = $baseUrl; Conn = $conn; Overview = $overview; OverviewError = $overviewError; Credential = $credential
+    Facts = $facts; Services = $services; Cloudflare = $cf }
+}
+
+# Arguments for the reusable credential functions: the authentik API token, validated against this installation.
+function Get-IdentityCredentialArgs($Settings, [string]$BaseUrl) {
+  $u = $BaseUrl
+  return @{ Settings = $Settings; Id = 'authentik-api'; SecretName = (Get-IdentityTokenSecretName); Label = 'authentik API token'; Validator = { param($t) Test-AuthentikCredential -BaseUrl $u -Token $t }.GetNewClosure() }
+}
+
+function Get-IdProp2($Object, [string]$Name, $Default = $null) {
+  if ($null -eq $Object) { return $Default }
+  $p = $Object.PSObject.Properties[$Name]
+  if ($p -and $null -ne $p.Value) { return $p.Value }
+  return $Default
+}
+
+function Merge-IdentityApp($Known, [hashtable]$Values) {
+  $o = [ordered]@{}
+  if ($Known) { foreach ($p in $Known.PSObject.Properties) { $o[$p.Name] = $p.Value } }
+  foreach ($k in $Values.Keys) { $o[$k] = $Values[$k] }
+  return [pscustomobject]$o
+}
+
+function Assert-IdentityConnection($Ctx) {
+  if ($Ctx.Config.provider -ne 'authentik') { Stop-Request 409 'Choose authentik as the identity provider first.' }
+  if (-not $Ctx.Install) { Stop-Request 409 'No authentik installation is recorded. Install or adopt one first.' }
+  if (-not $Ctx.Conn) { Stop-Request 409 $(if ($Ctx.Facts.token.message) { $Ctx.Facts.token.message } else { 'Connect the manager to authentik first (API token).' }) }
+  if (-not $Ctx.Facts.token.superuser) { Stop-Request 409 "The saved token belongs to '$($Ctx.Facts.token.username)', who is not an authentik administrator." }
+}
+
+function ConvertTo-AkActionView($Actions) {
+  return @(@($Actions) | ForEach-Object { [ordered]@{ kind = $_.Kind; object = $_.Object; name = $_.Name; summary = $_.Summary; detail = $_.Detail; status = $_.Status; message = $_.Message } })
+}
+
+function Get-AkFingerprint($Actions) { return (Get-TextSha256 ((@(@($Actions) | ForEach-Object { "$($_.Kind)|$($_.Object)|$($_.Name)|$($_.Detail)" })) -join "`n")) }
+
+function New-IdpPlanId($Data) {
+  foreach ($k in @($State.IdpPlans.Keys)) { if (((Get-Date) - $State.IdpPlans[$k].Created).TotalMinutes -gt 15) { $State.IdpPlans.Remove($k) } }
+  $id = New-RandomKey 12
+  $Data | Add-Member -NotePropertyName Created -NotePropertyValue (Get-Date) -Force
+  $State.IdpPlans[$id] = $Data
+  return $id
+}
+
+function Use-IdpPlan($Body, [string]$Kind) {
+  Assert-Confirmed $Body
+  $id = [string](Get-Field $Body 'planId' '')
+  if (-not $id -or -not $State.IdpPlans.ContainsKey($id) -or $State.IdpPlans[$id].Kind -ne $Kind) { Stop-Request 409 'This preview has expired or was already applied. Preview again.' }
+  $p = $State.IdpPlans[$id]; $State.IdpPlans.Remove($id)
+  if (((Get-Date) - $p.Created).TotalMinutes -gt 15) { Stop-Request 409 'This preview has expired. Preview again.' }
+  return $p
+}
+
+# Everything the Identity & Access page shows. Secrets never appear: the token only as metadata, the Google client
+# secret not at all.
+function Get-IdentityData([switch]$Deep) {
+  $ctx = Get-IdentityContext -Deep:$Deep
+  $cfg = $ctx.Config; $settings = $ctx.Settings
+  $model = Get-IdentityModel -Facts $ctx.Facts
+  $domains = @($ctx.Cloudflare.domains | ForEach-Object { [string]$_.name })
+  $suggested = $(if ($cfg.authentik.hostname) { $cfg.authentik.hostname } else { Get-SuggestedAuthHostname @($domains)[0] })
+  $googleValues = $null
+  if ($cfg.authentik.publicUrl) { $googleValues = Get-GoogleOAuthSettings -PublicUrl $cfg.authentik.publicUrl -Slug $cfg.authentik.google.slug -Domain $(if ($cfg.authentik.hostname -match '^[^.]+\.(.+)$') { $Matches[1] } else { '' }) }
+  $catalogDefaults = $null
+  try { $m = Get-CatalogApp -CatalogDir $CatalogDir -Id 'authentik'; if (Test-Installed) { $catalogDefaults = Get-AppDefaults $m $settings } } catch { }
+  $routeBody = $null
+  if ($ctx.Install -and $ctx.Install.serverContainer -and $suggested) {
+    $existing = $(if ($cfg.authentik.service) { @($ctx.Services | Where-Object { $_.name -eq $cfg.authentik.service })[0] } else { $null })
+    $name = $(if ($existing) { $existing.name } else { $n = 'authentik'; $i = 1; while (@($ctx.Services | Where-Object { $_.name -eq $n }).Count) { $i++; $n = "authentik-$i" }; $n })
+    $routeBody = [ordered]@{ op = $(if ($existing) { 'update' } else { 'add' }); name = $name
+      service = [ordered]@{ name = $name; displayName = 'authentik (sign-in)'; description = 'authentik sign-in page (Identity & Access)'; enabled = $true; hostnames = @($suggested); pathPrefix = ''; stripPrefix = $false; middlewares = @('default-headers@file')
+        target = [ordered]@{ type = 'docker'; host = $ctx.Install.serverContainer; port = 9000; protocol = 'http'; tlsSkipVerify = $false }
+        cloudflare = [ordered]@{ publish = [bool]$ctx.Cloudflare.tunnelId; access = $false } } }
+  }
+  return [ordered]@{
+    provider = $cfg.provider; providers = @(Get-IdentityProviders); config = $cfg; progress = $cfg.progress
+    installs = @($ctx.Installs); install = $ctx.Install; health = $ctx.Facts.health; token = $ctx.Facts.token; credential = $ctx.Credential; overviewError = $ctx.OverviewError
+    overview = $(if ($ctx.Overview) { [ordered]@{ version = $ctx.Overview.Version; user = $ctx.Overview.User; missingFlows = @($ctx.Overview.MissingFlows); outpost = $(if ($ctx.Overview.Outpost) { [ordered]@{ name = $ctx.Overview.Outpost.Name; authentikHost = $ctx.Overview.Outpost.AuthentikHost; providers = @($ctx.Overview.Outpost.Providers) } } else { $null })
+        settings = $ctx.Overview.Settings; sources = @($ctx.Overview.OAuthSources); loginStage = $ctx.Overview.LoginStage } } else { $null })
+    route = $ctx.Facts.route; cloudflare = $ctx.Facts.cloudflare; publicCheck = $ctx.Facts.publicCheck; google = $ctx.Facts.google; googleValues = $googleValues; apps = @($ctx.Facts.apps)
+    adminLinks = $(if ($ctx.BaseUrl) { $b = $ctx.BaseUrl.TrimEnd('/'); [ordered]@{ base = $b; users = "$b/if/admin/#/identity/users"; groups = "$b/if/admin/#/identity/groups"; invitations = "$b/if/admin/#/core/invitations"; applications = "$b/if/admin/#/core/applications"; flows = "$b/if/admin/#/flow/flows"; sources = "$b/if/admin/#/core/sources"; policies = "$b/if/admin/#/policy/policies" } } else { $null })
+    model = $model; domains = $domains; suggestedHostname = $suggested; routeBody = $routeBody; catalogDefaults = $catalogDefaults; contactEmail = [string](Read-SetupDraft).contactEmail
+    cloudflareReady = [bool]($ctx.Cloudflare.tunnelId -and (Get-CloudflareApiTokenInfo -Settings $settings).Stored)
+    services = @($ctx.Services | ForEach-Object { [ordered]@{ name = $_.name; displayName = $(if ($_.PSObject.Properties['displayName']) { $_.displayName } else { '' }); hostnames = @($_.hostnames); enabled = [bool]$_.enabled
+          target = (Get-ServiceUrl $_); publish = [bool]$_.cloudflare.publish; access = [bool]$_.cloudflare.access; auth = $(if ($_.PSObject.Properties['auth']) { $_.auth.provider } else { '' })
+          isIdentity = [bool]($ctx.Install -and $_.target.type -eq 'docker' -and $_.target.host -eq $ctx.Install.serverContainer) } })
+    checkedAt = (Get-Date -Format 's')
+  }
+}
+
+function Set-IdentityProviderRequest($Body) {
+  Assert-Installed
+  $p = [string](Get-Field $Body 'provider' '')
+  if ($p -eq 'authelia') { Stop-Request 409 'Authelia can be installed from the App Catalog, but its sign-in integration (Google, protected applications) is not implemented in this version. Choose authentik or Configure later.' }
+  if ($p -notin 'authentik', 'none') { Stop-Request 400 "Unknown identity provider '$p'." }
+  $settings = Get-Settings
+  $cfg = Read-IdentityConfig -Settings $settings
+  $protected = @((Read-ServiceRegistry -Settings $settings).services | Where-Object { $_.PSObject.Properties['auth'] })
+  if ($p -eq 'none' -and $protected.Count) { Stop-Request 409 "Remove authentik protection from $(@($protected | ForEach-Object { $_.name }) -join ', ') first." }
+  $cfg.provider = $p
+  Set-IdentityProgress $cfg 'provider' 'done' $p
+  Save-IdentityConfig -Settings $settings -Config $cfg
+  Write-Audit 'identity-provider' $p
+  return [ordered]@{ ok = $true; provider = $p }
+}
+
+# Records an authentik installation found on this PC (installed by the catalog or by hand). Nothing in authentik, its
+# containers, volumes or credentials is changed.
+function Invoke-IdentityAdopt($Body) {
+  Assert-Installed
+  $ctx = Get-IdentityContext
+  if ($ctx.Config.provider -ne 'authentik') { Stop-Request 409 'Choose authentik as the identity provider first.' }
+  $project = [string](Get-Field $Body 'project' '')
+  $container = [string](Get-Field $Body 'container' '')
+  $inst = @($ctx.Installs | Where-Object { ($project -and $_.project -eq $project) -or ($container -and $_.serverContainer -eq $container) })[0]
+  if (-not $inst) { Stop-Request 404 'That authentik installation was not found on this Docker engine.' }
+  $notes = @()
+  if (-not $inst.localUrl) { $notes += 'Its web port 9000 is not published on 127.0.0.1, so the manager cannot reach its API from this PC. Publish it as 127.0.0.1:<port>:9000 in its compose file.' }
+  if ($inst.serverContainer -and -not $inst.onProxyNetwork) { $notes += "$($inst.serverContainer) is not on the shared network '$($ctx.Settings.ProxyNetwork)'; Traefik needs that to reach it. Add the network to its compose file (the manager does not edit projects it did not create)." }
+  $cfg = $ctx.Config
+  $cfg.authentik.project = $inst.project; $cfg.authentik.folder = $inst.folder; $cfg.authentik.managed = [bool]$inst.managed
+  $cfg.authentik.serverContainer = $inst.serverContainer; $cfg.authentik.localUrl = $inst.localUrl
+  Set-IdentityProgress $cfg 'install' 'done' "adopted $($inst.project)"
+  Save-IdentityConfig -Settings $ctx.Settings -Config $cfg
+  Write-Audit 'identity-adopt' "project=$($inst.project) container=$($inst.serverContainer) managed=$($inst.managed)"
+  return [ordered]@{ ok = $true; install = $inst; notes = $notes }
+}
+
+# Replaces (or sets) the authentik API token. The candidate is validated against this authentik first: it must work,
+# belong to an administrator and reach every API area the manager uses. Only then does it replace the stored token;
+# a failed candidate leaves the stored token exactly as it was, so another attempt is always possible. For
+# installations made by the manager the token can be taken from the project's .env (AUTHENTIK_BOOTSTRAP_TOKEN).
+# Nothing in authentik changes: no container, account, outpost token or configuration is touched.
+function Save-IdentityTokenRequest($Body) {
+  Assert-Installed
+  $ctx = Get-IdentityContext
+  if (-not $ctx.Install) { Stop-Request 409 'Install or adopt authentik first.' }
+  if (-not $ctx.BaseUrl) { Stop-Request 409 'authentik has no local address (port 9000 on 127.0.0.1) the manager can reach.' }
+  $token = ''
+  if ([bool](Get-Field $Body 'fromBootstrap' $false)) {
+    if (-not ($ctx.Install.managed -and $ctx.Install.folder)) { Stop-Request 409 'Only installations made by this manager have a bootstrap token; paste a token instead.' }
+    $envFile = Read-AppEnv (Join-Path $ctx.Install.folder '.env')
+    if (-not $envFile.Contains('AUTHENTIK_BOOTSTRAP_TOKEN') -or -not $envFile['AUTHENTIK_BOOTSTRAP_TOKEN']) { Stop-Request 409 'This installation was made without a bootstrap token (an older catalog version). Create an API token in authentik and paste it.' }
+    $token = [string]$envFile['AUTHENTIK_BOOTSTRAP_TOKEN']
+  } else { $token = ([string](Get-Field $Body 'token' '')).Trim() }
+  if (-not $token) { Stop-Request 400 'Paste the new API token.' }
+  $credArgs = Get-IdentityCredentialArgs $ctx.Settings $ctx.BaseUrl
+  $r = Set-CredentialFromCandidate @credArgs -Candidate $token
+  $token = $null
+  if (-not $r.Ok) {
+    Write-Audit 'identity-token-rejected' "status=$($r.Result.Status) account=$($r.Result.Account)"
+    $msg = $(if ($r.Result.Status -eq 'unreachable') { "$($r.Result.Message) Nothing was changed." } else { "$($r.Result.Message) The token you entered was not saved; $(if ($r.View.stored) { 'the previously saved token is unchanged.' } else { 'nothing is saved yet.' })" })
+    Stop-Request 400 $msg @{ credential = $r.View; candidate = [ordered]@{ status = $r.Result.Status; account = $r.Result.Account; message = $r.Result.Message }; preserved = [bool]$r.View.stored }
+  }
+  Set-IdentityProgress $ctx.Config 'api' 'done' $r.Result.Account
+  Save-IdentityConfig -Settings $ctx.Settings -Config $ctx.Config
+  Write-Audit 'identity-token' "$(if ($r.Replaced) { 'replaced' } else { 'saved' }) account=$($r.Result.Account) expires=$($r.View.expiresAt)"
+  $model = Get-IdentityModel -Facts (Get-IdentityContext).Facts
+  return [ordered]@{ ok = $true; replaced = $r.Replaced; credential = $r.View; username = $r.Result.Account; superuser = $true; version = $r.Result.Version; next = @($model.next)[0]; warning = $r.View.expiryWarning }
+}
+
+# "Test connection": validates the stored token again without asking for it.
+function Test-IdentityTokenRequest {
+  Assert-Installed
+  $ctx = Get-IdentityContext
+  if (-not $ctx.BaseUrl) { Stop-Request 409 'No authentik installation with a local address is recorded.' }
+  $credArgs = Get-IdentityCredentialArgs $ctx.Settings $ctx.BaseUrl
+  $view = Test-StoredCredential @credArgs
+  Write-Audit 'identity-token-test' "status=$($view.status) account=$($view.account)"
+  return [ordered]@{ ok = [bool]$view.ok; credential = $view; next = @((Get-IdentityModel -Facts (Get-IdentityContext).Facts).next)[0] }
+}
+
+# Records the public sign-in hostname (the route itself is created through the normal service preview).
+function Set-IdentityHostnameRequest($Body) {
+  Assert-Installed
+  $settings = Get-Settings
+  $cfg = Read-IdentityConfig -Settings $settings
+  $h = ([string](Get-Field $Body 'hostname' '')).Trim().ToLowerInvariant()
+  if ($h -notmatch '^(?=.{1,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$') { Stop-Request 400 'Enter a hostname such as auth.example.com.' }
+  $svcName = ([string](Get-Field $Body 'service' '')).Trim().ToLowerInvariant()
+  if ($svcName -notmatch '^[a-z0-9]([a-z0-9-]{0,38}[a-z0-9])?$') { Stop-Request 400 'Invalid service name.' }
+  $services = @((Read-ServiceRegistry -Settings $settings).services)
+  $other = @($services | Where-Object { $_.name -ne $svcName -and @($_.hostnames) -contains $h })
+  if ($other.Count) { Stop-Request 409 "$h is already used by service '$($other[0].name)'." }
+  $cfg.authentik.hostname = $h; $cfg.authentik.service = $svcName; $cfg.authentik.publicUrl = "https://$h"
+  Set-IdentityProgress $cfg 'hostname' 'saved' $h
+  Save-IdentityConfig -Settings $settings -Config $cfg
+  Write-Audit 'identity-hostname' $h
+  return [ordered]@{ ok = $true; hostname = $h; publicUrl = "https://$h"; redirectUri = "https://$h/source/oauth/callback/$($cfg.authentik.google.slug)/" }
+}
+
+function Invoke-IdentityOutpost($Body, [switch]$Apply) {
+  Assert-Installed
+  $ctx = Get-IdentityContext
+  Assert-IdentityConnection $ctx
+  if (-not $ctx.Config.authentik.publicUrl) { Stop-Request 409 'Choose the public sign-in address first.' }
+  if (-not $Apply) {
+    $actions = Sync-AuthentikOutpost -Conn $ctx.Conn -PublicUrl $ctx.Config.authentik.publicUrl -WhatIf
+    $id = New-IdpPlanId ([pscustomobject]@{ Kind = 'outpost'; Fingerprint = (Get-AkFingerprint $actions) })
+    return [ordered]@{ planId = $id; actions = @(ConvertTo-AkActionView $actions); canApply = [bool]@($actions | Where-Object { $_.Kind -ne 'none' }).Count }
+  }
+  $p = Use-IdpPlan $Body 'outpost'
+  if ((Get-AkFingerprint (Sync-AuthentikOutpost -Conn $ctx.Conn -PublicUrl $ctx.Config.authentik.publicUrl -WhatIf)) -ne $p.Fingerprint) { Stop-Request 409 'authentik changed since the preview. Preview again.' }
+  $actions = Sync-AuthentikOutpost -Conn $ctx.Conn -PublicUrl $ctx.Config.authentik.publicUrl
+  Set-IdentityProgress $ctx.Config 'outpost' 'done' $ctx.Config.authentik.publicUrl
+  Save-IdentityConfig -Settings $ctx.Settings -Config $ctx.Config
+  Write-Audit 'identity-outpost' $ctx.Config.authentik.publicUrl
+  return [ordered]@{ ok = $true; actions = @(ConvertTo-AkActionView $actions) }
+}
+
+# The initial owner's Google address: asked once. It can be changed until the owner has signed in with Google; after
+# that, people are managed in authentik.
+function Set-IdentityOwnerRequest($Body) {
+  Assert-Installed
+  $settings = Get-Settings
+  $cfg = Read-IdentityConfig -Settings $settings
+  if ($cfg.authentik.owner.subject) { Stop-Request 409 "The initial owner ($($cfg.authentik.owner.email)) is already set up with Google. Add more people, or change who owns what, in authentik." }
+  try { $email = ConvertTo-OwnerEmail ([string](Get-Field $Body 'email' '')) } catch { Stop-Request 400 $_.Exception.Message }
+  $cfg.authentik.owner.email = $email
+  $cfg.authentik.owner.makeAdmin = [bool](Get-Field $Body 'makeAdmin' $true)
+  Set-IdentityProgress $cfg 'owner' 'saved' ''
+  Save-IdentityConfig -Settings $settings -Config $cfg
+  Write-Audit 'identity-owner' 'initial owner address saved'
+  return [ordered]@{ ok = $true; owner = $cfg.authentik.owner }
+}
+
+function Get-GoogleDesired($Body, $Cfg) {
+  $id = ([string](Get-Field $Body 'clientId' $Cfg.authentik.google.clientId)).Trim(); $secret = ([string](Get-Field $Body 'clientSecret' '')).Trim()
+  $json = [string](Get-Field $Body 'clientJson' '')
+  if ($json) {
+    # Google's downloaded client file (preferred): validated here; the secret is used once and never stored.
+    $redir = "$($Cfg.authentik.publicUrl)/source/oauth/callback/$($Cfg.authentik.google.slug)/"
+    $g = ConvertFrom-GoogleClientJson -Json $json -ExpectedRedirectUri $redir
+    $json = $null
+    if (-not $g.Ok) { Stop-Request 400 ($g.Errors -join ' ') @{ jsonErrors = @($g.Errors) } }
+    $id = $g.ClientId; $secret = $g.ClientSecret
+  }
+  return [pscustomobject]@{ Slug = $Cfg.authentik.google.slug; ClientId = $id; ClientSecret = $secret
+    OwnerEmail = $Cfg.authentik.owner.email; OwnerVerified = [bool]$Cfg.authentik.owner.subject; Replace = [bool](Get-Field $Body 'replace' $false); Repair = [bool](Get-Field $Body 'repair' $false) }
+}
+
+# Checks a downloaded Google client file without using it: client type, ID, secret present, redirect URI, endpoints.
+function Invoke-IdentityGoogleInspect($Body) {
+  Assert-Installed
+  $cfg = Read-IdentityConfig -Settings (Get-Settings)
+  if (-not $cfg.authentik.publicUrl) { Stop-Request 409 'Set up the public sign-in address first: the file must contain its redirect URI.' }
+  $redir = "$($cfg.authentik.publicUrl)/source/oauth/callback/$($cfg.authentik.google.slug)/"
+  $g = ConvertFrom-GoogleClientJson -Json ([string](Get-Field $Body 'clientJson' '')) -ExpectedRedirectUri $redir
+  return [ordered]@{ ok = $g.Ok; clientId = $g.ClientId; projectId = $g.ProjectId; secretPresent = [bool]$g.ClientSecret; redirectUris = @($g.RedirectUris); expectedRedirectUri = $redir; errors = @($g.Errors); warnings = @($g.Warnings) }
+}
+
+# Saves the client ID (never the secret), so the wizard survives a refresh or a trip to Google Cloud.
+function Save-IdentityGoogleRequest($Body) {
+  Assert-Installed
+  $settings = Get-Settings
+  $cfg = Read-IdentityConfig -Settings $settings
+  $id = ([string](Get-Field $Body 'clientId' '')).Trim()
+  if ($id -and -not (Test-GoogleClientId $id)) { Stop-Request 400 'The client ID does not look like a Google OAuth client ID (it ends in .apps.googleusercontent.com).' }
+  $cfg.authentik.google.clientId = $id
+  Set-IdentityProgress $cfg 'google' 'draft' 'client ID saved'
+  Save-IdentityConfig -Settings $settings -Config $cfg
+  return [ordered]@{ ok = $true; google = $cfg.authentik.google }
+}
+
+function Invoke-IdentityGooglePlan($Body) {
+  Assert-Installed
+  $ctx = Get-IdentityContext
+  Assert-IdentityConnection $ctx
+  if (-not $ctx.Config.authentik.publicUrl) { Stop-Request 409 'Set up the public sign-in address first: Google needs the https redirect URI.' }
+  if (-not $ctx.Config.authentik.owner.email) { Stop-Request 409 'Enter the initial owner''s Google account first.' }
+  $d = Get-GoogleDesired $Body $ctx.Config
+  try { $r = Sync-AuthentikGoogleSource -Conn $ctx.Conn -Desired $d -WhatIf }
+  catch { if ($_.Exception.Data['NeedsReplace']) { Stop-Request 409 $_.Exception.Message @{ needsReplace = $true } } else { Stop-Request 400 $_.Exception.Message } }
+  $id = New-IdpPlanId ([pscustomobject]@{ Kind = 'google'; Desired = $d; Fingerprint = (Get-AkFingerprint $r.Actions) })
+  return [ordered]@{ planId = $id; actions = @(ConvertTo-AkActionView $r.Actions); canApply = $true; secretProvided = [bool]$d.ClientSecret; redirectUri = "$($ctx.Config.authentik.publicUrl)/source/oauth/callback/$($d.Slug)/"
+    notes = @("Only $($d.OwnerEmail) can create an account with Google at first. Everyone else is added later in authentik (invitations, or by editing the enrollment policy there).",
+      'Google accounts are never linked to existing authentik accounts by email.',
+      'akadmin keeps signing in with its password: Google is an additional sign-in method, never the only way in.') }
+}
+
+function Invoke-IdentityGoogleApply($Body) {
+  Assert-Installed
+  $p = Use-IdpPlan $Body 'google'
+  $ctx = Get-IdentityContext
+  Assert-IdentityConnection $ctx
+  $now = $null; try { $now = Sync-AuthentikGoogleSource -Conn $ctx.Conn -Desired $p.Desired -WhatIf } catch { Stop-Request 409 $_.Exception.Message }
+  if ((Get-AkFingerprint $now.Actions) -ne $p.Fingerprint) { Stop-Request 409 'authentik changed since the preview. Preview again.' }
+  $null = New-ChangeRecoveryPoint 'before Google sign-in configuration'
+  $result = $null; $err = ''
+  try { $result = Sync-AuthentikGoogleSource -Conn $ctx.Conn -Desired $p.Desired } catch { $err = $_.Exception.Message }
+  $p.Desired.ClientSecret = $null
+  $cfg = $ctx.Config; $g = $cfg.authentik.google
+  if ($err) {
+    Set-IdentityProgress $cfg 'google' 'failed' $err
+    Save-IdentityConfig -Settings $ctx.Settings -Config $cfg
+    Write-Audit 'identity-google' "failed: $err"
+    return [ordered]@{ ok = $false; message = "$err Nothing after the failed step was changed; preview again to continue where it stopped."; actions = @() }
+  }
+  $g.clientId = $p.Desired.ClientId
+  if (@($result.Actions | Where-Object { $_.Kind -ne 'none' -and $_.Object -eq 'Google source' }).Count) { $g.configuredAt = (Get-Date -Format 's') }
+  Set-IdentityProgress $cfg 'google' 'configured' ''
+  Save-IdentityConfig -Settings $ctx.Settings -Config $cfg
+  Write-Audit 'identity-google' ("applied: " + ((@($result.Actions | Where-Object { $_.Kind -ne 'none' } | ForEach-Object { "$($_.Kind) $($_.Object) $($_.Name)" })) -join '; '))
+  $redir = $null; if ($cfg.authentik.hostname) { $redir = Test-AuthentikGoogleRedirect -BaseUrl $ctx.BaseUrl -PublicHost $cfg.authentik.hostname -Slug $g.slug -ExpectClientId $g.clientId }
+  return [ordered]@{ ok = $true; actions = @(ConvertTo-AkActionView $result.Actions); redirect = $redir }
+}
+
+# Owner verification (explicit setup action). Google path: the account connected to the Google source with the owner's
+# address (authentik's enrollment policy only let Google-verified addresses through); the Google subject seen first is
+# pinned. Local path: the administrator whose token the manager uses, signed in after the check was started. Both: the
+# account must be Internal, joins "DTC owners" (and the administrators if chosen). An External account is only changed
+# to Internal when the request says repair = true.
+function Invoke-IdentityOwnerVerify($Body) {
+  Assert-Installed
+  $ctx = Get-IdentityContext
+  Assert-IdentityConnection $ctx
+  $cfg = $ctx.Config; $o = $cfg.authentik.owner
+  $local = $cfg.authMode -eq 'local'
+  $repair = [bool](Get-Field $Body 'repair' $false)
+  $since = [datetime]::MinValue
+  if ($local) {
+    if (-not $o.localSince) { Stop-Request 409 'Start the local sign-in check first.' }
+    $since = [datetime]$o.localSince
+    $me = (Invoke-AuthentikApi $ctx.Conn GET '/core/users/me/').user
+    $owner = [pscustomobject]@{ Pk = [int]$me.pk; Username = [string]$me.username; Subject = '' }
+    $null = Sync-AuthentikOwnersGroup -Conn $ctx.Conn
+  } else {
+    if (-not $o.email) { Stop-Request 409 'Enter the initial owner''s Google account first.' }
+    $found = @(Find-AuthentikOwner -Conn $ctx.Conn -OwnerEmail $o.email -Slug $cfg.authentik.google.slug | Where-Object { $_.IsActive })
+    if (-not $found.Count) { return [ordered]@{ ok = $false; verified = $false; items = @(); message = "Nobody has signed in with Google as $($o.email) yet. Press ""Continue with Google"", choose that account, then ""I've signed in - check again""." } }
+    if ($found.Count -gt 1) { Stop-Request 409 "Several authentik accounts signed in with Google as $($o.email): $(@($found | ForEach-Object { $_.Username }) -join ', '). Resolve this in authentik first." }
+    $owner = $found[0]
+    if ($o.subject -and $owner.Subject -ne $o.subject) { Stop-Request 409 'A different Google identity signed in with the owner''s address than the one verified first. Nothing was changed; check the account in authentik.' }
+  }
+  $repaired = @()
+  $u = Invoke-AuthentikApi $ctx.Conn GET "/core/users/$($owner.Pk)/"
+  if ([string]$u.type -ne 'internal') {
+    if (-not $repair) {
+      $chk = Get-AuthentikOwnerCheck -Conn $ctx.Conn -Owner $owner -MakeAdmin:([bool]$o.makeAdmin -and -not $local) -ExpectSubject $o.subject -Since $since -Local:$local
+      return [ordered]@{ ok = $false; verified = $false; needsRepair = $true; items = @($chk.Items); username = $owner.Username; message = "'$($owner.Username)' is an External authentik account, so authentik's dashboard refuses it (""Interface can only be accessed by internal users""). Repair makes it Internal; nothing else changes." }
+    }
+    if (Set-AuthentikUserInternal -Conn $ctx.Conn -UserPk $owner.Pk) { $repaired += "made '$($owner.Username)' Internal" }
+  }
+  $null = Complete-AuthentikOwner -Conn $ctx.Conn -UserPk $owner.Pk -MakeAdmin:([bool]$o.makeAdmin -and -not $local)
+  $chk = Get-AuthentikOwnerCheck -Conn $ctx.Conn -Owner $owner -MakeAdmin:([bool]$o.makeAdmin -and -not $local) -ExpectSubject $o.subject -Since $since -Local:$local
+  if ($chk.Ok) {
+    if (-not $o.verifiedAt -or (-not $local -and -not $o.subject)) { $o.verifiedAt = $(if ($chk.LastLogin) { $chk.LastLogin } else { Get-Date -Format 's' }) }
+    $o.username = $owner.Username
+    if (-not $local) { $o.subject = $owner.Subject; if (-not $cfg.authentik.google.verifiedAt) { $cfg.authentik.google.verifiedAt = $o.verifiedAt; $cfg.authentik.google.verifiedBy = $owner.Username } }
+    Set-IdentityProgress $cfg 'owner' 'verified' $owner.Username
+    Save-IdentityConfig -Settings $ctx.Settings -Config $cfg
+  }
+  Write-Audit 'identity-owner-verify' "user=$($owner.Username) ok=$($chk.Ok) local=$local repaired=$($repaired -join ',')"
+  return [ordered]@{ ok = $chk.Ok; verified = $chk.Ok; items = @($chk.Items); username = $owner.Username; repaired = $repaired
+    message = $(if ($chk.Ok) { "Verified: $($owner.Username) is the owner." } else { 'Not verified yet: ' + ((@($chk.Items | Where-Object { -not $_.ok } | ForEach-Object { "$($_.label): $($_.message)" })) -join ' ') })
+    next = $(if ($chk.Ok) { @((Get-IdentityModel -Facts (Get-IdentityContext).Facts).next)[0] } else { '' }) }
+}
+
+# Local path: remember when the check started, so only a sign-in after it counts.
+function Start-IdentityLocalOwnerCheck {
+  Assert-Installed
+  $settings = Get-Settings
+  $cfg = Read-IdentityConfig -Settings $settings
+  if ($cfg.authentik.owner.verifiedAt -and $cfg.authMode -eq 'local') { Stop-Request 409 'The owner is already verified.' }
+  $cfg.authentik.owner.localSince = (Get-Date).AddSeconds(-5).ToString('s')
+  Save-IdentityConfig -Settings $settings -Config $cfg
+  return [ordered]@{ ok = $true; since = $cfg.authentik.owner.localSince }
+}
+
+function Set-IdentityModeRequest($Body) {
+  Assert-Installed
+  $m = [string](Get-Field $Body 'mode' '')
+  if ($m -notin 'local', 'google') { Stop-Request 400 'mode must be local or google.' }
+  $settings = Get-Settings
+  $cfg = Read-IdentityConfig -Settings $settings
+  if ($cfg.provider -ne 'authentik') { $cfg.provider = 'authentik' }
+  # Only the guided path changes: switching never touches authentik accounts, policies or application access.
+  $cfg.authMode = $m
+  Set-IdentityProgress $cfg 'mode' 'done' $m
+  Save-IdentityConfig -Settings $settings -Config $cfg
+  Write-Audit 'identity-mode' $m
+  return [ordered]@{ ok = $true; mode = $m }
+}
+
+function Set-IdentityWizardStepRequest($Body) {
+  Assert-Installed
+  $step = [string](Get-Field $Body 'step' '')
+  if ($step -notmatch '^[a-z-]{1,30}$') { Stop-Request 400 'Invalid step.' }
+  $settings = Get-Settings
+  $cfg = Read-IdentityConfig -Settings $settings
+  $cfg.wizardStep = $step
+  Save-IdentityConfig -Settings $settings -Config $cfg
+  return [ordered]@{ ok = $true }
+}
+
+# Google-first sign-in page: preview, apply (records the previous brand values), restore.
+function Invoke-IdentityLoginPage($Body, [string]$Action) {
+  Assert-Installed
+  $ctx = Get-IdentityContext
+  Assert-IdentityConnection $ctx
+  $cfg = $ctx.Config; $lp = $cfg.authentik.loginPage
+  $domain = $(if ($cfg.authentik.hostname -match '^[^.]+\.(.+)$') { $Matches[1] } else { $cfg.authentik.hostname })
+  $title = "Sign in to $domain"
+  switch ($Action) {
+    'plan' {
+      try { $r = Sync-AuthentikLoginPage -Conn $ctx.Conn -Title $title -Slug $cfg.authentik.google.slug -WhatIf } catch { Stop-Request 400 $_.Exception.Message }
+      $id = New-IdpPlanId ([pscustomobject]@{ Kind = 'loginpage'; Fingerprint = (Get-AkFingerprint $r.Actions) })
+      return [ordered]@{ planId = $id; actions = @(ConvertTo-AkActionView $r.Actions); title = $title; canApply = [bool]@($r.Actions | Where-Object { $_.Kind -ne 'none' }).Count
+        recoveryUrl = "$($ctx.BaseUrl)/if/flow/default-authentication-flow/" }
+    }
+    'apply' {
+      $p = Use-IdpPlan $Body 'loginpage'
+      if ((Get-AkFingerprint (Sync-AuthentikLoginPage -Conn $ctx.Conn -Title $title -Slug $cfg.authentik.google.slug -WhatIf).Actions) -ne $p.Fingerprint) { Stop-Request 409 'authentik changed since the preview. Preview again.' }
+      $r = Sync-AuthentikLoginPage -Conn $ctx.Conn -Title $title -Slug $cfg.authentik.google.slug
+      if (-not $lp.appliedAt) { $lp.brand = $r.Previous.brand; $lp.previousFlow = $r.Previous.flow; $lp.previousTitle = $r.Previous.title }
+      $lp.appliedAt = (Get-Date -Format 's')
+      Save-IdentityConfig -Settings $ctx.Settings -Config $cfg
+      Write-Audit 'identity-loginpage' 'applied'
+      return [ordered]@{ ok = $true; actions = @(ConvertTo-AkActionView $r.Actions) }
+    }
+    'restore' {
+      Assert-Confirmed $Body
+      if (-not $lp.appliedAt) { Stop-Request 409 'The Google-first sign-in page was not applied by the manager.' }
+      Restore-AuthentikLoginPage -Conn $ctx.Conn -Previous ([pscustomobject]@{ brand = $lp.brand; flow = $lp.previousFlow; title = $lp.previousTitle })
+      $lp.appliedAt = ''
+      Save-IdentityConfig -Settings $ctx.Settings -Config $cfg
+      Write-Audit 'identity-loginpage' 'restored'
+      return [ordered]@{ ok = $true }
+    }
+  }
+}
+
+# Protecting applications: one service at a time is turned into a change body for the normal Traefik/Cloudflare
+# pipeline. Cloudflare Access stays as it is unless 'remove' is chosen explicitly.
+function Get-ProtectRequest([string]$Name, $Ctx, [string]$AccessChoice = 'keep', [switch]$Remove) {
+  $svc = @($Ctx.Services | Where-Object { $_.name -eq $Name.ToLowerInvariant() })[0]
+  if (-not $svc) { Stop-Request 404 "No service named '$Name'." }
+  if ($Ctx.Install -and $svc.target.type -eq 'docker' -and $svc.target.host -eq $Ctx.Install.serverContainer) { Stop-Request 400 "'$($svc.name)' is the authentik sign-in page itself; it cannot be protected by authentik (endless redirect loop)." }
+  if ($Ctx.Config.authentik.service -and $svc.name -eq $Ctx.Config.authentik.service) { Stop-Request 400 "'$($svc.name)' is the authentik sign-in page itself; it cannot be protected by authentik." }
+  if (-not $Remove) {
+    if (-not $svc.enabled) { Stop-Request 400 "'$($svc.name)' is disabled." }
+    if (@($svc.hostnames).Count -ne 1) { Stop-Request 400 "'$($svc.name)' has several hostnames; authentik identifies an application by one address." }
+    if (-not $Ctx.Install.onProxyNetwork) { Stop-Request 409 "authentik ($($Ctx.Install.serverContainer)) is not on the shared network, so Traefik cannot ask it whether a visitor may pass." }
+  }
+  if ($AccessChoice -notin 'keep', 'remove') { Stop-Request 400 'cloudflareAccess must be keep or remove.' }
+  $copy = $svc | ConvertTo-Json -Depth 8 | ConvertFrom-Json
+  if ($AccessChoice -eq 'remove') { $copy.cloudflare.access = $false }
+  if ($Remove) { $copy.PSObject.Properties.Remove('auth') | Out-Null; $copy | Add-Member -NotePropertyName auth -NotePropertyValue ([pscustomobject]@{ provider = 'none' }) -Force }
+  else { $copy | Add-Member -NotePropertyName auth -NotePropertyValue ([pscustomobject]@{ provider = 'authentik'; endpoint = "http://$($Ctx.Install.serverContainer):9000" }) -Force }
+  $cfReady = [bool]($Ctx.Cloudflare.tunnelId -and (Get-CloudflareApiTokenInfo -Settings $Ctx.Settings).Stored)
+  return [pscustomobject]@{ Service = $svc; ChangeBody = [pscustomobject]@{ op = 'update'; name = $svc.name; service = $copy; cloudflare = [pscustomobject]@{ automate = [bool]($cfReady -and $copy.cloudflare.publish); accessEmails = @(Get-ManagedAccessEmails $Ctx.Cloudflare @($svc.hostnames)[0]); cleanup = ($AccessChoice -eq 'remove') } } }
+}
+
+# PublicUrl: the sign-in address browsers are sent to; protection points the embedded outpost at it (or refuses when
+# none is set and the outpost would send browsers to an address that only works on this PC).
+function Get-ProtectDesired($Svc) {
+  $pub = ''; try { $pub = [string](Read-IdentityConfig -Settings (Get-Settings)).authentik.publicUrl } catch { }
+  return [pscustomobject]@{ Service = $Svc.name; DisplayName = $(if ($Svc.PSObject.Properties['displayName']) { $Svc.displayName } else { $Svc.name }); Hostname = @($Svc.hostnames)[0]; PublicUrl = $pub }
+}
+
+# Preview for "Protect selected with authentik" (services: [...]) or for removing protection from one (service).
+function Invoke-IdentityProtectPlan($Body, [switch]$Remove) {
+  Assert-Installed
+  $ctx = Get-IdentityContext
+  Assert-IdentityConnection $ctx
+  foreach ($k in @('emails', 'domains', 'groups', 'createGroup')) { if ($Body.PSObject.Properties[$k]) { Stop-Request 400 "Who may open an application is managed in authentik, not here ('$k' is not accepted)." } }
+  $names = @(@(Get-Field $Body 'services' @()) | ForEach-Object { [string]$_ } | Where-Object { $_ } | Select-Object -Unique)
+  if (-not $names.Count -and (Get-Field $Body 'service' '')) { $names = @([string](Get-Field $Body 'service' '')) }
+  if (-not $names.Count) { Stop-Request 400 'Select at least one application.' }
+  if ($Remove -and $names.Count -ne 1) { Stop-Request 400 'Remove protection from one application at a time.' }
+  if ($names.Count -gt 20) { Stop-Request 400 'At most 20 applications at once.' }
+  $access = [string](Get-Field $Body 'cloudflareAccess' 'keep')
+  $items = @(); $stored = @()
+  foreach ($n in $names) {
+    $req = Get-ProtectRequest $n $ctx $access -Remove:$Remove
+    $ak = $null
+    try { $ak = $(if ($Remove) { Remove-AuthentikAppProtection -Conn $ctx.Conn -Service $req.Service.name -WhatIf } else { (Sync-AuthentikAppProtection -Conn $ctx.Conn -Desired (Get-ProtectDesired $req.Service) -WhatIf).Actions }) } catch { Stop-Request 400 "$($req.Service.name): $($_.Exception.Message)" }
+    $plan = Build-ChangePlan $req.ChangeBody
+    $view = ConvertTo-PlanView $plan ''
+    $svc = $req.Service
+    $notes = @()
+    if ($Remove) { $notes += $(if ($svc.cloudflare.publish -and -not $req.ChangeBody.service.cloudflare.access) { 'After this, the application is reachable WITHOUT any sign-in by anyone on the Internet (public, no Cloudflare Access). Its own login is the only protection.' } elseif ($svc.cloudflare.publish) { 'After this, Cloudflare Access is the only sign-in in front of the application.' } else { 'After this, the application is reachable from this PC without sign-in.' }); $notes += 'The authentik application and its access rules stay in authentik; protecting it again reuses them.' }
+    else {
+      if ($svc.cloudflare.publish -and $req.ChangeBody.service.cloudflare.access) { $notes += 'Cloudflare Access stays in front: visitors sign in with Cloudflare first, then with authentik.' }
+      if (@($ak | Where-Object { $_.Object -eq 'access' -and $_.Kind -eq 'none' }).Count) { $notes += 'This application already has access rules in authentik; they are kept exactly as they are.' }
+    }
+    $errors = @($view.traefik.issues | Where-Object { $_.Level -eq 'Error' }).Count + @($view.cloudflare.errors).Count
+    $items += [ordered]@{ service = $svc.name; displayName = (Get-ProtectDesired $svc).DisplayName; hostname = @($svc.hostnames)[0]; authentik = @(ConvertTo-AkActionView $ak); traefik = $view; notes = $notes; errors = $errors }
+    $stored += [pscustomobject]@{ Service = $svc.name; ChangeBody = ($req.ChangeBody | ConvertTo-Json -Depth 10 -Compress); AkFingerprint = (Get-AkFingerprint $ak); TraefikKey = $plan.TraefikKey; CfFingerprint = $plan.Cloudflare.Fingerprint }
+  }
+  $id = New-IdpPlanId ([pscustomobject]@{ Kind = $(if ($Remove) { 'unprotect' } else { 'protect' }); Items = $stored; Access = $access })
+  $total = @($items | ForEach-Object { $_.errors } | Measure-Object -Sum).Sum
+  return [ordered]@{ planId = $id; items = $items; cloudflareAccess = $access; canApply = ($total -eq 0)
+    service = $(if ($items.Count -eq 1) { $items[0].service } else { '' }); authentik = $(if ($items.Count -eq 1) { $items[0].authentik } else { @() }); traefik = $(if ($items.Count -eq 1) { $items[0].traefik } else { $null }); notes = $(if ($items.Count -eq 1) { $items[0].notes } else { @() }) }
+}
+
+# Applies a protect/unprotect preview, one application after the other (each with its own Traefik backup). An
+# application counts as protected only after an unauthenticated request was refused or sent to sign in.
+function Invoke-IdentityProtectApply($Body, [switch]$Remove) {
+  Assert-Installed
+  $p = Use-IdpPlan $Body $(if ($Remove) { 'unprotect' } else { 'protect' })
+  $ctx = Get-IdentityContext
+  Assert-IdentityConnection $ctx
+  $confirmed = @(@(Get-Field $Body 'confirmOverwrites' @()) | ForEach-Object { [string]$_ })
+  # Everything is checked against the current state before anything is changed.
+  $prepared = @()
+  foreach ($it in $p.Items) {
+    $plan = Build-ChangePlan ($it.ChangeBody | ConvertFrom-Json)
+    $svc = @($ctx.Services | Where-Object { $_.name -eq $it.Service })[0]
+    $akNow = $(if ($Remove) { Remove-AuthentikAppProtection -Conn $ctx.Conn -Service $it.Service -WhatIf } else { (Sync-AuthentikAppProtection -Conn $ctx.Conn -Desired (Get-ProtectDesired $svc) -WhatIf).Actions })
+    if ($plan.TraefikKey -ne $it.TraefikKey -or $plan.Cloudflare.Fingerprint -ne $it.CfFingerprint -or (Get-AkFingerprint $akNow) -ne $it.AkFingerprint) { Stop-Request 409 "The configuration, Cloudflare or authentik changed since the preview ($($it.Service)). Preview again." }
+    $missing = @($plan.Cloudflare.Actions | Where-Object { $_.Overwrite -and $confirmed -notcontains $_.Id } | ForEach-Object { $_.Id })
+    if ($missing.Count) { Stop-Request 400 ('Confirm each overwrite of an existing Cloudflare resource: ' + ($missing -join ', ')) }
+    $prepared += [pscustomobject]@{ Item = $it; Plan = $plan; Service = $svc }
+  }
+  $cfg = $ctx.Config
+  $results = @()
+  foreach ($x in $prepared) {
+    $name = $x.Item.Service
+    # Planned again now, against the registry as the previous applications left it: a plan built before them would
+    # write their old (unprotected) definitions back. Only this service's definition differs from the current state.
+    $plan = Build-ChangePlan ($x.Item.ChangeBody | ConvertFrom-Json)
+    $out = [ordered]@{ service = $name; ok = $true; authentik = @(); traefik = $null; challenge = $null; message = '' }
+    if (-not $Remove) {
+      # authentik first: when the route starts asking authentik, the application and provider must already exist.
+      try { $r = Sync-AuthentikAppProtection -Conn $ctx.Conn -Desired (Get-ProtectDesired $x.Service); $out.authentik = @(ConvertTo-AkActionView $r.Actions) }
+      catch { $out.ok = $false; $out.message = "authentik: $($_.Exception.Message) The Traefik route was not changed."; $results += $out; continue }
+      Set-IdentityApp $cfg $name ([pscustomobject][ordered]@{ slug = $r.Slug; providerPk = $r.ProviderPk; applicationPk = $r.ApplicationPk; initialAccess = $r.Access; protectedAt = (Get-Date -Format 's'); verifiedAt = ''; verifiedBy = '' })
+      Save-IdentityConfig -Settings $ctx.Settings -Config $cfg
+      # The route switches only once the embedded outpost has loaded the provider (otherwise it would answer 404).
+      $wait = Wait-AuthentikOutpost -BaseUrl $ctx.BaseUrl -Hostname @($plan.New.hostnames)[0] -Seconds 90
+      if (-not $wait.Ready) { $out.ok = $false; $out.message = "authentik's embedded outpost has not loaded the application yet (HTTP $($wait.Status)). The Traefik route was not changed; protect it again in a minute (nothing is created twice)."; $results += $out; continue }
+      if ($plan.Traefik.FileChanges -gt 0 -or $plan.Traefik.RegistryChanged) { $out.traefik = Invoke-ChangePlanSteps $plan $confirmed } else { $out.traefik = [ordered]@{ ok = $true; steps = @(); warnings = @() } }
+      if (-not $out.traefik.ok) { $out.ok = $false; $out.message = 'Traefik did not accept the change; the route is unchanged.' }
+      else {
+        $deadline = (Get-Date).AddSeconds(20)
+        do { $out.challenge = Test-ForwardAuthChallenge -TraefikPort $ctx.Settings.HttpPort -Hostname @($plan.New.hostnames)[0] -AuthHostname $cfg.authentik.hostname; if ($out.challenge.State -ne 'open') { break }; Start-Sleep -Seconds 2 } while ((Get-Date) -lt $deadline)
+        $State.IdpChecks[$name] = $out.challenge
+        if ($out.challenge.State -ne 'auth') { $out.ok = $false; $out.message = "ForwardAuth is not verified: $($out.challenge.Message)" }
+        else { $out.message = 'Protected: an unauthenticated request is sent to sign in.' }
+      }
+    } else {
+      # Traefik first: the route stops asking authentik before the outpost stops serving the application.
+      if ($plan.Traefik.FileChanges -gt 0 -or $plan.Traefik.RegistryChanged) { $out.traefik = Invoke-ChangePlanSteps $plan $confirmed } else { $out.traefik = [ordered]@{ ok = $true; steps = @(); warnings = @() } }
+      if (-not $out.traefik.ok) { $out.ok = $false; $out.message = 'Traefik did not accept the change; protection is unchanged.' }
+      else {
+        try { $out.authentik = @(ConvertTo-AkActionView (Remove-AuthentikAppProtection -Conn $ctx.Conn -Service $name)) } catch { $out.message = "The route no longer uses authentik, but the outpost assignment could not be removed: $($_.Exception.Message)" }
+        Set-IdentityApp $cfg $name $null
+        $State.IdpChecks.Remove($name)
+      }
+    }
+    $results += $out
+  }
+  $allOk = -not @($results | Where-Object { -not $_.ok }).Count
+  Set-IdentityProgress $cfg 'apps' $(if ($allOk) { $(if ($Remove) { 'unprotected' } else { 'protected' }) } else { 'failed' }) ((@($results | ForEach-Object { $_.service })) -join ', ')
+  Save-IdentityConfig -Settings $ctx.Settings -Config $cfg
+  Write-Audit $(if ($Remove) { 'identity-unprotect' } else { 'identity-protect' }) ((@($results | ForEach-Object { "$($_.service) ok=$($_.ok)" })) -join '; ')
+  $first = $results[0]
+  return [ordered]@{ ok = $allOk; results = $results; authentik = $first.authentik; traefik = $first.traefik; challenge = $first.challenge; message = $(if ($results.Count -eq 1) { $first.message } else { "$(@($results | Where-Object { $_.ok }).Count) of $($results.Count) done." }) }
+}
+
+# --- Router ----------------------------------------------------------------------------------------------------
+
+function Invoke-ApiRoute($Request, $Body) {
+  $m = $Request.Method
+  $p = $Request.Path
+  # Until a deployment is chosen, nothing may change any folder: only the project and manager actions are allowed.
+  if (-not $State.Chosen -and $m -ne 'GET' -and -not ($p.StartsWith('/api/projects/') -or $p -eq '/api/manager/stop')) {
+    Stop-Request 409 'Choose a deployment first (open an existing one or start a new one).'
+  }
+  $settings = Get-Settings
+  switch -Exact ("$m $p") {
+    'GET /api/session' { return [ordered]@{ ok = $true } }
+    'GET /api/status' { return Get-StatusData }
+    'GET /api/services' { return Get-ServicesData }
+    'POST /api/services/plan' { return Invoke-PlanRequest $Body }
+    'POST /api/services/apply' { return Invoke-ApplyRequest $Body }
+    'POST /api/validate' {
+      if (-not (Test-Installed)) { return [ordered]@{ ok = $false; installed = $false; message = (Get-NotInstalledMessage); issues = @(); drift = 0; deep = $null } }
+      $registry = Read-ServiceRegistry -Settings $settings
+      $plan = Get-ServicePlan -Settings $settings -Services $registry.services
+      $out = [ordered]@{ ok = -not $plan.HasErrors; installed = $true; message = ''; issues = @($plan.Issues); drift = $plan.FileChanges; deep = $null }
+      if ([bool](Get-Field $Body 'deep' $false)) {
+        $deep = Test-TraefikDynamicConfig -Settings $settings -Plan $plan
+        $out.deep = $deep
+        $out.ok = $out.ok -and $deep.Ok
+      }
+      return $out
+    }
+    'GET /api/backups' { return Get-BackupsData }
+    'GET /api/backups/export' {
+      $format = [string]$Request.Query['format']
+      if ($format -eq 'zip') {
+        $a = New-ConfigBackupArchive -Settings $settings -SourceRoot $here
+        Write-Audit 'backup-export' "zip files=$(@($a.Manifest.archive.files).Count) excluded=$(@($a.Excluded).Count)"
+        return New-Download $a.FileName 'application/zip' $a.Bytes
+      }
+      if ($format -ne 'json') { Stop-Request 400 "Unknown export format '$format'." }
+      $e = Export-ConfigManifest -Settings $settings -SourceRoot $here
+      Write-Audit 'backup-export' 'json'
+      return New-Download $e.FileName 'application/json; charset=utf-8' $e.Text
+    }
+    'GET /api/backups/recovery/download' {
+      $id = [string]$Request.Query['id']
+      try { [byte[]]$bytes = Get-RecoveryPointBytes -Settings $settings -Id $id } catch { Stop-Request 404 $_.Exception.Message }
+      return New-Download $id 'application/zip' $bytes
+    }
+    'POST /api/backups/import/preview' { return Invoke-ImportPreview $Body }
+    'POST /api/backups/import/apply' { return Invoke-ImportApply $Body }
+    'GET /api/projects' { return Get-ProjectsData }
+    'POST /api/projects/inspect' { return Invoke-ProjectInspect $Body }
+    'POST /api/projects/attach' { return Invoke-ProjectAttach $Body }
+    'POST /api/projects/new' { return Invoke-ProjectNew $Body }
+    'POST /api/projects/forget' { return Invoke-ProjectForget $Body }
+    'GET /api/projects/browse' { return Get-FolderBrowseData ([string]$Request.Query['path']) }
+    'POST /api/projects/upgrade/preview' { return Invoke-UpgradePreview $Body }
+    'POST /api/projects/upgrade/apply' { return Invoke-UpgradeApply $Body }
+    'POST /api/manager/stop' { return Invoke-ManagerStop $Body }
+    'GET /api/dashboard' { return Get-DashboardData }
+    'POST /api/dashboard/settings' { return Save-DashboardSettingsRequest $Body }
+    'GET /api/overview' { return Get-OverviewData }
+    'GET /api/infrastructure' { return Get-InfrastructureData }
+    'GET /api/docker/containers' { return Get-DockerContainersData }
+    'GET /api/docker/claims' { return Get-HostnameClaimsData ([string]$Request.Query['hostname']) ([string]$Request.Query['service']) }
+    'POST /api/docker/probe' { return Invoke-PortProbe $Body }
+    'POST /api/services/backend' { return Invoke-BackendResolve $Body }
+    'POST /api/docker/connect' { return Invoke-NetworkConnect $Body }
+    'POST /api/services/health' { return Invoke-ServiceHealth $Body }
+    'GET /api/catalog' { return Get-CatalogData }
+    'GET /api/catalog/defaults' { try { $cm = Get-CatalogApp -CatalogDir $CatalogDir -Id ([string]$Request.Query['id']) } catch { Stop-Request 404 $_.Exception.Message }; Assert-Installed; return Get-AppDefaults $cm (Get-Settings) }
+    'POST /api/catalog/plan' { return Invoke-AppPlan $Body }
+    'POST /api/catalog/apply' { return Invoke-AppApply $Body }
+    'GET /api/apps' { return Get-AppsData }
+    'POST /api/apps/action' { return Invoke-AppAction $Body }
+    'GET /api/apps/logs' { $tl = 200; [int]::TryParse([string]$Request.Query['tail'], [ref]$tl) | Out-Null; return Get-AppLogsData ([string]$Request.Query['project']) $tl ([string]$Request.Query['service']) }
+    'GET /api/apps/detail' { return Get-AppDetailData ([string]$Request.Query['project']) }
+    'POST /api/apps/archive' { return Invoke-AppArchive $Body }
+    'POST /api/apps/restore' { return Invoke-AppRestoreRecord $Body }
+    'POST /api/apps/adopt/plan' { return Get-AppAdoptPlan $Body }
+    'POST /api/apps/adopt' { return Invoke-AppAdopt $Body }
+    'POST /api/apps/cleanup/plan' { return Get-AppCleanupPlan $Body }
+    'POST /api/apps/cleanup' { return Invoke-AppCleanup $Body }
+    'POST /api/apps/remove/plan' { return Get-AppRemovePlan $Body }
+    'POST /api/apps/health' { return Invoke-AppHealthRequest $Body }
+    'POST /api/apps/update/preview' { return Invoke-AppUpdatePreview $Body }
+    'POST /api/apps/update/apply' { return Invoke-AppUpdateApply $Body }
+    'POST /api/apps/remove' { return Invoke-AppRemove $Body }
+    'POST /api/apps/backup' { return Invoke-AppBackup $Body }
+    'GET /api/system/resources' { return Get-HostResources }
+    'GET /api/identity' { Assert-Installed; return Get-IdentityData -Deep:([string]$Request.Query['deep'] -eq '1') }
+    'GET /api/routing' { return Get-RoutingView $Request.Query }
+    'POST /api/identity/provider' { return Set-IdentityProviderRequest $Body }
+    'POST /api/identity/adopt' { return Invoke-IdentityAdopt $Body }
+    'POST /api/identity/token' { return Save-IdentityTokenRequest $Body }
+    'POST /api/identity/token/test' { return Test-IdentityTokenRequest }
+    'POST /api/identity/token/delete' {
+      Assert-Installed; Assert-Confirmed $Body
+      $removed = Remove-StoredCredential -Settings $settings -Id 'authentik-api' -SecretName (Get-IdentityTokenSecretName)
+      Write-Audit 'identity-token-removed' ''
+      return [ordered]@{ removed = $removed }
+    }
+    'POST /api/identity/hostname' { return Set-IdentityHostnameRequest $Body }
+    'POST /api/identity/outpost/plan' { return Invoke-IdentityOutpost $Body }
+    'POST /api/identity/outpost/apply' { return Invoke-IdentityOutpost $Body -Apply }
+    'POST /api/identity/owner' { return Set-IdentityOwnerRequest $Body }
+    'POST /api/identity/owner/verify' { return Invoke-IdentityOwnerVerify $Body }
+    'POST /api/identity/owner/local-start' { return Start-IdentityLocalOwnerCheck }
+    'POST /api/identity/mode' { return Set-IdentityModeRequest $Body }
+    'POST /api/identity/wizard' { return Set-IdentityWizardStepRequest $Body }
+    'POST /api/identity/google/inspect' { return Invoke-IdentityGoogleInspect $Body }
+    'POST /api/identity/loginpage/plan' { return Invoke-IdentityLoginPage $Body 'plan' }
+    'POST /api/identity/loginpage/apply' { return Invoke-IdentityLoginPage $Body 'apply' }
+    'POST /api/identity/loginpage/restore' { return Invoke-IdentityLoginPage $Body 'restore' }
+    'POST /api/identity/google/save' { return Save-IdentityGoogleRequest $Body }
+    'POST /api/identity/google/plan' { return Invoke-IdentityGooglePlan $Body }
+    'POST /api/identity/google/apply' { return Invoke-IdentityGoogleApply $Body }
+    'POST /api/identity/protect/plan' { return Invoke-IdentityProtectPlan $Body }
+    'POST /api/identity/protect/apply' { return Invoke-IdentityProtectApply $Body }
+    'POST /api/identity/unprotect/plan' { return Invoke-IdentityProtectPlan $Body -Remove }
+    'POST /api/identity/unprotect/apply' { return Invoke-IdentityProtectApply $Body -Remove }
+    'GET /api/environment' { return Get-EnvironmentData }
+    'GET /api/expert/config' { return Get-ExpertConfigData }
+    'POST /api/setup/contact' { return Set-ContactEmailRequest $Body }
+    'POST /api/dashboard/plan' { return Invoke-DashboardPlanRequest $Body }
+    'POST /api/dashboard/apply' { return Invoke-DashboardApplyRequest $Body }
+    'POST /api/dashboard/verify' { return Invoke-DashboardVerifyRequest $Body }
+    'POST /api/backups/preview' { return Get-BackupPreview $Body }
+    'POST /api/backups/restore' {
+      Assert-Installed
+      Assert-Confirmed $Body
+      $id = [string](Get-Field $Body 'id' '')
+      if (@(Get-ServiceBackups $settings | Where-Object { $_.Id -eq $id }).Count -eq 0) { Stop-Request 404 "No backup '$id'." }
+      $null = New-ChangeRecoveryPoint "before rollback to $id"
+      $r = Restore-ServiceBackup -Settings $settings -Id $id
+      Write-Audit 'rollback' "restored=$($r.Restored) saved=$($r.SavedCurrentAs)"
+      return [ordered]@{ restored = $r.Restored; savedCurrentAs = $r.SavedCurrentAs; warning = $r.ReloadWarning }
+    }
+    'GET /api/logs' {
+      $role = [string]$Request.Query['role']
+      if (@((Get-StackContainerNames $settings).Keys) -notcontains $role) { Stop-Request 400 "Unknown container '$role'." }
+      $tail = 200
+      if ($Request.Query.ContainsKey('tail')) { [int]::TryParse($Request.Query['tail'], [ref]$tail) | Out-Null }
+      if (-not (Test-Installed)) { return [ordered]@{ Container = (Get-StackContainerNames $settings)[$role]; Ok = $false; Lines = @(Get-NotInstalledMessage) } }
+      return Get-StackLogs -Settings $settings -Role $role -Tail $tail
+    }
+    'GET /api/audit' {
+      $file = Join-Path $InstallPath 'logs\webui-audit.log'
+      $lines = @()
+      if (Test-Path -LiteralPath $file) {
+        # Last 256 KB only; Get-Content -Tail can spin forever on Windows PowerShell 5.1.
+        $fs = [IO.File]::Open($file, 'Open', 'Read', 'ReadWrite')
+        try {
+          $start = [Math]::Max(0, $fs.Length - 262144)
+          $null = $fs.Seek($start, 'Begin')
+          $text = (New-Object IO.StreamReader($fs, [Text.Encoding]::UTF8)).ReadToEnd()
+        } finally { $fs.Dispose() }
+        $lines = @($text -split "`r?`n" | Where-Object { $_ } | Select-Object -Last 200)
+      }
+      return [ordered]@{ lines = $lines }
+    }
+    'POST /api/diagnostics' {
+      $script = Join-Path $here 'scripts\Get-Diagnostics.ps1'
+      $r = Invoke-PowerShellFile $script @('-ProjectPath', $InstallPath)
+      return [ordered]@{ ok = ($r.ExitCode -eq 0); lines = $r.Lines }
+    }
+    'POST /api/install/preview' {
+      $r = Invoke-PowerShellFile (Join-Path $here 'install.ps1') @('-InstallPath', $InstallPath, '-DryRun')
+      return [ordered]@{ ok = ($r.ExitCode -eq 0); lines = $r.Lines }
+    }
+    'POST /api/install/run' {
+      Assert-Confirmed $Body
+      $args2 = @('-InstallPath', $InstallPath, '-Start')
+      if ([bool](Get-Field $Body 'enableTunnel' $false)) { $args2 += '-EnableTunnel' }
+      $r = Invoke-PowerShellFile (Join-Path $here 'install.ps1') $args2
+      Write-Audit 'install' "exit=$($r.ExitCode)"
+      return [ordered]@{ ok = ($r.ExitCode -eq 0); lines = $r.Lines }
+    }
+    'GET /api/cloudflare' { return Get-CloudflareData }
+    'POST /api/cloudflare/token' { return Save-TokenRequest $Body }
+    'POST /api/cloudflare/token/delete' {
+      Assert-Confirmed $Body
+      $removed = Remove-CloudflareApiToken -Settings $settings
+      Write-Audit 'cloudflare-token-removed' ''
+      return [ordered]@{ removed = $removed }
+    }
+    'GET /api/cloudflare/accounts' {
+      if (-not (Get-CloudflareApiTokenInfo -Settings $settings).Stored) { Stop-Request 409 'Save a Cloudflare API token first.' }
+      return [ordered]@{ accounts = @(Invoke-CloudflareApi -Settings $settings -Path '/accounts' -All | ForEach-Object { [ordered]@{ id = [string]$_.id; name = [string]$_.name } }) }
+    }
+    'GET /api/cloudflare/zones' {
+      # Only the allowed domains: services can be published under these and nothing else.
+      $config = Assert-CloudflareReady
+      return [ordered]@{ zones = @(Select-AllowedZones $config (Get-CloudflareZones -Settings $settings -AccountId $config.accountId)) }
+    }
+    'GET /api/cloudflare/discovery' { return Get-DiscoveryRequest }
+    'POST /api/cloudflare/domains' { return Set-DomainsRequest $Body }
+    'GET /api/setup' { return Get-SetupData }
+    'POST /api/setup/path' { return Set-InstallPathRequest $Body }
+    'POST /api/setup/settings' { return Save-SettingsRequest $Body }
+    'POST /api/setup/suggest' {
+      Assert-NotInstalled 'The instance settings'
+      $s = Get-SuggestedStackSettings -InstallPath $InstallPath
+      return [ordered]@{ settings = ConvertTo-InstanceValues $s; conflicts = @(Get-StackConflicts -Settings $s) }
+    }
+    'POST /api/setup/check' { return [ordered]@{ settings = ConvertTo-InstanceValues $settings; conflicts = @(Get-StackConflicts -Settings $settings) } }
+    'POST /api/setup/deployment' { return Set-DeploymentRequest $Body }
+    'POST /api/setup/preview' { return Get-InstallPlan }
+    'POST /api/setup/install' { return Invoke-InstallRequest $Body }
+    'GET /api/cloudflare/tunnels' {
+      $config = Assert-CloudflareReady
+      return [ordered]@{ tunnels = @(Get-CloudflareTunnels -Settings $settings -AccountId $config.accountId) }
+    }
+    'POST /api/cloudflare/select' { return Select-CloudflareRequest $Body }
+    'POST /api/cloudflare/tunnel' { return New-TunnelRequest $Body }
+    'POST /api/cloudflare/connector' { return Install-ConnectorRequest $Body }
+  }
+  Stop-Request 404 "No such endpoint: $m $p"
+}
+
+function Invoke-Request($Request) {
+  # DNS-rebinding protection: only our own loopback origin may talk to us.
+  $hostHeader = if ($Request.Headers.ContainsKey('host')) { $Request.Headers['host'].ToLowerInvariant() } else { '' }
+  if ($State.Hosts -notcontains $hostHeader) {
+    return @{ Status = 421; Body = "Unexpected Host header.`n"; Headers = $SecurityHeaders }
+  }
+  $path = $Request.Path
+
+  if (-not $path.StartsWith('/api/')) {
+    if ($Request.Method -ne 'GET') { return @{ Status = 405; Body = "Method not allowed.`n"; Headers = $SecurityHeaders } }
+    if ($path -eq '/' -and $Request.Query.ContainsKey('k')) {
+      if (-not (Test-ConstantTimeEqual ([string]$Request.Query['k']) $State.LaunchKey)) { return @{ Status = 403; Body = "Invalid or expired link. Use the link printed by webui.ps1.`n"; Headers = $SecurityHeaders } }
+      $sid = New-RandomKey
+      $State.Sessions[$sid] = [pscustomobject]@{ Csrf = (New-RandomKey); Created = (Get-Date) }
+      # Launcher mode: a link works once (it may linger in browser history or a process listing); the next one is
+      # written to the user-only link file for "open again".
+      if ($SingleUseLaunch) { $State.LaunchKey = New-RandomKey; Write-LaunchUrlFile }
+      $h = @{} + $SecurityHeaders
+      $h['Set-Cookie'] = "$($State.Cookie)=$sid; Path=/; HttpOnly; SameSite=Strict"
+      $h['Location'] = '/'
+      return @{ Status = 303; Body = ''; Headers = $h }
+    }
+    if (-not $StaticFiles.ContainsKey($path)) { return @{ Status = 404; Body = "Not found.`n"; Headers = $SecurityHeaders } }
+    $file = $StaticFiles[$path]
+    return @{ Status = 200; ContentType = $file[1]; Body = [IO.File]::ReadAllBytes((Join-Path $StaticRoot $file[0])); Headers = $SecurityHeaders }
+  }
+
+  $sid = Get-Cookie $Request $State.Cookie
+  if (-not $sid -or -not $State.Sessions.ContainsKey($sid)) {
+    return New-JsonResponse @{ error = 'Not signed in. Open the link printed by webui.ps1 in this browser.'; signedOut = $true } 401
+  }
+  $session = $State.Sessions[$sid]
+  $body = $null
+  if ($Request.Method -ne 'GET') {
+    $origin = if ($Request.Headers.ContainsKey('origin')) { $Request.Headers['origin'] } else { '' }
+    if ($State.Origins -notcontains $origin) { return New-JsonResponse @{ error = 'Cross-origin request refused.' } 403 }
+    $csrf = if ($Request.Headers.ContainsKey('x-csrf-token')) { $Request.Headers['x-csrf-token'] } else { '' }
+    if (-not (Test-ConstantTimeEqual $csrf $session.Csrf)) { return New-JsonResponse @{ error = 'Missing or invalid CSRF token. Reload the page.' } 403 }
+    $ct = if ($Request.Headers.ContainsKey('content-type')) { $Request.Headers['content-type'] } else { '' }
+    if ($ct -notmatch '^application/json\b') { return New-JsonResponse @{ error = 'Content-Type must be application/json.' } 415 }
+    try { $body = if ($Request.Body) { $Request.Body | ConvertFrom-Json } else { [pscustomobject]@{} } }
+    catch { return New-JsonResponse @{ error = 'Request body is not valid JSON.' } 400 }
+  }
+  try {
+    $data = Invoke-ApiRoute $Request $body
+    if ($Request.Path -eq '/api/session') { $data = [ordered]@{ ok = $true; csrf = $session.Csrf; installPath = $InstallPath; chosen = [bool]$State.Chosen; canStop = [bool]$StopFile } }
+    if ($data -is [pscustomobject] -and $data.PSObject.Properties['IsDownload']) {
+      $h = @{} + $SecurityHeaders
+      $h['Content-Disposition'] = "attachment; filename=`"$($data.FileName -replace '[^A-Za-z0-9._-]', '_')`""
+      return @{ Status = 200; ContentType = $data.ContentType; Body = $data.Body; Headers = $h }
+    }
+    return New-JsonResponse $data
+  } catch {
+    $status = 500
+    if ($_.Exception.Data.Contains('status')) { $status = [int]$_.Exception.Data['status'] }
+    $payload = [ordered]@{ error = ((ConvertTo-RedactedText @($_.Exception.Message)) -join ' ') }
+    if ($_.Exception.Data.Contains('extra')) { foreach ($k in $_.Exception.Data['extra'].Keys) { $payload[$k] = $_.Exception.Data['extra'][$k] } }
+    if ($status -eq 500) { Write-Audit 'error' "$($Request.Method) $($Request.Path): $($payload.error)" }
+    return New-JsonResponse $payload $status
+  }
+}
+
+# --- Start -------------------------------------------------------------------------------------------------------
+
+# The current sign-in link, readable by this Windows user only (the launcher reads it to open the browser again).
+function Write-LaunchUrlFile {
+  if (-not $LaunchUrlFile) { return }
+  $dir = Split-Path -Parent $LaunchUrlFile
+  if ($dir -and -not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
+  # Written to a temporary file that is restricted first, then moved into place: the link file never exists with
+  # default permissions, not even for a moment.
+  $tmp = "$LaunchUrlFile.tmp-" + [Guid]::NewGuid().ToString('N').Substring(0, 8)
+  [IO.File]::WriteAllText($tmp, "http://127.0.0.1:$Port/?k=$($State.LaunchKey)")
+  if ($SingleUseLaunch) { Set-SecretFileAcl $tmp }
+  Move-Item -LiteralPath $tmp -Destination $LaunchUrlFile -Force
+}
+
+try { $listener = New-LoopbackListener $Port }
+catch { throw "Cannot listen on 127.0.0.1:$Port ($($_.Exception.Message)). Is the web UI already running? Use -Port to pick another port." }
+$launchUrl = "http://127.0.0.1:$Port/?k=$($State.LaunchKey)"
+Write-Host "Deployment Manager (Traefik + Cloudflare) for $(if ($ProjectChosen) { $InstallPath } else { 'your deployments' })" -ForegroundColor Cyan
+Write-Host "Listening on http://127.0.0.1:$Port/ (this PC only). Press Ctrl+C to stop."
+if ($LaunchUrlFile) {
+  Write-LaunchUrlFile
+  if ($OpenBrowser -and -not $NoBrowser) { Start-Process "http://127.0.0.1:$Port/?k=$($State.LaunchKey)" }
+} else {
+  Write-Host ''
+  Write-Host 'Open this link (it signs this browser in; do not share it):' -ForegroundColor Yellow
+  Write-Host "  $launchUrl"
+  if (-not $NoBrowser) { Start-Process $launchUrl }
+}
+try {
+  # 3 MB: a backup upload (at most 2 MB) arrives base64-encoded in a JSON body.
+  Start-HttpLoop -Listener $listener -StopFile $StopFile -MaxBodyBytes 3145728 -Handler { param($r) Invoke-Request $r }
+} finally {
+  $listener.Stop()
+  Write-Host 'Web UI stopped.'
+}

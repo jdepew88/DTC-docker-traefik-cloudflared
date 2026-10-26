@@ -1,0 +1,191 @@
+{
+  "schema": 1,
+  "manifestVersion": "2026.10.21",
+  "id": "authelia",
+  "name": "Authelia",
+  "category": "authentication",
+  "group": "B",
+  "description": "Lightweight single sign-on and two-factor portal for Traefik forward authentication, with file-backed users (no database or LDAP needed).",
+  "maintainer": "Authelia contributors",
+  "license": "Apache-2.0",
+  "source": {
+    "type": "curated",
+    "url": "https://github.com/authelia/authelia"
+  },
+  "docs": [
+    {
+      "title": "Get started",
+      "url": "https://www.authelia.com/integration/prologue/get-started/"
+    },
+    {
+      "title": "Traefik integration",
+      "url": "https://www.authelia.com/integration/proxies/traefik/"
+    },
+    {
+      "title": "Session cookie domain",
+      "url": "https://www.authelia.com/configuration/session/introduction/"
+    }
+  ],
+  "platforms": {
+    "windows-docker-desktop": "supported",
+    "linux-docker": "untested",
+    "unraid": "untested",
+    "podman": "untested"
+  },
+  "installable": true,
+  "services": {
+    "app": {
+      "image": "authelia/authelia:4.39.28@sha256:bd97cff4fcbf715b5ff1f9ae286afbe6033afce385302520b0368122d43a6f54",
+      "ports": [
+        {
+          "container": 9091,
+          "protocol": "http",
+          "primary": true
+        }
+      ],
+      "environment": {
+        "TZ": "{{timezone}}",
+        "AUTHELIA_IDENTITY_VALIDATION_RESET_PASSWORD_JWT_SECRET_FILE": "/secrets/JWT_SECRET",
+        "AUTHELIA_SESSION_SECRET_FILE": "/secrets/SESSION_SECRET",
+        "AUTHELIA_STORAGE_ENCRYPTION_KEY_FILE": "/secrets/STORAGE_ENCRYPTION_KEY"
+      },
+      "volumes": [
+        {
+          "name": "config",
+          "target": "/config",
+          "kind": "project",
+          "source": "config",
+          "description": "configuration.yml and users_database.yml (edit them here)."
+        },
+        {
+          "name": "secrets",
+          "target": "/secrets",
+          "kind": "project",
+          "source": "secrets",
+          "readOnly": true,
+          "description": "Generated secrets (one file each)."
+        },
+        {
+          "name": "data",
+          "target": "/data",
+          "kind": "volume",
+          "description": "SQLite storage and notifications."
+        }
+      ],
+      "resources": {
+        "memoryMB": 60,
+        "diskMB": 60
+      }
+    }
+  },
+  "inputs": [
+    {
+      "id": "domain",
+      "type": "text",
+      "label": "Protected domain",
+      "required": true,
+      "pattern": "^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\\.)+[a-z]{2,63}$",
+      "help": "Your domain, e.g. example.com. Authelia's session cookie needs a real domain (not localhost) and HTTPS."
+    },
+    {
+      "id": "authHost",
+      "type": "text",
+      "label": "Sign-in subdomain",
+      "default": "auth",
+      "pattern": "^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$",
+      "help": "The portal will live at https://<this>.<domain> once you publish it."
+    },
+    {
+      "id": "adminUser",
+      "type": "text",
+      "label": "Administrator user name",
+      "default": "admin",
+      "pattern": "^[a-z][a-z0-9._-]{1,31}$"
+    },
+    {
+      "id": "adminEmail",
+      "type": "text",
+      "label": "Administrator email",
+      "required": true,
+      "pattern": "^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$"
+    },
+    {
+      "id": "adminPassword",
+      "type": "password",
+      "label": "Administrator password"
+    },
+    {
+      "id": "adminHash",
+      "type": "derived",
+      "method": "authelia-argon2",
+      "from": "adminPassword",
+      "label": "Administrator password hash"
+    },
+    {
+      "id": "jwtSecret",
+      "type": "generated",
+      "bytes": 32,
+      "label": "Password-reset signing secret"
+    },
+    {
+      "id": "sessionSecret",
+      "type": "generated",
+      "bytes": 32,
+      "label": "Session secret"
+    },
+    {
+      "id": "storageKey",
+      "type": "generated",
+      "bytes": 32,
+      "label": "Storage encryption key"
+    }
+  ],
+  "files": [
+    {
+      "path": "config/configuration.yml",
+      "content": "---\n# Authelia configuration, generated once by the Deployment Manager. Edit freely: it is never overwritten.\n# Secrets come from the files in ../secrets (AUTHELIA_*_FILE variables), not from this file.\nserver:\n  address: 'tcp://:9091'\nlog:\n  level: 'info'\ntotp:\n  issuer: '{{input:domain}}'\nauthentication_backend:\n  file:\n    path: '/config/users_database.yml'\naccess_control:\n  default_policy: 'deny'\n  rules:\n    - domain: '*.{{input:domain}}'\n      policy: 'one_factor'\nsession:\n  cookies:\n    - name: 'authelia_session'\n      domain: '{{input:domain}}'\n      authelia_url: 'https://{{input:authHost}}.{{input:domain}}'\n      expiration: '1 hour'\n      inactivity: '5 minutes'\nregulation:\n  max_retries: 3\n  find_time: '2 minutes'\n  ban_time: '5 minutes'\nstorage:\n  local:\n    path: '/data/db.sqlite3'\nnotifier:\n  filesystem:\n    filename: '/data/notification.txt'\n...\n"
+    },
+    {
+      "path": "config/users_database.yml",
+      "secret": true,
+      "content": "# Authelia users. Hash new passwords with: docker exec <container> authelia crypto hash generate argon2 --password '<password>'\nusers:\n  {{input:adminUser}}:\n    disabled: false\n    displayname: '{{input:adminUser}}'\n    password: '{{input:adminHash}}'\n    email: '{{input:adminEmail}}'\n    groups:\n      - 'admins'\n"
+    },
+    {
+      "path": "secrets/JWT_SECRET",
+      "secret": true,
+      "content": "{{input:jwtSecret}}"
+    },
+    {
+      "path": "secrets/SESSION_SECRET",
+      "secret": true,
+      "content": "{{input:sessionSecret}}"
+    },
+    {
+      "path": "secrets/STORAGE_ENCRYPTION_KEY",
+      "secret": true,
+      "content": "{{input:storageKey}}"
+    }
+  ],
+  "privileges": [],
+  "dependencies": [],
+  "security": [
+    "Authelia protects apps only once Traefik forwards authentication to it (a forwardAuth middleware) and the portal is published over HTTPS; installing it changes no existing route.",
+    "The administrator password is hashed with argon2 on this PC by Authelia itself; the plain password is kept only in credentials.txt (readable by your account)."
+  ],
+  "update": {
+    "strategy": "pinned-digest",
+    "notes": "Read the release notes: configuration keys are occasionally renamed between minor versions."
+  },
+  "web": {
+    "service": "app",
+    "path": "/",
+    "localPort": 9091
+  },
+  "exposure": {
+    "default": "access"
+  },
+  "resources": {
+    "memoryMB": 60,
+    "diskMB": 60
+  }
+}

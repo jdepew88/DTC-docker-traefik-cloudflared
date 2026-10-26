@@ -2,11 +2,19 @@
 .env
 secrets/
 *token*
-# Site-specific routes rendered on the deployed host
-traefik/dynamic/omnivoice.yml
+# Site-specific state rendered on the deployed host
+config/services.json
+config/cloudflare.json
+config/setup.json
+config/dashboard.json
+traefik/dynamic/admin-dashboard.yml
+logs/
+traefik/dynamic/svc-*.yml
+traefik/dynamic/zz-test-*.yml
 traefik/dynamic/*.local.yml
 traefik/dynamic/app-*.yml
 traefik/dynamic/.reload
+*.tmp-*
 # Wizard state (no secrets, but deployment-specific)
 tunnel.json
 # Installer state
@@ -20,3 +28,5 @@ zipped project start/
 *.log
 .DS_Store
 __pycache__/
+# Local-only notes that may hold credentials
+API key*

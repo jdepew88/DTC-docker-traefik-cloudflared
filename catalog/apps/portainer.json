@@ -1,0 +1,116 @@
+{
+  "schema": 1,
+  "manifestVersion": "2026.10.25",
+  "id": "portainer",
+  "name": "Portainer CE",
+  "category": "management",
+  "description": "Web interface to manage Docker containers, images, volumes, networks and Compose stacks.",
+  "maintainer": "Portainer.io",
+  "license": "Zlib",
+  "source": {
+    "type": "curated",
+    "url": "https://github.com/portainer/portainer"
+  },
+  "docs": [
+    {
+      "title": "Install Portainer CE with Docker",
+      "url": "https://docs.portainer.io/start/install-ce/server/docker/linux"
+    },
+    {
+      "title": "Portainer documentation",
+      "url": "https://docs.portainer.io/"
+    }
+  ],
+  "platforms": {
+    "windows-docker-desktop": "supported",
+    "linux-docker": "untested",
+    "unraid": "untested",
+    "podman": "untested"
+  },
+  "installable": true,
+  "services": {
+    "app": {
+      "image": "portainer/portainer-ce:2.45.2@sha256:03f94a406496dc84d37b552795fc424ccad8d0d7200353b6a82915f6e8f73ab0",
+      "ports": [
+        {
+          "container": 9443,
+          "protocol": "https",
+          "primary": true,
+          "selfSigned": true
+        }
+      ],
+      "volumes": [
+        {
+          "name": "data",
+          "target": "/data",
+          "kind": "volume",
+          "description": "Portainer's users and settings."
+        }
+      ],
+      "dockerSocket": true,
+      "environment": {}
+    }
+  },
+  "inputs": [
+    {
+      "id": "adminPassword",
+      "type": "password",
+      "label": "Administrator password (user admin)",
+      "help": "Created right after the first start through Portainer's initial-administrator API, so setup cannot time out or be claimed by someone else."
+    }
+  ],
+  "privileges": [
+    {
+      "kind": "docker-socket",
+      "explain": "Portainer mounts the Docker socket. Anyone who can sign in to Portainer controls every container on this PC and, through Docker, the PC itself."
+    }
+  ],
+  "dependencies": [],
+  "security": [
+    "Portainer controls every container on this PC. The administrator is created immediately after the first start (password in credentials.txt), so the 5-minute setup window cannot be used by someone else.",
+    "Never publish it without Cloudflare Access in front of its own login."
+  ],
+  "update": {
+    "strategy": "pinned-digest",
+    "notes": "LTS channel (2.45.2 at the time of curation)."
+  },
+  "web": {
+    "service": "app",
+    "path": "/",
+    "tlsSkipVerify": true,
+    "localPort": 9443,
+    "status": {
+      "port": 9000,
+      "scheme": "http"
+    }
+  },
+  "exposure": {
+    "default": "access",
+    "allowPublic": false,
+    "warning": "Portainer controls Docker on this PC: publish it only behind Cloudflare Access."
+  },
+  "group": "A",
+  "choiceGroup": {
+    "id": "docker-management",
+    "recommended": false,
+    "note": "Alternative to Arcane for people who prefer Portainer's workflows. Optional; installing both is rarely useful."
+  },
+  "resources": {
+    "memoryMB": 150,
+    "diskMB": 300
+  },
+  "postInstall": [
+    {
+      "service": "app",
+      "label": "create the administrator (admin)",
+      "http": {
+        "path": "/api/users/admin/init",
+        "body": "{\"Username\":\"admin\",\"Password\":\"{{input:adminPassword}}\"}",
+        "tokenFromLog": {
+          "pattern": "setup_token=\\S*?([A-Za-z0-9_-]{16,})",
+          "header": "X-Setup-Token"
+        }
+      }
+    }
+  ]
+}

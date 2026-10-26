@@ -1,0 +1,189 @@
+{
+  "schema": 1,
+  "manifestVersion": "2026.10.25",
+  "id": "immich",
+  "name": "Immich",
+  "category": "photos",
+  "group": "D",
+  "description": "Self-hosted photo and video library with mobile backup, faces and smart search. Server, machine learning (optional), Valkey and its own PostgreSQL with vector extensions (immich-db).",
+  "maintainer": "Immich contributors",
+  "license": "AGPL-3.0",
+  "source": {
+    "type": "curated",
+    "url": "https://github.com/immich-app/immich"
+  },
+  "docs": [
+    {
+      "title": "Docker Compose installation",
+      "url": "https://docs.immich.app/install/docker-compose"
+    },
+    {
+      "title": "Requirements",
+      "url": "https://docs.immich.app/install/requirements"
+    },
+    {
+      "title": "Release v3.3.5",
+      "url": "https://github.com/immich-app/immich/releases/tag/v3.3.5"
+    }
+  ],
+  "platforms": {
+    "windows-docker-desktop": "supported",
+    "linux-docker": "untested",
+    "unraid": "untested",
+    "podman": "untested"
+  },
+  "installable": true,
+  "services": {
+    "immich-server": {
+      "image": "ghcr.io/immich-app/immich-server:v3.3.5@sha256:485d546a2e31d6a8b4db8423fcba5c109de8c218d93410af115fd1ccfc4352a6",
+      "role": "app",
+      "label": "Immich server",
+      "ports": [
+        {
+          "container": 2283,
+          "protocol": "http",
+          "primary": true
+        }
+      ],
+      "environment": {
+        "TZ": "{{timezone}}",
+        "DB_HOSTNAME": "immich-db",
+        "DB_USERNAME": "postgres",
+        "DB_PASSWORD": "{{input:dbPassword}}",
+        "DB_DATABASE_NAME": "immich",
+        "REDIS_HOSTNAME": "immich-redis",
+        "IMMICH_MACHINE_LEARNING_ENABLED": "{{input:enableMl}}"
+      },
+      "volumes": [
+        {
+          "name": "library",
+          "target": "/data",
+          "kind": "volume",
+          "input": "libraryFolder",
+          "backup": false,
+          "description": "Your photo and video library (thumbnails add 10-20%)."
+        }
+      ],
+      "dependsOn": [
+        {
+          "service": "immich-redis",
+          "condition": "service_started"
+        },
+        {
+          "service": "immich-db",
+          "condition": "service_started"
+        }
+      ],
+      "resources": {
+        "memoryMB": 1500,
+        "diskMB": 1600
+      }
+    },
+    "immich-machine-learning": {
+      "image": "ghcr.io/immich-app/immich-machine-learning:v3.3.5@sha256:5b28c9352c8374b8a1ed96fbdd8d6755fea6e43510ec43fdf6538aa02ea40f56",
+      "role": "worker",
+      "label": "Machine learning",
+      "when": "enableMl",
+      "volumes": [
+        {
+          "name": "model-cache",
+          "target": "/cache",
+          "kind": "volume",
+          "backup": false,
+          "description": "Downloaded models (re-downloadable)."
+        }
+      ],
+      "resources": {
+        "memoryMB": 2500,
+        "diskMB": 3500
+      }
+    },
+    "immich-redis": {
+      "image": "docker.io/valkey/valkey:9@sha256:c123e3715db63d06d4ad6964884037aa0d5d4d703939b9929954112889708e1d",
+      "role": "cache",
+      "label": "Valkey",
+      "healthcheck": {
+        "test": [
+          "CMD-SHELL",
+          "redis-cli ping | grep -q PONG || exit 1"
+        ]
+      },
+      "resources": {
+        "memoryMB": 50,
+        "diskMB": 60
+      }
+    },
+    "immich-db": {
+      "image": "ghcr.io/immich-app/postgres:14-vectorchord0.4.3-pgvectors0.2.0@sha256:bcf63357191b76a916ae5eb93464d65c07511da41e3bf7a8416db519b40b1c23",
+      "role": "database",
+      "label": "PostgreSQL (vector)",
+      "stateful": true,
+      "environment": {
+        "POSTGRES_PASSWORD": "{{input:dbPassword}}",
+        "POSTGRES_USER": "postgres",
+        "POSTGRES_DB": "immich",
+        "POSTGRES_INITDB_ARGS": "--data-checksums"
+      },
+      "volumes": [
+        {
+          "name": "pgdata",
+          "target": "/var/lib/postgresql/data",
+          "kind": "volume",
+          "description": "Immich database (PostgreSQL 14 with VectorChord/pgvecto.rs). Must be a Docker volume on Windows."
+        }
+      ],
+      "shmSize": "128mb",
+      "resources": {
+        "memoryMB": 1000,
+        "diskMB": 700
+      }
+    }
+  },
+  "inputs": [
+    {
+      "id": "enableMl",
+      "type": "boolean",
+      "label": "Machine learning (faces, smart search)",
+      "default": "true",
+      "help": "Needs about 2.5 GB more memory. Without it Immich still stores and shows photos."
+    },
+    {
+      "id": "libraryFolder",
+      "type": "folder",
+      "label": "Photo library folder (optional)",
+      "help": "Leave empty to keep the library in a Docker volume (fastest on Windows). A folder on another drive also works, more slowly. Never a network share for the database."
+    },
+    {
+      "id": "dbPassword",
+      "type": "generated",
+      "bytes": 24,
+      "label": "Database password"
+    }
+  ],
+  "privileges": [],
+  "dependencies": [
+    "PostgreSQL 14 with VectorChord and pgvecto.rs (Immich's own image)",
+    "Valkey"
+  ],
+  "security": [
+    "Immich recommends at least 6 GB of RAM (8 GB) with machine learning; install it only when that much is free.",
+    "The database stays in a Docker volume: Immich's database does not work on NTFS.",
+    "Create the administrator right after the first start."
+  ],
+  "update": {
+    "strategy": "pinned-digest",
+    "notes": "Always read the release notes: Immich releases can require database migrations. The database image is changed only together with a catalog update."
+  },
+  "web": {
+    "service": "immich-server",
+    "path": "/",
+    "localPort": 2283
+  },
+  "exposure": {
+    "default": "access"
+  },
+  "resources": {
+    "memoryMB": 5050,
+    "diskMB": 5860
+  }
+}

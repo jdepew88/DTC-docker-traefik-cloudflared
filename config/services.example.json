@@ -1,0 +1,85 @@
+{
+  "version": 1,
+  "services": [
+    {
+      "name": "plex",
+      "description": "Plex Media Server on another device on the LAN",
+      "enabled": false,
+      "hostnames": ["plex.example.com"],
+      "pathPrefix": "",
+      "stripPrefix": false,
+      "target": {
+        "type": "lan",
+        "host": "10.10.0.11",
+        "port": 32800,
+        "protocol": "http",
+        "tlsSkipVerify": false
+      },
+      "middlewares": ["default-headers@file"],
+      "cloudflare": {
+        "publish": true,
+        "access": true
+      }
+    },
+    {
+      "name": "grafana",
+      "description": "An app running directly on Windows (listening on 0.0.0.0:3000)",
+      "enabled": false,
+      "hostnames": ["grafana.example.com"],
+      "pathPrefix": "",
+      "stripPrefix": false,
+      "target": {
+        "type": "host",
+        "host": "host.docker.internal",
+        "port": 3000,
+        "protocol": "http",
+        "tlsSkipVerify": false
+      },
+      "middlewares": ["default-headers@file"],
+      "cloudflare": {
+        "publish": true,
+        "access": true
+      }
+    },
+    {
+      "name": "wiki",
+      "description": "A container attached to the shared proxy network",
+      "enabled": false,
+      "hostnames": ["wiki.example.com"],
+      "pathPrefix": "",
+      "stripPrefix": false,
+      "target": {
+        "type": "docker",
+        "host": "wikijs",
+        "port": 3000,
+        "protocol": "http",
+        "tlsSkipVerify": false
+      },
+      "middlewares": ["default-headers@file", "compress@file"],
+      "cloudflare": {
+        "publish": true,
+        "access": false
+      }
+    },
+    {
+      "name": "nas",
+      "description": "A LAN device with a self-signed HTTPS admin UI, local only",
+      "enabled": false,
+      "hostnames": ["nas.example.com"],
+      "pathPrefix": "",
+      "stripPrefix": false,
+      "target": {
+        "type": "lan",
+        "host": "192.168.1.20",
+        "port": 5001,
+        "protocol": "https",
+        "tlsSkipVerify": true
+      },
+      "middlewares": ["default-headers@file"],
+      "cloudflare": {
+        "publish": false,
+        "access": true
+      }
+    }
+  ]
+}

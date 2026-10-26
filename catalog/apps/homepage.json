@@ -1,0 +1,118 @@
+{
+  "schema": 1,
+  "manifestVersion": "2026.10.21",
+  "id": "homepage",
+  "name": "Homepage",
+  "category": "dashboard",
+  "group": "A",
+  "description": "A configurable start page with links to your apps and their status. The first configuration lists the apps installed by this manager; scripts\\Update-HomepageConfig.ps1 refreshes the generated part and keeps your own edits.",
+  "maintainer": "gethomepage contributors",
+  "license": "GPL-3.0",
+  "source": {
+    "type": "curated",
+    "url": "https://github.com/gethomepage/homepage"
+  },
+  "docs": [
+    {
+      "title": "Homepage documentation",
+      "url": "https://gethomepage.dev/"
+    },
+    {
+      "title": "Docker installation and allowed hosts",
+      "url": "https://gethomepage.dev/installation/docker/"
+    },
+    {
+      "title": "Services (siteMonitor)",
+      "url": "https://gethomepage.dev/configs/services/"
+    }
+  ],
+  "platforms": {
+    "windows-docker-desktop": "supported",
+    "linux-docker": "untested",
+    "unraid": "untested",
+    "podman": "untested"
+  },
+  "installable": true,
+  "services": {
+    "app": {
+      "image": "ghcr.io/gethomepage/homepage:v2.6.0@sha256:3e38fe788223cb46a3ce1f046ef11667b40f7707fdca0dcbfa3f86c5c42bf1e8",
+      "ports": [
+        {
+          "container": 3000,
+          "protocol": "http",
+          "primary": true
+        }
+      ],
+      "environment": {
+        "HOMEPAGE_ALLOWED_HOSTS": "localhost:{{localPort}},127.0.0.1:{{localPort}},{{service:app}}:3000,{{input:publicHost}}",
+        "TZ": "{{timezone}}"
+      },
+      "volumes": [
+        {
+          "name": "config",
+          "target": "/app/config",
+          "kind": "project",
+          "source": "config",
+          "description": "services.yaml, settings.yaml and the other YAML files (edit them here)."
+        }
+      ],
+      "resources": {
+        "memoryMB": 150,
+        "diskMB": 300
+      }
+    }
+  },
+  "inputs": [
+    {
+      "id": "publicHost",
+      "type": "text",
+      "label": "Public hostname (optional)",
+      "pattern": "^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\\.)+[a-z]{2,63}$",
+      "help": "If you will publish Homepage (e.g. home.example.com), enter it so Homepage accepts requests for it."
+    }
+  ],
+  "files": [
+    {
+      "path": "config/settings.yaml",
+      "content": "# Homepage settings, generated once by the Deployment Manager; your edits are kept.\ntitle: Home lab\ntheme: dark\ncolor: slate\nheaderStyle: boxed\n"
+    },
+    {
+      "path": "config/services.yaml",
+      "content": "# Your own groups and cards: add them outside the generated block, which scripts\\Update-HomepageConfig.ps1 updates.\n# Status checks (siteMonitor) use the shared Docker network; no Docker socket is used.\n# BEGIN Deployment Manager (generated: this block is replaced on every update; edit outside it)\n{{installedApps}}# END Deployment Manager\n"
+    },
+    {
+      "path": "config/widgets.yaml",
+      "content": "- greeting:\n    text_size: xl\n    text: Home lab\n- datetime:\n    format:\n      dateStyle: long\n      timeStyle: short\n"
+    },
+    {
+      "path": "config/bookmarks.yaml",
+      "content": "[]\n"
+    },
+    {
+      "path": "config/docker.yaml",
+      "content": "# Docker integration is off on purpose (no Docker socket). See https://gethomepage.dev/configs/docker/ for a read-only socket proxy.\n"
+    }
+  ],
+  "privileges": [],
+  "dependencies": [],
+  "security": [
+    "No Docker socket and no API keys: the page shows links and HTTP status only, never Docker or Traefik controls.",
+    "Homepage has no login unless you enable it; publish it behind Cloudflare Access."
+  ],
+  "update": {
+    "strategy": "pinned-digest",
+    "notes": "Configuration files in the project folder are kept across updates."
+  },
+  "web": {
+    "service": "app",
+    "path": "/",
+    "localPort": 3010
+  },
+  "exposure": {
+    "default": "access"
+  },
+  "resources": {
+    "memoryMB": 150,
+    "diskMB": 300
+  }
+}

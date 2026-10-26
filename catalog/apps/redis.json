@@ -1,0 +1,38 @@
+{
+  "schema": 1,
+  "manifestVersion": "2026.10.25",
+  "id": "redis",
+  "name": "Redis / Valkey",
+  "category": "tools",
+  "group": "B",
+  "availability": "reference",
+  "description": "In-memory cache. Added only to apps that need one (Immich, Dispatcharr modular), as Valkey (BSD-licensed, Redis-compatible).",
+  "maintainer": "Valkey project (Linux Foundation)",
+  "license": "BSD-3-Clause (Valkey); Redis 7.4+ is RSALv2/SSPLv1, 8.0+ also AGPLv3",
+  "source": {
+    "type": "curated",
+    "url": "https://github.com/valkey-io/valkey"
+  },
+  "docs": [
+    {
+      "title": "Valkey",
+      "url": "https://valkey.io/"
+    },
+    {
+      "title": "Redis licensing",
+      "url": "https://redis.io/legal/licenses/"
+    }
+  ],
+  "platforms": {
+    "windows-docker-desktop": "supported",
+    "linux-docker": "untested",
+    "unraid": "untested",
+    "podman": "untested"
+  },
+  "installable": false,
+  "installNote": "Installed only inside the apps that need it, on their private network. authentik no longer uses Redis (removed in 2025.10), so none is added there.",
+  "imageReference": "valkey/valkey:9.1.2-alpine@sha256:48332870af354a799964c0012ae1194a0bf2bf894eb508f945810596dc2d8d11",
+  "exposure": {
+    "default": "local"
+  }
+}

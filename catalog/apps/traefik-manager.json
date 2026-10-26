@@ -1,0 +1,122 @@
+{
+  "schema": 1,
+  "manifestVersion": "2026.10.21",
+  "id": "traefik-manager",
+  "name": "Traefik Manager",
+  "category": "management",
+  "group": "A",
+  "description": "Web interface to inspect the existing Traefik (routers, services, middlewares, health) and to draft routes. Installed read-only: it reads Traefik's API, and the routes it writes stay in its own folder until an ownership plan is approved.",
+  "maintainer": "chr0nzz",
+  "license": "GPL-3.0",
+  "source": {
+    "type": "curated",
+    "url": "https://github.com/chr0nzz/traefik-manager"
+  },
+  "docs": [
+    {
+      "title": "Traefik Manager documentation",
+      "url": "https://traefik-manager.xyzlab.dev/"
+    },
+    {
+      "title": "Docker install",
+      "url": "https://traefik-manager.xyzlab.dev/docker.html"
+    },
+    {
+      "title": "Security",
+      "url": "https://github.com/chr0nzz/traefik-manager/blob/main/docs/security.md"
+    }
+  ],
+  "platforms": {
+    "windows-docker-desktop": "supported",
+    "linux-docker": "untested",
+    "unraid": "untested",
+    "podman": "untested"
+  },
+  "installable": true,
+  "services": {
+    "app": {
+      "image": "ghcr.io/chr0nzz/traefik-manager:1.15.4@sha256:db016c04be30b76afbf259c5ca4c3667d861805404bc2d572f9ad326e5bf96c1",
+      "ports": [
+        {
+          "container": 5000,
+          "protocol": "http",
+          "primary": true
+        }
+      ],
+      "environment": {
+        "TRAEFIK_API_URL": "http://{{traefikContainer}}:8080",
+        "CONFIG_DIR": "/app/config/routes",
+        "COOKIE_SECURE": "false",
+        "CERT_RESOLVER": "none",
+        "DOMAINS": "{{domains}}",
+        "TZ": "{{timezone}}"
+      },
+      "volumes": [
+        {
+          "name": "config",
+          "target": "/app/config",
+          "kind": "project",
+          "source": "config",
+          "description": "Its settings and the routes it manages (config/routes); not loaded by the live Traefik."
+        },
+        {
+          "name": "backups",
+          "target": "/app/backups",
+          "kind": "project",
+          "source": "backups",
+          "description": "Its own backups before every change."
+        }
+      ],
+      "resources": {
+        "memoryMB": 150,
+        "diskMB": 250
+      }
+    }
+  },
+  "inputs": [
+    {
+      "id": "adminPassword",
+      "type": "password",
+      "label": "Administrator password",
+      "help": "Set with Traefik Manager's own reset command after the first start; change it later in its settings."
+    }
+  ],
+  "postInstall": [
+    {
+      "service": "app",
+      "label": "set the administrator password",
+      "command": [
+        "flask",
+        "reset-password",
+        "--password",
+        "{{input:adminPassword}}"
+      ]
+    }
+  ],
+  "privileges": [],
+  "dependencies": [
+    "The existing Traefik's API on the shared network (read-only)"
+  ],
+  "security": [
+    "Read-only towards the live proxy: no Docker socket, no access to the live Traefik's dynamic folder or static configuration. Routes drafted in Traefik Manager are saved in its own config/routes folder and take effect only if that folder is later given to Traefik (an explicit ownership decision).",
+    "It reads Traefik's API at http://<traefik container>:8080 over the shared network; the API has no write operations.",
+    "Never publish it without Cloudflare Access (it is an administration interface). The first sign-in runs its setup wizard."
+  ],
+  "update": {
+    "strategy": "pinned-digest",
+    "notes": "Its settings and route drafts are in the project folder and survive updates."
+  },
+  "web": {
+    "service": "app",
+    "path": "/",
+    "localPort": 5000
+  },
+  "exposure": {
+    "default": "access",
+    "allowPublic": false
+  },
+  "resources": {
+    "memoryMB": 150,
+    "diskMB": 250
+  }
+}

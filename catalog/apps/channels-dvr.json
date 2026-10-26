@@ -1,0 +1,102 @@
+{
+  "schema": 1,
+  "manifestVersion": "2026.10.21",
+  "id": "channels-dvr",
+  "name": "Channels DVR Server",
+  "category": "media",
+  "group": "C",
+  "description": "DVR server for the Channels app (subscription required). On Windows the native installer is recommended; the container has limitations on Docker Desktop.",
+  "maintainer": "Fancy Bits, LLC",
+  "license": "Proprietary (Channels DVR subscription required)",
+  "source": {
+    "type": "curated",
+    "url": "https://hub.docker.com/r/fancybits/channels-dvr"
+  },
+  "docs": [
+    {
+      "title": "Docker image (official)",
+      "url": "https://hub.docker.com/r/fancybits/channels-dvr"
+    },
+    {
+      "title": "Channels DVR Server (native Windows)",
+      "url": "https://getchannels.com/dvr-server/"
+    },
+    {
+      "title": "Subscription",
+      "url": "https://getchannels.com/docs/getting-started/quick-start-guide/subscription/"
+    }
+  ],
+  "platforms": {
+    "windows-docker-desktop": "limited",
+    "linux-docker": "untested",
+    "unraid": "untested",
+    "podman": "untested"
+  },
+  "installable": true,
+  "services": {
+    "app": {
+      "image": "fancybits/channels-dvr:latest@sha256:438e362cf739f4d002ecdcc17baee6917ecd22a8d9d4aa044288042c1039d591",
+      "ports": [
+        {
+          "container": 8089,
+          "protocol": "http",
+          "primary": true
+        }
+      ],
+      "environment": {
+        "TZ": "{{timezone}}"
+      },
+      "volumes": [
+        {
+          "name": "config",
+          "target": "/channels-dvr",
+          "kind": "volume",
+          "description": "Server data (it updates itself inside this volume)."
+        },
+        {
+          "name": "recordings",
+          "target": "/shares/DVR",
+          "kind": "folder",
+          "input": "recordingsFolder",
+          "description": "Your recordings."
+        }
+      ],
+      "stateful": true
+    }
+  },
+  "inputs": [
+    {
+      "id": "recordingsFolder",
+      "type": "folder",
+      "label": "Recordings folder",
+      "required": true,
+      "help": "An existing folder with enough space, e.g. D:\\DVR."
+    }
+  ],
+  "privileges": [],
+  "dependencies": [],
+  "security": [
+    "Docker Desktop has no host networking for Bonjour, no /dev/dri transcoding and no LAN broadcast: Channels apps must connect by IP address and HDHomeRun tuners must be added by IP. The native Windows server has none of these limits.",
+    "The server updates itself inside its volume, so the image digest does not pin the server version.",
+    "Requires a Channels DVR subscription."
+  ],
+  "update": {
+    "strategy": "self-updating",
+    "notes": "Channels DVR updates itself; image updates only change the launcher."
+  },
+  "alternatives": [
+    "Native Windows installer: https://getchannels.com/dvr-server/"
+  ],
+  "web": {
+    "service": "app",
+    "path": "/",
+    "localPort": 8089
+  },
+  "exposure": {
+    "default": "local"
+  },
+  "resources": {
+    "memoryMB": 500,
+    "diskMB": 600
+  }
+}

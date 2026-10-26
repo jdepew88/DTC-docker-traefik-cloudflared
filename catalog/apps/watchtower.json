@@ -1,0 +1,46 @@
+{
+  "schema": 1,
+  "manifestVersion": "2026.10.25",
+  "id": "watchtower",
+  "name": "Watchtower",
+  "category": "updates",
+  "group": "E",
+  "availability": "retired",
+  "retired": {
+    "date": "2026-10-25",
+    "note": "No longer offered: archived by its maintainers and incompatible with current Docker; unattended updates are not recommended. Existing Watchtower containers are still recognized; nothing is removed.",
+    "replacement": [
+      "whats-up-docker"
+    ]
+  },
+  "deprecated": true,
+  "deprecationNote": "Archived by its maintainers (December 2025); last release v1.7.1 (2023). It fails against current Docker Engines (\"client version 1.25 is too old\") and needs full Docker socket access to recreate containers unattended.",
+  "description": "Legacy automatic container updater. Listed for reference only: unattended updates are disabled in this manager.",
+  "maintainer": "containrrr (archived)",
+  "license": "Apache-2.0",
+  "source": {
+    "type": "curated",
+    "url": "https://github.com/containrrr/watchtower"
+  },
+  "docs": [
+    {
+      "title": "Farewell announcement",
+      "url": "https://github.com/containrrr/watchtower/discussions/2135"
+    }
+  ],
+  "platforms": {
+    "windows-docker-desktop": "supported",
+    "linux-docker": "untested",
+    "unraid": "untested",
+    "podman": "untested"
+  },
+  "installable": false,
+  "installNote": "Not installable: unmaintained and incompatible with current Docker. Use What's Up Docker (notifications) and Installed apps > Updates (backup, preview, confirmation) instead.",
+  "imageReference": "containrrr/watchtower:1.7.1@sha256:6dd50763bbd632a83cb154d5451700530d1e44200b268a4e9488fefdfcf2b038",
+  "alternatives": [
+    "whats-up-docker"
+  ],
+  "exposure": {
+    "default": "local"
+  }
+}

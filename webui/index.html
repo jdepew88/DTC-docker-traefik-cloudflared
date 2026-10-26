@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <title>Deployment Manager</title>
+  <link rel="icon" href="/icon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/app.css">
+  <script src="/logic.js" defer></script>
+  <script src="/ui.js" defer></script>
+  <script src="/setup.js" defer></script>
+  <script src="/pages.js" defer></script>
+  <script src="/backend.js" defer></script>
+  <script src="/brands.js" defer></script>
+  <script src="/explorer.js" defer></script>
+  <script src="/discover.js" defer></script>
+  <script src="/catalog.js" defer></script>
+  <script src="/deployments.js" defer></script>
+  <script src="/credentials.js" defer></script>
+  <script src="/identity.js" defer></script>
+  <script src="/routing.js" defer></script>
+  <script src="/projects.js" defer></script>
+  <script src="/app.js" defer></script>
+</head>
+<body data-level="intermediate">
+  <a class="skip-link" href="#main">Skip to content</a>
+  <header class="topbar">
+    <a class="brand" href="#" id="brand-link">
+      <img src="/icon.svg" alt="">
+      <span>Deployment Manager <small>Traefik + Cloudflare</small></span>
+    </a>
+    <div class="spacer"></div>
+    <a class="instance-pill" id="instance-pill" href="#projects" aria-live="polite" title="Switch deployment"><span class="dot"></span>Loading…</a>
+    <div class="segmented" role="radiogroup" aria-label="Detail level" id="level-switch">
+      <label title="Essential settings and plain explanations"><input type="radio" name="detail-level" value="beginner"><span>Beginner</span></label>
+      <label title="Adds ports, addresses and summaries"><input type="radio" name="detail-level" value="intermediate"><span>Intermediate</span></label>
+      <label title="Adds Docker networking, DNS records and Traefik details"><input type="radio" name="detail-level" value="advanced"><span>Advanced</span></label>
+      <label title="Everything: generated files, commands, raw output"><input type="radio" name="detail-level" value="expert"><span>Expert</span></label>
+    </div>
+  </header>
+
+  <div id="signed-out" class="callout warn" hidden>
+    <h2>Not signed in</h2>
+    <p>This page only works with the one-time link that <code>webui.ps1</code> printed in its PowerShell window
+      (it looks like <code>http://127.0.0.1:8190/?k=...</code>). Open that link in this browser. If the server was
+      restarted, use the new link.</p>
+  </div>
+
+  <div class="layout" id="layout">
+    <nav class="rail" id="rail" aria-label="Main"></nav>
+    <div>
+      <nav class="mobile-nav" id="mobile-nav" aria-label="Main (compact)"></nav>
+      <main id="main" tabindex="-1"></main>
+    </div>
+  </div>
+
+  <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+
+  <dialog id="plan-dialog" aria-labelledby="plan-title">
+    <form method="dialog" class="dialog-body">
+      <header class="dialog-head">
+        <h2 id="plan-title">Review changes</h2>
+        <button type="button" class="icon-btn" data-close aria-label="Close">&times;</button>
+      </header>
+      <div id="plan-content" class="dialog-scroll"></div>
+      <footer class="dialog-foot" id="plan-foot"></footer>
+    </form>
+  </dialog>
+
+  <dialog id="confirm-dialog" aria-labelledby="confirm-title">
+    <form method="dialog" class="dialog-body">
+      <header class="dialog-head">
+        <h2 id="confirm-title">Confirm</h2>
+        <button type="button" class="icon-btn" data-close aria-label="Close">&times;</button>
+      </header>
+      <div id="confirm-content" class="dialog-scroll"></div>
+      <footer class="dialog-foot">
+        <button type="button" class="btn" data-close>Cancel</button>
+        <button type="button" class="btn primary" id="confirm-ok">Confirm</button>
+      </footer>
+    </form>
+  </dialog>
+</body>
+</html>

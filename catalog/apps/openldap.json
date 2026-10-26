@@ -1,0 +1,40 @@
+{
+  "schema": 1,
+  "manifestVersion": "2026.10.21",
+  "id": "openldap",
+  "name": "OpenLDAP",
+  "category": "authentication",
+  "group": "B",
+  "description": "Full OpenLDAP server. Listed for reference: there is currently no free, maintained, stable OpenLDAP container image.",
+  "maintainer": "osixia (container), OpenLDAP Foundation (server)",
+  "license": "MIT (container), OpenLDAP Public License (server)",
+  "source": {
+    "type": "curated",
+    "url": "https://github.com/osixia/container-openldap"
+  },
+  "docs": [
+    {
+      "title": "osixia OpenLDAP container",
+      "url": "https://github.com/osixia/container-openldap"
+    },
+    {
+      "title": "Bitnami catalogue change",
+      "url": "https://github.com/bitnami/containers"
+    }
+  ],
+  "platforms": {
+    "windows-docker-desktop": "supported",
+    "linux-docker": "untested",
+    "unraid": "untested",
+    "podman": "untested"
+  },
+  "installable": false,
+  "installNote": "osixia/openldap 1.5.0 (2021) is unmaintained and its revived v2 line (2.6.15-beta) is a beta; free Bitnami OpenLDAP images are no longer published. Use LLDAP as the directory for now; this entry is re-checked when a stable OpenLDAP 2.x image ships.",
+  "imageReference": "osixia/openldap:2.6.15-beta@sha256:b23155ca4217ea928f2fec86453aabf87168a221150f26bcdcef7f3a3c84d35d",
+  "alternatives": [
+    "lldap"
+  ],
+  "exposure": {
+    "default": "local"
+  }
+}

@@ -1,0 +1,27 @@
+# EXAMPLE: routing a Compose app with Docker labels instead of config\services.json.
+#
+# The service registry (services.ps1 / web UI) is the recommended way: it validates, previews, backs up and
+# can roll back every change. Labels are an alternative for apps whose Compose file you own; Traefik picks
+# them up live through the read-only socket proxy.
+#
+# Attach only the app's web-facing service to the shared proxy network (not its database), and use the port
+# the app listens on INSIDE the container. No `ports:` mapping is needed for Traefik.
+services:
+  myapp:
+    image: example/myapp:1.2.3
+    networks: [default, proxy]
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.myapp.rule=Host(`myapp.example.com`)
+      - traefik.http.routers.myapp.entrypoints=web
+      - traefik.http.routers.myapp.middlewares=default-headers@file
+      - traefik.http.services.myapp.loadbalancer.server.port=8000
+
+networks:
+  proxy:
+    name: proxy          # PROXY_NETWORK in the proxy's .env
+    external: true
+
+# For a container started with `docker run`, attach it once (live, no restart) and register it:
+#   docker network connect proxy <container>
+#   .\services.ps1 add -Name myapp -Hostname myapp.example.com -TargetType docker -TargetHost <container> -Port 8000 -Apply

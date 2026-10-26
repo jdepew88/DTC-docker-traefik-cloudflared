@@ -1,17 +1,19 @@
 #requires -version 5.1
 <#
 .SYNOPSIS
-  Live semantic tests for the Traefik + cloudflared stack (docker compose config alone is not enough).
+  Live semantic tests for one running Traefik + cloudflared instance (docker compose config alone is not enough).
 
 .DESCRIPTION
-  Starts the disposable whoami echo backend (profile `test`), runs the checks below, then removes it.
+  Starts the disposable whoami echo backend (profile `test`), routes it with a file-provider route rendered by
+  the same generator services.ps1 uses (written as traefik\dynamic\zz-test-whoami.yml, never into
+  config\services.json), runs the checks below, then removes both.
     - Compose config, Traefik health and version, no ERR log lines, no unexpected socket-proxy denials
     - Socket proxy: allowed read-only endpoints work, image listing and POST are denied, 2375 not published
-    - Container-name DNS over the shared `proxy` network
-    - Host-based routing, 404 for unknown hosts, dashboard only on loopback
+    - Container-name DNS over the shared proxy network
+    - Generated route: host routing, path-prefix + strip-prefix, 404 for unknown hosts, dashboard only on loopback
     - X-Forwarded-* trusted only from the cloudflared address; spoofing from elsewhere is overwritten
     - WebSocket upgrade and a 25 MB streamed upload
-    - OmniVoice routes (if traefik\dynamic\omnivoice.yml exists)
+    - Every enabled service in config\services.json has a loaded, enabled router (backend reachability is a warning)
     - cloudflared connector health (if running); end-to-end through Cloudflare with -PublicTestHost
 
 .PARAMETER PublicTestHost
@@ -31,14 +33,25 @@ param(
 
 $ErrorActionPreference = 'Stop'
 # Resolved here: $PSScriptRoot/$MyInvocation are not populated in param() defaults on PowerShell 5.1.
-if (-not $ProjectPath) { $ProjectPath = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path) }
+# Code comes from this script's own package; -ProjectPath only selects the instance under test.
+$toolRoot = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
+if (-not $ProjectPath) { $ProjectPath = $toolRoot }
+$ProjectPath = [IO.Path]::GetFullPath($ProjectPath)
 Set-StrictMode -Version 2.0
+Import-Module (Join-Path $toolRoot 'lib\TraefikProxy.psm1') -Force
+if (-not (Test-Path -LiteralPath (Join-Path $ProjectPath 'compose.yaml'))) {
+  Write-Host "Not installed: no compose.yaml in $ProjectPath. Install first with .\install.ps1 -Start." -ForegroundColor Red
+  exit 1
+}
 
-$TraefikImage = 'traefik:v3.7.15'
+$settings = Get-StackSettings -InstallPath $ProjectPath
 $ExpectedVersion = '3.7.15'
-$CloudflaredIp = '172.31.250.10'
-$TunnelNetwork = 'traefik-cloudflared_tunnel'
+$TraefikC = $settings.TraefikContainer
+$SocketC = $settings.SocketProxyContainer
+$CloudflaredC = $settings.CloudflaredContainer
+$WhoamiC = $settings.WhoamiContainer
 $WhoamiHost = 'whoami.localhost'
+$TestRouteFile = Join-Path $settings.DynamicDir 'zz-test-whoami.yml'
 $script:Results = New-Object System.Collections.ArrayList
 
 function Invoke-Native {
@@ -65,15 +78,9 @@ function Test-Condition([string]$Name, [bool]$Condition, [string]$Detail) {
   if ($Condition) { Add-Result 'PASS' $Name $Detail } else { Add-Result 'FAIL' $Name $Detail }
 }
 
-$composeBase = @('docker', 'compose', '--project-directory', $ProjectPath, '-f', (Join-Path $ProjectPath 'compose.yaml'))
-$dotEnv = @{}
-$envFile = Join-Path $ProjectPath '.env'
-if (Test-Path -LiteralPath $envFile) {
-  foreach ($line in Get-Content -LiteralPath $envFile) { if ($line -match '^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*?)\s*$') { $dotEnv[$Matches[1]] = $Matches[2] } }
-}
-$httpPort = 8180; if ($dotEnv.ContainsKey('TRAEFIK_HTTP_PORT') -and $dotEnv['TRAEFIK_HTTP_PORT']) { $httpPort = [int]$dotEnv['TRAEFIK_HTTP_PORT'] }
-$dashPort = 8181; if ($dotEnv.ContainsKey('TRAEFIK_DASHBOARD_PORT') -and $dotEnv['TRAEFIK_DASHBOARD_PORT']) { $dashPort = [int]$dotEnv['TRAEFIK_DASHBOARD_PORT'] }
-$base = "http://127.0.0.1:$httpPort"
+$composeBase = @('docker') + (Get-ComposeArgs -Settings $settings)
+$base = "http://127.0.0.1:$($settings.HttpPort)"
+$dashPort = $settings.DashboardPort
 
 function Invoke-Curl {
   # curl.exe ships with Windows 10/11; unlike Invoke-WebRequest on 5.1 it can set the Host header.
@@ -81,49 +88,89 @@ function Invoke-Curl {
   return $r
 }
 
-Write-Host "Testing project at $ProjectPath" -ForegroundColor Cyan
+# Renders the test route with the production generator and makes Traefik load it.
+function Set-TestRoute([string[]]$Hostnames) {
+  $whoami = New-ServiceDefinition -Name 'whoami-test' -Hostname $Hostnames -TargetType docker -TargetHost $WhoamiC -Port 80 -Description 'Disposable test route (tests\Test-Stack.ps1)'
+  $prefixed = New-ServiceDefinition -Name 'whoami-test-prefix' -Hostname $Hostnames[0] -TargetType docker -TargetHost $WhoamiC -Port 80 -PathPrefix '/prefixed' -StripPrefix
+  # One file-provider document may hold only one http: block, so the two generated routes are merged.
+  $yaml = Merge-RouteYaml (ConvertTo-TraefikRouteYaml $whoami) (ConvertTo-TraefikRouteYaml $prefixed)
+  Write-TextFileAtomic $TestRouteFile $yaml
+  $null = Sync-TraefikDynamic $settings
+}
+
+# Merges two generated single-service files (same section layout) into one file-provider document.
+function Merge-RouteYaml([string]$A, [string]$B) {
+  $sections = [ordered]@{ routers = @(); middlewares = @(); services = @(); serversTransports = @() }
+  foreach ($doc in @($A, $B)) {
+    $current = $null
+    foreach ($line in ($doc -split "`n")) {
+      if ($line -match '^  (routers|middlewares|services|serversTransports):\s*$') { $current = $Matches[1]; continue }
+      if ($line -match '^\S' -or $line -eq '') { $current = $null; continue }
+      if ($current) { $sections[$current] += $line }
+    }
+  }
+  $out = @('# Disposable test routes written by tests\Test-Stack.ps1; removed when the tests finish.', 'http:')
+  foreach ($key in $sections.Keys) { if ($sections[$key].Count -gt 0) { $out += "  ${key}:"; $out += $sections[$key] } }
+  return ($out -join "`n") + "`n"
+}
+
+Write-Host "Testing instance '$($settings.StackName)' at $ProjectPath" -ForegroundColor Cyan
 
 # --- Static / container state -------------------------------------------------------------------
 $cfg = Invoke-Native @($composeBase + @('config', '--quiet'))
 Test-Condition 'compose config' ($cfg.ExitCode -eq 0) $cfg.Text
 
-$health = Invoke-Native docker inspect traefik --format '{{.State.Health.Status}}'
+$health = Invoke-Native docker inspect $TraefikC --format '{{.State.Health.Status}}'
 Test-Condition 'traefik healthy' ($health.Text.Trim() -eq 'healthy') $health.Text.Trim()
-if ($health.Text.Trim() -ne 'healthy') { Write-Host 'Traefik is not running/healthy; start it with docker compose up -d' -ForegroundColor Red; exit 1 }
+if ($health.Text.Trim() -ne 'healthy') { Write-Host "Traefik ($TraefikC) is not running/healthy; start it with .\install.ps1 -Start" -ForegroundColor Red; exit 1 }
 
 $version = Invoke-Curl "http://127.0.0.1:$dashPort/api/version"
 Test-Condition 'traefik version' ($version.Text -match ('"Version":"' + [regex]::Escape($ExpectedVersion) + '"')) $version.Text
 
-$publishedTraefik = (Invoke-Native docker port traefik).Text
+$publishedTraefik = (Invoke-Native docker port $TraefikC).Text
 $loopbackOnly = -not ($publishedTraefik -split "`n" | Where-Object { $_ -and $_ -notmatch '-> 127\.0\.0\.1:' })
 Test-Condition 'traefik ports loopback-only' $loopbackOnly ($publishedTraefik -replace "`n", '; ')
 
+$entry = (Invoke-Curl "http://127.0.0.1:$dashPort/api/entrypoints/web").Text
+Test-Condition 'static config from .env (trusted cloudflared IP)' ($entry -match [regex]::Escape($settings.CloudflaredIp + '/32')) $settings.CloudflaredIp
+Test-Condition 'request hardening active (aliasHeadersStrategy)' ($entry -match '"aliasHeadersStrategy":"delete"') ''
+$overview = (Invoke-Curl "http://127.0.0.1:$dashPort/api/overview").Text
+Test-Condition 'docker and file providers enabled' ($overview -match '"providers":\[[^\]]*"Docker"' -and $overview -match '"providers":\[[^\]]*"File"') (([regex]::Match($overview, '"providers":\[[^\]]*\]')).Value)
+
 # --- Socket proxy --------------------------------------------------------------------------------
-$socketPorts = (Invoke-Native docker port socket-proxy).Text.Trim()
-Test-Condition 'socket-proxy not published' ($socketPorts -eq '') "docker port socket-proxy: '$socketPorts'"
-$allowed = Invoke-Native docker exec traefik wget -q -O- http://socket-proxy:2375/version
+$socketPorts = (Invoke-Native docker port $SocketC).Text.Trim()
+Test-Condition 'socket-proxy not published' ($socketPorts -eq '') "docker port ${SocketC}: '$socketPorts'"
+$allowed = Invoke-Native docker exec $TraefikC wget -q -O- http://socket-proxy:2375/version
 Test-Condition 'socket-proxy allows /version' ($allowed.ExitCode -eq 0 -and $allowed.Text -match '"ApiVersion"') ''
-$deniedImages = Invoke-Native docker exec traefik wget -q -O- http://socket-proxy:2375/images/json
+$deniedImages = Invoke-Native docker exec $TraefikC wget -q -O- http://socket-proxy:2375/images/json
 Test-Condition 'socket-proxy denies /images' ($deniedImages.Text -match '403') $deniedImages.Text
-$deniedPost = Invoke-Native docker exec traefik wget -q -O- --post-data '{}' http://socket-proxy:2375/containers/create
+$deniedPost = Invoke-Native docker exec $TraefikC wget -q -O- --post-data '{}' http://socket-proxy:2375/containers/create
 Test-Condition 'socket-proxy denies POST' ($deniedPost.Text -match '403') $deniedPost.Text
 
 # --- Echo backend ----------------------------------------------------------------------------------
 $up = Invoke-Native @($composeBase + @('--profile', 'test', 'up', '-d', 'whoami'))
-Test-Condition 'whoami started' ($up.ExitCode -eq 0) ''
-$deadline = (Get-Date).AddSeconds(30)
-do {
-  Start-Sleep -Milliseconds 500
-  $routers = (Invoke-Curl "http://127.0.0.1:$dashPort/api/http/routers").Text
-} while ($routers -notmatch 'whoami-test@docker' -and (Get-Date) -lt $deadline)
-Test-Condition 'docker provider discovered whoami' ($routers -match 'whoami-test@docker') ''
+Test-Condition 'whoami started' ($up.ExitCode -eq 0) $(if ($up.ExitCode -ne 0) { $up.Text } else { '' })
 
 try {
-  $dns = Invoke-Native docker exec traefik wget -q -O- http://whoami-test/
-  Test-Condition 'container-name DNS on proxy network' ($dns.Text -match 'Hostname:') 'traefik -> http://whoami-test/'
+  Set-TestRoute @($WhoamiHost)
+  $deadline = (Get-Date).AddSeconds(30)
+  do {
+    Start-Sleep -Milliseconds 500
+    $routers = (Invoke-Curl "http://127.0.0.1:$dashPort/api/http/routers").Text
+  } while ($routers -notmatch 'svc-whoami-test-prefix@file' -and (Get-Date) -lt $deadline)
+  Test-Condition 'file provider loaded generated route' ($routers -match 'svc-whoami-test@file' -and $routers -match 'svc-whoami-test-prefix@file') ''
+
+  $dns = Invoke-Native docker exec $TraefikC wget -q -O- "http://$WhoamiC/"
+  Test-Condition 'container-name DNS on proxy network' ($dns.Text -match 'Hostname:') "traefik -> http://$WhoamiC/"
 
   $routed = Invoke-Curl -H "Host: $WhoamiHost" "$base/"
-  Test-Condition 'host routing' ($routed.Text -match 'Hostname:' -and $routed.Text -match "Host: $WhoamiHost") "Host: $WhoamiHost"
+  Test-Condition 'host routing (generated docker target)' ($routed.Text -match 'Hostname:' -and $routed.Text -match "Host: $WhoamiHost") "Host: $WhoamiHost"
+
+  $prefixed = Invoke-Curl -H "Host: $WhoamiHost" "$base/prefixed/echo-path"
+  Test-Condition 'path prefix + strip prefix' ($prefixed.Text -match 'GET /echo-path HTTP') ((($prefixed.Text -split "`n") | Where-Object { $_ -match '^GET ' }) -join '')
+
+  $headers = Invoke-Curl -D - -o NUL -H "Host: $WhoamiHost" "$base/"
+  Test-Condition 'default-headers middleware applied' ($headers.Text -match '(?im)^X-Content-Type-Options: nosniff' -and $headers.Text -match '(?im)^X-Frame-Options: DENY') ''
 
   $unknown = Invoke-Curl -o NUL -w '%{http_code}' -H 'Host: nothing.invalid' "$base/"
   Test-Condition 'unknown host -> 404' ($unknown.Text.Trim() -eq '404') $unknown.Text
@@ -135,11 +182,11 @@ try {
   $spoof = Invoke-Curl -H "Host: $WhoamiHost" -H 'X-Forwarded-Proto: https' -H 'X-Forwarded-For: 203.0.113.9' "$base/"
   Test-Condition 'untrusted X-Forwarded-* overwritten' ($spoof.Text -match 'X-Forwarded-Proto: http\r?\n' -and $spoof.Text -notmatch '203\.0\.113\.9') 'loopback client sent X-Forwarded-Proto: https'
 
-  $cfRunning = (Invoke-Native docker inspect cloudflared --format '{{.State.Running}}').Text.Trim() -eq 'true'
+  $cfRunning = Test-ContainerRunning $CloudflaredC
   if ($cfRunning) {
-    Add-Result 'SKIP' 'trusted X-Forwarded-* from cloudflared IP' "cloudflared holds $CloudflaredIp; covered by -PublicTestHost"
+    Add-Result 'SKIP' 'trusted X-Forwarded-* from cloudflared IP' "cloudflared holds $($settings.CloudflaredIp); covered by -PublicTestHost"
   } else {
-    $trusted = Invoke-Native docker run --rm --network $TunnelNetwork --ip $CloudflaredIp --entrypoint wget $TraefikImage -q -O- --header "Host: $WhoamiHost" --header 'X-Forwarded-Proto: https' http://traefik/
+    $trusted = Invoke-Native docker run --rm --network $settings.TunnelNetwork --ip $settings.CloudflaredIp --entrypoint wget $settings.TraefikImage -q -O- --header "Host: $WhoamiHost" --header 'X-Forwarded-Proto: https' http://traefik/
     Test-Condition 'trusted X-Forwarded-* from cloudflared IP' ($trusted.Text -match 'X-Forwarded-Proto: https') "tunnel network -> http://traefik/ (also proves DNS on tunnel network)"
   }
 
@@ -157,19 +204,17 @@ try {
 
   # --- Tunnel ------------------------------------------------------------------------------------
   if ($cfRunning) {
-    $cfHealth = (Invoke-Native docker inspect cloudflared --format '{{.State.Health.Status}}').Text.Trim()
+    $cfHealth = (Invoke-Native docker inspect $CloudflaredC --format '{{.State.Health.Status}}').Text.Trim()
     Test-Condition 'cloudflared healthy' ($cfHealth -eq 'healthy') $cfHealth
-    $cfLogs = (Invoke-Native docker logs --tail 300 cloudflared).Text
+    $cfLogs = (Invoke-Native docker logs --tail 300 $CloudflaredC).Text
     Test-Condition 'tunnel connections registered' ($cfLogs -match 'Registered tunnel connection') ''
   } else {
     Add-Result 'SKIP' 'cloudflared' 'tunnel profile not running'
   }
 
   if ($PublicTestHost) {
-    # Re-label whoami for the public test host only for the duration of this check.
-    $env:WHOAMI_TEST_HOST = $PublicTestHost
-    $null = Invoke-Native @($composeBase + @('--profile', 'test', 'up', '-d', 'whoami'))
-    Remove-Item Env:\WHOAMI_TEST_HOST
+    # Answer the public test host only for the duration of this check.
+    Set-TestRoute @($WhoamiHost, $PublicTestHost.ToLowerInvariant())
     Start-Sleep -Seconds 3
     $public = Invoke-Curl -i "https://$PublicTestHost/"
     if ($public.Text -match 'Hostname:') {
@@ -182,41 +227,42 @@ try {
     } else {
       Add-Result 'FAIL' 'public: tunnel round trip' ((($public.Text -split "`n") | Select-Object -First 3) -join ' | ')
     }
-    $null = Invoke-Native @($composeBase + @('--profile', 'test', 'up', '-d', 'whoami'))
+    Set-TestRoute @($WhoamiHost)
   }
 
-  # --- OmniVoice ---------------------------------------------------------------------------------
-  $omniFile = Join-Path $ProjectPath 'traefik\dynamic\omnivoice.yml'
-  if (Test-Path -LiteralPath $omniFile) {
-    $omniHost = $null
-    if ((Get-Content -LiteralPath $omniFile -Raw) -match 'Host\(`([^`]+)`\)') { $omniHost = $Matches[1] }
-    foreach ($svc in @('omnivoice-triton-api', 'omnivoice-perform-api')) {
-      $nets = (Invoke-Native docker inspect $svc --format '{{range $k, $v := .NetworkSettings.Networks}}{{$k}} {{end}}').Text
-      Test-Condition "$svc attached to proxy" ($nets -match '(^|\s)proxy(\s|$)') $nets.Trim()
-    }
-    $api = Invoke-Curl -H "Host: $omniHost" "$base/api/health"
-    Test-Condition 'OmniVoice /api/health via Traefik' ($api.Text -match '"status":\s*"ok"') $api.Text
-    $perform = Invoke-Curl -H "Host: $omniHost" "$base/perform-api/health"
-    Test-Condition 'OmniVoice /perform-api/health via Traefik' ($perform.Text -match '"status":\s*"ok"') ''
-    $ui = Invoke-Curl -o NUL -w '%{http_code}' -H "Host: $omniHost" "$base/"
-    if ($ui.Text.Trim() -eq '200') { Add-Result 'PASS' 'OmniVoice UI via Traefik' 'host.docker.internal:8010' }
-    else { Add-Result 'WARN' 'OmniVoice UI via Traefik' "HTTP $($ui.Text.Trim()) - is the Vite server running (npm run dev / preview on port 8010)?" }
+  # --- Registered services -----------------------------------------------------------------------
+  $registry = Read-ServiceRegistry -Settings $settings
+  $enabled = @($registry.services | Where-Object { $_.enabled })
+  if ($enabled.Count -eq 0) {
+    Add-Result 'SKIP' 'registered services' 'config\services.json has no enabled services'
   } else {
-    Add-Result 'SKIP' 'OmniVoice' 'traefik\dynamic\omnivoice.yml not present'
+    $routerList = Get-TraefikApi $settings '/api/http/routers'
+    foreach ($svc in $enabled) {
+      $router = @($routerList | Where-Object { $_.name -eq "svc-$($svc.name)@file" })
+      Test-Condition "service '$($svc.name)' router loaded" ($router.Count -eq 1 -and $router[0].status -eq 'enabled') $(if ($router.Count -eq 1) { $router[0].rule } else { 'missing' })
+      $probePath = '/'
+      if ($svc.pathPrefix) { $probePath = $svc.pathPrefix + '/' }
+      $code = (Invoke-Curl -o NUL -w '%{http_code}' -H "Host: $($svc.hostnames[0])" "$base$probePath").Text.Trim()
+      if ($code -match '^(502|503|504|000)$') { Add-Result 'WARN' "service '$($svc.name)' backend" "HTTP $code from $(Get-ServiceUrl $svc) - is the app running and reachable?" }
+      else { Add-Result 'PASS' "service '$($svc.name)' backend" "HTTP $code" }
+    }
   }
 } finally {
+  Remove-Item -LiteralPath $TestRouteFile -ErrorAction SilentlyContinue
+  $null = Sync-TraefikDynamic $settings
   if (-not $KeepWhoami) {
     $null = Invoke-Native @($composeBase + @('--profile', 'test', 'rm', '-s', '-f', 'whoami'))
-    $left = (Invoke-Native docker ps -a --filter name=^whoami-test$ --format '{{.Names}}').Text.Trim()
+    $left = (Invoke-Native docker ps -a --filter "name=^$WhoamiC$" --format '{{.Names}}').Text.Trim()
     Test-Condition 'whoami removed after tests' ($left -eq '') ''
   }
+  Test-Condition 'test route removed after tests' (-not (Test-Path -LiteralPath $TestRouteFile)) ''
 }
 
 # --- Logs --------------------------------------------------------------------------------------------
-$traefikLogs = (Invoke-Native docker logs --since 30m traefik).Text
+$traefikLogs = (Invoke-Native docker logs --since 30m $TraefikC).Text
 $errLines = @($traefikLogs -split "`n" | Where-Object { $_ -match '\bERR\b' })
 Test-Condition 'no Traefik ERR log lines (30 min)' ($errLines.Count -eq 0) (($errLines | Select-Object -First 3) -join ' | ')
-$proxyLogs = (Invoke-Native docker logs --since 30m socket-proxy).Text
+$proxyLogs = (Invoke-Native docker logs --since 30m $SocketC).Text
 $unexpected = @($proxyLogs -split "`n" | Where-Object { $_ -match '" 403 |\s403\s' -and $_ -notmatch '/images/json|/containers/create' })
 Test-Condition 'no unexpected socket-proxy denials' ($unexpected.Count -eq 0) (($unexpected | Select-Object -First 3) -join ' | ')
 
