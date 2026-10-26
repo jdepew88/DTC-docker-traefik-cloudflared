@@ -18,7 +18,7 @@
 
   // --- Navigation ---------------------------------------------------------------------------------------------------------
   const OPS_NAV = [
-    ['overview', 'Overview', 'home'], ['explorer', 'Infrastructure Explorer', 'network'], ['services', 'Services', 'list'], ['catalog', 'App Catalog', 'download'], ['apps', 'Installed apps', 'box'], ['identity', 'Identity & Access', 'lock'], ['cloudflare', 'Cloudflare', 'cloud'],
+    ['overview', 'Overview', 'home'], ['explorer', 'Infrastructure Explorer', 'network'], ['services', 'Services', 'list'], ['provision', 'New app', 'plus'], ['catalog', 'App Catalog', 'download'], ['apps', 'Installed apps', 'box'], ['identity', 'Identity & Access', 'lock'], ['cloudflare', 'Cloudflare', 'cloud'],
     ['dashboard', 'Traefik Dashboard', 'gauge'], ['backups', 'Backups', 'archive'], ['diagnostics', 'Diagnostics', 'terminal'],
     ['settings', 'Settings', 'settings'], ['help', 'Help and Learning', 'book'],
   ];

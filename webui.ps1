@@ -63,6 +63,13 @@ Import-Module (Join-Path $here 'lib\CredentialManager.psm1') -Force
 Import-Module (Join-Path $here 'lib\RoutingModel.psm1') -Force
 Import-Module (Join-Path $here 'lib\Authentik.psm1') -Force
 Import-Module (Join-Path $here 'lib\IdentityProvider.psm1') -Force
+Import-Module (Join-Path $here 'lib\SafeFetch.psm1') -Force
+Import-Module (Join-Path $here 'lib\AppSources.psm1') -Force
+Import-Module (Join-Path $here 'lib\HostPlatform.psm1') -Force
+Import-Module (Join-Path $here 'lib\ProvisionPolicy.psm1') -Force
+Import-Module (Join-Path $here 'lib\IdentityContract.psm1') -Force
+Import-Module (Join-Path $here 'lib\AiAssist.psm1') -Force
+Import-Module (Join-Path $here 'lib\Recipes.psm1') -Force
 if (-not $CatalogDir) { $CatalogDir = Join-Path $here 'catalog' }
 Import-Module (Join-Path $here 'lib\LocalHttp.psm1') -Force
 Set-CloudflareApiBase $CloudflareApiBase
@@ -105,6 +112,8 @@ $State = @{
   AppPlans  = @{}
   IdpPlans  = @{}
   IdpChecks = @{}
+  ProvisionPlans = @{}
+  AiEstimates = @{}
   Cookie    = "tpx_session_$Port"
   Origins   = @("http://127.0.0.1:$Port", "http://localhost:$Port")
   Hosts     = @("127.0.0.1:$Port", "localhost:$Port")
@@ -134,6 +143,7 @@ $StaticFiles = @{
   '/explorer.js' = @('explorer.js', 'text/javascript; charset=utf-8')
   '/discover.js' = @('discover.js', 'text/javascript; charset=utf-8')
   '/catalog.js' = @('catalog.js', 'text/javascript; charset=utf-8')
+  '/provision.js' = @('provision.js', 'text/javascript; charset=utf-8')
   '/credentials.js' = @('credentials.js', 'text/javascript; charset=utf-8')
   '/identity.js' = @('identity.js', 'text/javascript; charset=utf-8')
   '/routing.js' = @('routing.js', 'text/javascript; charset=utf-8')
@@ -1582,8 +1592,7 @@ function Get-ComposeContainerFacts {
 # the roles the manifest declares and the optional services this installation left out.
 function Get-InstanceLifecycle($Instance, [object[]]$Facts, $Catalog) {
   $cs = @($Facts | Where-Object { $_.project -eq $Instance.project })
-  $entry = Resolve-CatalogEntry $Catalog $Instance.appId
-  $m = $(if ($entry) { $entry.manifest } else { $null })
+  $m = Get-InstanceManifest $Instance $Catalog
   $defined = @()
   $composePath = Get-AppComposePath $Instance
   if ($Instance.folder -and (Test-Path -LiteralPath $composePath)) { $defined = @((Get-ComposeServiceImages ([IO.File]::ReadAllText($composePath))).Keys) }
@@ -1693,11 +1702,13 @@ function Get-AppSecretKeys($Manifest) {
 # Validated preview of an installation: compose.yaml, configuration files and the .env with secrets masked, plus
 # every check (names, folder, volumes, port, network, memory, disk, docker compose config). Writes nothing except a
 # temporary copy for `docker compose config` (removed again).
-function Invoke-AppPlan($Body) {
+# $Manifest: an imported application (provisioning engine), validated with the same rules as catalog manifests.
+function Invoke-AppPlan($Body, $Manifest = $null) {
   Assert-Installed
   $settings = Get-Settings
   $appId = [string](Get-Field $Body 'appId' '')
-  try { $m = Get-CatalogApp -CatalogDir $CatalogDir -Id $appId } catch { Stop-Request 404 $_.Exception.Message }
+  if ($Manifest) { $m = $Manifest; $merr = @(Test-AppManifest $m -AllowImported); if ($merr.Count) { Stop-Request 400 ('The application manifest is not valid: ' + ($merr -join '; ')) } }
+  else { try { $m = Get-CatalogApp -CatalogDir $CatalogDir -Id $appId } catch { Stop-Request 404 $_.Exception.Message } }
   if ((Get-ManifestAvailability $m) -eq 'retired') { Stop-Request 410 "$($m.name) is no longer offered for new installations: $($m.retired.note)" }
   $platform = Get-PlatformSupport $m
   if (-not $platform.installable) { Stop-Request 409 "$($m.name) cannot be installed here: $(if ($m.PSObject.Properties['installNote']) { $m.installNote } else { $platform.support })" }
@@ -1801,13 +1812,13 @@ function Invoke-AppPlan($Body) {
   $canApply = $compose -and -not @($checks | Where-Object { $_.state -eq 'failed' }).Count
   foreach ($k in @($State.AppPlans.Keys)) { if (((Get-Date) - $State.AppPlans[$k].Created).TotalMinutes -gt 15) { $State.AppPlans.Remove($k) } }
   $planId = New-RandomKey 12
-  if ($canApply) { $State.AppPlans[$planId] = [pscustomobject]@{ Created = (Get-Date); AppId = $m.id; Project = $project; Folder = $folder; Compose = $compose; EnvAll = $envAll; Values = $resolved.Values; Derived = @($resolved.Derived); Privileged = $privileged; Images = $images; LocalPort = $localPort; StartNow = $startNow; Label = $instanceLabel } }
+  if ($canApply) { $State.AppPlans[$planId] = [pscustomobject]@{ Created = (Get-Date); AppId = $m.id; Project = $project; Folder = $folder; Compose = $compose; EnvAll = $envAll; Values = $resolved.Values; Derived = @($resolved.Derived); Privileged = $privileged; Images = $images; LocalPort = $localPort; StartNow = $startNow; Label = $instanceLabel; Manifest = $Manifest } }
   return [ordered]@{
     planId = $(if ($canApply) { $planId } else { '' }); canApply = [bool]$canApply; appId = $m.id; name = $m.name; project = $project; folder = $folder
     container = (Get-AppContainerName $m $project $m.web.service)
     services = @($active | ForEach-Object { [ordered]@{ name = $_.Name; container = (Get-AppContainerName $m $project $_.Name); image = [string]$_.Value.image; stateful = [bool](Get-Prop2 $_.Value 'stateful' $false) } })
     compose = $compose; envPreview = $preview; files = $filesPreview; checks = $checks.ToArray(); existingVolumes = @($volumes | Where-Object { (Invoke-Docker volume inspect $_).ExitCode -eq 0 })
-    privileges = @($m.privileges); security = @($m.security); volumes = $volumes; images = $images; resources = [ordered]@{ need = $need; host = $res }
+    privileges = @(Get-Prop2 $m 'privileges' @()); security = @(Get-Prop2 $m 'security' @()); volumes = $volumes; images = $images; resources = [ordered]@{ need = $need; host = $res }
     localUrl = $(if ($localPort) { "http://127.0.0.1:$localPort/" } else { '' }); startNow = $startNow; existing = $existing; anotherInstance = $another; instanceLabel = $instanceLabel
   }
 }
@@ -1971,7 +1982,7 @@ function Invoke-AppApply($Body) {
   $plan = $State.AppPlans[$planId]; $State.AppPlans.Remove($planId)
   if ($plan.Privileged -and -not [bool](Get-Field $Body 'confirmPrivileges' $false)) { Stop-Request 400 'This app needs elevated privileges: confirm them explicitly.' }
   if ((Test-Path -LiteralPath $plan.Folder) -and @(Get-ChildItem -LiteralPath $plan.Folder -Force | Where-Object { $_.Name -ne 'backups' }).Count) { Stop-Request 409 "$($plan.Folder) is no longer empty. Preview again." }
-  $m = Get-CatalogApp -CatalogDir $CatalogDir -Id $plan.AppId
+  $m = $(if ($plan.PSObject.Properties['Manifest'] -and $plan.Manifest) { $plan.Manifest } else { Get-CatalogApp -CatalogDir $CatalogDir -Id $plan.AppId })
   $steps = New-Object System.Collections.ArrayList
   $step = { param($name, $status, $message) $null = $steps.Add([ordered]@{ name = $name; status = $status; message = $message }) }
   $values = $plan.Values.Clone()
@@ -2057,6 +2068,16 @@ function Get-AppHealth([string]$Project, $Manifest, $Settings, [int]$WaitSeconds
   return $out
 }
 
+# The manifest of an installed instance: the catalog's, or for an application imported by the provisioning engine the
+# copy saved next to its compose.yaml (manifestFile in config\apps.json).
+function Get-InstanceManifest($Record, $Catalog = $null) {
+  $file = [string]$(if ($Record -is [System.Collections.IDictionary]) { $Record['manifestFile'] } else { Get-Prop2 $Record 'manifestFile' '' })
+  $folder = [string]$(if ($Record -is [System.Collections.IDictionary]) { $Record['folder'] } else { Get-Prop2 $Record 'folder' '' })
+  if ($file -and $folder -and $file -notmatch '[\\/]') { $p = Join-Path $folder $file; if (Test-Path -LiteralPath $p) { try { return ([IO.File]::ReadAllText($p) | ConvertFrom-Json) } catch { } } }
+  if ($null -ne $Catalog) { $e = Resolve-CatalogEntry $Catalog ([string]$Record.appId); if ($e) { return $e.manifest }; return $null }
+  return (Get-CatalogApp -CatalogDir $CatalogDir -Id ([string]$Record.appId))
+}
+
 function Find-InstalledApp([string]$Project) {
   $settings = Get-Settings
   $a = @(Read-AppsRegistry $settings | Where-Object { $_.project -eq $Project })
@@ -2085,8 +2106,7 @@ function Get-AppsData {
   $facts = @(Get-ComposeContainerFacts)
   $instances = @(Get-InstalledInstances $settings $catalog $facts)
   $views = @(foreach ($i in $instances) {
-      $entry = Resolve-CatalogEntry $catalog $i.appId
-      $m = $(if ($entry) { $entry.manifest } else { $null })
+      $m = Get-InstanceManifest $i $catalog
       $composePath = Get-AppComposePath $i
       $composeText = $(if ($i.folder -and (Test-Path -LiteralPath $composePath)) { [IO.File]::ReadAllText($composePath) } else { '' })
       $diff = @(); if ($m -and $composeText) { $diff = @(Get-AppUpdateDiff $m $composeText) }
@@ -2154,12 +2174,12 @@ function Invoke-AppAction($Body) {
   if ($action -notin 'start', 'stop', 'restart') { Stop-Request 400 "Unknown action '$action'." }
   if ($action -eq 'start' -and -not @(Get-ComposeProjectContainers $a.project).Count) {
     # First start of a prepared project: check memory again, then create the containers (downloads the pinned images).
-    try { $mm = Get-CatalogApp -CatalogDir $CatalogDir -Id $a.appId; $need = Get-AppResourceEstimate $mm @{}; $res = Get-HostResources; $free = [Math]::Min($res.dockerFreeMB, $res.windowsFreeMB)
+    try { $mm = Get-InstanceManifest $a; $need = Get-AppResourceEstimate $mm @{}; $res = Get-HostResources; $free = [Math]::Min($res.dockerFreeMB, $res.windowsFreeMB)
       if ($need.memoryMB -gt $free -and -not [bool](Get-Field $Body 'force' $false)) { Stop-Request 409 "$($a.name) needs about $($need.memoryMB) MB but only $free MB is free. Stop other apps first." } } catch [System.Management.Automation.RuntimeException] { if ($_.Exception.Message -match 'needs about') { throw } }
     $r = Invoke-Docker compose --project-directory $a.folder -f (Get-AppComposePath $a) up -d
     $hp = Join-Path $a.folder '.post-install.json'
     if ($r.ExitCode -eq 0 -and (Test-Path -LiteralPath $hp)) {
-      $mm = Get-CatalogApp -CatalogDir $CatalogDir -Id $a.appId
+      $mm = Get-InstanceManifest $a
       $stored = @([IO.File]::ReadAllText($hp) | ConvertFrom-Json)
       $health = Get-AppHealth $a.project $mm (Get-Settings) 90
       $lp = $(if ($a.PSObject.Properties['localPort']) { [int]$a.localPort } else { 0 })
@@ -2191,7 +2211,7 @@ function Get-AppLogsData([string]$Project, [int]$Tail, [string]$Service = '') {
 function Invoke-AppHealthRequest($Body) {
   Assert-Installed
   $a = Find-InstalledApp ([string](Get-Field $Body 'project' ''))
-  try { $m = Get-CatalogApp -CatalogDir $CatalogDir -Id $a.appId } catch { Stop-Request 409 $_.Exception.Message }
+  try { $m = Get-InstanceManifest $a } catch { Stop-Request 409 $_.Exception.Message }
   return Get-AppHealth $a.project $m (Get-Settings) 0
 }
 
@@ -2255,7 +2275,7 @@ function Invoke-AppBackup($Body) {
   Assert-Installed
   Assert-Confirmed $Body
   $a = Find-InstalledApp ([string](Get-Field $Body 'project' ''))
-  try { $m = Get-CatalogApp -CatalogDir $CatalogDir -Id $a.appId } catch { Stop-Request 409 $_.Exception.Message }
+  try { $m = Get-InstanceManifest $a } catch { Stop-Request 409 $_.Exception.Message }
   return Invoke-AppBackupCore $a $m (Get-Settings)
 }
 
@@ -2290,7 +2310,7 @@ function Get-AppUpdateItems($App, $Manifest, [switch]$Registry) {
 function Invoke-AppUpdatePreview($Body) {
   Assert-Installed
   $a = Find-InstalledApp ([string](Get-Field $Body 'project' ''))
-  try { $m = Get-CatalogApp -CatalogDir $CatalogDir -Id $a.appId } catch { Stop-Request 409 $_.Exception.Message }
+  try { $m = Get-InstanceManifest $a } catch { Stop-Request 409 $_.Exception.Message }
   $items = @(Get-AppUpdateItems $a $m -Registry:([bool](Get-Field $Body 'registry' $true)))
   $applicable = @($items | Where-Object { -not $_.blocked })
   $key = Get-TextSha256 (($applicable | ForEach-Object { "$($_.service)|$($_.from)|$($_.to)" }) -join "`n")
@@ -2308,7 +2328,7 @@ function Invoke-AppUpdateApply($Body) {
   Assert-Installed
   Assert-Confirmed $Body
   $a = Find-InstalledApp ([string](Get-Field $Body 'project' ''))
-  $m = Get-CatalogApp -CatalogDir $CatalogDir -Id $a.appId
+  $m = Get-InstanceManifest $a
   $items = @(Get-AppUpdateItems $a $m -Registry:([bool](Get-Field $Body 'registry' $true)) | Where-Object { -not $_.blocked })
   $key = Get-TextSha256 (($items | ForEach-Object { "$($_.service)|$($_.from)|$($_.to)" }) -join "`n")
   if (-not $items.Count -or $key -ne [string](Get-Field $Body 'previewKey' '')) { Stop-Request 409 'The installed project, the catalog or the registry changed since the preview. Preview again.' }
@@ -2359,7 +2379,7 @@ function Invoke-AppRemove($Body) {
   if ($r.ExitCode -ne 0) { Stop-Request 500 "docker compose down failed: $((ConvertTo-RedactedText @($r.Output)) -join ' ')" }
   $folderRemoved = $false
   if ($deleteFolder) {
-    foreach ($f in @(Get-ChildItem -LiteralPath $a.folder -Force -File)) { if ($f.Name -in 'compose.yaml', '.env', 'README.md', 'credentials.txt', '.post-install.json' -or $f.Name -like 'compose.yaml.bak-*') { $f.IsReadOnly = $false; Remove-Item -LiteralPath $f.FullName -Force } }
+    foreach ($f in @(Get-ChildItem -LiteralPath $a.folder -Force -File)) { if ($f.Name -in 'compose.yaml', '.env', 'README.md', 'credentials.txt', '.post-install.json', '.dtc-manifest.json' -or $f.Name -like 'compose.yaml.bak-*') { $f.IsReadOnly = $false; Remove-Item -LiteralPath $f.FullName -Force } }
     if (-not @(Get-ChildItem -LiteralPath $a.folder -Force).Count) { Remove-Item -LiteralPath $a.folder -Force; $folderRemoved = $true }
   }
   Save-AppsRegistry $settings @(Read-AppsRegistry $settings | Where-Object { $_.project -ne $a.project })
@@ -2389,7 +2409,7 @@ function Get-AppRemovalInventory($Record, $Settings) {
   $cf = Read-CloudflareConfig -Settings $Settings
   $cfHosts = @(); if ($cf.PSObject.Properties['managed'] -and $cf.managed) { $cfHosts = @($cf.managed.PSObject.Properties | Where-Object { $hosts -contains $_.Name } | ForEach-Object { $_.Name }) }
   $idApps = @(); try { $ap = Get-Prop2 (Get-Prop2 (Read-IdentityConfig -Settings $Settings) 'authentik' $null) 'apps' $null; if ($ap) { $idApps = @($ap.PSObject.Properties | Where-Object { @($routes | ForEach-Object { $_.name }) -contains $_.Name } | ForEach-Object { [string](Get-Prop2 $_.Value 'slug' $_.Name) }) } } catch { }
-  $files = @(); if ($inst.folder -and (Test-Path -LiteralPath $inst.folder)) { $files = @(Get-ChildItem -LiteralPath $inst.folder -Force -File | Where-Object { $_.Name -in 'compose.yaml', '.env', 'README.md', 'credentials.txt', '.post-install.json' -or $_.Name -like 'compose.yaml.bak-*' } | ForEach-Object { $_.Name }) }
+  $files = @(); if ($inst.folder -and (Test-Path -LiteralPath $inst.folder)) { $files = @(Get-ChildItem -LiteralPath $inst.folder -Force -File | Where-Object { $_.Name -in 'compose.yaml', '.env', 'README.md', 'credentials.txt', '.post-install.json', '.dtc-manifest.json' -or $_.Name -like 'compose.yaml.bak-*' } | ForEach-Object { $_.Name }) }
   return Get-RemovalInventory -Instance $inst -Containers $cs -All $all -Routes $routes -CloudflareHosts $cfHosts -IdentityApps $idApps -ProxyNetwork $Settings.ProxyNetwork -FolderFiles $files
 }
 
@@ -3646,6 +3666,606 @@ function Invoke-IdentityProtectApply($Body, [switch]$Remove) {
   return [ordered]@{ ok = $allOk; results = $results; authentik = $first.authentik; traefik = $first.traefik; challenge = $first.challenge; message = $(if ($results.Count -eq 1) { $first.message } else { "$(@($results | Where-Object { $_.ok }).Count) of $($results.Count) done." }) }
 }
 
+# --- Universal provisioning: Container -> Reverse proxy -> Authentication ----------------------------------------
+# A pasted link becomes a draft (lib\AppSources.psm1), reviewed for security and host compatibility
+# (lib\ProvisionPolicy.psm1, lib\HostPlatform.psm1) and optionally completed by AI (lib\AiAssist.psm1). One approved
+# operation then reuses the existing pipelines: the App Catalog installer (an ordinary Compose project), the service
+# planner (explicit Traefik file-provider YAML; Cloudflare DNS, tunnel route and Access through the existing tunnel)
+# and Identity & Access through the identity contract below. Each operation keeps a journal (config\provision\
+# operations) of what it created, reused or modified; rollback undoes only what the operation created or modified.
+
+function Get-ProvisionDir([string]$Sub) { $d = Join-Path $InstallPath "config\provision\$Sub"; New-Item -ItemType Directory -Force -Path $d | Out-Null; return $d }
+function Assert-ProvisionId([string]$Value, [string]$What) { if ($Value -notmatch '^[a-f0-9]{8,32}$') { Stop-Request 400 "Invalid $What." }; return $Value }
+
+function Read-ProvisionDraft([string]$Id) {
+  $p = Join-Path (Get-ProvisionDir 'drafts') "$(Assert-ProvisionId $Id 'draft id').json"
+  if (-not (Test-Path -LiteralPath $p)) { Stop-Request 404 'This draft no longer exists. Import the link again.' }
+  return ([IO.File]::ReadAllText($p) | ConvertFrom-Json)
+}
+function Save-ProvisionDraft($Draft) { Write-TextFileAtomic (Join-Path (Get-ProvisionDir 'drafts') "$($Draft.draftId).json") (($Draft | ConvertTo-Json -Depth 30) + "`n") }
+function Read-ProvisionJournal([string]$Id) {
+  $p = Join-Path (Get-ProvisionDir 'operations') "$(Assert-ProvisionId $Id 'operation id').json"
+  if (-not (Test-Path -LiteralPath $p)) { Stop-Request 404 'No such provisioning operation.' }
+  return (ConvertTo-OrderedTree ([IO.File]::ReadAllText($p) | ConvertFrom-Json))
+}
+function Save-ProvisionJournal($Journal) { Write-TextFileAtomic (Join-Path (Get-ProvisionDir 'operations') "$($Journal.operationId).json") (($Journal | ConvertTo-Json -Depth 20) + "`n") }
+
+# Names that must never leave this PC in an AI request or a shared recipe: this deployment's domains and host names,
+# the Windows user and machine names, and the installation folder.
+function Get-ProvisionPrivateNames($Settings) {
+  $n = @($env:USERNAME, $env:COMPUTERNAME, $env:USERDOMAIN, $InstallPath)
+  try { $cf = Read-CloudflareConfig -Settings $Settings; $n += @($cf.domains | ForEach-Object { [string]$_.name }) } catch { }
+  try { $n += @((Read-ServiceRegistry -Settings $Settings).services | ForEach-Object { @($_.hostnames) }) } catch { }
+  try { $ic = Read-IdentityConfig -Settings $Settings; $n += @($ic.authentik.hostname, $ic.authentik.owner.email) } catch { }
+  return @($n | Where-Object { $_ -and ([string]$_).Length -ge 3 } | ForEach-Object { [string]$_ } | Select-Object -Unique)
+}
+
+# The draft as the page shows it: structure (never values of secrets), open questions, evidence, the security review,
+# host compatibility, ForwardAuth suitability and whether a curated recipe exists for the same application.
+function Get-ProvisionDraftView($Draft) {
+  $m = $Draft.manifest
+  $adapter = Get-CurrentHostAdapter
+  $findings = @(Get-ManifestSecurityFindings $m)
+  $compat = Get-HostCompatibility $m $adapter
+  $errors = @(Test-AppManifest $m -AllowImported)
+  $svcs = @($m.services.PSObject.Properties | ForEach-Object {
+      $s = $_.Value
+      [ordered]@{ name = $_.Name; role = [string](Get-Prop2 $s 'role' ''); image = [string]$s.image
+        ports = @(@(Get-Prop2 $s 'ports' @()) | ForEach-Object { [ordered]@{ container = [int]$_.container; protocol = [string]$_.protocol; primary = [bool](Get-Prop2 $_ 'primary' $false) } })
+        volumes = @(@(Get-Prop2 $s 'volumes' @()) | ForEach-Object { [ordered]@{ name = [string]$_.name; kind = [string](Get-Prop2 $_ 'kind' 'volume'); target = [string]$_.target } })
+        settings = @(if (Get-Prop2 $s 'environment' $null) { $s.environment.PSObject.Properties | ForEach-Object { $_.Name } })
+        dependsOn = @(@(Get-Prop2 $s 'dependsOn' @()) | ForEach-Object { "$($_.service) ($($_.condition))" }) }
+    })
+  $inputs = @(@(Get-Prop2 $m 'inputs' @()) | ForEach-Object { [ordered]@{ id = [string]$_.id; type = [string]$_.type; label = [string](Get-Prop2 $_ 'label' $_.id); required = [bool](Get-Prop2 $_ 'required' $false); default = $(if ([string]$_.type -in 'text', 'timezone', 'boolean') { [string](Get-Prop2 $_ 'default' '') } else { '' }) } })
+  $aiRuns = @(@(Get-Prop2 $Draft 'ai' @()))
+  $blocked = @($findings | Where-Object { $_.severity -eq 'block' }).Count -or $errors.Count -or $compat.status -eq 'incompatible' -or -not [bool](Get-Prop2 $m 'installable' $false)
+  return [ordered]@{ draftId = $Draft.draftId; createdAt = $Draft.createdAt; url = $Draft.url; kind = $Draft.kind; id = [string]$m.id; name = [string]$m.name; description = [string]$m.description
+    license = [string]$m.license; maintainer = [string]$m.maintainer; source = $m.source; docs = @($m.docs); architectures = @(Get-Prop2 $m 'architectures' @())
+    services = $svcs; web = (Get-Prop2 $m 'web' $null); inputs = $inputs; privileges = @(Get-Prop2 $m 'privileges' @())
+    unresolved = @(Get-Prop2 $m.draft 'unresolved' @()); unsupported = @(Get-Prop2 $m.draft 'unsupported' @()); evidence = @(Get-Prop2 $m.draft 'evidence' @()); assumptions = @(Get-Prop2 $m.draft 'assumptions' @())
+    knownIssues = @(Get-Prop2 $m 'knownIssues' @()); verification = (Get-Prop2 $m 'verification' $null); findings = $findings; compatibility = $compat; manifestErrors = $errors
+    protection = (Get-ProtectionCompatibility $m); catalogMatch = (Get-Prop2 $Draft 'catalogMatch' $null)
+    ai = [ordered]@{ runs = $aiRuns.Count; usd = [Math]::Round((@($aiRuns | ForEach-Object { [double](Get-Prop2 (Get-Prop2 $_ 'usage' $null) 'usd' 0) }) | Measure-Object -Sum).Sum, 5) }
+    deployable = (-not $blocked) }
+}
+
+function Get-ProvisionData {
+  Assert-Installed
+  $settings = Get-Settings
+  $drafts = @(Get-ChildItem -LiteralPath (Get-ProvisionDir 'drafts') -Filter '*.json' -File | Sort-Object LastWriteTime -Descending | Select-Object -First 50 | ForEach-Object {
+      try { $d = [IO.File]::ReadAllText($_.FullName) | ConvertFrom-Json; [ordered]@{ draftId = $d.draftId; name = [string]$d.manifest.name; kind = $d.kind; url = $d.url; createdAt = $d.createdAt; unresolved = @(Get-Prop2 $d.manifest.draft 'unresolved' @()).Count } } catch { }
+    })
+  $ops = @(Get-ChildItem -LiteralPath (Get-ProvisionDir 'operations') -Filter '*.json' -File | Sort-Object LastWriteTime -Descending | Select-Object -First 20 | ForEach-Object {
+      try { $j = [IO.File]::ReadAllText($_.FullName) | ConvertFrom-Json; [ordered]@{ operationId = $j.operationId; summary = $j.summary; state = $j.state; startedAt = $j.startedAt } } catch { }
+    })
+  $ai = Read-AiConfig $settings
+  $key = Get-ProtectedSecretInfo -Settings $settings -Name (Get-AiKeySecretName)
+  $domains = @(); try { $domains = @((Read-CloudflareConfig -Settings $settings).domains | ForEach-Object { [string]$_.name }) } catch { }
+  return [ordered]@{ drafts = $drafts; operations = $ops; domains = $domains; host = (Get-CurrentHostAdapter); hosts = @(Get-HostAdapters | ForEach-Object { [ordered]@{ id = $_.id; name = $_.name; status = $_.status; tested = $_.tested } })
+    sources = @('Docker Hub (hub.docker.com links or image names)', 'GitHub repositories and Compose files', 'GitHub Container Registry, Quay and lscr.io image names', 'Unraid template XML (raw links)', 'awesome-selfhosted entries')
+    ai = [ordered]@{ provider = $ai.provider; model = $ai.model; escalationModel = $ai.escalationModel; allowEscalation = [bool]$ai.allowEscalation; monthlyLimitUsd = $ai.monthlyLimitUsd; perRequestLimitUsd = $ai.perRequestLimitUsd; maxOutputTokens = $ai.maxOutputTokens
+      keyStored = [bool]$key.Stored; providers = @(Get-AiProviders); prices = (Get-AiPrices); month = (Get-AiMonthSpend (Read-AiUsage $settings) ([double]$ai.monthlyLimitUsd)) }
+    identity = (Get-IdentityContractStatus); recipes = @(Get-LocalRecipes $settings).Count; registry = (Get-RecipeRegistryInfo) }
+}
+
+function Invoke-ProvisionImport($Body) {
+  Assert-Installed
+  $url = ([string](Get-Field $Body 'url' '')).Trim()
+  if (-not $url) { Stop-Request 400 'Paste a link or an image name.' }
+  $catalog = @(Get-CatalogApps -CatalogDir $CatalogDir | Where-Object { -not @($_.errors).Count })
+  $r = $null
+  try { $r = Import-AppSource -Text $url -CatalogApps $catalog } catch { Stop-Request 422 $_.Exception.Message }
+  $draft = [ordered]@{ version = 1; draftId = (New-SecretValue 8); createdAt = (Get-Date -Format 's'); url = $url; kind = $r.Kind; catalogMatch = $r.CatalogMatch; manifest = $r.Manifest; ai = @() }
+  $saved = ($draft | ConvertTo-Json -Depth 30) | ConvertFrom-Json
+  Save-ProvisionDraft $saved
+  Write-Audit 'provision-import' "$($r.Kind) $($r.Manifest.id) draft=$($draft.draftId)"
+  return (Get-ProvisionDraftView $saved)
+}
+
+function Invoke-ProvisionDraftEdit($Body) {
+  Assert-Installed
+  $d = Read-ProvisionDraft ([string](Get-Field $Body 'draftId' ''))
+  $tree = ConvertTo-OrderedTree $d.manifest
+  try { $tree = Set-DraftWebPort $tree ([string](Get-Field $Body 'webService' '')) ([int](Get-Field $Body 'webPort' 0)) ([string](Get-Field $Body 'protocol' 'http')) } catch { Stop-Request 400 $_.Exception.Message }
+  $d.manifest = ($tree | ConvertTo-Json -Depth 30) | ConvertFrom-Json
+  Save-ProvisionDraft $d
+  return (Get-ProvisionDraftView $d)
+}
+
+function Remove-ProvisionDraftRequest($Body) {
+  $id = Assert-ProvisionId ([string](Get-Field $Body 'draftId' '')) 'draft id'
+  $p = Join-Path (Get-ProvisionDir 'drafts') "$id.json"
+  if (Test-Path -LiteralPath $p) { Remove-Item -LiteralPath $p -Force }
+  return [ordered]@{ removed = $true }
+}
+
+# --- AI assistance (optional, approved per request) ---
+
+function Get-ProvisionDocumentation($Manifest) {
+  $kind = [string](Get-Prop2 $Manifest.source 'kind' ''); $url = [string](Get-Prop2 $Manifest.source 'url' ''); $up = [string](Get-Prop2 $Manifest.source 'upstream' '')
+  $text = ''
+  if ($kind -eq 'dockerhub' -and $url -match 'hub\.docker\.com/(?:_/|r/)([^/?#]+)(?:/([^/?#]+))?') {
+    $repo = $(if ($Matches[2]) { "$($Matches[1])/$($Matches[2])" } else { "library/$($Matches[1])" })
+    try { $text = [string](Invoke-SafeJson -Url "https://hub.docker.com/v2/repositories/$repo/").full_description } catch { }
+  }
+  $gh = @($url, $up) | Where-Object { $_ -match '^https://github\.com/[^/]+/[^/]+' } | Select-Object -First 1
+  if (-not $text -and $gh -and $gh -match '^https://github\.com/([^/]+)/([^/#?]+)') {
+    try { $rd = Invoke-SafeJson -Url "https://api.github.com/repos/$($Matches[1])/$($Matches[2] -replace '\.git$', '')/readme"; if ([string]$rd.download_url) { $text = (Invoke-SafeFetch -Url ([string]$rd.download_url) -MaxBytes 512KB).Text } } catch { }
+  }
+  return $text
+}
+
+function Invoke-ProvisionAiEstimate($Body) {
+  Assert-Installed
+  $settings = Get-Settings
+  $cfg = Read-AiConfig $settings
+  if ($cfg.provider -eq 'none') { Stop-Request 409 'AI assistance is off. Turn it on with your own API key, or answer the open questions yourself.' }
+  $d = Read-ProvisionDraft ([string](Get-Field $Body 'draftId' ''))
+  if (-not @(Get-Prop2 $d.manifest.draft 'unresolved' @()).Count) { Stop-Request 409 'This draft has no open questions; AI is not needed.' }
+  $req = New-AiPlanningRequest -Manifest $d.manifest -Documentation (Get-ProvisionDocumentation $d.manifest) -PrivateNames (Get-ProvisionPrivateNames $settings) -MaxChars $cfg.maxContextChars
+  $escalate = [bool](Get-Field $Body 'escalate' $false)
+  if ($escalate -and -not $cfg.allowEscalation) { Stop-Request 400 'Escalation to the larger model is not allowed in your AI settings.' }
+  $model = $(if ($escalate) { $cfg.escalationModel } else { $cfg.model })
+  $est = Get-AiCostEstimate $req $model $cfg.maxOutputTokens
+  $spend = Get-AiMonthSpend (Read-AiUsage $settings) ([double]$cfg.monthlyLimitUsd)
+  $budget = Test-AiBudget $est $cfg $spend
+  foreach ($k in @($State.AiEstimates.Keys)) { if (((Get-Date) - $State.AiEstimates[$k].Created).TotalMinutes -gt 15) { $State.AiEstimates.Remove($k) } }
+  $id = New-SecretValue 8
+  $State.AiEstimates[$id] = [pscustomobject]@{ Created = (Get-Date); DraftId = $d.draftId; Request = $req; Model = $model; Estimate = $est }
+  return [ordered]@{ estimateId = $id; provider = $cfg.provider; model = $model; estimate = $est; budget = $budget; month = $spend; redacted = $req.Removed
+    preview = [ordered]@{ system = $req.System; user = $req.User; chars = $req.Chars } }
+}
+
+function Invoke-ProvisionAiRun($Body) {
+  Assert-Installed
+  Assert-Confirmed $Body
+  $settings = Get-Settings
+  $id = [string](Get-Field $Body 'estimateId' '')
+  if (-not $State.AiEstimates.ContainsKey($id)) { Stop-Request 409 'This estimate has expired or was used. Estimate again.' }
+  $e = $State.AiEstimates[$id]; $State.AiEstimates.Remove($id)
+  $cfg = Read-AiConfig $settings
+  $budget = Test-AiBudget $e.Estimate $cfg (Get-AiMonthSpend (Read-AiUsage $settings) ([double]$cfg.monthlyLimitUsd))
+  if (-not $budget.ok) { Stop-Request 409 $budget.reason }
+  $d = Read-ProvisionDraft $e.DraftId
+  $key = ''
+  if ((Get-ProtectedSecretInfo -Settings $settings -Name (Get-AiKeySecretName)).Stored) { $key = Read-ProtectedSecret -Settings $settings -Name (Get-AiKeySecretName) }
+  $res = $null
+  try { $res = Invoke-AiPlanning -Settings $settings -Request $e.Request -Model $e.Model -MaxOutputTokens $cfg.maxOutputTokens -ApiKey $key -Provider $cfg.provider } catch { $key = $null; Stop-Request 502 $_.Exception.Message }
+  $key = $null
+  $merged = Merge-AiProposal (ConvertTo-OrderedTree $d.manifest) $res.Proposal
+  $d.manifest = ($merged.Manifest | ConvertTo-Json -Depth 30) | ConvertFrom-Json
+  $run = [ordered]@{ at = (Get-Date -Format 's'); model = $res.Model; cached = $res.Cached; usage = $res.Usage; applied = @($merged.Applied); rejected = @($merged.Rejected); summary = [string](Get-Prop2 $res.Proposal 'summary' '') }
+  $d.ai = @(@(Get-Prop2 $d 'ai' @()) + [pscustomobject]$run)
+  Save-ProvisionDraft $d
+  Write-Audit 'provision-ai' "draft=$($d.draftId) model=$($res.Model) cached=$($res.Cached) usd=$($res.Usage.usd)"
+  return [ordered]@{ run = $run; draft = (Get-ProvisionDraftView $d) }
+}
+
+function Set-ProvisionAiSettingsRequest($Body) {
+  Assert-Installed
+  $settings = Get-Settings
+  $c = Read-AiConfig $settings
+  $prov = [string](Get-Field $Body 'provider' $c.provider)
+  if ($prov -notin 'none', 'anthropic') { Stop-Request 400 'Provider must be none or anthropic (other providers are not implemented).' }
+  $prices = Get-AiPrices
+  foreach ($k in @('model', 'escalationModel')) { $v = [string](Get-Field $Body $k $c[$k]); if (-not $prices.Contains($v)) { Stop-Request 400 "Unknown model '$v'." }; $c[$k] = $v }
+  $c.provider = $prov
+  $c.allowEscalation = [bool](Get-Field $Body 'allowEscalation' $c.allowEscalation)
+  foreach ($k in @('monthlyLimitUsd', 'perRequestLimitUsd')) { $v = 0.0; if ([double]::TryParse([string](Get-Field $Body $k $c[$k]), [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$v)) { $c[$k] = $v } else { Stop-Request 400 "$k must be a number." } }
+  $mt = 0; if ([int]::TryParse([string](Get-Field $Body 'maxOutputTokens' $c.maxOutputTokens), [ref]$mt)) { $c.maxOutputTokens = $mt }
+  Save-AiConfig $settings $c
+  Write-Audit 'provision-ai-settings' "provider=$($c.provider) model=$($c.model) monthly=$($c.monthlyLimitUsd)"
+  return (Read-AiConfig $settings)
+}
+
+function Save-ProvisionAiKeyRequest($Body) {
+  Assert-Installed
+  $k = ([string](Get-Field $Body 'key' '')).Trim()
+  if ($k -notmatch '^sk-ant-[A-Za-z0-9_-]{20,200}$') { Stop-Request 400 'That does not look like an Anthropic API key (sk-ant-...). A Claude subscription is not an API key.' }
+  Save-ProtectedSecret -Settings (Get-Settings) -Name (Get-AiKeySecretName) -Value $k -Label 'Anthropic API key (AI assistance)'
+  $k = $null
+  Write-Audit 'provision-ai-key' 'saved'
+  return [ordered]@{ stored = $true }
+}
+
+# --- Identity contract (docs/provisioning.md). The provisioner calls only these; they wrap Identity & Access. ---
+
+# 1 + 2. Providers and readiness, from the same context the Identity & Access page uses.
+function Get-IdentityContractStatus {
+  $ctx = $null
+  try { $ctx = Get-IdentityContext } catch { return [ordered]@{ providers = @(Get-ContractProviders @(Get-IdentityProviders) (Get-IdentityReadiness @{ provider = '' })); readiness = (Get-IdentityReadiness @{ provider = '' }) } }
+  $ov = $null; if ($ctx.Conn) { try { $ov = Get-AuthentikOverview $ctx.Conn } catch { } }
+  $owners = $false; if ($ctx.Conn) { try { $owners = [bool](Get-AuthentikGroup $ctx.Conn (Get-AuthentikOwnersGroupName)) } catch { } }
+  $facts = [ordered]@{ provider = [string]$ctx.Config.provider; installFound = [bool]$ctx.Install; running = [bool]($ctx.Install -and $ctx.Install.server -and $ctx.Install.server.state -eq 'running')
+    onProxyNetwork = [bool]($ctx.Install -and $ctx.Install.onProxyNetwork); tokenOk = [bool]$ctx.Conn; outpost = [bool]($ov -and $ov.Outpost)
+    outpostBrowserHostOk = $false; publicUrl = [string]$ctx.Config.authentik.publicUrl; ownersGroup = $owners }
+  $ready = Get-IdentityReadiness $facts
+  return [ordered]@{ providers = @(Get-ContractProviders @(Get-IdentityProviders) $ready); readiness = $ready; endpoint = $(if ($ctx.Install) { "http://$($ctx.Install.serverContainer):9000" } else { '' }); publicUrl = [string]$ctx.Config.authentik.publicUrl }
+}
+
+# 3 + 4. Whether an application can be protected and what protecting it would change in authentik (read-only).
+function Get-IdentityProtectionPreview([string]$ServiceName, [string]$Hostname, [string]$DisplayName) {
+  $ctx = Get-IdentityContext
+  Assert-IdentityConnection $ctx
+  if ($Hostname -and $ctx.Config.authentik.hostname -and $Hostname -eq $ctx.Config.authentik.hostname) { Stop-Request 400 "$Hostname is authentik's own sign-in address; it cannot be protected by authentik." }
+  $desired = [pscustomobject]@{ Service = $ServiceName; DisplayName = $DisplayName; Hostname = $Hostname; PublicUrl = [string]$ctx.Config.authentik.publicUrl }
+  $r = Sync-AuthentikAppProtection -Conn $ctx.Conn -Desired $desired -WhatIf
+  return [ordered]@{ actions = @(ConvertTo-AkActionView $r.Actions); reuses = @($r.Actions | Where-Object { $_.Kind -eq 'none' } | ForEach-Object { "$($_.Object) $($_.Name)" }); creates = @($r.Actions | Where-Object { $_.Kind -eq 'create' } | ForEach-Object { "$($_.Object) $($_.Name)" }) }
+}
+
+# 5. Protection through the existing protect pipeline (authentik first, wait for the outpost, then the route), so the
+# result is exactly what the Identity & Access page would have done. Returns the apply result and what was created.
+function Request-IdentityProtection([string]$ServiceName) {
+  $plan = Invoke-IdentityProtectPlan ([pscustomobject]@{ services = @($ServiceName); cloudflareAccess = 'keep' })
+  if (-not $plan.canApply) { throw "The protection preview has errors: $((@($plan.items | ForEach-Object { @($_.traefik.traefik.issues) | ForEach-Object { $_.Message } })) -join ' ')" }
+  $res = Invoke-IdentityProtectApply ([pscustomobject]@{ planId = $plan.planId; confirm = $true; confirmOverwrites = @() })
+  $first = @($res.results)[0]
+  return [ordered]@{ ok = [bool]$res.ok; message = [string]$res.message; challenge = $first.challenge
+    created = @(@($first.authentik) | Where-Object { [string]$_.kind -eq 'create' -or [string](Get-Prop2 $_ 'Kind' '') -eq 'create' } | ForEach-Object { "$(Get-Prop2 $_ 'object' (Get-Prop2 $_ 'Object' '')) $(Get-Prop2 $_ 'name' (Get-Prop2 $_ 'Name' ''))" })
+    authentik = @($first.authentik) }
+}
+
+# 6. Verification: one anonymous request through Traefik must be sent to sign in.
+function Test-IdentityProtection([string]$Hostname) {
+  $settings = Get-Settings
+  $cfg = Read-IdentityConfig -Settings $settings
+  return (Test-ForwardAuthChallenge -TraefikPort $settings.HttpPort -Hostname $Hostname -AuthHostname $cfg.authentik.hostname)
+}
+
+# 7. Rollback of protection set up by one operation: the route stops asking authentik (Traefik first), then the
+# provider is unassigned from the outpost; the authentik application and provider are deleted only when this
+# operation created both. The outpost, flows, Google source, owners group and other applications are never touched.
+function Undo-IdentityProtection([string]$ServiceName, [bool]$CreatedByOperation) {
+  $ctx = Get-IdentityContext
+  Assert-IdentityConnection $ctx
+  $svc = @($ctx.Services | Where-Object { $_.name -eq $ServiceName })[0]
+  $out = @()
+  if ($svc -and $svc.PSObject.Properties['auth'] -and $svc.auth.provider -eq 'authentik') {
+    $req = Get-ProtectRequest $ServiceName $ctx 'keep' -Remove
+    $plan = Build-ChangePlan $req.ChangeBody
+    $r = Invoke-ChangePlanSteps $plan @()
+    if (-not $r.ok) { throw 'Traefik did not accept removing the ForwardAuth middleware.' }
+    $out += 'Route: ForwardAuth middleware removed'
+  }
+  $acts = @(Remove-AuthentikAppProtection -Conn $ctx.Conn -Service $ServiceName -DeleteObjects:$CreatedByOperation)
+  $out += @($acts | Where-Object { $_.Kind -ne 'none' } | ForEach-Object { $_.Summary })
+  $cfg = Read-IdentityConfig -Settings $ctx.Settings
+  Set-IdentityApp $cfg $ServiceName $null
+  Save-IdentityConfig -Settings $ctx.Settings -Config $cfg
+  $State.IdpChecks.Remove($ServiceName)
+  return $out
+}
+
+# --- Plan, apply, verify, roll back ---
+
+# The service route of a provisioned app: an explicit file-provider definition pointing at the web container by its
+# Compose service DNS name on the shared network (stable across container recreation).
+function New-ProvisionService($AppPlan, $Manifest, [string]$Hostname, [bool]$Publish, [bool]$Access, [string]$AuthEndpoint = '') {
+  $web = [string]$Manifest.web.service
+  $primary = @(@($Manifest.services.$web.ports) | Where-Object { $_.PSObject.Properties['primary'] -and $_.primary })[0]
+  $svc = [pscustomobject][ordered]@{ name = $AppPlan.project; displayName = ([string]$Manifest.name).Substring(0, [Math]::Min(80, ([string]$Manifest.name).Length)); description = "Provisioned from $([string](Get-Prop2 $Manifest.source 'kind' 'catalog'))"
+    enabled = $true; hostnames = @($Hostname); middlewares = @('default-headers@file')
+    target = [pscustomobject]@{ type = 'docker'; host = $AppPlan.container; port = [int]$primary.container; protocol = [string]$primary.protocol; tlsSkipVerify = ([string]$primary.protocol -eq 'https') }
+    cloudflare = [pscustomobject]@{ publish = $Publish; access = $Access } }
+  if ($AuthEndpoint) { $svc | Add-Member -NotePropertyName auth -NotePropertyValue ([pscustomobject]@{ provider = 'authentik'; endpoint = $AuthEndpoint }) }
+  return $svc
+}
+
+function Invoke-ProvisionPlan($Body) {
+  Assert-Installed
+  $settings = Get-Settings
+  $draftId = [string](Get-Field $Body 'draftId' ''); $appId = [string](Get-Field $Body 'appId' '')
+  $imported = [bool]$draftId
+  $d = $null
+  if ($imported) { $d = Read-ProvisionDraft $draftId; $m = $d.manifest }
+  elseif ($appId) { try { $m = Get-CatalogApp -CatalogDir $CatalogDir -Id $appId } catch { Stop-Request 404 $_.Exception.Message } }
+  else { Stop-Request 400 'Choose an imported draft or a catalog application.' }
+  $access = [string](Get-Field $Body 'access' 'local')
+  if ($access -notin 'local', 'lan', 'public') { Stop-Request 400 'Access must be local, lan or public (remote-server access is not implemented in this version).' }
+  $auth = [string](Get-Field $Body 'auth' $(if ($access -eq 'local') { 'none' } else { 'authentik' }))
+  if ($auth -notin 'authentik', 'cloudflare-access', 'native', 'none', 'authelia') { Stop-Request 400 'Unknown authentication choice.' }
+  $hostname = ([string](Get-Field $Body 'hostname' '')).Trim().ToLowerInvariant()
+  $ack = @(@(Get-Field $Body 'acknowledge' @()) | ForEach-Object { [string]$_ })
+  $blockers = New-Object System.Collections.ArrayList; $warnings = New-Object System.Collections.ArrayList
+  $cf = Read-CloudflareConfig -Settings $settings
+  $cfReady = [bool]($cf.tunnelId -and (Get-CloudflareApiTokenInfo -Settings $settings).Stored)
+  if ($access -ne 'local') {
+    if ($hostname -notmatch '^(?=.{4,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$') { Stop-Request 400 'Enter a host name such as app.example.com.' }
+    if ($access -eq 'public') {
+      $zones = @($cf.domains | ForEach-Object { [string]$_.name })
+      if (-not @($zones | Where-Object { $hostname -eq $_ -or $hostname.EndsWith(".$_") }).Count) { Stop-Request 400 "$hostname is not in a Cloudflare domain of this deployment ($(if ($zones.Count) { $zones -join ', ' } else { 'none connected' }))." }
+      if (-not $cfReady) { $null = $blockers.Add('Cloudflare is not connected (API token and tunnel), so the hostname cannot be published. Connect it on the Cloudflare page, or choose LAN access.') }
+    } else { $null = $warnings.Add("Traefik in this deployment listens on 127.0.0.1 only: the route $hostname works on this PC; other devices on your network reach it only after Traefik is configured to listen on the LAN (not changed here).") }
+  }
+  # 1. Container: security review, host compatibility, then the regular installation preview.
+  $findings = @(if ($imported) { Get-ManifestSecurityFindings $m } else { @() })
+  $compat = Get-HostCompatibility $m (Get-CurrentHostAdapter)
+  if ($compat.status -eq 'incompatible') { foreach ($i in @($compat.items | Where-Object { $_.level -eq 'incompatible' })) { $null = $blockers.Add($i.message) } }
+  $acks = Test-FindingsAcknowledged $findings $ack
+  foreach ($b in @($findings | Where-Object { $_.severity -eq 'block' })) { $null = $blockers.Add($b.message) }
+  # A draft that is not installable (or invalid) stops here: the installation preview needs a complete manifest.
+  $early = $false
+  if ($imported) { $errs = @(Test-AppManifest $m -AllowImported); foreach ($x in $errs) { $null = $blockers.Add("Manifest: $x"); $early = $true } }
+  if ($imported -and -not [bool](Get-Prop2 $m 'installable' $false)) { $null = $blockers.Add("Not installable yet: $(Get-Prop2 $m 'installNote' 'answer the open questions first.')"); $early = $true }
+  if ($early) {
+    return [ordered]@{ planId = ''; canApply = $false; blockers = @($blockers); warnings = @($warnings); findings = $findings; compatibility = $compat; acknowledgements = $acks }
+  }
+  $appBody = [pscustomobject]@{ appId = [string]$m.id; startNow = $true; anotherInstance = [bool](Get-Field $Body 'anotherInstance' $false); instanceLabel = [string](Get-Field $Body 'instanceLabel' '') }
+  foreach ($k in @('project', 'folder', 'localPort', 'timezone', 'inputs', 'reuseData')) { $v = Get-Field $Body $k $null; if ($null -ne $v) { $appBody | Add-Member -NotePropertyName $k -NotePropertyValue $v } }
+  $app = Invoke-AppPlan $appBody $(if ($imported) { $m } else { $null })
+  foreach ($c in @($app.checks | Where-Object { $_.state -eq 'failed' })) { $null = $blockers.Add("$($c.label): $($c.message)") }
+  # Imported images already running elsewhere on this PC (same repository as the web service): never a silent duplicate.
+  if ($imported) {
+    $repo = ([string]$m.services.($m.web.service).image -replace '@sha256:.*$', '' -replace ':[^:/]+$', '')
+    $running = @(Get-ComposeContainerFacts | Where-Object { ([string]$_.image -replace '@sha256:.*$', '' -replace ':[^:/]+$', '') -eq $repo })
+    if ($running.Count -and -not $appBody.anotherInstance) { $null = $blockers.Add("$repo already runs on this PC ($(@($running | ForEach-Object { $_.name }) -join ', ')). Manage or adopt it on the Installed apps page, or choose to install another, separate instance.") }
+  }
+  # 2. Reverse proxy and Cloudflare: the final route as one regular change plan (preview only; nothing is written).
+  $identity = Get-IdentityContractStatus
+  $protect = Get-ProtectionCompatibility $m
+  $options = @(Get-ProvisionAuthOptions $access $identity.readiness $cfReady $protect)
+  $opt = @($options | Where-Object { $_.id -eq $auth })[0]
+  if (-not $opt -or -not $opt.available) { $null = $blockers.Add("Authentication '$auth' is not available: $(if ($opt) { $opt.reason } else { 'unknown' })") }
+  elseif ($opt.requiresAck -and $ack -notcontains "auth:$auth") { $null = $blockers.Add("Acknowledge: $($opt.reason)") }
+  $route = $null; $identityPreview = $null
+  if ($access -ne 'local') {
+    $svcName = $app.project
+    if (@((Read-ServiceRegistry -Settings $settings).services | Where-Object { $_.name -eq $svcName }).Count) { $null = $blockers.Add("A service route named '$svcName' already exists; choose another project name.") }
+    $final = New-ProvisionService $app $m $hostname ($access -eq 'public') ($auth -eq 'cloudflare-access') $(if ($auth -eq 'authentik') { [string]$identity.endpoint } else { '' })
+    try {
+      $plan = Build-ChangePlan ([pscustomobject]@{ op = 'add'; name = $svcName; service = $final; cloudflare = [pscustomobject]@{ automate = ($access -eq 'public' -and $cfReady); accessEmails = @(); cleanup = $true } })
+      $route = ConvertTo-PlanView $plan ''
+      foreach ($i in @($route.traefik.issues | Where-Object { $_.Level -eq 'Error' -and $_.Message -notmatch 'No such container|not found|does not exist' })) { $null = $blockers.Add("Traefik: $($i.Message)") }
+      foreach ($e in @($route.cloudflare.errors)) { $null = $blockers.Add("Cloudflare: $e") }
+      foreach ($a in @($route.cloudflare.actions | Where-Object { $_.Overwrite })) { $null = $warnings.Add("Cloudflare: $($a.Summary) overwrites an existing resource; it needs your explicit confirmation.") }
+    } catch { $null = $blockers.Add("Route: $($_.Exception.Message)") }
+    if ($auth -eq 'authentik' -and $opt -and $opt.available) {
+      try { $identityPreview = Get-IdentityProtectionPreview $svcName $hostname ([string]$m.name) } catch { $null = $blockers.Add("authentik: $($_.Exception.Message)") }
+      if ($protect.forwardAuth -eq 'caution') { $null = $warnings.Add("ForwardAuth: $($protect.recommendation)") }
+      if ($access -eq 'lan') { $null = $warnings.Add('authentik sends browsers to the public sign-in page and back to this host name: the host name must resolve for the browsers that use it.') }
+    }
+  }
+  if (-not $acks.ok) { foreach ($x in $acks.missing) { $null = $blockers.Add("Review and acknowledge: $(@($findings | Where-Object { $_.id -eq $x })[0].message)") } }
+  $aiRuns = @(if ($d) { @(Get-Prop2 $d 'ai' @()) })
+  $steps = @('Write the Compose project and start it (images pinned by digest; only the web port on 127.0.0.1)', 'Check that the containers and their dependencies are healthy and the web interface answers')
+  if ($access -ne 'local') { $steps += "Add the Traefik route $hostname (explicit file-provider YAML)$(if ($access -eq 'public') { ', not public yet' })" }
+  if ($auth -eq 'authentik') { $steps += 'Protect it with authentik (application, provider, owner-only access, outpost), then verify that anonymous visitors are sent to sign in' }
+  if ($access -eq 'public') { $steps += "Publish $hostname through the existing Cloudflare Tunnel$(if ($auth -eq 'cloudflare-access') { ' behind Cloudflare Access' })" }
+  $steps += 'Verify every stage and record the result'
+  $canApply = [bool]($app.canApply -and -not $blockers.Count)
+  $planId = ''
+  if ($canApply) {
+    foreach ($k in @($State.ProvisionPlans.Keys)) { if (((Get-Date) - $State.ProvisionPlans[$k].Created).TotalMinutes -gt 15) { $State.ProvisionPlans.Remove($k) } }
+    $planId = New-SecretValue 8
+    $State.ProvisionPlans[$planId] = [pscustomobject]@{ Created = (Get-Date); DraftId = $draftId; AppId = $appId; Imported = $imported; AppPlanId = $app.planId; Access = $access; Auth = $auth; Hostname = $hostname
+      Project = $app.project; Container = $app.container; Manifest = $m; Endpoint = [string]$identity.endpoint; CfReady = $cfReady; Name = [string]$m.name; Volumes = @($app.volumes); Folder = $app.folder }
+  }
+  return [ordered]@{ planId = $planId; canApply = $canApply; blockers = @($blockers); warnings = @($warnings); steps = $steps
+    container = $app; findings = $findings; acknowledgements = $acks; compatibility = $compat
+    routing = $route; authentication = [ordered]@{ choice = $auth; options = $options; protection = $protect; identity = $identityPreview; readiness = $identity.readiness }
+    access = [ordered]@{ choice = $access; hostname = $hostname; cloudflareReady = $cfReady }
+    ai = [ordered]@{ runs = $aiRuns.Count; usd = [Math]::Round((@($aiRuns | ForEach-Object { [double](Get-Prop2 (Get-Prop2 $_ 'usage' $null) 'usd' 0) }) | Measure-Object -Sum).Sum, 5); note = 'No AI is used during deployment.' } }
+}
+
+# Runs an approved plan stage by stage. A stage that fails stops the operation; nothing later runs, and the journal
+# says what exists so far. An app chosen for authentik protection is published only after protection is verified.
+function Invoke-ProvisionApply($Body) {
+  Assert-Installed
+  Assert-Confirmed $Body
+  $settings = Get-Settings
+  $planId = [string](Get-Field $Body 'planId' '')
+  if (-not $State.ProvisionPlans.ContainsKey($planId)) { Stop-Request 409 'This review has expired or was already used. Review again.' }
+  $p = $State.ProvisionPlans[$planId]; $State.ProvisionPlans.Remove($planId)
+  $confirmed = @(@(Get-Field $Body 'confirmOverwrites' @()) | ForEach-Object { [string]$_ })
+  $j = New-ProvisionJournal (New-SecretValue 8) "$($p.Name) as $($p.Project)$(if ($p.Hostname) { " at $($p.Hostname)" }) ($($p.Access), $($p.Auth))"
+  $j.plan = [ordered]@{ draftId = $p.DraftId; appId = $p.AppId; project = $p.Project; access = $p.Access; auth = $p.Auth; hostname = $p.Hostname; container = $p.Container }
+  $fail = { param($stage, $msg) Add-JournalStage $j $stage 'failed' $msg; $j.state = 'failed'; Save-ProvisionJournal $j; Write-Audit 'provision-apply' "$($j.operationId) failed at $stage" }
+  Save-ProvisionJournal $j
+  # Stage 1: the Compose project (the regular App Catalog installer, with the imported manifest).
+  $res = $null
+  try { $res = Invoke-AppApply ([pscustomobject]@{ planId = $p.AppPlanId; confirm = $true; confirmPrivileges = [bool](Get-Field $Body 'confirmPrivileges' $false) }) }
+  catch { & $fail 'install' $_.Exception.Message; return [ordered]@{ ok = $false; operationId = $j.operationId; journal = $j } }
+  Add-JournalResource $j 'compose-project' $p.Project 'created' $res.folder ([ordered]@{ action = 'app-remove'; project = $p.Project })
+  foreach ($v in @($p.Volumes)) { Add-JournalResource $j 'data-volume' $v 'created' '' ([ordered]@{ action = 'volume'; name = $v }) }
+  if ($p.Imported) {
+    # The imported manifest is kept next to compose.yaml so start, update, backup and removal know the application.
+    $mf = Join-Path $res.folder '.dtc-manifest.json'
+    [IO.File]::WriteAllText($mf, (($p.Manifest | ConvertTo-Json -Depth 30) + "`n"), (New-Object Text.UTF8Encoding($false)))
+    Save-AppsRegistry $settings @(Read-AppsRegistry $settings | ForEach-Object { if ($_.project -eq $p.Project) { $_ | Add-Member -NotePropertyName manifestFile -NotePropertyValue '.dtc-manifest.json' -Force; $_ | Add-Member -NotePropertyName source -NotePropertyValue ([string](Get-Prop2 $p.Manifest.source 'kind' 'imported')) -Force }; $_ })
+  }
+  if (-not $res.ok) { & $fail 'install' (@($res.steps | Where-Object { $_.status -eq 'Failed' } | ForEach-Object { "$($_.name): $($_.message)" }) -join ' '); return [ordered]@{ ok = $false; operationId = $j.operationId; journal = $j; install = $res } }
+  Add-JournalStage $j 'install' 'passed' "Project $($p.Project) in $($res.folder)"
+  $httpOk = [bool]($res.health -and $res.health.http -and $res.health.http.result -in 'http', 'https')
+  if (-not $httpOk) { & $fail 'backend' "The web interface of $($p.Container) did not answer: $(if ($res.health -and $res.health.http) { $res.health.http.detail } else { 'no answer' })"; return [ordered]@{ ok = $false; operationId = $j.operationId; journal = $j; install = $res } }
+  Add-JournalStage $j 'backend' 'passed' "$($p.Container) answers"
+  Save-ProvisionJournal $j
+  if ($p.Access -ne 'local') {
+    # Stage 2: the route, not public yet (and without authentication: protection is added by Identity & Access).
+    $first = New-ProvisionService ([pscustomobject]@{ project = $p.Project; container = $p.Container }) $p.Manifest $p.Hostname $false $false ''
+    $rp = Build-ChangePlan ([pscustomobject]@{ op = 'add'; name = $p.Project; service = $first; cloudflare = [pscustomobject]@{ automate = $false } })
+    $rr = Invoke-ChangePlanSteps $rp @()
+    if (-not $rr.ok) { & $fail 'route' 'Traefik did not accept the route.'; return [ordered]@{ ok = $false; operationId = $j.operationId; journal = $j } }
+    Add-JournalResource $j 'traefik-route' $p.Project 'created' "svc-$($p.Project).yml" ([ordered]@{ action = 'service-remove'; service = $p.Project })
+    Add-JournalStage $j 'route' 'passed' "$($p.Hostname) -> $($p.Container)"
+    Save-ProvisionJournal $j
+    # Stage 3: authentik protection through the identity contract.
+    if ($p.Auth -eq 'authentik') {
+      $pr = $null
+      try { $pr = Request-IdentityProtection $p.Project } catch { & $fail 'authentication' $_.Exception.Message; return [ordered]@{ ok = $false; operationId = $j.operationId; journal = $j } }
+      $createdAk = @($pr.created)
+      Add-JournalResource $j 'authentik-application' "dm-$($p.Project)" $(if (@($createdAk | Where-Object { $_ -like 'application*' }).Count -and @($createdAk | Where-Object { $_ -like 'proxy provider*' }).Count) { 'created' } else { 'reused' }) (($createdAk) -join ', ') ([ordered]@{ action = 'identity-undo'; service = $p.Project })
+      Add-JournalResource $j 'authentik-outpost' 'embedded outpost' 'shared' "provider dm-$($p.Project) assigned"
+      if (-not $pr.ok) { & $fail 'authentication' $pr.message; return [ordered]@{ ok = $false; operationId = $j.operationId; journal = $j } }
+      Add-JournalStage $j 'authentication' 'passed' $pr.message
+      Save-ProvisionJournal $j
+    }
+    # Stage 4: publication through the existing tunnel (only after protection is verified).
+    if ($p.Access -eq 'public') {
+      $reg = @((Read-ServiceRegistry -Settings $settings).services | Where-Object { $_.name -eq $p.Project })[0]
+      $pub = $reg | ConvertTo-Json -Depth 8 | ConvertFrom-Json
+      $pub.cloudflare.publish = $true; $pub.cloudflare.access = ($p.Auth -eq 'cloudflare-access')
+      $cp = Build-ChangePlan ([pscustomobject]@{ op = 'update'; name = $p.Project; service = $pub; cloudflare = [pscustomobject]@{ automate = $true; accessEmails = @(); cleanup = $false } })
+      $missing = @($cp.Cloudflare.Actions | Where-Object { $_.Overwrite -and $confirmed -notcontains $_.Id })
+      if ($missing.Count) { & $fail 'publish' "Confirm the overwrite of existing Cloudflare resources first: $(@($missing | ForEach-Object { $_.Summary }) -join '; ')"; return [ordered]@{ ok = $false; operationId = $j.operationId; journal = $j } }
+      $pr2 = Invoke-ChangePlanSteps $cp $confirmed
+      if (-not $pr2.ok) { & $fail 'publish' 'Cloudflare or Traefik did not accept the publication.'; return [ordered]@{ ok = $false; operationId = $j.operationId; journal = $j } }
+      foreach ($a in @($cp.Cloudflare.Actions | Where-Object { $_.Kind -ne 'none' })) { Add-JournalResource $j "cloudflare-$([string]$a.Step)" $p.Hostname $(if ($a.Overwrite) { 'modified' } else { 'created' }) ([string]$a.Summary) ([ordered]@{ action = 'service-remove'; service = $p.Project }) }
+      Add-JournalStage $j 'publish' 'passed' "https://$($p.Hostname)"
+      Save-ProvisionJournal $j
+    }
+  }
+  $j.verification = Get-ProvisionVerification $j
+  $j.state = $(if (@($j.verification | Where-Object { $_.status -eq 'failed' }).Count) { 'needs-attention' } else { 'deployed' })
+  Save-ProvisionJournal $j
+  Write-Audit 'provision-apply' "$($j.operationId) $($j.state) project=$($p.Project) access=$($p.Access) auth=$($p.Auth)"
+  return [ordered]@{ ok = $true; operationId = $j.operationId; journal = $j; url = $(if ($p.Access -eq 'public') { "https://$($p.Hostname)/" } elseif ($p.Access -eq 'lan') { "http://$($p.Hostname)/" } else { $res.localUrl }); localUrl = $res.localUrl; credentialsFile = $res.credentialsFile }
+}
+
+# Every stage checked on its own; a stage that does not apply says so, and nothing untested is reported as passed.
+function Get-ProvisionVerification($Journal) {
+  $settings = Get-Settings
+  $out = New-Object System.Collections.ArrayList
+  $add = { param($stage, $status, $detail) $null = $out.Add([ordered]@{ stage = $stage; status = $status; detail = $detail }) }
+  $plan = $Journal.plan
+  $rec = @(Read-AppsRegistry $settings | Where-Object { $_.project -eq $plan.project })[0]
+  if (-not $rec) { & $add 'containers' 'failed' 'The application is no longer registered.'; return @($out) }
+  $compose = Get-AppComposePath $rec
+  $cfgCheck = Invoke-Docker compose --project-directory $rec.folder -f $compose config -q
+  & $add 'compose' $(if ($cfgCheck.ExitCode -eq 0) { 'passed' } else { 'failed' }) 'docker compose config'
+  $imgs = @($rec.images); $missingImg = @($imgs | Where-Object { (Invoke-Docker image inspect $_).ExitCode -ne 0 })
+  & $add 'images' $(if ($missingImg.Count) { 'failed' } else { 'passed' }) $(if ($missingImg.Count) { "missing: $($missingImg -join ', ')" } else { "$($imgs.Count) image(s) present, pinned by digest" })
+  $cs = @(Get-ComposeProjectContainers $plan.project)
+  $notRunning = @($cs | Where-Object { $_.state -ne 'running' -and $_.status -notmatch 'Exited \(0\)' })
+  & $add 'containers' $(if ($cs.Count -and -not $notRunning.Count) { 'passed' } else { 'failed' }) "$(@($cs | Where-Object { $_.state -eq 'running' }).Count) running$(if ($notRunning.Count) { "; not running: $(@($notRunning | ForEach-Object { $_.name }) -join ', ')" })"
+  $unhealthy = @($cs | Where-Object { [string]$_.health -match 'unhealthy' })
+  & $add 'dependencies' $(if ($unhealthy.Count) { 'failed' } elseif (@($cs | Where-Object { [string]$_.health -match 'healthy' }).Count) { 'passed' } else { 'not-tested' }) $(if ($unhealthy.Count) { "unhealthy: $(@($unhealthy | ForEach-Object { $_.name }) -join ', ')" } elseif (@($cs | Where-Object { [string]$_.health -match 'healthy' }).Count) { 'health checks pass' } else { 'no health checks defined' })
+  $m = Get-InstanceManifest $rec
+  $h = $null; if ($m) { $h = Get-AppHealth $plan.project $m $settings 0 }
+  $httpOk = [bool]($h -and $h.http -and $h.http.result -in 'http', 'https')
+  & $add 'backend' $(if ($httpOk) { 'passed' } else { 'failed' }) $(if ($h -and $h.http) { "$($h.http.result): $($h.http.detail)" } else { 'no answer' })
+  & $add 'docker-dns' $(if ($httpOk) { 'passed' } else { 'not-tested' }) $(if ($httpOk) { "$($plan.container) resolved by name on the shared network" } else { 'needs a reachable backend' })
+  $svc = $null
+  if ($plan.access -ne 'local') { $svc = @((Read-ServiceRegistry -Settings $settings).services | Where-Object { $_.name -eq $plan.project })[0] }
+  if (-not $svc) { foreach ($s in @('router', 'cloudflare', 'public', 'auth-challenge')) { & $add $s 'not-applicable' 'Local access only: no route.' } }
+  else {
+    $model = $null; try { $model = Get-RoutingModel -Facts (Get-RoutingFacts $settings $svc -Probe) } catch { }
+    $stages = @(if ($model) { @($model.stages) })
+    # The routing model's states: only 'verified' is a passed check; 'configured' means checked in the configuration only.
+    $state = { param([string[]]$ids) $ss = @($stages | Where-Object { $ids -contains [string]$_.id }); if (-not $ss.Count) { 'not-tested' } elseif (@($ss | Where-Object { $_.state -eq 'failed' }).Count) { 'failed' } elseif (-not @($ss | Where-Object { $_.state -ne 'verified' }).Count) { 'passed' } else { 'not-tested' } }
+    $summary = { param([string[]]$ids) (@($stages | Where-Object { $ids -contains [string]$_.id } | ForEach-Object { "$($_.title): $($_.summary)" }) -join ' ') }
+    & $add 'router' (& $state @('router')) $(if ($model) { & $summary @('router') } else { 'routing model unavailable' })
+    if ($plan.access -eq 'public') {
+      & $add 'cloudflare' (& $state @('dns', 'tunnel')) (& $summary @('dns', 'tunnel'))
+      # One real request from the Internet side: Cloudflare -> tunnel -> Traefik. A sign-in page (authentik or Cloudflare
+      # Access) proves that the protection layer answers; the application itself is verified by the backend stage.
+      $pr = Invoke-ProbeRequest "https://$($plan.hostname)/"
+      $toAuth = [string]$pr.Location -match '(cloudflareaccess\.com|/outpost\.goauthentik\.io/|/application/o/authorize|/if/flow/)'
+      & $add 'public' $(if ($pr.Status -ge 200 -and $pr.Status -lt 400) { 'passed' } else { 'failed' }) $(if ($pr.Error) { $pr.Error } elseif ($toAuth) { "HTTP $($pr.Status): the sign-in layer answers (the application behind it is checked by the backend stage)" } else { "HTTP $($pr.Status)" })
+    } else { & $add 'cloudflare' 'not-applicable' 'Not published.'; & $add 'public' 'not-applicable' 'Not published.' }
+    if ($plan.auth -eq 'authentik') {
+      $c = Test-IdentityProtection $plan.hostname
+      & $add 'auth-challenge' $(if ($c.State -eq 'auth') { 'passed' } else { 'failed' }) ([string]$c.Message)
+      & $add 'unauthorized-rejected' $(if ($c.State -eq 'auth') { 'passed' } else { 'failed' }) 'An anonymous request is sent to sign in instead of reaching the application.'
+      & $add 'authorized-access' 'not-tested' 'Needs a real sign-in in your browser; the manager records it once authentik reports a successful sign-in to this application.'
+    } else { & $add 'auth-challenge' 'not-applicable' "Authentication: $($plan.auth)" }
+  }
+  return @($out)
+}
+
+function Invoke-ProvisionVerify($Body) {
+  Assert-Installed
+  $j = Read-ProvisionJournal ([string](Get-Field $Body 'operationId' ''))
+  $j.verification = Get-ProvisionVerification $j
+  Save-ProvisionJournal $j
+  return [ordered]@{ operationId = $j.operationId; verification = $j.verification }
+}
+
+function Get-ProvisionRollbackPreview($Body) {
+  Assert-Installed
+  $j = Read-ProvisionJournal ([string](Get-Field $Body 'operationId' ''))
+  return [ordered]@{ operationId = $j.operationId; summary = $j.summary; state = $j.state; plan = (Get-ProvisionRollbackPlan $j -DeleteData:([bool](Get-Field $Body 'deleteData' $false))) }
+}
+
+# Undoes one operation: Cloudflare and the route first (the hostname stops answering), then authentik (only what this
+# operation created), then the Compose project (data volumes only with deleteData and the project name typed).
+function Invoke-ProvisionRollback($Body) {
+  Assert-Installed
+  Assert-Confirmed $Body
+  $settings = Get-Settings
+  $j = Read-ProvisionJournal ([string](Get-Field $Body 'operationId' ''))
+  if ([string]$j.state -eq 'rolled-back') { Stop-Request 409 'This operation was already rolled back.' }
+  $deleteData = [bool](Get-Field $Body 'deleteData' $false)
+  if ($deleteData -and [string](Get-Field $Body 'confirmText' '') -ne [string]$j.plan.project) { Stop-Request 400 "Type the project name ($($j.plan.project)) to delete its data." }
+  $rb = Get-ProvisionRollbackPlan $j -DeleteData:$deleteData
+  $done = New-Object System.Collections.ArrayList
+  $err = ''
+  $did = @{}
+  try {
+    $akStep = @($rb.steps | Where-Object { $_.kind -eq 'authentik-application' })[0]
+    $hasRoute = @($rb.steps | Where-Object { $_.kind -eq 'traefik-route' -or $_.kind -like 'cloudflare-*' }).Count
+    if ($akStep) { foreach ($x in (Undo-IdentityProtection ([string]$j.plan.project) $true)) { $null = $done.Add("authentik: $x") } }
+    elseif (@($rb.kept | Where-Object { $_.kind -eq 'authentik-application' }).Count -and $hasRoute) { foreach ($x in (Undo-IdentityProtection ([string]$j.plan.project) $false)) { $null = $done.Add("authentik: $x") } }
+    if ($hasRoute) {
+      $reg = @((Read-ServiceRegistry -Settings $settings).services | Where-Object { $_.name -eq [string]$j.plan.project })
+      if ($reg.Count) {
+        $plan = Build-ChangePlan ([pscustomobject]@{ op = 'remove'; name = [string]$j.plan.project; cloudflare = [pscustomobject]@{ automate = $true; cleanup = $true } })
+        $r = Invoke-ChangePlanSteps $plan @()
+        if (-not $r.ok) { throw 'Traefik or Cloudflare did not accept removing the route.' }
+        $null = $done.Add("Route $($j.plan.hostname) removed$(if (@($rb.steps | Where-Object { $_.kind -like 'cloudflare-*' }).Count) { ' with the Cloudflare records this operation created' })")
+      }
+    }
+    if (@($rb.steps | Where-Object { $_.kind -eq 'compose-project' }).Count -and @(Read-AppsRegistry $settings | Where-Object { $_.project -eq [string]$j.plan.project }).Count) {
+      $rm = Invoke-AppRemove ([pscustomobject]@{ project = [string]$j.plan.project; confirm = $true; deleteVolumes = $deleteData; deleteFolder = $deleteData; confirmText = [string](Get-Field $Body 'confirmText' '') })
+      $null = $done.Add("Compose project $($rm.project) removed$(if ($deleteData) { ' with its data' } else { "; data volumes kept: $(@($rm.keptVolumes) -join ', ')" })")
+    }
+  } catch { $err = $_.Exception.Message }
+  $j.state = $(if ($err) { 'rollback-failed' } else { 'rolled-back' })
+  Add-JournalStage $j 'rollback' $(if ($err) { 'failed' } else { 'passed' }) $(if ($err) { $err } else { ($done -join '; ') })
+  Save-ProvisionJournal $j
+  Write-Audit 'provision-rollback' "$($j.operationId) $($j.state)"
+  return [ordered]@{ ok = (-not $err); done = @($done); kept = @($rb.kept); error = $err; state = $j.state }
+}
+
+# --- Recipes (local; sharing is an explicit, previewed export) ---
+
+function Invoke-ProvisionRecipeSave($Body) {
+  Assert-Installed
+  $settings = Get-Settings
+  $j = Read-ProvisionJournal ([string](Get-Field $Body 'operationId' ''))
+  $rec = @(Read-AppsRegistry $settings | Where-Object { $_.project -eq [string]$j.plan.project })[0]
+  if (-not $rec) { Stop-Request 409 'The application of this operation is no longer installed.' }
+  $m = Get-InstanceManifest $rec
+  $r = New-Recipe -Manifest $m -HostFingerprint (Get-HostFingerprint) -Verification @($j.verification) -Origin 'local' -KnownIssues @(Get-Prop2 $m 'knownIssues' @())
+  $path = Save-Recipe $settings $r
+  return [ordered]@{ saved = $true; id = $r.id; file = (Split-Path -Leaf $path); trust = $r.trust }
+}
+
+function Get-ProvisionRecipeShare($Body) {
+  Assert-Installed
+  $settings = Get-Settings
+  $id = [string](Get-Field $Body 'recipeId' '')
+  if ($id -notmatch '^[a-z0-9][a-z0-9-]{0,60}$') { Stop-Request 400 'Invalid recipe id.' }
+  $r = @(Get-LocalRecipes $settings | Where-Object { [string]$_.id -eq $id })[0]
+  if (-not $r) { Stop-Request 404 'No such recipe.' }
+  $s = ConvertTo-SanitizedRecipe $r (Get-ProvisionPrivateNames $settings)
+  return [ordered]@{ recipe = $s.Recipe; removed = $s.Removed; errors = @(Test-Recipe $s.Recipe); note = 'Nothing is uploaded. This is exactly what an exported file contains.' }
+}
+
+function Invoke-ProvisionRecipeImport($Body) {
+  Assert-Installed
+  try { $path = Import-RecipeText (Get-Settings) ([string](Get-Field $Body 'text' '')) } catch { Stop-Request 400 $_.Exception.Message }
+  return [ordered]@{ imported = $true; file = (Split-Path -Leaf $path) }
+}
+
+function Get-ProvisionRecipes($Query) {
+  Assert-Installed
+  $settings = Get-Settings
+  $app = [string]$Query['app']
+  $list = @(Get-LocalRecipes $settings $app)
+  $ranked = @(Get-RecipeRanking $list (Get-HostFingerprint))
+  return [ordered]@{ recipes = @($ranked | ForEach-Object { [ordered]@{ id = $_.Recipe.id; application = $_.Recipe.application; host = $_.Recipe.host; trust = $_.Recipe.trust; origin = $_.Recipe.provenance.origin; score = $_.Score; reasons = $_.Reasons; compatible = $_.Compatible } }); registry = (Get-RecipeRegistryInfo) }
+}
+
 # --- Router ----------------------------------------------------------------------------------------------------
 
 function Invoke-ApiRoute($Request, $Body) {
@@ -3765,6 +4385,25 @@ function Invoke-ApiRoute($Request, $Body) {
     'POST /api/identity/protect/apply' { return Invoke-IdentityProtectApply $Body }
     'POST /api/identity/unprotect/plan' { return Invoke-IdentityProtectPlan $Body -Remove }
     'POST /api/identity/unprotect/apply' { return Invoke-IdentityProtectApply $Body -Remove }
+    'GET /api/provision' { return Get-ProvisionData }
+    'POST /api/provision/import' { return Invoke-ProvisionImport $Body }
+    'GET /api/provision/draft' { Assert-Installed; return Get-ProvisionDraftView (Read-ProvisionDraft ([string]$Request.Query['id'])) }
+    'POST /api/provision/draft/web' { return Invoke-ProvisionDraftEdit $Body }
+    'POST /api/provision/draft/delete' { return Remove-ProvisionDraftRequest $Body }
+    'POST /api/provision/ai/settings' { return Set-ProvisionAiSettingsRequest $Body }
+    'POST /api/provision/ai/key' { return Save-ProvisionAiKeyRequest $Body }
+    'POST /api/provision/ai/key/delete' { Assert-Installed; Assert-Confirmed $Body; Remove-ProtectedSecret -Settings (Get-Settings) -Name (Get-AiKeySecretName); Write-Audit 'provision-ai-key' 'deleted'; return [ordered]@{ stored = $false } }
+    'POST /api/provision/ai/estimate' { return Invoke-ProvisionAiEstimate $Body }
+    'POST /api/provision/ai/run' { return Invoke-ProvisionAiRun $Body }
+    'POST /api/provision/plan' { return Invoke-ProvisionPlan $Body }
+    'POST /api/provision/apply' { return Invoke-ProvisionApply $Body }
+    'POST /api/provision/verify' { return Invoke-ProvisionVerify $Body }
+    'POST /api/provision/rollback/plan' { return Get-ProvisionRollbackPreview $Body }
+    'POST /api/provision/rollback' { return Invoke-ProvisionRollback $Body }
+    'GET /api/provision/recipes' { return Get-ProvisionRecipes $Request.Query }
+    'POST /api/provision/recipe/save' { return Invoke-ProvisionRecipeSave $Body }
+    'POST /api/provision/recipe/share' { return Get-ProvisionRecipeShare $Body }
+    'POST /api/provision/recipe/import' { return Invoke-ProvisionRecipeImport $Body }
     'GET /api/environment' { return Get-EnvironmentData }
     'GET /api/expert/config' { return Get-ExpertConfigData }
     'POST /api/setup/contact' { return Set-ContactEmailRequest $Body }

@@ -532,9 +532,54 @@
   // Display name of an installed instance: the application, plus its label when it has one (e.g. "Testing").
   function instanceTitle(a) { return a && a.label ? `${a.name} (${a.label})` : (a ? a.name : ''); }
 
+  // --- New app (provisioning): Container -> Reverse proxy -> Authentication -> Review and deploy ---------------------
+  // Findings the user must acknowledge before a deployment can be reviewed (block findings cannot be acknowledged).
+  function provisionAckIds(findings) { return (findings || []).filter((f) => f.severity === 'high' || f.severity === 'review').map((f) => f.id); }
+  // Where the app is reachable, and which sign-in choices make sense there (the server decides availability).
+  const PROVISION_ACCESS = {
+    local: { label: 'Only this PC', text: 'Opens on 127.0.0.1; no route, nothing published.' },
+    lan: { label: 'A host name on your network', text: 'An explicit Traefik route. In this deployment Traefik listens on this PC only.' },
+    public: { label: 'A public address (Cloudflare Tunnel)', text: 'An explicit Traefik route, published through your existing Cloudflare Tunnel.' },
+  };
+  // Pure: step states of the wizard. s: { draft, acknowledged[], access, hostname, auth, review, result }.
+  function provisionWizard(s) {
+    const st = s || {};
+    const draft = st.draft || null;
+    const acks = new Set(st.acknowledged || []);
+    const pending = draft ? provisionAckIds(draft.findings).filter((id) => !acks.has(id)) : [];
+    const containerDone = !!(draft && draft.deployable && !pending.length);
+    const hostOk = /^(?=.{4,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/.test(String(st.hostname || ''));
+    const proxyDone = containerDone && (st.access === 'local' || ((st.access === 'lan' || st.access === 'public') && hostOk));
+    const authDone = proxyDone && !!st.auth && !(st.access === 'public' && st.auth === 'none') && !(st.access === 'local' && st.auth !== 'none' && st.auth !== 'native');
+    const deployed = !!(st.result && st.result.ok);
+    const steps = [
+      { id: 'container', number: 1, title: 'Container', done: containerDone, available: true, missing: !draft ? 'Import an application' : !draft.deployable ? 'The draft cannot be deployed yet' : pending.length ? `${pending.length} item(s) to review` : '' },
+      { id: 'proxy', number: 2, title: 'Reverse proxy', done: proxyDone, available: containerDone, missing: proxyDone ? '' : (st.access && st.access !== 'local' && !hostOk ? 'Enter a host name' : 'Choose where it is reachable') },
+      { id: 'auth', number: 3, title: 'Authentication', done: authDone, available: proxyDone, missing: authDone ? '' : 'Choose who has access' },
+      { id: 'review', number: 4, title: 'Review and deploy', done: deployed, available: authDone, missing: deployed ? '' : 'Review, then deploy' },
+    ];
+    const current = (steps.find((x) => !x.done && x.available) || steps[steps.length - 1]).id;
+    return { steps, current, pendingAcks: pending };
+  }
+  // Pure: the overall verdict of a deployment's verification stages. Untested stages never count as passed.
+  function provisionVerdict(stages) {
+    const list = stages || [];
+    const n = (st) => list.filter((x) => x.status === st).length;
+    const counts = { passed: n('passed'), failed: n('failed'), notTested: n('not-tested'), notApplicable: n('not-applicable') };
+    const state = counts.failed ? 'attention' : counts.notTested ? 'partial' : counts.passed ? 'verified' : 'unknown';
+    return { counts, state };
+  }
+  // Pure: a host name suggestion: <app id>.<first domain>.
+  function suggestProvisionHostname(appId, domains) {
+    const label = suggestLabel(appId || '');
+    const d = (domains || []).find(Boolean);
+    return label && d ? `${label}.${d}` : '';
+  }
+
   return {
     ROUTING_STATES, routingState, routingEvidence, endpointAudience, endpointKind, ROUTING_HELP, routingHelp, journeyPath,
     DEPLOYMENT_STATES, deploymentState, statusTone, serviceGroups, terminationText, healthText, shortImage, roleSource, catalogInstallState, instanceTitle,
+    provisionAckIds, PROVISION_ACCESS, provisionWizard, provisionVerdict, suggestProvisionHostname,
     IDENTITY_STATES, identityState, googleRedirectUri, isGoogleClientId, identityNextStep, identityWizard, wizardNeighbours, CREDENTIAL_STATUS, credentialStatus,
     appProtectionState, protectionSummary,
     LEVELS, LEVEL_TITLES, DEFAULT_LEVEL, normalizeLevel, levelIndex, isVisibleAt,
