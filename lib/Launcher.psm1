@@ -28,15 +28,17 @@ function Get-LauncherEdition([string]$ProgramPath) {
 function Get-LauncherBaseDir { return (Join-Path $env:LOCALAPPDATA 'TraefikProxy') }
 
 # The installed manager and extracted packages share %LOCALAPPDATA%\TraefikProxy (as before). A development checkout gets
-# its own folder, so its tray, port, sign-in link and settings never touch the installed manager's.
+# its own folder outside it (%LOCALAPPDATA%\TraefikProxy-dev\<folder>-<hash>), so its tray, port, sign-in link, settings
+# and logs never touch the installed manager's folder.
 function Get-LauncherStateDir([string]$ProgramPath) {
   $base = Get-LauncherBaseDir
   if ((Get-LauncherEdition $ProgramPath) -ne 'development') { return $base }
+  $base = "$base-dev"
   $full = [IO.Path]::GetFullPath($ProgramPath).TrimEnd('\').ToLowerInvariant()
   $sha = [Security.Cryptography.SHA256]::Create()
   $hash = (-join ($sha.ComputeHash($script:Utf8NoBom.GetBytes($full))[0..3] | ForEach-Object { $_.ToString('x2') }))
   $name = (Split-Path -Leaf $full) -replace '[^A-Za-z0-9._-]', '_'
-  return (Join-Path $base "dev\$name-$hash")
+  return (Join-Path $base "$name-$hash")
 }
 
 function Get-LauncherDefaultPort([string]$Edition) { if ($Edition -eq 'development') { return 8290 }; return 8190 }

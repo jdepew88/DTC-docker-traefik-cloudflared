@@ -105,7 +105,7 @@ try {
   [IO.File]::WriteAllText("$ed\installed\.install-manifest.json", '{}')
   Test-Condition 'edition: git checkout = development, install manifest = installed, else package' ((Get-LauncherEdition "$ed\dev") -eq 'development' -and (Get-LauncherEdition "$ed\installed") -eq 'installed' -and (Get-LauncherEdition "$ed\package") -eq 'package')
   $devState = Get-LauncherStateDir "$ed\dev"
-  Test-Condition 'state folder: installed = %LOCALAPPDATA%\TraefikProxy, development = its own subfolder' ((Get-LauncherStateDir "$ed\installed") -eq (Get-LauncherBaseDir) -and $devState -like "$(Get-LauncherBaseDir)\dev\dev-*" -and $devState -ne (Get-LauncherStateDir "$ed\package"))
+  Test-Condition 'state folder: installed = %LOCALAPPDATA%\TraefikProxy, development = its own folder outside it' ((Get-LauncherStateDir "$ed\installed") -eq (Get-LauncherBaseDir) -and $devState -like "$(Get-LauncherBaseDir)-dev\dev-*" -and $devState -notlike "$(Get-LauncherBaseDir)\*" -and $devState -ne (Get-LauncherStateDir "$ed\package")) $devState
   Test-Condition 'default port: 8190 installed, 8290 development (both can run)' ((Get-LauncherDefaultPort 'installed') -eq 8190 -and (Get-LauncherDefaultPort 'development') -eq 8290)
 
   $st = Join-Path $work 'state-unit'
@@ -392,7 +392,9 @@ try {
     Test-Condition 'page: the default deployment is marked; others offer Make default' ($isDefault -and $hasMake)
     $shots = Join-Path $work 'shots'; New-Item -ItemType Directory -Force -Path $shots | Out-Null
     Save-PageScreenshot $cdp (Join-Path $shots 'launcher-1-recovery.png')
-    $null = Invoke-PageScript $cdp "document.querySelector('[data-make-default]').click(); true"
+    # The chooser also lists real running stacks (e.g. traefik-ext1): click the button of this test's deployment only.
+    $clicked = [bool](Invoke-PageScript $cdp "(() => { const b = [...document.querySelectorAll('[data-make-default]')].find((x) => x.dataset.makeDefault === $(ConvertTo-Json $pathB)); if (b) b.click(); return !!b; })()")
+    if (-not $clicked) { Add-Result 'FAIL' 'page: Make default button of the test deployment' 'not found' }
     $made = Wait-Until { (Read-LauncherSettings $bst $repo).defaultDeployment -eq $pathB } 20
     $marked = Wait-PageCondition $cdp "[...document.querySelectorAll('.rv')].some((c) => c.textContent.includes('$stackB') && c.textContent.includes('Default at startup'))" 15
     Test-Condition 'page: Make default saves the new default and marks it' ($made -and $marked)

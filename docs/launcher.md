@@ -68,6 +68,11 @@ not start a second copy. Instead, it asks the running tray to open the dashboard
 | **Open Log Folder** | Opens `logs\` in the state folder. |
 | **Exit** | Stops the manager the tray started and removes the icon. A manager you started with `START-HERE.cmd` is left running. |
 
+**Finding the icon.** Windows 11 puts new tray icons in the hidden-icons overflow (the **^** arrow next to the clock)
+at first. To keep it visible, drag it onto the taskbar. You can also turn it on under *Settings > Personalization >
+Taskbar > Other system tray icons*. It is listed there as **Windows PowerShell**, because the tray runs inside
+`powershell.exe`.
+
 The icon has a status dot:
 
 | Dot | Meaning |
@@ -131,7 +136,7 @@ so, and the bookmark works again once the port is free.
 ## Settings, state and logs
 
 The installed manager and extracted packages use **`%LOCALAPPDATA%\TraefikProxy`**. A development checkout (a git
-checkout or worktree) uses `%LOCALAPPDATA%\TraefikProxy\dev\<folder>-<hash>`. It therefore has its own settings, port
+checkout or worktree) uses `%LOCALAPPDATA%\TraefikProxy-dev\<folder>-<hash>`, outside the installed manager's folder. It therefore has its own settings, port
 (8290), sign-in link, tray, shortcuts ("(development)") and Start-with-Windows entry. It never controls, restarts or
 stops the installed manager.
 

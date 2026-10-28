@@ -89,7 +89,7 @@ foreach ($k in @('ok', 'busy', 'error', 'off')) { $bmp = New-LauncherBitmap 32 $
 
 $Tray = New-Object System.Windows.Forms.NotifyIcon
 $Tray.Icon = $Icons['busy']
-$Tray.Text = 'DTC: starting'
+$Tray.Text = $(if ($Edition -eq 'development') { 'DTC (dev): starting' } else { 'DTC: starting' })
 $Menu = New-Object System.Windows.Forms.ContextMenuStrip
 function Add-MenuItem([string]$Text, [scriptblock]$Action, [switch]$Bold) {
   $item = New-Object System.Windows.Forms.ToolStripMenuItem($Text)
