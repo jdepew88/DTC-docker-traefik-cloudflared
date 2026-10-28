@@ -40,7 +40,18 @@ param(
   [switch]$SingleUseLaunch,
   [switch]$OpenBrowser,
   # App Catalog manifests (default: catalog\ next to this script; tests use a fixture folder).
-  [string]$CatalogDir
+  [string]$CatalogDir,
+  # Launcher (Start-DeploymentManager.ps1): its state folder (launcher.json: default deployment, startup preferences), how
+  # this start was requested (default / choose / recovery) and a notice for the chooser (e.g. "default deployment missing").
+  [string]$LauncherStateDir,
+  [ValidateSet('', 'default', 'choose', 'recovery')][string]$StartMode = '',
+  [string]$StartNotice,
+  # Remembered browsers: sign-ins from the launch link set a cookie that lasts -RememberDays and survives restarts, so a
+  # bookmarked http://127.0.0.1:<port>/ keeps working. Only SHA-256 hashes of the cookies are stored, with a user-only ACL.
+  [string]$SessionFile,
+  [ValidateRange(1, 365)][int]$RememberDays = 30,
+  # Tests only: the Startup folder for "Start with Windows" (default: this user's Startup folder).
+  [string]$StartupDir
 )
 
 $ErrorActionPreference = 'Stop'
@@ -70,6 +81,7 @@ Import-Module (Join-Path $here 'lib\ProvisionPolicy.psm1') -Force
 Import-Module (Join-Path $here 'lib\IdentityContract.psm1') -Force
 Import-Module (Join-Path $here 'lib\AiAssist.psm1') -Force
 Import-Module (Join-Path $here 'lib\Recipes.psm1') -Force
+Import-Module (Join-Path $here 'lib\Launcher.psm1') -Force
 if (-not $CatalogDir) { $CatalogDir = Join-Path $here 'catalog' }
 Import-Module (Join-Path $here 'lib\LocalHttp.psm1') -Force
 Set-CloudflareApiBase $CloudflareApiBase
@@ -114,6 +126,7 @@ $State = @{
   IdpChecks = @{}
   ProvisionPlans = @{}
   AiEstimates = @{}
+  Remembered = @{}
   Cookie    = "tpx_session_$Port"
   Origins   = @("http://127.0.0.1:$Port", "http://localhost:$Port")
   Hosts     = @("127.0.0.1:$Port", "localhost:$Port")
@@ -2977,6 +2990,108 @@ function Invoke-UpgradeApply($Body) {
   return [ordered]@{ ok = ($r.ExitCode -eq 0); lines = $r.Lines; recoveryPoint = $recovery; upgrade = (Get-UpgradeStatus -Path $path -SourceRoot $here) }
 }
 
+# --- Launcher: remembered browsers, start mode, default deployment, Start with Windows -------------------------------------
+# Remembered browsers (-SessionFile): only SHA-256 hashes of session cookies and their expiry are stored, in a file readable
+# by this Windows user only, so a copy of the file signs nobody in. Launcher settings (lib\Launcher.psm1) hold no secret.
+# Changing the default deployment only records a folder: nothing in Docker, in the deployment or in Cloudflare changes.
+
+function Read-RememberedSessions {
+  $State.Remembered.Clear()
+  if (-not $SessionFile -or -not (Test-Path -LiteralPath $SessionFile)) { return }
+  try {
+    $j = [IO.File]::ReadAllText($SessionFile) | ConvertFrom-Json
+    $now = Get-Date
+    foreach ($e in @(Get-Field $j 'sessions' @())) {
+      if (-not $e -or -not $e.PSObject.Properties['hash'] -or -not $e.PSObject.Properties['expires']) { continue }
+      $exp = [datetime]::MinValue
+      $ok = [datetime]::TryParseExact([string]$e.expires, 's', [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::None, [ref]$exp)
+      if ($ok -and [string]$e.hash -match '^[0-9A-F]{64}$' -and $exp -gt $now) { $State.Remembered[([string]$e.hash).ToUpperInvariant()] = $exp }
+    }
+  } catch { }
+}
+
+function Save-RememberedSessions {
+  if (-not $SessionFile) { return }
+  $now = Get-Date
+  $list = @($State.Remembered.Keys | Where-Object { $State.Remembered[$_] -gt $now } | Sort-Object | ForEach-Object { [ordered]@{ hash = $_; expires = $State.Remembered[$_].ToString('s', [Globalization.CultureInfo]::InvariantCulture) } })
+  $dir = Split-Path -Parent $SessionFile
+  if ($dir -and -not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
+  $tmp = "$SessionFile.tmp-" + [Guid]::NewGuid().ToString('N').Substring(0, 8)
+  [IO.File]::WriteAllText($tmp, (ConvertTo-Json -Depth 3 -InputObject ([ordered]@{ schema = 1; sessions = $list })) + "`n")
+  Set-SecretFileAcl $tmp
+  Move-Item -LiteralPath $tmp -Destination $SessionFile -Force
+}
+
+# The session for a cookie: an in-memory one, else a remembered browser (gets a new CSRF token after a restart).
+function Get-RequestSession([string]$Sid) {
+  if (-not $Sid) { return $null }
+  if ($State.Sessions.ContainsKey($Sid)) { return $State.Sessions[$Sid] }
+  if (-not $SessionFile -or $Sid -notmatch '^[A-Za-z0-9_-]{20,64}$') { return $null }
+  $hash = Get-TextSha256 $Sid
+  if ($State.Remembered.ContainsKey($hash) -and $State.Remembered[$hash] -gt (Get-Date)) {
+    $State.Sessions[$Sid] = [pscustomobject]@{ Csrf = (New-RandomKey); Created = (Get-Date) }
+    return $State.Sessions[$Sid]
+  }
+  return $null
+}
+
+function Assert-Launcher {
+  if (-not $LauncherStateDir) { Stop-Request 409 'Startup settings need the launcher: start the manager with the DTC shortcut, Start-DeploymentManager.ps1 or START-HERE.cmd (not webui.ps1 directly).' }
+}
+
+function Get-LauncherData {
+  if (-not $LauncherStateDir) { return [ordered]@{ available = $false; startMode = $StartMode } }
+  $s = Read-LauncherSettings -StateDir $LauncherStateDir -ProgramPath $here
+  $d = Get-LauncherDeployment ([string]$s.defaultDeployment)
+  return [ordered]@{
+    available = $true; startMode = $StartMode; notice = [string]$StartNotice; edition = $s.edition; programPath = $here; problem = $s.problem
+    defaultDeployment = [ordered]@{ path = $s.defaultDeployment; stackName = $(if ($d.stackName) { $d.stackName } else { $s.defaultStackName }); kind = $d.kind; usable = $d.usable }
+    openBrowserOnManualLaunch = $s.openBrowserOnManualLaunch; dockerWaitSeconds = $s.dockerWaitSeconds
+    preferredPort = $s.port; port = $Port; bookmarkUrl = "http://127.0.0.1:$Port/"; rememberBrowser = [bool]$SessionFile; rememberDays = $RememberDays
+    autostart = (Get-LauncherAutostart -ProgramPath $here -StartupDir $StartupDir); launcherBuilt = (Test-Path -LiteralPath (Get-LauncherExePath $here))
+    appName = (Get-LauncherAppName $s.edition); logDir = (Get-LauncherFiles $LauncherStateDir).LogDir
+  }
+}
+
+function Set-LauncherSettingsRequest($Body) {
+  Assert-Launcher
+  $s = Read-LauncherSettings -StateDir $LauncherStateDir -ProgramPath $here
+  $changes = New-Object System.Collections.ArrayList
+  $flag = {
+    param($Name)
+    $v = $Body.$Name
+    if ($v -isnot [bool]) { Stop-Request 400 "$Name must be true or false." }
+    return $v
+  }
+  if ($Body.PSObject.Properties['defaultDeployment']) {
+    $path = [string]$Body.defaultDeployment
+    if ($path) {
+      try { $path = ConvertTo-ProjectPath $path } catch { Stop-Request 400 $_.Exception.Message }
+      $d = Get-LauncherDeployment $path
+      if (-not $d.usable) { Stop-Request 409 "$path is not an installed deployment of this tool, so it cannot be the default. Finish its setup first, or choose another folder." }
+      $s.defaultDeployment = $path; $s.defaultStackName = $d.stackName
+      $null = $changes.Add("default deployment $path ($($d.stackName))")
+    } else { $s.defaultDeployment = ''; $s.defaultStackName = ''; $null = $changes.Add('default deployment cleared') }
+  }
+  if ($Body.PSObject.Properties['openBrowserOnManualLaunch']) { $s.openBrowserOnManualLaunch = & $flag 'openBrowserOnManualLaunch'; $null = $changes.Add("open browser on manual launch: $($s.openBrowserOnManualLaunch)") }
+  if ($Body.PSObject.Properties['dockerWaitSeconds']) {
+    $w = [string]$Body.dockerWaitSeconds
+    if ($w -notmatch '^\d{1,4}$' -or [int]$w -gt 1800) { Stop-Request 400 'dockerWaitSeconds must be between 0 and 1800.' }
+    $s.dockerWaitSeconds = [int]$w; $null = $changes.Add("wait for Docker Desktop: $w s")
+  }
+  if ($Body.PSObject.Properties['autostart']) {
+    $want = & $flag 'autostart'
+    if ($want -and -not (Test-Path -LiteralPath (Get-LauncherExePath $here))) {
+      try { $null = New-LauncherExe -ProgramPath $here } catch { Write-LauncherLog -StateDir $LauncherStateDir -Source 'website' -Level 'WARN' -Message "The windowless launcher could not be built; autostart uses powershell.exe hidden instead. $($_.Exception.Message)" }
+    }
+    try { $null = Set-LauncherAutostart -ProgramPath $here -Enabled $want -StartupDir $StartupDir } catch { Stop-Request 500 "Start with Windows could not be changed: $($_.Exception.Message)" }
+    $s.autostart = $want; $null = $changes.Add("start with Windows: $want")
+  }
+  Save-LauncherSettings $LauncherStateDir $s
+  Write-LauncherLog -StateDir $LauncherStateDir -Source 'website' -Message ('Settings changed: ' + (@($changes) -join '; '))
+  return Get-LauncherData
+}
+
 function Invoke-ManagerStop($Body) {
   Assert-Confirmed $Body
   if (-not $StopFile) { Stop-Request 409 'This manager was started without a stop file. Close its PowerShell window (or press Ctrl+C there) to stop it.' }
@@ -4272,7 +4387,7 @@ function Invoke-ApiRoute($Request, $Body) {
   $m = $Request.Method
   $p = $Request.Path
   # Until a deployment is chosen, nothing may change any folder: only the project and manager actions are allowed.
-  if (-not $State.Chosen -and $m -ne 'GET' -and -not ($p.StartsWith('/api/projects/') -or $p -eq '/api/manager/stop')) {
+  if (-not $State.Chosen -and $m -ne 'GET' -and -not ($p.StartsWith('/api/projects/') -or $p.StartsWith('/api/launcher/') -or $p -eq '/api/manager/stop')) {
     Stop-Request 409 'Choose a deployment first (open an existing one or start a new one).'
   }
   $settings = Get-Settings
@@ -4323,6 +4438,8 @@ function Invoke-ApiRoute($Request, $Body) {
     'POST /api/projects/upgrade/preview' { return Invoke-UpgradePreview $Body }
     'POST /api/projects/upgrade/apply' { return Invoke-UpgradeApply $Body }
     'POST /api/manager/stop' { return Invoke-ManagerStop $Body }
+    'GET /api/launcher' { return Get-LauncherData }
+    'POST /api/launcher/settings' { return Set-LauncherSettingsRequest $Body }
     'GET /api/dashboard' { return Get-DashboardData }
     'POST /api/dashboard/settings' { return Save-DashboardSettingsRequest $Body }
     'GET /api/overview' { return Get-OverviewData }
@@ -4517,12 +4634,20 @@ function Invoke-Request($Request) {
       if (-not (Test-ConstantTimeEqual ([string]$Request.Query['k']) $State.LaunchKey)) { return @{ Status = 403; Body = "Invalid or expired link. Use the link printed by webui.ps1.`n"; Headers = $SecurityHeaders } }
       $sid = New-RandomKey
       $State.Sessions[$sid] = [pscustomobject]@{ Csrf = (New-RandomKey); Created = (Get-Date) }
+      $cookie = "$($State.Cookie)=$sid; Path=/; HttpOnly; SameSite=Strict"
+      if ($SessionFile) {
+        $State.Remembered[(Get-TextSha256 $sid)] = (Get-Date).AddDays($RememberDays)
+        try { Save-RememberedSessions } catch { }
+        $cookie += "; Max-Age=$($RememberDays * 86400)"
+      }
       # Launcher mode: a link works once (it may linger in browser history or a process listing); the next one is
       # written to the user-only link file for "open again".
       if ($SingleUseLaunch) { $State.LaunchKey = New-RandomKey; Write-LaunchUrlFile }
       $h = @{} + $SecurityHeaders
-      $h['Set-Cookie'] = "$($State.Cookie)=$sid; Path=/; HttpOnly; SameSite=Strict"
-      $h['Location'] = '/'
+      $h['Set-Cookie'] = $cookie
+      # The launcher may ask for a page after sign-in (?to=projects); only plain page names are accepted.
+      $to = [string]$Request.Query['to']
+      $h['Location'] = $(if ($to -match '^[a-z][a-z-]{0,30}$') { "/#$to" } else { '/' })
       return @{ Status = 303; Body = ''; Headers = $h }
     }
     if (-not $StaticFiles.ContainsKey($path)) { return @{ Status = 404; Body = "Not found.`n"; Headers = $SecurityHeaders } }
@@ -4531,10 +4656,10 @@ function Invoke-Request($Request) {
   }
 
   $sid = Get-Cookie $Request $State.Cookie
-  if (-not $sid -or -not $State.Sessions.ContainsKey($sid)) {
-    return New-JsonResponse @{ error = 'Not signed in. Open the link printed by webui.ps1 in this browser.'; signedOut = $true } 401
+  $session = Get-RequestSession $sid
+  if (-not $session) {
+    return New-JsonResponse @{ error = 'Not signed in. Open the manager from the DTC tray icon (Open Dashboard) or with the link printed by webui.ps1.'; signedOut = $true } 401
   }
-  $session = $State.Sessions[$sid]
   $body = $null
   if ($Request.Method -ne 'GET') {
     $origin = if ($Request.Headers.ContainsKey('origin')) { $Request.Headers['origin'] } else { '' }
@@ -4546,9 +4671,15 @@ function Invoke-Request($Request) {
     try { $body = if ($Request.Body) { $Request.Body | ConvertFrom-Json } else { [pscustomobject]@{} } }
     catch { return New-JsonResponse @{ error = 'Request body is not valid JSON.' } 400 }
   }
+  # Sign out of this browser: forgets the session (and the remembered browser); the next visit needs a new launch link.
+  if ($Request.Method -eq 'POST' -and $path -eq '/api/session/signout') {
+    $State.Sessions.Remove($sid)
+    if ($SessionFile) { $State.Remembered.Remove((Get-TextSha256 $sid)); try { Save-RememberedSessions } catch { } }
+    return New-JsonResponse ([ordered]@{ signedOut = $true }) 200 @{ 'Set-Cookie' = "$($State.Cookie)=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0" }
+  }
   try {
     $data = Invoke-ApiRoute $Request $body
-    if ($Request.Path -eq '/api/session') { $data = [ordered]@{ ok = $true; csrf = $session.Csrf; installPath = $InstallPath; chosen = [bool]$State.Chosen; canStop = [bool]$StopFile } }
+    if ($Request.Path -eq '/api/session') { $data = [ordered]@{ ok = $true; csrf = $session.Csrf; installPath = $InstallPath; chosen = [bool]$State.Chosen; canStop = [bool]$StopFile; startMode = $StartMode; launcher = [bool]$LauncherStateDir; remembered = [bool]$SessionFile } }
     if ($data -is [pscustomobject] -and $data.PSObject.Properties['IsDownload']) {
       $h = @{} + $SecurityHeaders
       $h['Content-Disposition'] = "attachment; filename=`"$($data.FileName -replace '[^A-Za-z0-9._-]', '_')`""
@@ -4580,6 +4711,7 @@ function Write-LaunchUrlFile {
   Move-Item -LiteralPath $tmp -Destination $LaunchUrlFile -Force
 }
 
+Read-RememberedSessions
 try { $listener = New-LoopbackListener $Port }
 catch { throw "Cannot listen on 127.0.0.1:$Port ($($_.Exception.Message)). Is the web UI already running? Use -Port to pick another port." }
 $launchUrl = "http://127.0.0.1:$Port/?k=$($State.LaunchKey)"

@@ -19,6 +19,11 @@
   .\Start-DeploymentManager.ps1 -Restart
   .\Start-DeploymentManager.ps1 -Status
   .\Start-DeploymentManager.ps1 -InstallPath D:\proxy   # open one deployment directly (skip the chooser)
+  .\Start-DeploymentManager.ps1 -StartMode default      # open the saved default deployment (launcher\DTC-Tray.ps1 does this)
+  .\Start-DeploymentManager.ps1 -StartMode recovery     # start without opening any deployment
+
+  The DTC tray app (launcher\DTC-Tray.ps1, started by DTC.exe and the shortcuts from Setup-Launcher.cmd) runs this script
+  without a window (-Background -LogFile). See docs\launcher.md.
 #>
 [CmdletBinding()]
 param(
@@ -33,25 +38,45 @@ param(
   # Tests: a separate state folder (default %LOCALAPPDATA%\TraefikProxy) and a projects folder to search.
   [string]$StateDir,
   [string]$ProjectsRoot,
-  [string]$CloudflareApiBase
+  [string]$CloudflareApiBase,
+  # default: open the saved default deployment (else the chooser, with a notice); choose: the chooser; recovery: open no
+  # deployment. Without -StartMode the chooser opens, as before. -InstallPath always wins.
+  [ValidateSet('', 'default', 'choose', 'recovery')][string]$StartMode = '',
+  # Started by the tray app: never asks a question; output goes to -LogFile.
+  [switch]$Background,
+  [string]$LogFile,
+  # Tests: the Startup folder the website's "Start with Windows" setting writes to.
+  [string]$StartupDir
 )
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 2.0
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
-if (-not $StateDir) { $StateDir = Join-Path $env:LOCALAPPDATA 'TraefikProxy' }
+$launcherModule = Join-Path $here 'lib\Launcher.psm1'
+if (Test-Path -LiteralPath $launcherModule) { Import-Module $launcherModule -Force -DisableNameChecking }
+# The installed manager uses %LOCALAPPDATA%\TraefikProxy; a development checkout its own subfolder (see lib\Launcher.psm1).
+if (-not $StateDir) { $StateDir = $(if (Get-Command Get-LauncherStateDir -ErrorAction SilentlyContinue) { Get-LauncherStateDir $here } else { Join-Path $env:LOCALAPPDATA 'TraefikProxy' }) }
 $managerFile = Join-Path $StateDir 'manager.json'
 $launchFile = Join-Path $StateDir 'launch.url'
 $stopFile = Join-Path $StateDir 'manager.stop'
+if ($Background -and $IfRunning -eq 'ask') { $IfRunning = 'open' }
+if ($LogFile) {
+  try {
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $LogFile) | Out-Null
+    if ((Test-Path -LiteralPath $LogFile) -and (Get-Item -LiteralPath $LogFile).Length -gt 1MB) { Move-Item -LiteralPath $LogFile -Destination "$LogFile.1" -Force }
+    Start-Transcript -LiteralPath $LogFile -Append | Out-Null
+  } catch { }
+}
 
 function Say([string]$Text, [string]$Color = 'Gray') { Write-Host $Text -ForegroundColor $Color }
-function Fail([string]$Text, [int]$Code = 1) { Say ''; Say "Problem: $Text" 'Red'; exit $Code }
+function Log([string]$Level, [string]$Text) { if (Get-Command Write-LauncherLog -ErrorAction SilentlyContinue) { Write-LauncherLog -StateDir $StateDir -Source 'manager' -Level $Level -Message $Text } }
+function Fail([string]$Text, [int]$Code = 1) { Say ''; Say "Problem: $Text" 'Red'; Log 'ERROR' $Text; if ($LogFile) { try { Stop-Transcript | Out-Null } catch { } }; exit $Code }
 
 # --- Checks --------------------------------------------------------------------------------------------------------------
 
 if ($PSVersionTable.PSVersion -lt [version]'5.1') { Fail "Windows PowerShell 5.1 or later is required (found $($PSVersionTable.PSVersion)). It is part of Windows 10 and 11." }
 $required = @('webui.ps1', 'install.ps1', 'compose.yaml', 'lib\TraefikProxy.psm1', 'lib\CloudflareApi.psm1', 'lib\LocalHttp.psm1', 'lib\Dashboard.psm1', 'lib\ConfigBackup.psm1',
-  'lib\ProjectDiscovery.psm1', 'lib\Infrastructure.psm1', 'lib\DockerDiscovery.psm1', 'lib\ServiceHealth.psm1', 'lib\BackendResolver.psm1', 'lib\AppCatalog.psm1',
+  'lib\ProjectDiscovery.psm1', 'lib\Launcher.psm1', 'lib\Infrastructure.psm1', 'lib\DockerDiscovery.psm1', 'lib\ServiceHealth.psm1', 'lib\BackendResolver.psm1', 'lib\AppCatalog.psm1',
   'webui\explorer.js', 'webui\brands.js', 'webui\discover.js', 'webui\catalog.js', 'catalog\apps\echo.json', 'webui\index.html', 'webui\app.js', 'webui\ui.js', 'webui\logic.js', 'webui\setup.js', 'webui\pages.js', 'webui\backend.js', 'webui\projects.js', 'webui\app.css', 'webui\learn.json')
 $missing = @($required | Where-Object { -not (Test-Path -LiteralPath (Join-Path $here $_)) })
 if ($missing.Count) { Fail ("These program files are missing next to Start-DeploymentManager.ps1: $($missing -join ', '). Extract the whole ZIP again (all folders) and start START-HERE.cmd from the extracted folder.") }
@@ -130,15 +155,30 @@ if ($running) {
 
 # --- Start ----------------------------------------------------------------------------------------------------------------------
 
+# Launcher settings (no secrets): preferred port, default deployment, remembered browsers.
+$launcher = Read-LauncherSettings -StateDir $StateDir -ProgramPath $here
+if ($launcher.problem) { Say $launcher.problem 'Yellow'; Log 'WARN' $launcher.problem }
+if (-not $PSBoundParameters.ContainsKey('Port')) { $Port = [int]$launcher.port }
+$notice = ''
+if ($StartMode -and -not $InstallPath) {
+  $plan = Resolve-LauncherStart $launcher $StartMode
+  if ($plan.installPath) { $InstallPath = $plan.installPath; Say "Default deployment: $($plan.stackName) ($InstallPath)" 'Green' }
+  $notice = $plan.notice
+  if ($plan.level -eq 'warn') { Say $notice 'Yellow' }
+  Log $(if ($plan.level -eq 'warn') { 'WARN' } else { 'INFO' }) "Start mode $StartMode, deployment: $(if ($InstallPath) { $InstallPath } else { '(chooser)' }). $notice"
+}
+
 $chosen = $Port
 if (-not (Test-PortFree $chosen)) {
   $chosen = @(($Port + 1)..($Port + 30) | Where-Object { Test-PortFree $_ })[0]
   if (-not $chosen) { Fail "Ports $Port-$($Port + 30) on 127.0.0.1 are all in use. Start with -Port <another port>." }
-  Say "Port $Port is used by another program; using $chosen instead." 'Yellow'
+  $portNote = "Port $Port is used by another program, so the manager runs on $chosen this time. A bookmark to port $Port works again once that port is free."
+  Say $portNote 'Yellow'; Log 'WARN' $portNote
+  $notice = (@($notice, $portNote) | Where-Object { $_ }) -join ' '
 }
 
 Say 'Deployment Manager (Traefik + Cloudflare)' 'Cyan'
-Say "Program folder: $here"
+Say "Program folder: $here ($(Get-LauncherEdition $here))"
 $docker = Get-Command docker -ErrorAction SilentlyContinue
 if (-not $docker) { Say 'Docker Desktop: not found. The website opens anyway and explains how to install it.' 'Yellow' }
 else {
@@ -155,7 +195,11 @@ Remove-Item -LiteralPath $stopFile, $launchFile -Force -ErrorAction SilentlyCont
 # No secret in this file: process id, port and folders only.
 [IO.File]::WriteAllText($managerFile, (ConvertTo-Json -Compress -InputObject ([ordered]@{ pid = $PID; port = $chosen; startedAt = (Get-Date -Format 's'); sourcePath = $here })))
 Say "Starting on http://127.0.0.1:$chosen/ (this PC only). Keep this window open; close it or press Ctrl+C to stop."
-$webArgs = @{ Port = $chosen; LaunchUrlFile = $launchFile; StopFile = $stopFile; SingleUseLaunch = $true; OpenBrowser = (-not $NoBrowser); StateFile = (Join-Path $StateDir 'webui.json') }
+$webArgs = @{ Port = $chosen; LaunchUrlFile = $launchFile; StopFile = $stopFile; SingleUseLaunch = $true; OpenBrowser = (-not $NoBrowser); StateFile = (Join-Path $StateDir 'webui.json')
+  LauncherStateDir = $StateDir; StartMode = $StartMode; StartNotice = $notice }
+# Remembered browsers: a bookmarked http://127.0.0.1:<port>/ keeps working across restarts (see webui.ps1 -SessionFile).
+if ($launcher.rememberBrowser) { $webArgs['SessionFile'] = Join-Path $StateDir 'sessions.json'; $webArgs['RememberDays'] = [int]$launcher.rememberDays }
+if ($StartupDir) { $webArgs['StartupDir'] = $StartupDir }
 if ($InstallPath) { $webArgs['InstallPath'] = $InstallPath }
 if ($ProjectsRoot) { $webArgs['ProjectsRoot'] = $ProjectsRoot }
 if ($CloudflareApiBase) { $webArgs['CloudflareApiBase'] = $CloudflareApiBase }
@@ -166,10 +210,12 @@ try {
   $exitCode = 1
   Say ''
   Say "The Deployment Manager stopped with an error: $($_.Exception.Message)" 'Red'
+  Log 'ERROR' "The manager stopped with an error: $($_.Exception.Message)"
   Say 'If this keeps happening, run tests\Test-FirstRun.ps1 or open an issue with this message (it contains no secrets).'
 } finally {
   $info = Read-ManagerInfo
   if ($info -and [int]$info.pid -eq $PID) { Remove-Item -LiteralPath $managerFile -Force -ErrorAction SilentlyContinue }
   Remove-Item -LiteralPath $launchFile, $stopFile -Force -ErrorAction SilentlyContinue
+  if ($LogFile) { try { Stop-Transcript | Out-Null } catch { } }
 }
 exit $exitCode

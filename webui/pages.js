@@ -569,8 +569,8 @@
       h('section', { class: 'card' }, h('h2', null, 'The manager itself'),
         h('p', { class: 'muted small' }, 'This website runs on this PC only. Stopping it does not stop your deployments: Traefik, cloudflared and your apps keep running.'),
         ctx.state.session.canStop ? h('div', { class: 'actions' }, h('button', { type: 'button', class: 'btn danger-outline', onclick: async (e) => {
-          const ok = await U.confirmDialog({ title: 'Stop the manager?', body: 'The website stops. Your deployments keep running. Start it again with START-HERE.cmd.', okText: 'Stop the manager', danger: true });
-          if (ok) await withBusy(e.currentTarget, async () => { await api('POST', '/api/manager/stop', { confirm: true }); fill(main, h('div', { class: 'callout' }, h('h1', null, 'The manager has stopped.'), h('p', null, 'You can close this tab. Double-click START-HERE.cmd to start it again.'))); });
+          const ok = await U.confirmDialog({ title: 'Stop the manager?', body: 'The website stops. Your deployments keep running. Start it again with the DTC shortcut (or START-HERE.cmd).', okText: 'Stop the manager', danger: true });
+          if (ok) await withBusy(e.currentTarget, async () => { await api('POST', '/api/manager/stop', { confirm: true }); fill(main, h('div', { class: 'callout' }, h('h1', null, 'The manager has stopped.'), h('p', null, 'You can close this tab. Start it again with the DTC shortcut, Open Dashboard in the DTC tray menu, or START-HERE.cmd.'))); });
         } }, 'Stop the manager')) : h('p', { class: 'small' }, 'To stop it, close its PowerShell window or press Ctrl+C there. Started with START-HERE.cmd, it can also be stopped here or with STOP-MANAGER.cmd.')));
   };
 

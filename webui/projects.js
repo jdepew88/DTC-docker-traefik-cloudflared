@@ -20,11 +20,12 @@
     if (sub === 'review' && ctx.state.reviewPath) return renderReview(main, ctx, ctx.state.reviewPath);
     fill(main, head(ctx), h('p', { class: 'muted' }, 'Looking for deployments…'));
     const data = ctx.state.projects = await api('GET', '/api/projects');
+    const launcher = ctx.state.launcher = await api('GET', '/api/launcher').catch(() => null);
     const list = arr(data.projects).filter((p) => p.summary.kind !== 'other' || p.recent);
     const pathInput = h('input', { id: 'new-path', value: ctx.state.forms.newPath || data.suggestedNewPath, spellcheck: 'false', autocomplete: 'off' });
     pathInput.addEventListener('input', () => { ctx.state.forms.newPath = pathInput.value; });
     const best = list.find((p) => p.summary.usable);
-    fill(main, head(ctx),
+    fill(main, head(ctx), launcherBanner(launcher),
       h('div', { class: 'callout' }, h('p', null, best
         ? ['We found ', h('strong', null, best.summary.stackName || folderName(best.summary.path)), '. Select ', h('strong', null, 'Review and open'), ' to continue managing it: nothing is reinstalled or changed by opening it.']
         : 'No existing deployment was found in the usual places. Start a new one, or choose its folder if you installed it somewhere else.')),
@@ -42,6 +43,7 @@
             catch (err) { if (err.data && err.data.needsAttach) { toast(err.message, true); ctx.state.reviewPath = pathInput.value.trim(); ctx.navigate('projects', 'review'); return; } throw err; }
             resetProjectState(ctx); ctx.state.session.chosen = true; await ctx.refresh(); ctx.navigate('setup');
           }) }, 'Start setup')), hint: 'A new folder under your Docker projects folder is suggested. A folder that already contains a deployment is opened instead, never reinstalled.' })),
+      launcherCard(ctx, launcher),
       h('p', { class: 'muted small' }, 'Have a backup file instead? ', h('a', { href: '#backups' }, 'Restore from a backup'), ' recovers configuration into a deployment; you do not need it to open an existing one.'));
   };
 
@@ -56,6 +58,8 @@
     const name = s.stackName || folderName(s.path);
     const chips = [plainChip(kindText, kindTone)];
     if (p.active) chips.push(plainChip('Open now', 'info'));
+    const startup = L.launcherDefaultAction(ctx.state.launcher, p);
+    if (startup === 'is-default') chips.push(plainChip('Default at startup', 'ok'));
     if (s.containers) chips.push(plainChip(`Containers ${s.containers}`, s.running ? 'ok' : 'warn'));
     if (s.installed && s.mode === 'tunnel') chips.push(s.tokenReadable ? plainChip('Cloudflare connected', 'ok') : plainChip('Cloudflare needs reconnection', 'warn'));
     if (s.upgrade === 'available') chips.push(chip('upgrade'));
@@ -66,9 +70,55 @@
         gate('expert', h('p', { class: 'rv-summary small' }, `Found via: ${arr(p.sources).join(', ')}${p.lastOpened ? `; last opened ${p.lastOpened.replace('T', ' ')}` : ''}${s.installedVersion ? `; files ${s.installedVersion}` : ''}`))),
       h('div', { class: 'rv-body' }, h('div', { class: 'rv-actions' },
         s.usable ? h('button', { type: 'button', class: 'btn primary small', onclick: () => { ctx.state.reviewPath = s.path; ctx.navigate('projects', 'review'); } }, 'Review and open') : null,
+        startup === 'make-default' ? h('button', { type: 'button', class: 'btn small', 'data-make-default': s.path, onclick: (e) => saveLauncher(ctx, { defaultDeployment: s.path }, e.currentTarget, `${name} now opens automatically when DTC starts. Nothing was started, stopped or changed.`) }, 'Make default') : null,
         s.kind === 'legacy' ? h('button', { type: 'button', class: 'btn small', onclick: () => { ctx.state.reviewPath = s.path; ctx.navigate('projects', 'review'); } }, 'Details') : null,
         s.kind === 'missing' ? h('button', { type: 'button', class: 'btn small', onclick: () => browseTo(ctx, s.path.split('\\').slice(0, -1).join('\\')) }, 'Locate…') : null,
         p.recent ? h('button', { type: 'button', class: 'btn small ghost', onclick: (e) => withBusy(e.currentTarget, async () => { await api('POST', '/api/projects/forget', { path: s.path }); toast('Removed from the list. No files or containers were touched.'); ctx.rerender(); }) }, 'Remove from list') : null)));
+  }
+
+  // --- Startup (DTC launcher): default deployment, Start with Windows, browser on manual start ------------------------------
+  // Settings only: none of these starts, stops or recreates a container, and the default is opened read-only at startup.
+  function launcherBanner(l) {
+    const n = L.launcherNotice(l);
+    if (!n) return null;
+    return h('div', { class: `callout${n.tone === 'warn' ? ' warn' : ''}`, id: 'launcher-notice', role: 'status' }, h('p', null, n.title ? h('strong', null, `${n.title}. `) : null, n.text));
+  }
+
+  async function saveLauncher(ctx, body, button, message) {
+    await withBusy(button, async () => {
+      ctx.state.launcher = await api('POST', '/api/launcher/settings', body);
+      if (message) toast(message);
+    });
+    ctx.rerender();
+  }
+
+  function launcherCard(ctx, l) {
+    if (!l || !l.available) return null;
+    const d = l.defaultDeployment || {};
+    const auto = L.autostartText(l.autostart);
+    const autoBox = h('input', { type: 'checkbox', id: 'launcher-autostart', checked: !!(l.autostart && l.autostart.enabled) });
+    autoBox.addEventListener('change', () => saveLauncher(ctx, { autostart: autoBox.checked }, autoBox, autoBox.checked ? 'DTC now starts silently when you sign in to Windows.' : 'Start with Windows is off.'));
+    const browserBox = h('input', { type: 'checkbox', id: 'launcher-open-browser', checked: !!l.openBrowserOnManualLaunch });
+    browserBox.addEventListener('change', () => saveLauncher(ctx, { openBrowserOnManualLaunch: browserBox.checked }, browserBox, 'Saved.'));
+    return h('section', { class: 'card', id: 'launcher-card' },
+      h('div', { class: 'card-head' }, h('h2', null, icon('rocket'), ' Startup and default deployment')),
+      h('p', { class: 'muted small' }, 'How the DTC shortcut and Start with Windows open this manager. Changing these settings never starts, stops or recreates a container.'),
+      kv([
+        ['Default deployment', d.path ? `${d.stackName || folderName(d.path)} — ${d.path}${d.usable ? '' : ' (not found: the chooser opens)'}` : 'Not set: the chooser opens. Select "Make default" on a deployment above.'],
+        ['Start with Windows', h('span', null, plainChip(auto.text, auto.tone))],
+        ['Bookmark', h('span', { class: 'mono' }, l.bookmarkUrl)],
+        ['Program folder', `${l.programPath} (${l.edition})`, 'intermediate'],
+        ['Logs', h('span', { class: 'mono' }, l.logDir), 'intermediate'],
+      ]),
+      h('div', { class: 'field' }, h('label', { class: 'check' }, autoBox, h('span', null, h('strong', null, 'Start with Windows'), ': silently in the system tray when you sign in, after Docker Desktop is ready. No browser opens.'))),
+      h('div', { class: 'field' }, h('label', { class: 'check' }, browserBox, h('span', null, h('strong', null, 'Open the browser when I start DTC'), ' from its shortcut. Start with Windows never opens it.'))),
+      l.rememberBrowser ? h('p', { class: 'small' }, `Bookmark ${l.bookmarkUrl}: once you have opened the dashboard from the tray icon, this browser stays signed in for ${l.rememberDays} days, also after restarts.`) : null,
+      l.port !== l.preferredPort ? h('div', { class: 'callout warn' }, h('p', null, `Port ${l.preferredPort} is in use by another program, so the manager runs on ${l.port} this time. Bookmarks to port ${l.preferredPort} work again once it is free.`)) : null,
+      l.edition === 'development' ? h('p', { class: 'muted small' }, 'Development checkout: it has its own settings, port and shortcuts and never controls the installed manager.') : null,
+      h('p', { class: 'muted small' }, 'Troubleshooting: the "DTC - Recovery mode" shortcut (or Restart in Recovery Mode in the tray menu) starts the manager without opening any deployment.'),
+      h('div', { class: 'actions' },
+        d.path ? h('button', { type: 'button', class: 'btn small ghost', id: 'launcher-clear-default', onclick: (e) => saveLauncher(ctx, { defaultDeployment: '' }, e.currentTarget, 'Default cleared: the chooser opens at startup.') }, 'Clear default') : null,
+        l.rememberBrowser ? h('button', { type: 'button', class: 'btn small ghost', id: 'launcher-signout', onclick: (e) => withBusy(e.currentTarget, async () => { await api('POST', '/api/session/signout', {}); location.reload(); }) }, 'Sign out this browser') : null));
   }
 
   // Server-side folder picker: lists subfolders (names only), marks deployments. A typed path works as well.

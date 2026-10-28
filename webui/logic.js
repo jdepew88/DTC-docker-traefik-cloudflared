@@ -576,10 +576,42 @@
     return label && d ? `${label}.${d}` : '';
   }
 
+  // --- Launcher (DTC tray, start modes, default deployment) ------------------------------------------------------------
+  // Pure: Windows paths compare without case and without a trailing backslash.
+  function samePath(a, b) {
+    const n = (p) => String(p || '').replace(/[\\/]+$/, '').toLowerCase();
+    return !!a && !!b && n(a) === n(b);
+  }
+  // Pure: the banner at the top of the chooser for this start (recovery mode, a missing default, a port fallback).
+  function launcherNotice(l) {
+    if (!l || !l.available) return null;
+    if (l.startMode === 'recovery') {
+      const text = String(l.notice || 'No deployment was opened automatically.').replace(/^Recovery mode:\s*/i, '');
+      return { tone: 'warn', title: 'Recovery mode', text: text.charAt(0).toUpperCase() + text.slice(1) };
+    }
+    if (l.notice) return { tone: l.defaultDeployment && l.defaultDeployment.path && !l.defaultDeployment.usable ? 'warn' : 'info', title: '', text: l.notice };
+    return null;
+  }
+  // Pure: what the chooser shows for one deployment: "Default at startup", a "Make default" action, or nothing.
+  function launcherDefaultAction(l, project) {
+    if (!l || !l.available || !project || !project.summary) return 'none';
+    const d = l.defaultDeployment || {};
+    if (samePath(d.path, project.summary.path)) return 'is-default';
+    return project.summary.kind === 'manager' && project.summary.usable ? 'make-default' : 'none';
+  }
+  // Pure: one line about Start with Windows.
+  function autostartText(a) {
+    if (!a || !a.enabled) return { tone: 'neutral', text: 'Off' };
+    if (!a.allowedByWindows) return { tone: 'warn', text: 'On, but disabled in Task Manager > Startup apps' };
+    if (!a.pointsHere) return { tone: 'warn', text: 'On, but it starts another copy of DTC. Turn it off and on again to use this one.' };
+    return { tone: 'ok', text: a.windowless ? 'On (silent, waits for Docker Desktop)' : 'On (waits for Docker Desktop; a console may flash briefly)' };
+  }
+
   return {
     ROUTING_STATES, routingState, routingEvidence, endpointAudience, endpointKind, ROUTING_HELP, routingHelp, journeyPath,
     DEPLOYMENT_STATES, deploymentState, statusTone, serviceGroups, terminationText, healthText, shortImage, roleSource, catalogInstallState, instanceTitle,
     provisionAckIds, PROVISION_ACCESS, provisionWizard, provisionVerdict, suggestProvisionHostname,
+    samePath, launcherNotice, launcherDefaultAction, autostartText,
     IDENTITY_STATES, identityState, googleRedirectUri, isGoogleClientId, identityNextStep, identityWizard, wizardNeighbours, CREDENTIAL_STATUS, credentialStatus,
     appProtectionState, protectionSummary,
     LEVELS, LEVEL_TITLES, DEFAULT_LEVEL, normalizeLevel, levelIndex, isVisibleAt,

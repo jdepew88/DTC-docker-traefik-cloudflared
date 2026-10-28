@@ -500,5 +500,26 @@ test('new app: step completion from the draft, acknowledgements, access and sign
   assert.strictEqual(L.suggestProvisionHostname('x', []), '');
 });
 
+test('launcher: default deployment, start notices and autostart text', () => {
+  assert.ok(L.samePath('C:\\Users\\me\\proxy\\', 'c:\\users\\ME\\proxy'));
+  assert.ok(!L.samePath('C:\\a', 'C:\\ab') && !L.samePath('', ''));
+  const l = { available: true, startMode: 'default', notice: '', defaultDeployment: { path: 'C:\\p\\traefik-proxy', usable: true } };
+  const proj = (path, kind = 'manager', usable = true) => ({ summary: { path, kind, usable } });
+  assert.strictEqual(L.launcherDefaultAction(l, proj('c:\\p\\traefik-proxy\\')), 'is-default');
+  assert.strictEqual(L.launcherDefaultAction(l, proj('C:\\p\\other')), 'make-default');
+  assert.strictEqual(L.launcherDefaultAction(l, proj('C:\\p\\draft', 'draft', true)), 'none', 'only installed deployments can be the default');
+  assert.strictEqual(L.launcherDefaultAction({ available: false }, proj('C:\\p\\other')), 'none', 'not started by the launcher');
+  assert.strictEqual(L.launcherNotice(l), null);
+  const rec = L.launcherNotice({ ...l, startMode: 'recovery', notice: 'Recovery mode: no deployment was opened.' });
+  assert.strictEqual(rec.title, 'Recovery mode');
+  assert.strictEqual(rec.text, 'No deployment was opened.', 'the title is not repeated in the text');
+  assert.strictEqual(L.launcherNotice({ ...l, notice: 'gone', defaultDeployment: { path: 'C:\\gone', usable: false } }).tone, 'warn');
+  assert.strictEqual(L.launcherNotice({ ...l, notice: 'Port 8190 is in use' }).tone, 'info');
+  assert.strictEqual(L.autostartText(null).text, 'Off');
+  assert.strictEqual(L.autostartText({ enabled: true, allowedByWindows: false, pointsHere: true }).tone, 'warn');
+  assert.strictEqual(L.autostartText({ enabled: true, allowedByWindows: true, pointsHere: false }).tone, 'warn');
+  assert.strictEqual(L.autostartText({ enabled: true, allowedByWindows: true, pointsHere: true, windowless: true }).tone, 'ok');
+});
+
 console.log(`\n${passed} passed, ${failures.length} failed`);
 process.exit(failures.length ? 1 : 0);

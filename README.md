@@ -44,6 +44,17 @@ traefik --socket-internal (internal)--> socket-proxy --> docker.sock (read-only,
 Double-clicking `START-HERE.cmd` again while the manager runs offers to open it again instead of starting a second
 copy. If port 8190 is taken, the next free port is used. No administrator rights are needed.
 
+### One click, no window: the DTC launcher (optional)
+
+Double-click **`Setup-Launcher.cmd`** once. It creates a **DTC Deployment Manager** shortcut on the desktop and in the
+Start menu, plus **DTC - Choose deployment** and **DTC - Recovery mode**. The shortcut starts the manager in the
+background with a **system-tray icon**: no PowerShell window, and it opens your **default deployment** without asking.
+The tray menu offers Open Dashboard, Choose Deployment, Restart Manager and Exit.
+
+Run `Setup-Launcher.cmd -Autostart` (or use the tray menu or the Deployments page) to turn on **Start with Windows**.
+DTC then starts silently when you sign in: it waits for Docker Desktop and opens no browser. Once you have opened the
+dashboard from the tray, a bookmark to `http://127.0.0.1:8190/` keeps working. See [docs/launcher.md](docs/launcher.md).
+
 ### Reopening an existing deployment (for example `traefik-ext1`)
 
 Start the manager with `START-HERE.cmd`; under *Continue where you left off* select the deployment (or *Open another
@@ -90,6 +101,7 @@ never changed.
 | Docker discovery and publishing: Services offers *Discover running containers*, *Install a new application* (App Catalog, next milestone) and *Enter an HTTP backend manually*; containers with networks, ports (likely HTTP / not HTTP / never publish), health and existing routes; port test in a short-lived probe container; wizard (name → port → hostname suggested and checked against every existing definition → reachability: shared network, confirmed attach, or published port → who can reach it → preview); one owner per hostname; per-service request-path health (DNS, Access, tunnel, router, service, backend, HTTP, optional public URL) that marks every check it did not perform | **Implemented and tested** (unit, a disposable instance with throwaway containers, browser); read-only compatibility checks against a real installation. |
 | Infrastructure Explorer: the request path (browser → DNS → Cloudflare → Access → tunnel → cloudflared → Traefik router → middleware → service → Docker network → app) with six separate states per component (detected, configured, running, reachable, authenticated, verified), tools shown apart from the path, small diagram and quick actions on the Overview | **Implemented and tested** (model unit tests, a disposable running instance, browser at three widths and four levels). Read-only. |
 | One-click launcher (`START-HERE.cmd`) and existing-deployment discovery / attach | **Implemented and tested** (launcher, discovery, attach without changes, recent projects, upgrade preview/apply on test folders, browser); discovery and read-only Cloudflare verification also run against a real installation. |
+| DTC tray launcher (`Setup-Launcher.cmd`, `launcher\DTC.exe`): no console window, tray menu, start modes default / choose / recovery, default deployment, Start with Windows (per-user Startup folder, waits for Docker Desktop), remembered browsers for a bookmarked address, logs | **Implemented and tested** in isolated folders (`tests\Test-Launcher.ps1`: real DTC.exe and tray, setup, all modes, port conflict, duplicate start, failures, the Deployments page in headless Edge). **Not done on this PC:** the setup was not run against your real desktop, Start menu and Startup folder, and the container-unchanged checks were skipped while Docker Desktop was stopped. |
 | Redesigned web UI: seven-step journey, four detail levels, review states, topology, operational pages, learning catalog | **Implemented and browser-tested** in headless Edge (desktop, tablet and phone widths, keyboard and accessible-name checks), including an installation of a disposable instance through the UI. The tunnel path through the UI has only run against the Cloudflare API mock. |
 | Identity & Access (optional): authentik installed from the catalog with a bootstrap administrator and API token, or an existing installation adopted; its sign-in hostname routed through the existing Traefik and tunnel; guided Google sign-in (Google offers no API for OAuth clients) with automatic authentik configuration (Google source, restricted sign-up, login button); an initial owner (owner-only enrollment and access group), then "protect selected applications" with per-application ForwardAuth (embedded outpost); afterwards users and access are managed in authentik only; resumable setup, health states that are only "verified" from real sign-in evidence; Explorer hop. See [docs/identity.md](docs/identity.md) | **Implemented and tested** against a disposable authentik 2026.8.5 (catalog install, API configuration, sign-ins with local test users through the real outpost and Traefik, fail closed, rollback, browser) with **synthetic** Google credentials. A real Google sign-in and the real Cloudflare publication of the sign-in hostname have **not** been run (they need your accounts). |
 | New app (universal provisioning): paste a Docker Hub, GitHub, Compose-file, Unraid template (XML) or awesome-selfhosted link; the manager builds a normalized manifest (images pinned by digest, dependencies, generated secrets, open questions instead of guesses), reviews it for security and host compatibility, and deploys it in one approved operation: Compose project (App Catalog installer) -> explicit Traefik route -> authentik protection through the identity contract -> Cloudflare publication through the existing tunnel -> stage-by-stage verification, with a journal and rollback of only what it created. Optional AI completion (your own Anthropic API key; per-request estimate and approval, limits, cache, redaction). Local installation recipes with sanitized export. See [docs/provisioning.md](docs/provisioning.md) | **Implemented and tested on Windows + Docker Desktop** (sources through fixtures and read-only checks against Docker Hub, GitHub, GHCR and an Unraid template; a real disposable two-service deployment with verification and rollback; authentik contract against an in-memory authentik; AI with a mocked provider). **Not run:** a real AI request, a real public Cloudflare publication and authentik protection of a provisioned app (they need your accounts or approval); other host platforms are designed, not tested. |
@@ -121,6 +133,8 @@ Everything the website does is also available from PowerShell.
 ```powershell
 .\Start-DeploymentManager.ps1                  # what START-HERE.cmd runs; -Status, -Stop, -Restart, -Port, -InstallPath
 .\Start-DeploymentManager.ps1 -InstallPath D:\proxy   # open one deployment directly (skips the chooser)
+.\Start-DeploymentManager.ps1 -StartMode default    # open the saved default deployment (choose / recovery: see docs\launcher.md)
+.\launcher\Install-Launcher.ps1 -Autostart          # what Setup-Launcher.cmd runs: DTC.exe, shortcuts, default, Start with Windows
 ```
 
 ```powershell
@@ -568,6 +582,8 @@ container on this PC already uses.
                                         # browser test of "How should Traefik connect to this application?" against an
                                         # installed instance, read-only (never applies; fails if routes, registry,
                                         # tunnel config, containers or networks change); -ScreenshotDir saves screenshots
+.\tests\Test-Launcher.ps1               # DTC tray launcher: settings, start modes, remembered browsers, autostart, setup, real DTC.exe + tray,
+                                        # port conflict, duplicate start, failures, Deployments page (isolated folders; -SkipTray, -SkipBrowser)
 .\tests\Test-Projects.ps1               # launcher (single-use link, duplicate start, ports, stop, START-HERE.cmd), discovery,
                                         # attach without changes, recent projects, upgrade preview/apply, browser;
                                         # -LiveReadOnly also inspects %USERPROFILE%\.docker\projects\traefik-proxy read-only
