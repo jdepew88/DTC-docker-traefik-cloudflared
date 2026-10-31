@@ -1,0 +1,59 @@
+{
+  "schemaVersion": 1,
+  "id": "omnivoice",
+  "displayName": "OmniVoice Studio",
+  "description": "A browser UI plus two GPU API containers, routed by path on one hostname.",
+  "defaultSubdomain": "voice",
+  "backends": [
+    {
+      "id": "ui",
+      "kind": "host",
+      "description": "Vite UI on the Windows host (npm run dev or npm run preview).",
+      "port": 8010,
+      "protocol": "http",
+      "healthPath": "/",
+      "required": true
+    },
+    {
+      "id": "triton-api",
+      "kind": "container",
+      "description": "OmniVoice TTS API, usually started with docker run.",
+      "containerNames": ["omnivoice-triton-api"],
+      "imagePattern": "(^|/)omnivoice-triton-api(:|@|$)",
+      "port": 18081,
+      "protocol": "http",
+      "healthPath": "/",
+      "required": true,
+      "timeouts": { "dial": "10s", "responseHeader": "600s", "idleConn": "180s" }
+    },
+    {
+      "id": "perform-api",
+      "kind": "container",
+      "description": "Performance-transfer API (Compose project omnivoice-wrapper-site).",
+      "containerNames": ["omnivoice-perform-api"],
+      "composeService": "omnivoice-perform-api",
+      "port": 18090,
+      "protocol": "http",
+      "healthPath": "/health",
+      "required": true,
+      "timeouts": { "dial": "10s", "responseHeader": "600s", "idleConn": "180s" }
+    }
+  ],
+  "routes": [
+    { "id": "perform-api", "backend": "perform-api", "pathPrefix": "/perform-api", "stripPrefix": true, "priority": 300 },
+    { "id": "api", "backend": "triton-api", "pathPrefix": "/api", "stripPrefix": true, "priority": 200 },
+    { "id": "ui", "backend": "ui", "priority": 100, "websocket": true }
+  ],
+  "preserve": {
+    "paths": ["C:\\DockerData\\omnivoice\\models", "C:\\DockerData\\omnivoice\\perform-models"]
+  },
+  "legacy": {
+    "composeProjects": ["traefik-cloudflared"]
+  },
+  "notes": [
+    "Uploads have no limit in Traefik, as in the standalone setup, but Cloudflare limits a request body by plan (100 MB on Free).",
+    "Cloudflare closes a request after about 100 seconds without a response (HTTP 524), whatever the 600 s Traefik allows. Long generations on the external route need a shorter request or the internal route.",
+    "Uploads over the entry point's read timeout (TRAEFIK_READ_TIMEOUT, 300 s by default) are cut off.",
+    "The Vite server only accepts hostnames in allowedHosts (vite.config.ts); an internal hostname outside that list gets HTTP 403 from the UI."
+  ]
+}

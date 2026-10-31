@@ -10,6 +10,9 @@ config/dashboard.json
 traefik/dynamic/admin-dashboard.yml
 logs/
 traefik/dynamic/svc-*.yml
+traefik/dynamic/adopt-*.yml
+config/adoptions/
+config/adoption.json
 traefik/dynamic/zz-test-*.yml
 traefik/dynamic/*.local.yml
 traefik/dynamic/app-*.yml

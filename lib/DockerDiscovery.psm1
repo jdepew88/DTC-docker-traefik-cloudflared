@@ -106,6 +106,15 @@ function Get-PortCandidates($Container) {
 }
 
 # All containers on the engine (one inspect call). $ProxyNetwork marks containers Traefik can already reach.
+# Pure: docker inspect output -> objects. A container that vanished since `docker ps` (a short-lived probe, a test) makes inspect
+# exit non-zero and adds an error line, while the others are still printed. The output holds every container's environment
+# variables, so it never goes into an error message.
+function ConvertFrom-InspectOutput([string[]]$Lines) {
+  $json = (@($Lines | Where-Object { $_ -notmatch '^\s*(Error|error)\b' }) -join "`n").Trim()
+  if (-not $json) { return @() }
+  try { return @(($json | ConvertFrom-Json) | ForEach-Object { $_ }) } catch { throw 'docker inspect returned output that could not be read.' }
+}
+
 function Get-DockerContainerInventory {
   param([string]$ProxyNetwork)
   $ids = Invoke-Docker ps -a -q --no-trunc
@@ -113,9 +122,8 @@ function Get-DockerContainerInventory {
   $list = @($ids.Output | Where-Object { $_ -match '^[0-9a-f]{12,64}$' })
   if (-not $list.Count) { return @() }
   $r = Invoke-Docker @(@('inspect') + $list)
-  if ($r.ExitCode -ne 0) { throw "docker inspect failed: $((@($r.Output) -join ' ').Trim())" }
-  $raw = @((@($r.Output) -join "`n") | ConvertFrom-Json)
-  return @($raw | ForEach-Object { $_ } | ForEach-Object {
+  $raw = @(ConvertFrom-InspectOutput $r.Output)
+  return @($raw | ForEach-Object {
       $c = ConvertFrom-DockerInspect $_
       $c.onProxyNetwork = [bool]($ProxyNetwork -and @($c.networks | Where-Object { $_.name -eq $ProxyNetwork }).Count)
       $c.ports = @(Get-PortCandidates $c)
@@ -211,4 +219,4 @@ function Test-ContainerPort {
   return $out
 }
 
-Export-ModuleMember -Function ConvertFrom-DockerInspect, Get-PortCandidates, Get-DockerContainerInventory, Find-HostnameClaims, Get-ProbeNetwork, ConvertFrom-ProbeOutput, Test-ContainerPort, Get-RuleHosts
+Export-ModuleMember -Function ConvertFrom-InspectOutput, ConvertFrom-DockerInspect, Get-PortCandidates, Get-DockerContainerInventory, Find-HostnameClaims, Get-ProbeNetwork, ConvertFrom-ProbeOutput, Test-ContainerPort, Get-RuleHosts

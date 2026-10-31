@@ -18,6 +18,7 @@
   // --- Entry points on the Services page --------------------------------------------------------------------------------
   P.serviceEntryPoints = (ctx) => h('div', { class: 'entry-cards', role: 'list', 'aria-label': 'Add an application' },
     [['discover', 'box', 'Discover running containers', 'Pick an app that already runs in Docker on this PC.'],
+      ['adopt', 'network', 'Adopt an existing application', 'Move an app you installed yourself, with all of its routes, behind these proxies.'],
       ['catalog', 'download', 'Install a new application', 'Choose from the App Catalog.'],
       ['services/add', 'edit', 'Enter an HTTP backend manually', 'An app on this PC, a NAS or another device, or any address.']].map(([href, ic, title, text]) =>
       h('a', { class: 'entry-card', role: 'listitem', href: `#${href}` }, h('span', { class: 'xp-icon' }, icon(ic)), h('span', null, h('strong', null, title), h('span', { class: 'small muted' }, text)))));

@@ -91,6 +91,7 @@ never changed.
 | Installer (`-DryRun`, `-Start`, `-Reload`, `-Rollback`, `-Stop`) | **Implemented and exercised** against an isolated instance. |
 | Interactive wizard (`-Wizard`, `-AddApp`) | **Implemented**; uses the shared service backend. The Cloudflare steps have **not** been run end to end against a real tunnel from this repository. |
 | Cloudflare Tunnel connector (`cloudflared`) | Compose service and token handling implemented; **not live-validated** in this repository. |
+| Adopt an existing application (`webui.ps1`, **Adopt an app**, [docs\adoption.md](docs/adoption.md)): discovery, routing specifications, internal / external / both routing, staged cutover, verification, rollback, retirement of an old proxy | **Implemented and tested** in isolated stacks with a fake authentik and a Cloudflare API mock (`tests\Test-Adoption.ps1`). **Not yet run against the real Cloudflare API, real authentik or a real `traefik-int1`; no adoption has been applied to a running deployment.** |
 | Browser-based setup and management UI (`webui.ps1`) | **Implemented and tested** against a Cloudflare API mock and a live isolated instance. Not yet run against the real Cloudflare API. |
 | Cloudflare-first onboarding (token template link, permission discovery, domain allowlist, local-only path) | **Implemented and mock-tested**, including a confirmed local-only install of a disposable instance. The template link has not been opened against a real Cloudflare account. |
 | Cloudflare API automation (tunnel create, connector token, DNS, tunnel routes, Access apps) | **Implemented and mock-tested**; DPAPI-encrypted API token. |
@@ -582,6 +583,7 @@ container on this PC already uses.
                                         # browser test of "How should Traefik connect to this application?" against an
                                         # installed instance, read-only (never applies; fails if routes, registry,
                                         # tunnel config, containers or networks change); -ScreenshotDir saves screenshots
+.\tests\Test-Adoption.ps1               # application adoption: unit tests, then two disposable proxies, echo backends, fake authentik, Cloudflare mock (-SkipInstance, -SkipBrowser)
 .\tests\Test-Launcher.ps1               # DTC tray launcher: settings, start modes, remembered browsers, autostart, setup, real DTC.exe + tray,
                                         # port conflict, duplicate start, failures, Deployments page (isolated folders; -SkipTray, -SkipBrowser)
 .\tests\Test-Projects.ps1               # launcher (single-use link, duplicate start, ports, stop, START-HERE.cmd), discovery,

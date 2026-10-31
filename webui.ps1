@@ -82,6 +82,8 @@ Import-Module (Join-Path $here 'lib\IdentityContract.psm1') -Force
 Import-Module (Join-Path $here 'lib\AiAssist.psm1') -Force
 Import-Module (Join-Path $here 'lib\Recipes.psm1') -Force
 Import-Module (Join-Path $here 'lib\Launcher.psm1') -Force
+Import-Module (Join-Path $here 'lib\AppAdoption.psm1') -Force
+. (Join-Path $here 'lib\AdoptionApi.ps1')
 if (-not $CatalogDir) { $CatalogDir = Join-Path $here 'catalog' }
 Import-Module (Join-Path $here 'lib\LocalHttp.psm1') -Force
 Set-CloudflareApiBase $CloudflareApiBase
@@ -160,6 +162,7 @@ $StaticFiles = @{
   '/credentials.js' = @('credentials.js', 'text/javascript; charset=utf-8')
   '/identity.js' = @('identity.js', 'text/javascript; charset=utf-8')
   '/routing.js' = @('routing.js', 'text/javascript; charset=utf-8')
+  '/adoption.js' = @('adoption.js', 'text/javascript; charset=utf-8')
   '/deployments.js' = @('deployments.js', 'text/javascript; charset=utf-8')
   '/learn.json' = @('learn.json', 'application/json; charset=utf-8')
   '/app.css'    = @('app.css', 'text/css; charset=utf-8')
@@ -4390,6 +4393,7 @@ function Invoke-ApiRoute($Request, $Body) {
   if (-not $State.Chosen -and $m -ne 'GET' -and -not ($p.StartsWith('/api/projects/') -or $p.StartsWith('/api/launcher/') -or $p -eq '/api/manager/stop')) {
     Stop-Request 409 'Choose a deployment first (open an existing one or start a new one).'
   }
+  if ($p.StartsWith('/api/adoption/')) { return Invoke-AdoptionApi $Request $Body "$m $p" }
   $settings = Get-Settings
   switch -Exact ("$m $p") {
     'GET /api/session' { return [ordered]@{ ok = $true } }
