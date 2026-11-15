@@ -1,4 +1,4 @@
-# Traefik + Cloudflare Tunnel reverse proxy for Windows (Docker Desktop)
+# DTC - Docker + Traefik + Cloudflare Tunnel reverse proxy for Windows (Docker Desktop)
 
 A general-purpose reverse proxy for Windows 11 and Docker Desktop. Route any number of applications through
 one Traefik v3 instance and, optionally, publish them through a Cloudflare Tunnel:
