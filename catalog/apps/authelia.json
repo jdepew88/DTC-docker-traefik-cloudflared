@@ -205,5 +205,11 @@
   "resources": {
     "memoryMB": 60,
     "diskMB": 60
+  },
+  "testStatus": {
+    "static": "passed",
+    "live": "passed",
+    "date": "2026-11-16",
+    "notes": "Installed in isolation: /api/health, Traefik route, backup and restore (2026-11-16). ForwardAuth with Authelia not implemented."
   }
 }

@@ -1,0 +1,140 @@
+{
+  "schema": 1,
+  "manifestVersion": "2026.11.17",
+  "id": "vaultwarden",
+  "name": "Vaultwarden",
+  "category": "passwords",
+  "group": "B",
+  "description": "Lightweight server compatible with the Bitwarden password manager apps and browser extensions. Vault data is encrypted on your devices; the server stores only ciphertext.",
+  "maintainer": "Daniel García and Mathijs van Veluw (BlackDex)",
+  "license": "AGPL-3.0",
+  "source": {
+    "type": "curated",
+    "url": "https://github.com/dani-garcia/vaultwarden"
+  },
+  "docs": [
+    {
+      "title": "Vaultwarden wiki",
+      "url": "https://github.com/dani-garcia/vaultwarden/wiki"
+    },
+    {
+      "title": "Enabling HTTPS",
+      "url": "https://github.com/dani-garcia/vaultwarden/wiki/Enabling-HTTPS"
+    },
+    {
+      "title": "Admin page",
+      "url": "https://github.com/dani-garcia/vaultwarden/wiki/Enabling-admin-page"
+    },
+    {
+      "title": "SSO with OpenID Connect",
+      "url": "https://github.com/dani-garcia/vaultwarden/wiki/Enabling-SSO-support-using-OpenId-Connect"
+    }
+  ],
+  "platforms": {
+    "windows-docker-desktop": "supported",
+    "linux-docker": "untested",
+    "unraid": "untested",
+    "podman": "untested"
+  },
+  "architectures": [
+    "amd64",
+    "arm64",
+    "arm/v7"
+  ],
+  "installable": true,
+  "aliases": [
+    "bitwarden-rs"
+  ],
+  "services": {
+    "app": {
+      "image": "vaultwarden/server:1.37.5@sha256:4fe17f415f90087377d37c755e0ea3cf189dcc6794e49cdd2a9adbb4937d9e1f",
+      "role": "app",
+      "label": "Vaultwarden",
+      "stateful": true,
+      "ports": [
+        {
+          "container": 80,
+          "protocol": "http",
+          "primary": true
+        }
+      ],
+      "environment": {
+        "DOMAIN": "{{appUrl}}",
+        "SIGNUPS_ALLOWED": "{{input:allowSignups}}",
+        "INVITATIONS_ALLOWED": "true",
+        "SHOW_PASSWORD_HINT": "false",
+        "TZ": "{{timezone}}"
+      },
+      "volumes": [
+        {
+          "name": "data",
+          "target": "/data",
+          "kind": "volume",
+          "description": "Encrypted vaults (SQLite), attachments, keys. Must be a Docker volume: SQLite over a Windows folder is unreliable."
+        }
+      ],
+      "resources": {
+        "memoryMB": 60,
+        "diskMB": 120
+      }
+    }
+  },
+  "inputs": [
+    {
+      "id": "allowSignups",
+      "type": "boolean",
+      "label": "Allow creating accounts",
+      "default": "true",
+      "help": "Needed to create your own account. Turn it off afterwards (SIGNUPS_ALLOWED=false in .env, then restart) and invite others instead."
+    }
+  ],
+  "privileges": [],
+  "dependencies": [],
+  "security": [
+    "The web vault needs HTTPS (or http://127.0.0.1 on this PC) because browsers allow its cryptography only in a secure context.",
+    "The /admin page is disabled (no ADMIN_TOKEN). Enable it only with an Argon2 hash (docker compose exec app /vaultwarden hash) and never publish /admin.",
+    "Back up the data volume: losing it loses every vault on this server.",
+    "The manager never reads vault contents; backups copy the encrypted database as it is."
+  ],
+  "authentication": {
+    "forwardAuth": "unsuitable",
+    "native": [
+      "local",
+      "oidc"
+    ],
+    "notes": [
+      "Bitwarden apps, browser extensions and the CLI call /api and /identity directly: ForwardAuth and Cloudflare Access break them. Publish it, if at all, without a sign-in gate; it has its own login and end-to-end encryption.",
+      "OpenID Connect sign-in (SSO_* settings, e.g. with authentik) is supported since 1.35; the master password stays required."
+    ]
+  },
+  "limitations": [
+    "Over plain http on a LAN address or hostname, the web vault refuses to sign in; use http://127.0.0.1 locally or publish it with HTTPS.",
+    "Bitwarden clients need version 2026.7.0 or later for Vaultwarden 1.37."
+  ],
+  "manualSetup": [
+    "Open it and create your account (signups are on), then set SIGNUPS_ALLOWED=false in .env and restart.",
+    "Optional: set up SMTP for invitations and the admin page with an Argon2 ADMIN_TOKEN."
+  ],
+  "update": {
+    "strategy": "pinned-digest",
+    "notes": "Read the release notes: minimum client versions change. The database migrates on start; the update backs it up first."
+  },
+  "web": {
+    "service": "app",
+    "path": "/",
+    "localPort": 8222
+  },
+  "exposure": {
+    "default": "local"
+  },
+  "resources": {
+    "memoryMB": 60,
+    "diskMB": 120
+  },
+  "testStatus": {
+    "static": "passed",
+    "live": "not-run",
+    "date": "2026-11-17",
+    "notes": "Manifest, Compose file set and route validated; not yet installed on a disposable deployment."
+  }
+}

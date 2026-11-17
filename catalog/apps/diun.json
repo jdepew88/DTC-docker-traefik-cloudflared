@@ -4,7 +4,7 @@
   "id": "diun",
   "name": "Diun",
   "category": "updates",
-  "group": "E",
+  "group": "A",
   "description": "Docker Image Update Notifier: headless, notification-only checks for newer image versions (ntfy, mail, Discord, webhooks, ...).",
   "maintainer": "CrazyMax",
   "license": "MIT",
@@ -163,5 +163,11 @@
   "resources": {
     "memoryMB": 80,
     "diskMB": 80
+  },
+  "testStatus": {
+    "static": "passed",
+    "live": "passed",
+    "date": "2026-11-16",
+    "notes": "Installed in isolation: headless, log check, backup and restore (2026-11-16)."
   }
 }

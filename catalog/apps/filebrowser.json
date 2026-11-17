@@ -1,0 +1,134 @@
+{
+  "schema": 1,
+  "manifestVersion": "2026.11.17",
+  "id": "filebrowser",
+  "name": "File Browser",
+  "category": "files",
+  "group": "D",
+  "description": "Simple web file manager for one folder you choose: browse, upload, download, share and edit files. Upstream was archived in 2026-09; v2.63.23 is the final release.",
+  "maintainer": "File Browser contributors (archived)",
+  "license": "Apache-2.0",
+  "source": {
+    "type": "curated",
+    "url": "https://github.com/filebrowser/filebrowser"
+  },
+  "docs": [
+    {
+      "title": "File Browser documentation",
+      "url": "https://filebrowser.org/"
+    },
+    {
+      "title": "Installation (Docker)",
+      "url": "https://filebrowser.org/installation"
+    }
+  ],
+  "platforms": {
+    "windows-docker-desktop": "supported",
+    "linux-docker": "untested",
+    "unraid": "untested",
+    "podman": "untested"
+  },
+  "architectures": [
+    "amd64",
+    "arm64",
+    "arm/v7"
+  ],
+  "website": "https://filebrowser.org",
+  "installable": true,
+  "deprecated": true,
+  "deprecationNote": "The File Browser repository was archived on 2026-09-01: no further releases or security fixes. Keep it local or behind authentik/Cloudflare Access, and prefer Nextcloud or HFS for anything exposed.",
+  "services": {
+    "app": {
+      "image": "filebrowser/filebrowser:v2.63.23@sha256:a469ea076d4a1b4b1d86a41d130f2f536cd9da996a2b1fb39c0d7635f9d89b9a",
+      "role": "app",
+      "label": "File Browser",
+      "ports": [
+        {
+          "container": 80,
+          "protocol": "http",
+          "primary": true
+        }
+      ],
+      "volumes": [
+        {
+          "name": "files",
+          "target": "/srv",
+          "kind": "folder",
+          "input": "rootFolder",
+          "description": "The one folder File Browser shows (read-write)."
+        },
+        {
+          "name": "database",
+          "target": "/database",
+          "kind": "volume",
+          "description": "Users, shares and settings (filebrowser.db)."
+        },
+        {
+          "name": "config",
+          "target": "/config",
+          "kind": "volume",
+          "description": "settings.json."
+        }
+      ],
+      "resources": {
+        "memoryMB": 40,
+        "diskMB": 40
+      }
+    }
+  },
+  "inputs": [
+    {
+      "id": "rootFolder",
+      "type": "folder",
+      "label": "Folder to manage",
+      "required": true,
+      "help": "Only this folder is visible and writable in File Browser. Choose a dedicated folder, never a whole drive or a system folder."
+    }
+  ],
+  "privileges": [],
+  "dependencies": [],
+  "security": [
+    "File Browser can delete and overwrite everything in the chosen folder: choose a dedicated folder.",
+    "Its admin password is random and printed once in its log on first start; change it immediately.",
+    "Unmaintained upstream: no security fixes after v2.63.23."
+  ],
+  "authentication": {
+    "forwardAuth": "compatible",
+    "native": [
+      "local",
+      "proxy-header"
+    ],
+    "notes": [
+      "No apps or API clients: a sign-in gate (authentik or Cloudflare Access) in front of it works well."
+    ]
+  },
+  "limitations": [
+    "Archived upstream: no further releases or security fixes.",
+    "Folders on Windows drives are accessed through Docker Desktop file sharing and are slower than Docker volumes."
+  ],
+  "manualSetup": [
+    "Read the generated admin password: docker compose logs app (look for \"randomly generated password\"), sign in as admin and change it."
+  ],
+  "update": {
+    "strategy": "pinned-digest",
+    "notes": "No newer versions will be published."
+  },
+  "web": {
+    "service": "app",
+    "path": "/",
+    "localPort": 8085
+  },
+  "exposure": {
+    "default": "access"
+  },
+  "resources": {
+    "memoryMB": 40,
+    "diskMB": 40
+  },
+  "testStatus": {
+    "static": "passed",
+    "live": "not-run",
+    "date": "2026-11-17",
+    "notes": "Manifest, Compose file set and route validated; not yet installed on a disposable deployment."
+  }
+}

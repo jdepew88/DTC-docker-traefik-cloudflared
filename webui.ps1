@@ -1573,6 +1573,9 @@ function Get-CatalogView($M) {
     architectures = @(& $field 'architectures' @()); authentication = (& $field 'authentication' $null); limitations = @(& $field 'limitations' @())
     headless = [bool](Get-Prop2 (& $field 'web' $null) 'headless' $false); postInstall = @(@(& $field 'postInstall' @()) | ForEach-Object { [string](Get-Prop2 $_ 'label' '') })
     components = @(if ($M.PSObject.Properties['services'] -and $M.services) { @($M.services.PSObject.Properties | ForEach-Object { Get-ServiceComponent $M $_.Name } | Select-Object -Unique) })
+    manualSetup = @(& $field 'manualSetup' @()); verification = (& $field 'testStatus' $null); website = [string](& $field 'website' '')
+    optionalPorts = @(if ($M.PSObject.Properties['services'] -and $M.services) { foreach ($sp in $M.services.PSObject.Properties) { foreach ($p in @(Get-Prop2 $sp.Value 'ports' @())) { $pub = Get-Prop2 $p 'publish' $null; if ($pub) {
+              [ordered]@{ service = $sp.Name; container = [int]$p.container; protocol = [string]$p.protocol; label = [string](Get-Prop2 $p 'label' ''); hostPort = [int](Get-Prop2 $pub 'hostPort' 0); address = [string](Get-Prop2 $pub 'address' ''); when = [string](Get-Prop2 $pub 'when' '') } } } } })
   }
 }
 
@@ -1679,8 +1682,26 @@ function Get-ExistingInstallations($Manifest, $Settings) {
   $catalog = @(Get-CatalogApps -CatalogDir $CatalogDir | Where-Object { -not @($_.errors).Count })
   $facts = @(Get-ComposeContainerFacts)
   $instances = @(Get-InstalledInstances $Settings $catalog $facts)
-  $un = @(Get-UnregisteredInstallations $facts $catalog (@($instances | ForEach-Object { $_.project }) + $Settings.StackName))
-  return @(Find-AppInstallations (Get-ApplicationId $Manifest) $instances $un)
+  $un = @(Get-DetectedInstallations $catalog (@($instances | ForEach-Object { $_.project }) + $Settings.StackName))
+  $found = @(Find-AppInstallations (Get-ApplicationId $Manifest) $instances @($un | Where-Object { $_.project }))
+  # Containers started without Compose count as existing installations too (they cannot be adopted, only inspected).
+  $found += @($un | Where-Object { -not $_.project -and $_.applicationId -eq (Get-ApplicationId $Manifest) } | ForEach-Object {
+      [ordered]@{ source = 'container'; project = $_.container; instanceId = ''; label = ''; folder = ''; archived = $false; origin = 'discovered'; state = [string]$_.containers[0].state; headline = ''
+        containers = 1; hostnames = @(); reason = $_.reason } })
+  return $found
+}
+
+# Installations of catalog applications on this PC that the manager does not manage: unregistered Compose projects
+# (adoptable) and containers started without Compose (inspect and route only). Read-only: two docker calls.
+function Get-DetectedInstallations($Valid, [string[]]$Exclude) {
+  $ids = @((Invoke-Docker ps -a -q).Output | Where-Object { "$_" -match '^[0-9a-f]{12,64}$' })
+  if (-not $ids.Count) { return @() }
+  $r = Invoke-Docker inspect $ids
+  if ($r.ExitCode -ne 0) { return @() }
+  $facts = @(foreach ($x in ((@($r.Output) -join "`n") | ConvertFrom-Json)) { ConvertFrom-ContainerInspect $x })
+  # Disposable test deployments (tests\TestResources.psm1 prefixes) are never shown as installations.
+  $facts = @($facts | Where-Object { $_.name -notmatch '^tp[xm]-[a-z]+-[0-9a-f]{6,8}' -and [string]$_.project -notmatch '^tp[xm]-[a-z]+-[0-9a-f]{6,8}' })
+  return @(@(Get-UnregisteredInstallations @($facts | Where-Object { $_.project }) $Valid $Exclude) + @(Get-StandaloneInstallations @($facts | Where-Object { -not $_.project }) $Valid))
 }
 
 # The catalog as the browser sees it: one entry per application (variants listed under it), each with the instances
@@ -1701,6 +1722,10 @@ function Get-CatalogData {
     [ordered]@{ localUrl = [string](Get-RecordValue $inst 'localUrl' ''); hostnames = @($rs | ForEach-Object { @($_.hostnames) }); public = [bool](@($rs | Where-Object { $_.cloudflare -and $_.cloudflare.publish }).Count)
       protected = [bool](@($rs | Where-Object { $_.PSObject.Properties['auth'] -and $_.auth }).Count) } }
   $instanceList = { param($appId) @($instances | Where-Object { $_.applicationId -eq $appId -and -not $_.archived } | ForEach-Object { [ordered]@{ project = $_.project; instanceId = $_.instanceId; label = $_.label; manifestId = $_.appId; prepared = $_.prepared; origin = $_.origin; access = (& $reach $_) } }) }
+  $exclude = @(@($instances | ForEach-Object { $_.project }) + $(if (Test-Installed) { (Get-Settings).StackName } else { @() }))
+  $detected = @(); try { $detected = @(Get-DetectedInstallations $valid $exclude) } catch { }
+  $detectedList = { param($appId) @($detected | Where-Object { $_.applicationId -eq $appId } | ForEach-Object { [ordered]@{ project = $_.project; container = [string](Get-Prop2 $_ 'container' ''); standalone = [bool](Get-Prop2 $_ 'standalone' $false)
+          folder = $_.folder; reason = $_.reason; containers = @($_.containers | ForEach-Object { [ordered]@{ name = $_.name; state = $_.state; image = $_.image } }) } }) }
   # Host facts for compatibility (architecture Docker runs, NVIDIA driver present).
   $hostInfo = [ordered]@{ architecture = ''; nvidiaGpu = [bool](Get-Command nvidia-smi.exe -ErrorAction SilentlyContinue) }
   $ai = Invoke-Docker info --format '{{.Architecture}}'; if ($ai.ExitCode -eq 0) { $hostInfo.architecture = ConvertTo-ImageArchitecture ((@($ai.Output) -join '').Trim()) }
@@ -1712,6 +1737,7 @@ function Get-CatalogData {
         $v.instances = @(& $instanceList $e.id)
         $v.archivedInstances = @($instances | Where-Object { $_.applicationId -eq $e.id -and $_.archived }).Count
         $v.installedAs = @($v.instances | ForEach-Object { $_.project })
+        $v.detected = @(& $detectedList $e.id)
         $v.compatibility = @(Get-AppHostCompatibility $e.manifest $hostInfo)
         $v
       })
@@ -1832,6 +1858,16 @@ function Invoke-AppPlan($Body, $Manifest = $null) {
   $context = @{ traefikContainer = $settings.TraefikContainer; proxyNetwork = $settings.ProxyNetwork; domains = $(if ($cfDomains.Count) { $cfDomains -join ',' } else { 'localhost' }) }
   $resolved = Resolve-AppValues -Manifest $m -Inputs $inputs -Project $project -AppUrl $appUrl -TimeZone $tz -LocalPort $localPort -Context $context
   foreach ($err in $resolved.Errors) { & $check 'Settings' $false $err }
+  # Extra ports the user opted into (e.g. Git over SSH, DNS, direct media-server access): free on this PC, and a clear
+  # note when they open to the local network.
+  foreach ($pp in @(Get-AppPublishedPorts $m $resolved.Values)) {
+    $what = "$(if ($pp.label) { $pp.label } else { "Port $($pp.container)" }) ($($pp.protocol.ToUpperInvariant()) $($pp.hostIp):$($pp.hostPort))"
+    $busy = $(if ($pp.protocol -eq 'udp') { $(if (@(Get-NetUDPEndpoint -LocalPort $pp.hostPort -ErrorAction SilentlyContinue).Count) { 'a process on this PC' } else { $null }) } else { Get-PortUser $pp.hostPort })
+    if ($pp.hostPort -eq $localPort -and $pp.protocol -eq 'tcp' -and -not ($pp.primary -and $pp.address -eq 'lan')) { $busy = 'the local web port chosen above' }
+    if ($busy) { & $check $what $false "Port $($pp.hostPort) is in use by $busy. Choose another port or leave this option off." }
+    elseif ($pp.address -eq 'lan') { & $check $what $true "Opens on every network interface of this PC: other devices on your network can connect (Windows may ask to allow it through the firewall). Nothing is published to the Internet." 'warning' }
+    else { & $check $what $true 'Opened on this PC only (127.0.0.1).' }
+  }
   $active = @(Get-ActiveServices $m $resolved.Values)
   $net = Get-DockerNetworkFacts $settings.ProxyNetwork
   & $check "Shared network '$($settings.ProxyNetwork)' exists" $net.exists $(if ($net.exists) { 'The web service joins it so Traefik can reach it by name; nothing is published yet.' } else { 'Start the proxy deployment first.' })

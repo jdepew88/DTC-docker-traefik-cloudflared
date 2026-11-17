@@ -537,5 +537,25 @@ test('app catalog: access, sign-in fit, host compatibility, findings and backups
   assert.strictEqual(L.backupTitle({ id: '20261116-201500', reason: 'before-update', volumes: [{ sizeMB: 1.5 }, { sizeMB: 2 }] }), '2026-11-16 20:15 · Before an update · 2 volumes (3.5 MB)');
 });
 
+test('catalog: one state per card (managed, detected, unsupported, manual setup, available) and the state filter', () => {
+  const ok = { installable: true, platform: { support: 'supported', installable: true }, compatibility: [{ label: 'CPU architecture', state: 'ok' }] };
+  assert.strictEqual(L.catalogStatus(ok).key, 'available');
+  assert.strictEqual(L.catalogStatus({ ...ok, instances: [{ project: 'a' }], detected: [{ project: 'b' }] }).key, 'managed', 'a managed instance wins');
+  const det = L.catalogStatus({ ...ok, detected: [{ project: 'docker-compose' }] });
+  assert.strictEqual(det.key, 'detected'); assert.ok(det.installed, 'detected counts as already installed');
+  assert.strictEqual(L.catalogStatus({ ...ok, compatibility: [{ label: 'CPU architecture', state: 'failed' }] }).key, 'unsupported');
+  assert.strictEqual(L.catalogStatus({ installable: false, installNote: 'x', platform: { support: 'supported', installable: false } }).key, 'manual');
+  assert.strictEqual(L.catalogStatus({ installable: true, platform: { support: 'unsupported', installable: false } }).key, 'unsupported');
+  assert.ok(L.catalogStatus({ ...ok, manualSetup: ['Claim the server'] }).manualSteps);
+  assert.ok(L.catalogStatusMatches({ ...ok, detected: [{ project: 'x' }] }, 'installed'));
+  assert.ok(!L.catalogStatusMatches(ok, 'installed'));
+  assert.ok(L.catalogStatusMatches({ ...ok, manualSetup: ['x'] }, 'manual'), 'installable apps with setup steps appear under manual setup');
+  assert.ok(L.catalogStatusMatches(ok, ''));
+  assert.strictEqual(L.verificationText({ static: 'passed', live: 'passed', date: '2026-11-17' }).text, 'Live-tested 2026-11-17');
+  assert.strictEqual(L.verificationText({ static: 'passed', live: 'not-run' }).tone, 'warn');
+  assert.match(L.verificationText({ static: 'passed', live: 'not-run' }).text, /not live-tested/);
+  assert.strictEqual(L.verificationText(null).text, 'Verification: not recorded');
+});
+
 console.log(`\n${passed} passed, ${failures.length} failed`);
 process.exit(failures.length ? 1 : 0);

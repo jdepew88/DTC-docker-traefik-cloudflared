@@ -1,25 +1,29 @@
 {
   "schema": 1,
-  "manifestVersion": "2026.10.21",
+  "manifestVersion": "2026.11.17",
   "id": "openldap",
   "name": "OpenLDAP",
   "category": "authentication",
   "group": "B",
-  "description": "Full OpenLDAP server. Listed for reference: there is currently no free, maintained, stable OpenLDAP container image.",
-  "maintainer": "osixia (container), OpenLDAP Foundation (server)",
+  "description": "Full OpenLDAP directory server (slapd) for apps that need standard LDAP schemas. No web interface; reachable only on its private network and, if you choose, on this PC.",
+  "maintainer": "intechcore (container), OpenLDAP Foundation and Symas (server)",
   "license": "MIT (container), OpenLDAP Public License (server)",
   "source": {
     "type": "curated",
-    "url": "https://github.com/osixia/container-openldap"
+    "url": "https://github.com/intechcore/openldap"
   },
   "docs": [
     {
-      "title": "osixia OpenLDAP container",
-      "url": "https://github.com/osixia/container-openldap"
+      "title": "Container documentation",
+      "url": "https://github.com/intechcore/openldap"
     },
     {
-      "title": "Bitnami catalogue change",
-      "url": "https://github.com/bitnami/containers"
+      "title": "OpenLDAP administrator guide",
+      "url": "https://www.openldap.org/doc/admin26/"
+    },
+    {
+      "title": "Symas OpenLDAP packages",
+      "url": "https://repo.symas.com/"
     }
   ],
   "platforms": {
@@ -28,13 +32,137 @@
     "unraid": "untested",
     "podman": "untested"
   },
-  "installable": false,
-  "installNote": "osixia/openldap 1.5.0 (2021) is unmaintained and its revived v2 line (2.6.15-beta) is a beta; free Bitnami OpenLDAP images are no longer published. Use LLDAP as the directory for now; this entry is re-checked when a stable OpenLDAP 2.x image ships.",
-  "imageReference": "osixia/openldap:2.6.15-beta@sha256:b23155ca4217ea928f2fec86453aabf87168a221150f26bcdcef7f3a3c84d35d",
+  "architectures": [
+    "amd64",
+    "arm64"
+  ],
+  "website": "https://www.openldap.org",
+  "installable": true,
+  "services": {
+    "app": {
+      "image": "ghcr.io/intechcore/openldap:2.6.16-6@sha256:f0f2c5743de191bef3b9643402ea8a38e518833b9922f661b868d4f4aa45e75e",
+      "role": "app",
+      "label": "OpenLDAP (slapd)",
+      "stateful": true,
+      "ports": [
+        {
+          "container": 389,
+          "protocol": "tcp",
+          "label": "LDAP",
+          "publish": {
+            "hostPort": 3389,
+            "address": "local",
+            "when": "localAccess"
+          }
+        }
+      ],
+      "environment": {
+        "LDAP_ORGANISATION": "{{input:organisation}}",
+        "LDAP_DOMAIN": "{{input:domain}}",
+        "LDAP_ADMIN_PASSWORD": "{{input:adminPassword}}",
+        "LDAP_CONFIG_PASSWORD": "{{input:configPassword}}",
+        "LDAP_TLS_VERIFY_CLIENT": "try"
+      },
+      "volumes": [
+        {
+          "name": "data",
+          "target": "/var/lib/ldap",
+          "kind": "volume",
+          "description": "Directory database (MDB). Must be a Docker volume."
+        },
+        {
+          "name": "config",
+          "target": "/etc/ldap/slapd.d",
+          "kind": "volume",
+          "description": "slapd configuration (cn=config)."
+        }
+      ],
+      "resources": {
+        "memoryMB": 40,
+        "diskMB": 120
+      }
+    }
+  },
+  "inputs": [
+    {
+      "id": "organisation",
+      "type": "text",
+      "label": "Organisation name",
+      "default": "Home",
+      "pattern": "^[A-Za-z0-9 ._-]{1,60}$"
+    },
+    {
+      "id": "domain",
+      "type": "text",
+      "label": "Directory domain",
+      "default": "example.com",
+      "pattern": "^[a-z0-9-]+(\\.[a-z0-9-]+)+$",
+      "help": "Becomes the base DN, e.g. example.com -> dc=example,dc=com."
+    },
+    {
+      "id": "adminPassword",
+      "type": "password",
+      "label": "Directory administrator password (cn=admin)"
+    },
+    {
+      "id": "configPassword",
+      "type": "generated",
+      "bytes": 24,
+      "label": "Configuration (cn=config) password"
+    },
+    {
+      "id": "localAccess",
+      "type": "boolean",
+      "label": "Open LDAP on this PC (127.0.0.1:3389)",
+      "default": "false",
+      "help": "For LDAP tools on this PC. Other apps reach it on the shared private network only when you connect them deliberately."
+    }
+  ],
+  "privileges": [],
+  "dependencies": [],
+  "security": [
+    "LDAP is never published through Traefik or Cloudflare; port 389 is unencrypted, so keep it on private networks.",
+    "The administrator password is used only when the directory is first created."
+  ],
+  "authentication": {
+    "forwardAuth": "not-applicable",
+    "native": [
+      "ldap-bind"
+    ],
+    "notes": [
+      "A directory, not a web app: applications sign in to it with LDAP binds."
+    ]
+  },
+  "limitations": [
+    "The container comes from a small vendor (intechcore) that packages the official Symas OpenLDAP 2.6 LTS builds; osixia/openldap is unmaintained and the free Bitnami images were withdrawn.",
+    "No web interface: manage entries with LDAP tools (ldapadd, Apache Directory Studio) or use LLDAP for a simpler directory with a web interface."
+  ],
+  "manualSetup": [
+    "Create organisational units, users and groups with LDAP tools (for example Apache Directory Studio against 127.0.0.1:3389 when local access is on)."
+  ],
   "alternatives": [
     "lldap"
   ],
+  "update": {
+    "strategy": "pinned-digest",
+    "notes": "Back up before updates: the MDB database and cn=config are in two volumes."
+  },
+  "web": {
+    "service": "app",
+    "headless": true,
+    "proxy": false
+  },
   "exposure": {
     "default": "local"
+  },
+  "resources": {
+    "memoryMB": 40,
+    "diskMB": 120
+  },
+  "testStatus": {
+    "static": "passed",
+    "live": "not-run",
+    "date": "2026-11-17",
+    "notes": "Manifest, Compose file set and route validated; not yet installed on a disposable deployment."
   }
 }

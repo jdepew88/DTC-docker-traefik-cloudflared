@@ -1,0 +1,242 @@
+{
+  "schema": 1,
+  "manifestVersion": "2026.11.17",
+  "id": "romm",
+  "name": "RomM",
+  "category": "games",
+  "group": "C",
+  "description": "Retro game library manager: scans your own ROM collection, fetches artwork and metadata, and plays supported systems in the browser. No games or BIOS files are included.",
+  "maintainer": "RomM contributors",
+  "license": "AGPL-3.0",
+  "source": {
+    "type": "curated",
+    "url": "https://github.com/rommapp/romm"
+  },
+  "docs": [
+    {
+      "title": "RomM documentation",
+      "url": "https://docs.romm.app/latest/"
+    },
+    {
+      "title": "Quick start (Docker)",
+      "url": "https://docs.romm.app/latest/Getting-Started/Quick-Start-Guide/"
+    },
+    {
+      "title": "Folder structure",
+      "url": "https://docs.romm.app/latest/Getting-Started/Folder-Structure/"
+    },
+    {
+      "title": "Metadata providers",
+      "url": "https://docs.romm.app/latest/Getting-Started/Metadata-Providers/"
+    }
+  ],
+  "platforms": {
+    "windows-docker-desktop": "supported",
+    "linux-docker": "untested",
+    "unraid": "untested",
+    "podman": "untested"
+  },
+  "architectures": [
+    "amd64",
+    "arm64"
+  ],
+  "website": "https://romm.app",
+  "installable": true,
+  "services": {
+    "romm": {
+      "image": "rommapp/romm:5.4.1@sha256:8677fb7b81b1d3db20b849e989a1dadc2a11159e51eb34a2acdcb01102274edf",
+      "role": "app",
+      "label": "RomM",
+      "ports": [
+        {
+          "container": 8080,
+          "protocol": "http",
+          "primary": true
+        }
+      ],
+      "environment": {
+        "DB_HOST": "romm-db",
+        "DB_NAME": "romm",
+        "DB_USER": "romm",
+        "DB_PASSWD": "{{input:dbPassword}}",
+        "ROMM_AUTH_SECRET_KEY": "{{input:authSecret}}",
+        "TZ": "{{timezone}}",
+        "HASHEOUS_API_ENABLED": "true",
+        "IGDB_CLIENT_ID": "{{input:igdbClientId}}",
+        "IGDB_CLIENT_SECRET": "{{input:igdbClientSecret}}",
+        "STEAMGRIDDB_API_KEY": "{{input:steamGridDbKey}}"
+      },
+      "volumes": [
+        {
+          "name": "library",
+          "target": "/romm/library",
+          "kind": "volume",
+          "input": "libraryFolder",
+          "backup": false,
+          "description": "Your game library: roms/<platform>/ and bios/<platform>/ (you supply the files)."
+        },
+        {
+          "name": "resources",
+          "target": "/romm/resources",
+          "kind": "volume",
+          "description": "Downloaded artwork and metadata."
+        },
+        {
+          "name": "assets",
+          "target": "/romm/assets",
+          "kind": "volume",
+          "description": "Saves, states and screenshots uploaded by players."
+        },
+        {
+          "name": "config",
+          "target": "/romm/config",
+          "kind": "volume",
+          "description": "config.yml (optional settings)."
+        },
+        {
+          "name": "redis-data",
+          "target": "/redis-data",
+          "kind": "volume",
+          "backup": false,
+          "description": "Built-in Valkey task queue."
+        }
+      ],
+      "dependsOn": [
+        {
+          "service": "romm-db",
+          "condition": "service_healthy"
+        }
+      ],
+      "resources": {
+        "memoryMB": 600,
+        "diskMB": 1200
+      }
+    },
+    "romm-db": {
+      "image": "mariadb:11.8@sha256:d36f18d65a0459510b8b0f643b226a6d299e3206486e2b64ff20754a6d291707",
+      "role": "database",
+      "label": "MariaDB",
+      "stateful": true,
+      "environment": {
+        "MARIADB_ROOT_PASSWORD": "{{input:dbRootPassword}}",
+        "MARIADB_DATABASE": "romm",
+        "MARIADB_USER": "romm",
+        "MARIADB_PASSWORD": "{{input:dbPassword}}"
+      },
+      "volumes": [
+        {
+          "name": "mysql",
+          "target": "/var/lib/mysql",
+          "kind": "volume",
+          "description": "RomM database (MariaDB 11.8 LTS)."
+        }
+      ],
+      "healthcheck": {
+        "test": [
+          "CMD",
+          "healthcheck.sh",
+          "--connect",
+          "--innodb_initialized"
+        ],
+        "interval": "10s",
+        "timeout": "5s",
+        "retries": 10,
+        "start_period": "30s"
+      },
+      "resources": {
+        "memoryMB": 200,
+        "diskMB": 400
+      }
+    }
+  },
+  "inputs": [
+    {
+      "id": "libraryFolder",
+      "type": "folder",
+      "label": "Game library folder (optional)",
+      "help": "A folder containing roms\\<platform>\\ (e.g. D:\\Games\\romm). Leave empty to use a Docker volume and upload games in the web interface."
+    },
+    {
+      "id": "igdbClientId",
+      "type": "text",
+      "label": "IGDB client ID (optional)",
+      "pattern": "^[A-Za-z0-9]*$",
+      "help": "From a Twitch developer application; improves metadata."
+    },
+    {
+      "id": "igdbClientSecret",
+      "type": "secret",
+      "label": "IGDB client secret (optional)"
+    },
+    {
+      "id": "steamGridDbKey",
+      "type": "secret",
+      "label": "SteamGridDB API key (optional)"
+    },
+    {
+      "id": "authSecret",
+      "type": "generated",
+      "bytes": 32,
+      "label": "Session secret"
+    },
+    {
+      "id": "dbPassword",
+      "type": "generated",
+      "bytes": 24,
+      "label": "Database password"
+    },
+    {
+      "id": "dbRootPassword",
+      "type": "generated",
+      "bytes": 24,
+      "label": "Database administrator password"
+    }
+  ],
+  "privileges": [],
+  "dependencies": [
+    "MariaDB 11.8"
+  ],
+  "security": [
+    "No ROMs, BIOS or firmware are included or downloaded. Use only games you own the rights to.",
+    "Metadata provider keys are optional and stored only in .env."
+  ],
+  "authentication": {
+    "forwardAuth": "caution",
+    "native": [
+      "local",
+      "oidc"
+    ],
+    "notes": [
+      "Handheld and emulator apps use RomM API tokens: ForwardAuth on the whole host blocks them. Prefer RomM's own OIDC sign-in with authentik (needs HTTPS)."
+    ]
+  },
+  "limitations": [
+    "Large libraries on a Windows drive are read through Docker Desktop file sharing: scans are slower, and new files may not be noticed automatically (scan manually)."
+  ],
+  "manualSetup": [
+    "Open it: the setup wizard creates the first (administrator) account.",
+    "Put your games in roms/<platform>/ (e.g. roms/snes/) and run a scan."
+  ],
+  "update": {
+    "strategy": "pinned-digest",
+    "notes": "RomM migrates its database on start; updates back up the database first."
+  },
+  "web": {
+    "service": "romm",
+    "path": "/",
+    "localPort": 8095
+  },
+  "exposure": {
+    "default": "access"
+  },
+  "resources": {
+    "memoryMB": 800,
+    "diskMB": 1600
+  },
+  "testStatus": {
+    "static": "passed",
+    "live": "not-run",
+    "date": "2026-11-17",
+    "notes": "Manifest, Compose file set and route validated; not yet installed on a disposable deployment."
+  }
+}

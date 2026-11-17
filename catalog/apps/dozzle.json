@@ -1,0 +1,169 @@
+{
+  "schema": 1,
+  "manifestVersion": "2026.11.17",
+  "id": "dozzle",
+  "name": "Dozzle",
+  "category": "monitoring",
+  "group": "A",
+  "description": "Real-time log viewer for Docker containers in the browser: live tail, search and per-container memory and CPU. Read-only through a socket proxy.",
+  "maintainer": "Amir Raminfar and contributors",
+  "license": "MIT",
+  "source": {
+    "type": "curated",
+    "url": "https://github.com/amir20/dozzle"
+  },
+  "docs": [
+    {
+      "title": "Dozzle documentation",
+      "url": "https://dozzle.dev/guide/getting-started"
+    },
+    {
+      "title": "Remote hosts and socket proxy",
+      "url": "https://dozzle.dev/guide/remote-hosts"
+    },
+    {
+      "title": "Authentication",
+      "url": "https://dozzle.dev/guide/authentication"
+    }
+  ],
+  "platforms": {
+    "windows-docker-desktop": "supported",
+    "linux-docker": "untested",
+    "unraid": "untested",
+    "podman": "untested"
+  },
+  "architectures": [
+    "amd64",
+    "arm64",
+    "arm/v7"
+  ],
+  "website": "https://dozzle.dev",
+  "installable": true,
+  "services": {
+    "app": {
+      "image": "amir20/dozzle:v11.4.3@sha256:244f218c876d6ed766277e71a537f34bfb2c01829e1927737e3673a8327deeb8",
+      "role": "app",
+      "label": "Dozzle",
+      "ports": [
+        {
+          "container": 8080,
+          "protocol": "http",
+          "primary": true
+        }
+      ],
+      "environment": {
+        "DOZZLE_REMOTE_HOST": "tcp://socket-proxy:2375|Docker",
+        "DOZZLE_NO_ANALYTICS": "true",
+        "DOZZLE_ENABLE_ACTIONS": "false",
+        "DOZZLE_ENABLE_SHELL": "false",
+        "DOZZLE_AUTH_PROVIDER": "none"
+      },
+      "volumes": [
+        {
+          "name": "data",
+          "target": "/data",
+          "kind": "volume",
+          "description": "Dozzle settings (setup wizard, saved filters)."
+        }
+      ],
+      "dependsOn": [
+        {
+          "service": "socket-proxy",
+          "condition": "service_started"
+        }
+      ],
+      "healthcheck": {
+        "test": [
+          "CMD",
+          "/dozzle",
+          "healthcheck"
+        ],
+        "interval": "30s",
+        "timeout": "5s",
+        "retries": 3,
+        "start_period": "10s"
+      },
+      "resources": {
+        "memoryMB": 40,
+        "diskMB": 40
+      }
+    },
+    "socket-proxy": {
+      "image": "tecnativa/docker-socket-proxy:v0.5.0@sha256:1f5038b54f06c3e18422902cf00ba21803d1c97805aae032e5e6673d532d3459",
+      "role": "support",
+      "label": "Docker socket proxy (read-only)",
+      "dockerSocket": true,
+      "dockerSocketReadOnly": true,
+      "environment": {
+        "CONTAINERS": "1",
+        "IMAGES": "0",
+        "INFO": "1",
+        "VERSION": "1",
+        "EVENTS": "1",
+        "PING": "1",
+        "POST": "0",
+        "DELETE": "0",
+        "BUILD": "0",
+        "COMMIT": "0",
+        "EXEC": "0",
+        "SECRETS": "0",
+        "SWARM": "0",
+        "SYSTEM": "0"
+      },
+      "resources": {
+        "memoryMB": 40,
+        "diskMB": 20
+      }
+    }
+  },
+  "inputs": [],
+  "privileges": [
+    {
+      "kind": "docker-socket",
+      "explain": "A socket proxy on Dozzle's private network gets the Docker socket read-only and allows only reading containers, logs, statistics and events (no POST, exec or delete). Dozzle itself never sees the socket; container actions and the shell stay disabled."
+    }
+  ],
+  "dependencies": [
+    "Read-only Docker socket proxy (tecnativa/docker-socket-proxy)"
+  ],
+  "security": [
+    "Container logs can contain secrets and personal data: keep Dozzle local, or publish it only behind authentik or Cloudflare Access.",
+    "Actions (start/stop/restart) and the container shell are disabled; the socket proxy would refuse them anyway."
+  ],
+  "authentication": {
+    "forwardAuth": "compatible",
+    "native": [
+      "local",
+      "oidc",
+      "forward-proxy"
+    ],
+    "notes": [
+      "Dozzle has no login of its own by default (DOZZLE_AUTH_PROVIDER=none): protect it with authentik ForwardAuth or Cloudflare Access before publishing. It also supports OIDC and trusted proxy headers."
+    ]
+  },
+  "limitations": [
+    "Shows the containers of this PC only (one Docker host)."
+  ],
+  "update": {
+    "strategy": "pinned-digest",
+    "notes": "Settings live in the data volume; updates change only the image."
+  },
+  "web": {
+    "service": "app",
+    "path": "/",
+    "localPort": 8087
+  },
+  "exposure": {
+    "default": "access"
+  },
+  "resources": {
+    "memoryMB": 80,
+    "diskMB": 60
+  },
+  "testStatus": {
+    "static": "passed",
+    "live": "not-run",
+    "date": "2026-11-17",
+    "notes": "Manifest, Compose file set and route validated; not yet installed on a disposable deployment."
+  }
+}

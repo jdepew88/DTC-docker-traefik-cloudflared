@@ -240,5 +240,11 @@
   "resources": {
     "memoryMB": 2530,
     "diskMB": 2730
+  },
+  "testStatus": {
+    "static": "passed",
+    "live": "not-run",
+    "date": "2026-11-16",
+    "notes": "Manifest, Compose file set and route validated; not installed on a disposable deployment yet."
   }
 }

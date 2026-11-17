@@ -134,5 +134,11 @@
   "resources": {
     "memoryMB": 50,
     "diskMB": 60
+  },
+  "testStatus": {
+    "static": "passed",
+    "live": "passed",
+    "date": "2026-11-16",
+    "notes": "Installed in isolation: administrator login API, backup and restore (2026-11-16)."
   }
 }

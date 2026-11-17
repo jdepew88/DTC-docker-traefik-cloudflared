@@ -113,6 +113,51 @@ function Test-AppFunction([string]$App, [string]$Project, [int]$Port, [string]$F
     'homepage' { $w = Wait-Http $Port '/' { param($r) $r.Status -eq 200 } 120 -HostHeader "127.0.0.1:$Port"; return @($w.Ok, "HTTP $($w.Response.Status) (allowed host 127.0.0.1:$Port)") }
     'whats-up-docker' { $w = Wait-Http $Port '/' { param($r) $r.Status -in 200, 302 } 120; return @($w.Ok, "HTTP $($w.Response.Status)") }
     'traefik-manager' { $w = Wait-Http $Port '/' { param($r) $r.Status -in 200, 302 } 120; return @($w.Ok, "HTTP $($w.Response.Status)") }
+    'dozzle' {
+      # The web interface answers and Dozzle reached Docker through the read-only socket proxy (no connection errors).
+      $w = Wait-Http $Port '/' { param($r) $r.Status -eq 200 } 90
+      $log = ((Invoke-Docker logs "$Project-app").Output -join "`n")
+      return @(($w.Ok -and $log -notmatch '(?i)could not connect|connection refused|permission denied|forbidden'), "HTTP $($w.Response.Status); log: $((($log -split "`n") | Select-Object -Last 3) -join ' | ')")
+    }
+    'vaultwarden' { $w = Wait-Http $Port '/api/config' { param($r) $r.Status -eq 200 -and $r.Body -match '"version"' } 120; return @($w.Ok, "/api/config: HTTP $($w.Response.Status) $(if ($w.Response.Body -match '"version":"([^"]+)"') { "version $($Matches[1])" })") }
+    'gitea' { $w = Wait-Http $Port '/api/healthz' { param($r) $r.Status -eq 200 -and $r.Body -match '"status":\s*"pass"' } 180; return @($w.Ok, "/api/healthz: $($w.Response.Body -replace '\s+', ' ')") }
+    'n8n' { $w = Wait-Http $Port '/healthz' { param($r) $r.Status -eq 200 -and $r.Body -match 'ok' } 240; return @($w.Ok, "/healthz: $($w.Response.Body)") }
+    'mealie' {
+      # The documented default administrator exists until it is changed (the catalog tells the user to change it).
+      $w = Wait-Http $Port '/api/app/about' { param($r) $r.Status -eq 200 -and $r.Body -match '"version"' } 240
+      $login = Wait-Http $Port '/api/auth/token' { param($r) $r.Status -eq 200 -and $r.Body -match 'access_token' } 30 -Method 'POST' -Body 'username=changeme%40example.com&password=MyPassword' -Headers @{ 'Content-Type' = 'application/x-www-form-urlencoded' }
+      return @(($w.Ok -and $login.Ok), "/api/app/about: HTTP $($w.Response.Status); default administrator sign-in: HTTP $($login.Response.Status)")
+    }
+    'filebrowser' { $w = Wait-Http $Port '/health' { param($r) $r.Status -eq 200 -and $r.Body -match 'OK' } 90; return @($w.Ok, "/health: $($w.Response.Body)") }
+    'hfs' {
+      $pw = [string](Read-AppEnv (Join-Path $Folder '.env'))['HFS_INITIAL_ADMIN_PASSWORD']
+      $w = Wait-Http $Port '/~/frontend/index.html' { param($r) $r.Status -eq 200 } 120
+      $log = ((Invoke-Docker logs "$Project").Output -join "`n")
+      return @(($w.Ok -and $pw.Length -ge 12 -and $log -notmatch '(?i)error'), "front end: HTTP $($w.Response.Status); log: $((($log -split "`n") | Select-Object -Last 2) -join ' | ')")
+    }
+    'pihole' {
+      # Dashboard password from .env: the Pi-hole API accepts it.
+      $pw = [string](Read-AppEnv (Join-Path $Folder '.env'))['FTLCONF_webserver_api_password']
+      $w = Wait-Http $Port '/api/auth' { param($r) $r.Status -eq 200 -and $r.Body -match '"valid":\s*true' } 180 -Method 'POST' -Body (@{ password = $pw } | ConvertTo-Json -Compress) -Headers @{ 'Content-Type' = 'application/json' }
+      return @($w.Ok, "/api/auth with the generated password: HTTP $($w.Response.Status)")
+    }
+    'openldap' {
+      $env2 = Read-AppEnv (Join-Path $Folder '.env')
+      $deadline = (Get-Date).AddSeconds(120); $r = $null
+      do { $r = Invoke-Docker exec "$Project" ldapwhoami -x -H ldap://localhost -D 'cn=admin,dc=example,dc=com' -w ([string]$env2['LDAP_ADMIN_PASSWORD']); if ($r.ExitCode -eq 0) { break }; Start-Sleep -Seconds 3 } while ((Get-Date) -lt $deadline)
+      return @(($r.ExitCode -eq 0 -and (($r.Output -join '') -match 'cn=admin')), "ldapwhoami as cn=admin: $((@($r.Output) -join ' ').Trim())")
+    }
+    'crowdsec' {
+      $deadline = (Get-Date).AddSeconds(240); $r = $null
+      do { $r = Invoke-Docker exec "$Project-app" cscli lapi status; if ($r.ExitCode -eq 0) { break }; Start-Sleep -Seconds 5 } while ((Get-Date) -lt $deadline)
+      $acq = Invoke-Docker exec "$Project-app" cscli metrics show acquisition
+      return @(($r.ExitCode -eq 0), "cscli lapi status: exit $($r.ExitCode); acquisition: $((@($acq.Output) | Where-Object { $_ -match 'docker' } | Select-Object -First 2) -join ' | ')")
+    }
+    'plex' { $w = Wait-Http $Port '/identity' { param($r) $r.Status -eq 200 -and $r.Body -match 'MediaContainer' } 240; return @($w.Ok, "/identity: HTTP $($w.Response.Status)") }
+    'nextcloud' { $w = Wait-Http $Port '/status.php' { param($r) $r.Status -eq 200 -and $r.Body -match '"installed":\s*true' } 600; return @($w.Ok, "/status.php: $($w.Response.Body)") }
+    'paperless-ngx' { $w = Wait-Http $Port '/api/' { param($r) $r.Status -in 200, 401, 403 } 420; return @($w.Ok, "/api/: HTTP $($w.Response.Status)") }
+    'romm' { $w = Wait-Http $Port '/api/heartbeat' { param($r) $r.Status -eq 200 } 300; return @($w.Ok, "/api/heartbeat: HTTP $($w.Response.Status)") }
+    'mediafusion' { $w = Wait-Http $Port '/health' { param($r) $r.Status -eq 200 } 600; return @($w.Ok, "/health: HTTP $($w.Response.Status) $($w.Response.Body)") }
     default { return @($true, 'no app-specific check') }
   }
 }
@@ -176,7 +221,10 @@ try {
     $headless = [bool](Get-Prop2 $m.web 'headless' $false)
     $port = $(if ($headless) { 0 } else { Get-FreeTcpPort })
     $inputs = @{}
-    switch ($app) { 'authelia' { $inputs = @{ domain = 'example.test'; adminEmail = 'admin@example.test' } } 'immich' { $inputs = @{ enableMl = 'false' } } }
+    # A disposable folder for apps that need one (shared files, media); never a real folder of this PC.
+    $sample = Join-Path $work "folder-$app"; New-Item -ItemType Directory -Force -Path $sample | Out-Null
+    switch ($app) { 'authelia' { $inputs = @{ domain = 'example.test'; adminEmail = 'admin@example.test' } } 'immich' { $inputs = @{ enableMl = 'false' } }
+      'filebrowser' { $inputs = @{ rootFolder = $sample } } 'hfs' { $inputs = @{ shareFolder = $sample } } 'plex' { $inputs = @{ mediaFolder = $sample; lanAccess = 'false' } } }
     # Memory of the services this installation runs (optional services switched off by an input are left out).
     $need = 0; $perService = $false
     foreach ($sp in $m.services.PSObject.Properties) {

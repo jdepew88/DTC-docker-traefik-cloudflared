@@ -1,0 +1,217 @@
+{
+  "schema": 1,
+  "manifestVersion": "2026.11.17",
+  "id": "gitea",
+  "name": "Gitea",
+  "category": "development",
+  "group": "D",
+  "description": "Self-hosted Git service: repositories, pull requests, issues, packages and CI (Actions). Gitea with its own PostgreSQL; Git over SSH optional.",
+  "maintainer": "The Gitea Authors",
+  "license": "MIT",
+  "source": {
+    "type": "curated",
+    "url": "https://github.com/go-gitea/gitea"
+  },
+  "docs": [
+    {
+      "title": "Installation with Docker",
+      "url": "https://docs.gitea.com/installation/install-with-docker"
+    },
+    {
+      "title": "Configuration cheat sheet",
+      "url": "https://docs.gitea.com/administration/config-cheat-sheet"
+    },
+    {
+      "title": "Reverse proxies",
+      "url": "https://docs.gitea.com/administration/reverse-proxies"
+    },
+    {
+      "title": "Gitea 28 release notes",
+      "url": "https://blog.gitea.com/release-of-28.0.0/"
+    }
+  ],
+  "platforms": {
+    "windows-docker-desktop": "supported",
+    "linux-docker": "untested",
+    "unraid": "untested",
+    "podman": "untested"
+  },
+  "architectures": [
+    "amd64",
+    "arm64"
+  ],
+  "website": "https://about.gitea.com",
+  "installable": true,
+  "services": {
+    "gitea": {
+      "image": "gitea/gitea:28.4.0@sha256:aa90e8f00b755b0d665214ab9c14447ea44d3190dbe6b6d0cb46cd9c4f55d309",
+      "role": "app",
+      "label": "Gitea",
+      "stateful": true,
+      "ports": [
+        {
+          "container": 3000,
+          "protocol": "http",
+          "primary": true
+        },
+        {
+          "container": 22,
+          "protocol": "tcp",
+          "label": "Git over SSH",
+          "publish": {
+            "hostPort": 2222,
+            "address": "lan",
+            "when": "enableSsh",
+            "input": "sshPort"
+          }
+        }
+      ],
+      "environment": {
+        "USER_UID": "1000",
+        "USER_GID": "1000",
+        "GITEA__database__DB_TYPE": "postgres",
+        "GITEA__database__HOST": "gitea-db:5432",
+        "GITEA__database__NAME": "gitea",
+        "GITEA__database__USER": "gitea",
+        "GITEA__database__PASSWD": "{{input:dbPassword}}",
+        "GITEA__server__ROOT_URL": "{{appUrl}}/",
+        "GITEA__server__SSH_PORT": "{{input:sshPort}}",
+        "GITEA__service__DISABLE_REGISTRATION": "true"
+      },
+      "volumes": [
+        {
+          "name": "data",
+          "target": "/data",
+          "kind": "volume",
+          "description": "Repositories, LFS objects, attachments, app.ini and SSH host keys."
+        }
+      ],
+      "dependsOn": [
+        {
+          "service": "gitea-db",
+          "condition": "service_healthy"
+        }
+      ],
+      "healthcheck": {
+        "test": [
+          "CMD",
+          "curl",
+          "-fsS",
+          "http://localhost:3000/api/healthz"
+        ],
+        "interval": "30s",
+        "timeout": "5s",
+        "retries": 5,
+        "start_period": "30s"
+      },
+      "resources": {
+        "memoryMB": 250,
+        "diskMB": 400
+      }
+    },
+    "gitea-db": {
+      "image": "postgres:18-alpine@sha256:b6972e1115a4ff8eba5d7f7d19184926d1e16d7d1136ae1e1a7ebf286da0f015",
+      "role": "database",
+      "label": "PostgreSQL",
+      "stateful": true,
+      "environment": {
+        "POSTGRES_USER": "gitea",
+        "POSTGRES_PASSWORD": "{{input:dbPassword}}",
+        "POSTGRES_DB": "gitea"
+      },
+      "volumes": [
+        {
+          "name": "pgdata",
+          "target": "/var/lib/postgresql",
+          "kind": "volume",
+          "description": "PostgreSQL 18 data (PostgreSQL 18 keeps it under /var/lib/postgresql). Must be a Docker volume on Windows."
+        }
+      ],
+      "healthcheck": {
+        "test": [
+          "CMD-SHELL",
+          "pg_isready -U gitea -d gitea"
+        ],
+        "interval": "10s",
+        "timeout": "5s",
+        "retries": 6,
+        "start_period": "20s"
+      },
+      "shmSize": "128mb",
+      "resources": {
+        "memoryMB": 150,
+        "diskMB": 300
+      }
+    }
+  },
+  "inputs": [
+    {
+      "id": "enableSsh",
+      "type": "boolean",
+      "label": "Git over SSH from your network",
+      "default": "false",
+      "help": "Opens the SSH port below on this PC. HTTPS cloning works without it."
+    },
+    {
+      "id": "sshPort",
+      "type": "text",
+      "label": "SSH port on this PC",
+      "default": "2222",
+      "pattern": "^[0-9]{2,5}$"
+    },
+    {
+      "id": "dbPassword",
+      "type": "generated",
+      "bytes": 24,
+      "label": "Database password"
+    }
+  ],
+  "privileges": [],
+  "dependencies": [
+    "PostgreSQL 18"
+  ],
+  "security": [
+    "Self-registration is off: the administrator is created on the first-start page, and others are invited or added by the administrator.",
+    "Gitea 28 routes migrations and mirrors through its own egress proxy rules; review them before mirroring private networks."
+  ],
+  "authentication": {
+    "forwardAuth": "caution",
+    "native": [
+      "local",
+      "oidc",
+      "ldap"
+    ],
+    "notes": [
+      "Git over HTTPS, the API, webhooks and Actions runners use tokens: ForwardAuth on the whole host breaks them. Use Gitea's OpenID Connect sign-in with authentik instead."
+    ]
+  },
+  "limitations": [
+    "Port 22 on Windows is usually taken; SSH uses 2222 by default.",
+    "Real-time notifications use WebSockets: the route must allow them (Traefik does by default)."
+  ],
+  "manualSetup": [
+    "Open it: the first-start page shows the database settings (already filled in) and lets you create the administrator account."
+  ],
+  "update": {
+    "strategy": "pinned-digest",
+    "notes": "Gitea dropped the \"1.\" prefix with version 28. Database migrations run on start; updates back up data and database first."
+  },
+  "web": {
+    "service": "gitea",
+    "path": "/",
+    "localPort": 3030
+  },
+  "exposure": {
+    "default": "access"
+  },
+  "resources": {
+    "memoryMB": 400,
+    "diskMB": 700
+  },
+  "testStatus": {
+    "static": "passed",
+    "live": "not-run",
+    "date": "2026-11-17",
+    "notes": "Manifest, Compose file set and route validated; not yet installed on a disposable deployment."
+  }
+}

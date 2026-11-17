@@ -1,0 +1,206 @@
+{
+  "schema": 1,
+  "manifestVersion": "2026.11.17",
+  "id": "crowdsec",
+  "name": "CrowdSec (detection)",
+  "category": "security",
+  "group": "A",
+  "description": "Security engine that reads Traefik's logs and detects attacks (scans, brute force, known exploits). Detection only here: nothing is blocked until you add a remediation component yourself.",
+  "maintainer": "CrowdSec SAS and contributors",
+  "license": "MIT",
+  "source": {
+    "type": "curated",
+    "url": "https://github.com/crowdsecurity/crowdsec"
+  },
+  "docs": [
+    {
+      "title": "CrowdSec documentation",
+      "url": "https://docs.crowdsec.net/"
+    },
+    {
+      "title": "Docker installation",
+      "url": "https://docs.crowdsec.net/u/getting_started/installation/docker"
+    },
+    {
+      "title": "Docker acquisition",
+      "url": "https://docs.crowdsec.net/docs/next/log_processor/data_sources/docker"
+    },
+    {
+      "title": "Traefik collection",
+      "url": "https://app.crowdsec.net/hub/author/crowdsecurity/collections/traefik"
+    }
+  ],
+  "platforms": {
+    "windows-docker-desktop": "supported",
+    "linux-docker": "untested",
+    "unraid": "untested",
+    "podman": "untested"
+  },
+  "architectures": [
+    "amd64",
+    "arm64",
+    "arm/v7"
+  ],
+  "website": "https://www.crowdsec.net",
+  "installable": true,
+  "services": {
+    "app": {
+      "image": "crowdsecurity/crowdsec:v1.8.2@sha256:65b74942f7e7ed5c60fde4ac15fc4ba715904c398c8b16dd451f4907d90347d4",
+      "role": "app",
+      "label": "CrowdSec security engine",
+      "ports": [
+        {
+          "container": 8080,
+          "protocol": "tcp",
+          "label": "Local API (private network only)"
+        }
+      ],
+      "environment": {
+        "TZ": "{{timezone}}",
+        "COLLECTIONS": "crowdsecurity/traefik",
+        "DISABLE_ONLINE_API": "{{input:offline}}",
+        "USE_WAL": "true"
+      },
+      "volumes": [
+        {
+          "name": "config",
+          "target": "/etc/crowdsec",
+          "kind": "volume",
+          "description": "Configuration, hub items and credentials."
+        },
+        {
+          "name": "data",
+          "target": "/var/lib/crowdsec/data",
+          "kind": "volume",
+          "description": "Decisions and alerts (SQLite)."
+        },
+        {
+          "name": "acquis",
+          "target": "/etc/crowdsec/acquis.d",
+          "kind": "project",
+          "source": "config/acquis.d",
+          "readOnly": true,
+          "description": "Which logs CrowdSec reads."
+        }
+      ],
+      "dependsOn": [
+        {
+          "service": "socket-proxy",
+          "condition": "service_started"
+        }
+      ],
+      "healthcheck": {
+        "test": [
+          "CMD",
+          "cscli",
+          "lapi",
+          "status"
+        ],
+        "interval": "30s",
+        "timeout": "5s",
+        "retries": 3,
+        "start_period": "60s"
+      },
+      "resources": {
+        "memoryMB": 200,
+        "diskMB": 200
+      }
+    },
+    "socket-proxy": {
+      "image": "tecnativa/docker-socket-proxy:v0.5.0@sha256:1f5038b54f06c3e18422902cf00ba21803d1c97805aae032e5e6673d532d3459",
+      "role": "support",
+      "label": "Docker socket proxy (read-only)",
+      "dockerSocket": true,
+      "dockerSocketReadOnly": true,
+      "environment": {
+        "CONTAINERS": "1",
+        "IMAGES": "0",
+        "INFO": "0",
+        "VERSION": "1",
+        "EVENTS": "1",
+        "PING": "1",
+        "POST": "0",
+        "DELETE": "0",
+        "BUILD": "0",
+        "COMMIT": "0",
+        "EXEC": "0",
+        "SECRETS": "0",
+        "SWARM": "0",
+        "SYSTEM": "0"
+      },
+      "resources": {
+        "memoryMB": 40,
+        "diskMB": 20
+      }
+    }
+  },
+  "files": [
+    {
+      "path": "config/acquis.d/traefik.yaml",
+      "content": "# CrowdSec acquisition: which logs to read. Written once at installation; your edits are kept.\n# Reads the Traefik container's log through the read-only socket proxy. Traefik must write its access log to\n# stdout (accessLog in its static configuration) for HTTP scenarios to see requests.\nsource: docker\ndocker_host: tcp://{{service:socket-proxy}}:2375\ncontainer_name:\n  - {{traefikContainer}}\nlabels:\n  type: traefik\n"
+    }
+  ],
+  "inputs": [
+    {
+      "id": "offline",
+      "type": "boolean",
+      "label": "Keep CrowdSec offline (no community blocklist, no signal sharing)",
+      "default": "true",
+      "help": "Off: CrowdSec registers with its Central API, shares attack signals and receives the community blocklist."
+    }
+  ],
+  "privileges": [
+    {
+      "kind": "docker-socket",
+      "explain": "A socket proxy on CrowdSec's private network gets the Docker socket read-only and allows only reading containers and their logs (no POST, exec or delete), so CrowdSec can read Traefik's log."
+    }
+  ],
+  "dependencies": [
+    "Read-only Docker socket proxy (tecnativa/docker-socket-proxy)"
+  ],
+  "security": [
+    "Detection only: no bouncer, firewall rule or Traefik middleware is installed, so nothing is blocked. Remediation (for example the Traefik bouncer plugin) is a separate, deliberate step.",
+    "The Local API stays on CrowdSec's private network; nothing is published."
+  ],
+  "authentication": {
+    "forwardAuth": "not-applicable",
+    "native": [
+      "api-keys"
+    ],
+    "notes": [
+      "No web interface: use cscli (docker compose exec app cscli alerts list) or enroll it in the CrowdSec Console yourself."
+    ]
+  },
+  "limitations": [
+    "Firewall bouncers (iptables/nftables) cannot protect a Windows host through Docker Desktop; blocking would have to happen in Traefik.",
+    "HTTP scenarios need Traefik's access log on its standard output; without it CrowdSec sees only Traefik's own messages.",
+    "Behind Docker Desktop, client addresses may appear as the Docker gateway, which limits what CrowdSec can attribute."
+  ],
+  "manualSetup": [
+    "Check what it detects: docker compose exec app cscli metrics, and cscli alerts list.",
+    "Optional: enable Traefik's access log on standard output so HTTP scenarios apply.",
+    "Optional, separately: add a remediation component (for example the Traefik bouncer) once you trust the detections."
+  ],
+  "update": {
+    "strategy": "pinned-digest",
+    "notes": "Hub collections update independently with cscli hub upgrade; the image changes only with a catalog update."
+  },
+  "web": {
+    "service": "app",
+    "headless": true,
+    "proxy": false
+  },
+  "exposure": {
+    "default": "local"
+  },
+  "resources": {
+    "memoryMB": 240,
+    "diskMB": 220
+  },
+  "testStatus": {
+    "static": "passed",
+    "live": "not-run",
+    "date": "2026-11-17",
+    "notes": "Manifest, Compose file set and route validated; not yet installed on a disposable deployment."
+  }
+}

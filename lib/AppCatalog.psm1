@@ -12,7 +12,14 @@ $script:IdPattern = '^[a-z0-9]([a-z0-9-]{0,30}[a-z0-9])?$'
 $script:ImagePattern = '^[a-z0-9]+([._/-][a-z0-9]+)*(:[A-Za-z0-9_][A-Za-z0-9_.-]{0,127})?@sha256:[0-9a-f]{64}$'
 $script:EnvKeyPattern = '^[A-Z][A-Z0-9_]{0,63}$'
 $script:Platforms = @('windows-docker-desktop', 'linux-docker', 'unraid', 'podman')
-$script:Categories = @('monitoring', 'media', 'management', 'authentication', 'networking', 'tools', 'productivity', 'communication', 'photos', 'dashboard', 'updates')
+$script:Categories = @('monitoring', 'media', 'management', 'authentication', 'networking', 'tools', 'productivity', 'communication', 'photos', 'dashboard', 'updates',
+  'security', 'passwords', 'files', 'development', 'automation', 'games', 'surveillance')
+# What has been demonstrated for a manifest (shown in the catalog): static = manifest, Compose file set and route checks;
+# live = a real installation of exactly these images on a disposable deployment (tests\Test-CatalogInstall.ps1).
+$script:LiveStates = @('passed', 'partial', 'not-run', 'failed')
+# Extra ports a service may publish on the host when the user opts in: 'local' = 127.0.0.1 only, 'lan' = every
+# interface of this PC (other devices on the network can connect).
+$script:PublishAddresses = @{ local = '127.0.0.1'; lan = '0.0.0.0' }
 # Paths inside an app's project folder: relative, no '..', no drive letters.
 $script:RelPathPattern = '^(?!.*\.\.)[A-Za-z0-9][A-Za-z0-9_.-]*(/[A-Za-z0-9_.-]+)*$'
 # Values computed at installation time from another input (see Resolve-DerivedValue in webui.ps1).
@@ -69,6 +76,7 @@ function Test-AppManifest($M, [switch]$AllowImported) {
   else { foreach ($p in $platforms.PSObject.Properties) { if ($script:Platforms -notcontains $p.Name) { & $add "unknown platform '$($p.Name)'" } elseif ($p.Value -notin 'supported', 'untested', 'limited', 'unsupported') { & $add "platform '$($p.Name)' must be supported, limited, untested or unsupported" } } }
   # Identity: the canonical id, earlier ids and other spellings (aliases), and variants grouped under one application.
   if ((Get-Prop $M 'manifestVersion' '') -and [string]$M.manifestVersion -notmatch '^[0-9A-Za-z][0-9A-Za-z.+-]{0,31}$') { & $add 'manifestVersion is invalid' }
+  foreach ($r in @(Get-Prop $M 'identifiedBy' @())) { if ([string]$r -notmatch '^[a-z0-9]+([._/-][a-z0-9]+)*$') { & $add "identifiedBy '$r' must be an image repository without tag" } }
   foreach ($a in @(Get-Prop $M 'aliases' @())) { if ([string]$a -notmatch $script:IdPattern -or [string]$a -eq $id) { & $add "alias '$a' is invalid" } }
   $variantOf = [string](Get-Prop $M 'variantOf' '')
   if ($variantOf -and ($variantOf -notmatch $script:IdPattern -or $variantOf -eq $id)) { & $add 'variantOf must name another application' }
@@ -87,6 +95,13 @@ function Test-AppManifest($M, [switch]$AllowImported) {
   $fits = $(if ($sourceType -eq 'curated') { $script:ForwardAuthFit } else { $script:ForwardAuthFitImported })
   if ($auth -and $fits -notcontains [string](Get-Prop $auth 'forwardAuth' '')) { & $add "authentication.forwardAuth must be one of $($fits -join ', ')" }
   foreach ($l in @(Get-Prop $M 'limitations' @())) { if (-not ([string]$l).Trim()) { & $add 'limitations must be non-empty sentences' } }
+  foreach ($l in @(Get-Prop $M 'manualSetup' @())) { if (-not ([string]$l).Trim()) { & $add 'manualSetup must be non-empty sentences' } }
+  $ver = Get-Prop $M 'testStatus' $null
+  if ($ver) {
+    if ([string](Get-Prop $ver 'static' '') -notin 'passed', 'not-run') { & $add 'testStatus.static must be passed or not-run' }
+    if ($script:LiveStates -notcontains [string](Get-Prop $ver 'live' '')) { & $add "testStatus.live must be one of $($script:LiveStates -join ', ')" }
+    if ((Get-Prop $ver 'date' '') -and [string]$ver.date -notmatch '^\d{4}-\d{2}-\d{2}$') { & $add 'testStatus.date must be YYYY-MM-DD' }
+  }
   if (-not [bool](Get-Prop $M 'installable' $false)) { if (-not [string](Get-Prop $M 'installNote' '') -and $availability -ne 'retired') { & $add 'a manifest that is not installable needs installNote' }; return $e.ToArray() }
   # Curated, installable manifests describe what the catalog shows before installation.
   if ($sourceType -eq 'curated') {
@@ -132,6 +147,17 @@ function Test-AppManifest($M, [switch]$AllowImported) {
       if ([int](Get-Prop $p 'container' 0) -lt 1 -or [int](Get-Prop $p 'container' 0) -gt 65535) { & $add "${where}: invalid port" }
       if ([string](Get-Prop $p 'protocol' '') -notin 'http', 'https', 'tcp', 'udp') { & $add "${where}: port protocol must be http, https, tcp or udp" }
       if ([bool](Get-Prop $p 'primary' $false)) { $primary++ }
+      $pub = Get-Prop $p 'publish' $null
+      if ($pub) {
+        if (-not $script:PublishAddresses.ContainsKey([string](Get-Prop $pub 'address' ''))) { & $add "${where}: publish.address must be local or lan" }
+        if ([int](Get-Prop $pub 'hostPort' 0) -lt 1 -or [int](Get-Prop $pub 'hostPort' 0) -gt 65535) { & $add "${where}: publish.hostPort must be a port number" }
+        $pw = [string](Get-Prop $pub 'when' '')
+        if ($pw -and -not @($inputs | Where-Object { $_.id -eq $pw -and $_.type -eq 'boolean' }).Count) { & $add "${where}: publish.when must name a boolean input" }
+        $pin = [string](Get-Prop $pub 'input' '')
+        if ($pin -and -not @($inputs | Where-Object { $_.id -eq $pin -and $_.type -eq 'text' }).Count) { & $add "${where}: publish.input must name a text input (the host port)" }
+        if ([string](Get-Prop $pub 'address' '') -eq 'lan' -and -not $pw) { & $add "${where}: a port published on the network must be opt-in (publish.when)" }
+        if ([string](Get-Prop $s 'networkMode' '') -eq 'host') { & $add "${where}: a host-network service cannot publish ports" }
+      }
     }
     foreach ($v in @(Get-Prop $s 'volumes' @())) {
       $kind = [string](Get-Prop $v 'kind' 'volume')
@@ -475,6 +501,25 @@ function Get-ActiveServices($Manifest, [hashtable]$Values) {
     })
 }
 
+# Pure: the extra host ports an installation publishes (opt-in ports of active services whose 'when' input is on):
+# service, container port, protocol (tcp/udp), host address and port, label. The host port can come from a text input.
+function Get-AppPublishedPorts($Manifest, [hashtable]$Values) {
+  return @(foreach ($sp in (Get-ActiveServices $Manifest $Values)) {
+      foreach ($p in @(Get-Prop $sp.Value 'ports' @())) {
+        $pub = Get-Prop $p 'publish' $null
+        if (-not $pub) { continue }
+        $w = [string](Get-Prop $pub 'when' '')
+        if ($w -and [string]$Values["input:$w"] -ne 'true') { continue }
+        $hp = [int](Get-Prop $pub 'hostPort' 0)
+        $pin = [string](Get-Prop $pub 'input' '')
+        if ($pin -and [string]$Values["input:$pin"] -match '^\d{1,5}$' -and [int]$Values["input:$pin"] -ge 1 -and [int]$Values["input:$pin"] -le 65535) { $hp = [int]$Values["input:$pin"] }
+        $proto = $(if ([string]$p.protocol -eq 'udp') { 'udp' } else { 'tcp' })
+        [ordered]@{ service = $sp.Name; container = [int]$p.container; protocol = $proto; address = [string]$pub.address; hostIp = $script:PublishAddresses[[string]$pub.address]; hostPort = $hp
+          label = [string](Get-Prop $p 'label' ''); primary = [bool](Get-Prop $p 'primary' $false) }
+      }
+    })
+}
+
 # A readable random password (24 characters from an unambiguous alphabet), for accounts a person signs in with.
 function New-PasswordValue([int]$Length = 24) {
   $alphabet = 'abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789'
@@ -513,6 +558,7 @@ function New-AppComposeText {
   $web = [string](Get-Prop (Get-Prop $Manifest 'web') 'service' '')
   $webProxy = [bool](Get-Prop (Get-Prop $Manifest 'web') 'proxy' $true)
   $active = @($all | ForEach-Object { $_.Name })
+  $published = @(Get-AppPublishedPorts $Manifest $Resolved.Values)
   $L = New-Object System.Collections.Generic.List[string]
   $L.Add("# Generated by the Deployment Manager from catalog app '$($Manifest.id)' ($($Manifest.name)).")
   if (@($Header).Count) { foreach ($hl in $Header) { $L.Add($hl) } }
@@ -575,10 +621,15 @@ function New-AppComposeText {
     if ([string](Get-Prop $s 'networkMode' '') -eq 'host') { $L.Add('    network_mode: host') }
     else {
       $primaryPorts = @(Get-Prop $s 'ports' @() | Where-Object { Get-Prop $_ 'primary' $false })
+      $pubs = @($published | Where-Object { $_.service -eq $sp.Name })
+      $portLines = @()
+      # The web port on 127.0.0.1, unless the user chose to open that same port on the network (which includes this PC).
       if ($LocalPort -gt 0 -and $sp.Name -eq $web -and $primaryPorts.Count) {
         $wp = [int]$primaryPorts[0].container
-        $L.Add('    ports:'); $L.Add("      - '127.0.0.1:${LocalPort}:$wp'")
+        if (-not @($pubs | Where-Object { $_.container -eq $wp -and $_.address -eq 'lan' -and $_.protocol -eq 'tcp' }).Count) { $portLines += "      - '127.0.0.1:${LocalPort}:$wp'" }
       }
+      foreach ($pp in $pubs) { $portLines += "      - '$($pp.hostIp):$($pp.hostPort):$($pp.container)$(if ($pp.protocol -eq 'udp') { '/udp' })'" }
+      if ($portLines.Count) { $L.Add('    ports:'); foreach ($pl in $portLines) { $L.Add($pl) } }
       $nets = @()
       if (($sp.Name -eq $web -and $webProxy) -or [bool](Get-Prop $s 'proxy' $false)) { $nets += 'proxy'; $usesProxy = $true }
       if ($multi -or -not $webProxy) { $nets += 'internal'; $usesInternal = $true }
@@ -699,6 +750,7 @@ function New-AppStackManifest {
   $activeNames = @($active | ForEach-Object { $_.Name })
   $fileOf = @{}; foreach ($f in $ComposeSet) { foreach ($s in @($f.services)) { $fileOf[[string]$s] = [string]$f.file } }
   $internal = "${Project}_internal"
+  $published = @(Get-AppPublishedPorts $Manifest $Resolved.Values)
   $svcList = @(foreach ($sp in $active) {
       $s = $sp.Value; $decl = Get-ServiceDeclaredLifecycle $s
       $nets = @()
@@ -717,7 +769,11 @@ function New-AppStackManifest {
         })
       $ports = @(foreach ($p in @(Get-Prop $s 'ports' @())) {
           $prim = [bool](Get-Prop $p 'primary' $false)
-          [ordered]@{ container = [int]$p.container; protocol = [string]$p.protocol; primary = $prim; published = $(if ($prim -and $sp.Name -eq $webName -and $LocalPort -gt 0) { "127.0.0.1:$LocalPort" } else { '' }) }
+          $proto = $(if ([string]$p.protocol -eq 'udp') { 'udp' } else { 'tcp' })
+          $pub = @($published | Where-Object { $_.service -eq $sp.Name -and $_.container -eq [int]$p.container -and $_.protocol -eq $proto })
+          $at = @($pub | ForEach-Object { "$($_.hostIp):$($_.hostPort)" })
+          if ($prim -and $sp.Name -eq $webName -and $LocalPort -gt 0 -and -not @($pub | Where-Object { $_.address -eq 'lan' }).Count) { $at = @("127.0.0.1:$LocalPort") + $at }
+          [ordered]@{ container = [int]$p.container; protocol = [string]$p.protocol; primary = $prim; label = [string](Get-Prop $p 'label' ''); published = ($at -join ', ') }
         })
       [ordered]@{ name = $sp.Name; container = (Get-AppContainerName $Manifest $Project $sp.Name); component = (Get-ServiceComponent $Manifest $sp.Name); file = [string]$fileOf[$sp.Name]
         role = $decl.role; lifecycle = $decl.lifecycle; label = $decl.label; image = [string]$s.image; stateful = [bool](Get-Prop $s 'stateful' $false)
@@ -750,7 +806,10 @@ function New-AppStackManifest {
       private = @(@($svcList | ForEach-Object { $_.networks }) | Where-Object { $_ -eq $internal } | Select-Object -Unique)
       note = 'Only the web front end joins the shared proxy network; databases, caches and other dependencies stay on the private network.' }
     volumes = @($svcList | ForEach-Object { $n = $_.name; @($_.volumes) | ForEach-Object { $o = [ordered]@{ service = $n }; foreach ($k in $_.Keys) { $o[$k] = $_[$k] }; $o } })
+    publishedPorts = @($published | ForEach-Object { [ordered]@{ service = $_.service; container = $_.container; protocol = $_.protocol; host = "$($_.hostIp):$($_.hostPort)"; scope = $(if ($_.address -eq 'lan') { 'this PC and the local network' } else { 'this PC only' }); label = $_.label } })
     authentication = [ordered]@{ forwardAuth = [string](Get-Prop $auth 'forwardAuth' 'unknown'); native = @(Get-Prop $auth 'native' @()); notes = @(Get-Prop $auth 'notes' @()) }
+    manualSetup = @(Get-Prop $Manifest 'manualSetup' @())
+    ownership = [ordered]@{ managedBy = 'deployment-manager'; origin = $Origin; note = $(if ($Origin -eq 'adopted') { 'Adopted: the manager records and operates this project; its Compose files and data were not rewritten.' } else { 'Created by the manager from the App Catalog.' }) }
     routing = [ordered]@{ owner = 'deployment-manager'; provider = 'traefik-file'; dockerLabels = $false
       note = 'Routes are explicit Traefik file-provider definitions (traefik/dynamic/svc-<route>.yml of the proxy deployment), created on the Services page or by New app. Installing does not publish anything.' }
     lifecycle = [ordered]@{ composeFiles = @($ComposeSet | ForEach-Object { [string]$_.file })
@@ -765,4 +824,4 @@ Export-ModuleMember -Function Test-AppManifest, Get-AppContainerName, Get-Active
   Get-AppIdentityKey, Resolve-CatalogEntry, Get-ApplicationId, Get-ManifestAvailability, Get-ServiceDeclaredLifecycle,
   ConvertTo-HostFolder, ConvertTo-EnvFileText, ConvertTo-AppCompose, New-AppReadme, Hide-SecretValues, Read-AppEnv, Get-AppsRegistryPath, Read-AppsRegistry,
   Save-AppsRegistry, Get-ComposeServiceImages, Get-AppUpdateDiff, New-AppComposeText, ConvertTo-AppComposeSet, Get-ServiceComponent, Get-ComponentFileName,
-  Get-ComposeFileEnv, Get-ComposeSetFingerprint, Get-StackStartOrder, New-AppStackManifest
+  Get-ComposeFileEnv, Get-ComposeSetFingerprint, Get-StackStartOrder, New-AppStackManifest, Get-AppPublishedPorts

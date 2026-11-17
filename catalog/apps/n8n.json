@@ -1,0 +1,212 @@
+{
+  "schema": 1,
+  "manifestVersion": "2026.11.17",
+  "id": "n8n",
+  "name": "n8n",
+  "category": "automation",
+  "group": "D",
+  "description": "Workflow automation with a visual editor and hundreds of integrations. n8n 2.x (stable line) with its own PostgreSQL; no integration is enabled until you add credentials yourself.",
+  "maintainer": "n8n GmbH",
+  "license": "Sustainable Use License (fair-code, not OSI-approved)",
+  "source": {
+    "type": "curated",
+    "url": "https://github.com/n8n-io/n8n"
+  },
+  "docs": [
+    {
+      "title": "Docker installation",
+      "url": "https://docs.n8n.io/hosting/installation/docker/"
+    },
+    {
+      "title": "Environment variables",
+      "url": "https://docs.n8n.io/hosting/configuration/environment-variables/"
+    },
+    {
+      "title": "Webhook URL behind a proxy",
+      "url": "https://docs.n8n.io/hosting/configuration/configuration-examples/webhook-url/"
+    },
+    {
+      "title": "n8n 2.0 breaking changes",
+      "url": "https://docs.n8n.io/2-0-breaking-changes/"
+    }
+  ],
+  "platforms": {
+    "windows-docker-desktop": "supported",
+    "linux-docker": "untested",
+    "unraid": "untested",
+    "podman": "untested"
+  },
+  "architectures": [
+    "amd64",
+    "arm64"
+  ],
+  "website": "https://n8n.io",
+  "installable": true,
+  "services": {
+    "n8n": {
+      "image": "n8nio/n8n:2.48.4@sha256:63bdcfdea7e0d21152a7ad8f62e6622658c5eae3835e7515dbd9b610cdb76111",
+      "role": "app",
+      "label": "n8n",
+      "stateful": true,
+      "ports": [
+        {
+          "container": 5678,
+          "protocol": "http",
+          "primary": true
+        }
+      ],
+      "environment": {
+        "DB_TYPE": "postgresdb",
+        "DB_POSTGRESDB_HOST": "n8n-db",
+        "DB_POSTGRESDB_PORT": "5432",
+        "DB_POSTGRESDB_DATABASE": "n8n",
+        "DB_POSTGRESDB_USER": "n8n",
+        "DB_POSTGRESDB_PASSWORD": "{{input:dbPassword}}",
+        "N8N_ENCRYPTION_KEY": "{{input:encryptionKey}}",
+        "N8N_EDITOR_BASE_URL": "{{appUrl}}/",
+        "WEBHOOK_URL": "{{appUrl}}/",
+        "N8N_PROXY_HOPS": "1",
+        "GENERIC_TIMEZONE": "{{timezone}}",
+        "TZ": "{{timezone}}",
+        "N8N_DIAGNOSTICS_ENABLED": "false",
+        "N8N_VERSION_NOTIFICATIONS_ENABLED": "false",
+        "N8N_ENFORCE_SETTINGS_FILE_PERMISSIONS": "true",
+        "N8N_RUNNERS_ENABLED": "true",
+        "N8N_SECURE_COOKIE": "{{input:secureCookie}}"
+      },
+      "volumes": [
+        {
+          "name": "data",
+          "target": "/home/node/.n8n",
+          "kind": "volume",
+          "description": "Settings, encryption key file and binary data."
+        }
+      ],
+      "dependsOn": [
+        {
+          "service": "n8n-db",
+          "condition": "service_healthy"
+        }
+      ],
+      "healthcheck": {
+        "test": [
+          "CMD",
+          "node",
+          "-e",
+          "require('http').get('http://127.0.0.1:5678/healthz',r=>process.exit(r.statusCode==200?0:1)).on('error',()=>process.exit(1))"
+        ],
+        "interval": "30s",
+        "timeout": "10s",
+        "retries": 5,
+        "start_period": "60s"
+      },
+      "resources": {
+        "memoryMB": 450,
+        "diskMB": 900
+      }
+    },
+    "n8n-db": {
+      "image": "postgres:18-alpine@sha256:b6972e1115a4ff8eba5d7f7d19184926d1e16d7d1136ae1e1a7ebf286da0f015",
+      "role": "database",
+      "label": "PostgreSQL",
+      "stateful": true,
+      "environment": {
+        "POSTGRES_USER": "n8n",
+        "POSTGRES_PASSWORD": "{{input:dbPassword}}",
+        "POSTGRES_DB": "n8n"
+      },
+      "volumes": [
+        {
+          "name": "pgdata",
+          "target": "/var/lib/postgresql",
+          "kind": "volume",
+          "description": "PostgreSQL 18 data (PostgreSQL 18 keeps it under /var/lib/postgresql). Must be a Docker volume on Windows."
+        }
+      ],
+      "healthcheck": {
+        "test": [
+          "CMD-SHELL",
+          "pg_isready -U n8n -d n8n"
+        ],
+        "interval": "10s",
+        "timeout": "5s",
+        "retries": 6,
+        "start_period": "20s"
+      },
+      "shmSize": "128mb",
+      "resources": {
+        "memoryMB": 150,
+        "diskMB": 300
+      }
+    }
+  },
+  "inputs": [
+    {
+      "id": "encryptionKey",
+      "type": "generated",
+      "bytes": 32,
+      "label": "Credential encryption key"
+    },
+    {
+      "id": "secureCookie",
+      "type": "boolean",
+      "label": "Secure cookies (HTTPS only)",
+      "default": "true",
+      "help": "Turn off only to open the editor over plain http from another device; http://127.0.0.1 works either way."
+    },
+    {
+      "id": "dbPassword",
+      "type": "generated",
+      "bytes": 24,
+      "label": "Database password"
+    }
+  ],
+  "privileges": [],
+  "dependencies": [
+    "PostgreSQL 18"
+  ],
+  "security": [
+    "Credentials you add to workflows are encrypted with the generated key in .env; losing .env makes them unreadable.",
+    "The Execute Command node and local file triggers are disabled by default in n8n 2.x; enabling them lets workflows run commands inside the container.",
+    "No integration, webhook or community package is enabled by the installation."
+  ],
+  "authentication": {
+    "forwardAuth": "caution",
+    "native": [
+      "local"
+    ],
+    "notes": [
+      "Webhooks (/webhook/, /webhook-test/), forms (/form/), OAuth callbacks and the public API (/api/v1) must stay reachable without a browser sign-in: ForwardAuth on the whole host breaks them. OIDC/SAML/LDAP need an n8n Enterprise licence."
+    ]
+  },
+  "limitations": [
+    "n8n 3.0 is in beta (one-way upgrade); this catalog stays on the 2.x stable line.",
+    "Webhook URLs use the address chosen at installation; after publishing it, set WEBHOOK_URL and N8N_EDITOR_BASE_URL in .env to the https address and restart."
+  ],
+  "manualSetup": [
+    "Open it and create the owner account on the first page.",
+    "After publishing: set WEBHOOK_URL=https://<hostname>/ in .env and restart so webhooks show the right address."
+  ],
+  "update": {
+    "strategy": "pinned-digest",
+    "notes": "Pinned to an exact 2.x release (the stable tag moves). Migrations run on start; updates back up the database and data volume first."
+  },
+  "web": {
+    "service": "n8n",
+    "path": "/",
+    "localPort": 5678
+  },
+  "exposure": {
+    "default": "access"
+  },
+  "resources": {
+    "memoryMB": 600,
+    "diskMB": 1200
+  },
+  "testStatus": {
+    "static": "passed",
+    "live": "not-run",
+    "date": "2026-11-17",
+    "notes": "Manifest, Compose file set and route validated; not yet installed on a disposable deployment."
+  }
+}

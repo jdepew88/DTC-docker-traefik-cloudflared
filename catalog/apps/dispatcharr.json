@@ -114,5 +114,11 @@
   "resources": {
     "memoryMB": 700,
     "diskMB": 1800
+  },
+  "testStatus": {
+    "static": "passed",
+    "live": "partial",
+    "date": "2026-11-16",
+    "notes": "Installed in isolation up to the Traefik route; backup, restore and removal not yet run (2026-11-16)."
   }
 }

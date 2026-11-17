@@ -4,7 +4,7 @@
   "id": "whats-up-docker",
   "name": "What's Up Docker",
   "category": "updates",
-  "group": "E",
+  "group": "A",
   "description": "Notifies you when newer images exist for your containers, with a web interface. Installed notification-only: it never updates anything, and it reads Docker through a read-only socket proxy.",
   "maintainer": "getwud",
   "license": "MIT",
@@ -155,5 +155,11 @@
   "resources": {
     "memoryMB": 190,
     "diskMB": 270
+  },
+  "testStatus": {
+    "static": "passed",
+    "live": "not-run",
+    "date": "2026-11-16",
+    "notes": "Manifest, Compose file set and route validated; not installed on a disposable deployment yet."
   }
 }

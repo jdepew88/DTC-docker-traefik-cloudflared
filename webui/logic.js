@@ -529,6 +529,51 @@
     const n = ((app && app.instances) || []).length;
     return n === 0 ? { installed: false, text: '' } : { installed: true, text: n === 1 ? 'Installed' : `Installed: ${n} instances` };
   }
+  // Catalog card: the one state that decides its primary action and the state filter.
+  //   managed     installed or adopted here (Manage)
+  //   detected    running on this PC, not managed here (Review and adopt / Inspect; never a plain Install)
+  //   unsupported cannot run on this host (platform, architecture or a failed host check)
+  //   manual      not installable from the catalog: a recipe or listing that needs manual setup
+  //   available   can be installed
+  // installed = managed or detected ("Already installed"). manualSteps = an installable app that still needs setup in
+  // the app itself afterwards (shown as a chip, not a separate state).
+  const CATALOG_STATES = {
+    managed: { text: 'Managed here', tone: 'ok' },
+    detected: { text: 'Detected on this PC', tone: 'info' },
+    unsupported: { text: 'Not supported on this PC', tone: 'err' },
+    manual: { text: 'Requires manual setup', tone: 'warn' },
+    available: { text: 'Available', tone: 'neutral' },
+  };
+  function catalogStatus(app) {
+    const a = app || {};
+    const managed = (a.instances || []).length;
+    const detected = (a.detected || []).length;
+    const compatFailed = (a.compatibility || []).some((c) => c.state === 'failed');
+    const platformOk = !a.platform || a.platform.installable !== false || !a.installable;
+    let key = 'available';
+    if (managed) key = 'managed';
+    else if (detected) key = 'detected';
+    else if (a.platform && a.platform.support === 'unsupported') key = 'unsupported';
+    else if (!a.installable) key = 'manual';
+    else if (compatFailed || !platformOk) key = 'unsupported';
+    return { key, ...CATALOG_STATES[key], installed: key === 'managed' || key === 'detected', manualSteps: (a.manualSetup || []).length > 0 };
+  }
+  function catalogStatusMatches(app, filter) {
+    if (!filter) return true;
+    const s = catalogStatus(app);
+    if (filter === 'installed') return s.installed;
+    if (filter === 'manual') return s.key === 'manual' || (s.key === 'available' && s.manualSteps);
+    return s.key === filter;
+  }
+  // Catalog card: what has been demonstrated (live installation on a disposable deployment vs static checks only).
+  function verificationText(v) {
+    if (!v) return { tone: 'neutral', text: 'Verification: not recorded' };
+    if (v.live === 'passed') return { tone: 'ok', text: `Live-tested${v.date ? ` ${v.date}` : ''}` };
+    if (v.live === 'partial') return { tone: 'warn', text: 'Partly live-tested' };
+    if (v.live === 'failed') return { tone: 'err', text: 'Live test failed' };
+    return { tone: 'warn', text: v.static === 'passed' ? 'Static checks only (not live-tested)' : 'Not verified' };
+  }
+
   // Display name of an installed instance: the application, plus its label when it has one (e.g. "Testing").
   function instanceTitle(a) { return a && a.label ? `${a.name} (${a.label})` : (a ? a.name : ''); }
 
@@ -652,7 +697,7 @@
   return {
     ROUTING_STATES, routingState, routingEvidence, endpointAudience, endpointKind, ROUTING_HELP, routingHelp, journeyPath,
     DEPLOYMENT_STATES, deploymentState, statusTone, serviceGroups, terminationText, healthText, shortImage, roleSource, catalogInstallState, instanceTitle,
-    catalogAccessText, authFitText, compatSummary, sortFindings, findingTone, backupTitle,
+    catalogAccessText, authFitText, compatSummary, sortFindings, findingTone, backupTitle, catalogStatus, catalogStatusMatches, verificationText,
     provisionAckIds, PROVISION_ACCESS, provisionWizard, provisionVerdict, suggestProvisionHostname,
     samePath, launcherNotice, launcherDefaultAction, autostartText,
     IDENTITY_STATES, identityState, googleRedirectUri, isGoogleClientId, identityNextStep, identityWizard, wizardNeighbours, CREDENTIAL_STATUS, credentialStatus,

@@ -90,5 +90,11 @@
   "resources": {
     "memoryMB": 200,
     "diskMB": 600
+  },
+  "testStatus": {
+    "static": "passed",
+    "live": "passed",
+    "date": "2026-11-16",
+    "notes": "Installed in isolation: entry-page API, Traefik route, backup and restore (2026-11-16)."
   }
 }

@@ -1,0 +1,72 @@
+{
+  "schema": 1,
+  "manifestVersion": "2026.11.17",
+  "id": "shinobi",
+  "name": "Shinobi",
+  "category": "surveillance",
+  "group": "E",
+  "description": "Network video recorder for IP cameras (RTSP/ONVIF). Listed with manual setup only: upstream publishes no versioned images and its licence restricts commercial use.",
+  "maintainer": "Shinobi Systems",
+  "license": "Shinobi Open Source Software License Agreement (free for personal and non-commercial use; not OSI-approved)",
+  "source": {
+    "type": "curated",
+    "url": "https://gitlab.com/Shinobi-Systems/Shinobi"
+  },
+  "docs": [
+    {
+      "title": "Docker installation",
+      "url": "https://docs.shinobi.video/installation/docker"
+    },
+    {
+      "title": "Docker on Windows",
+      "url": "https://docs.shinobi.video/installation/docker-windows"
+    },
+    {
+      "title": "Licence",
+      "url": "https://gitlab.com/Shinobi-Systems/Shinobi/-/blob/dev/LICENSE.md"
+    },
+    {
+      "title": "Shinobi Pro",
+      "url": "https://shinobi.cloud/pro"
+    }
+  ],
+  "platforms": {
+    "windows-docker-desktop": "supported",
+    "linux-docker": "untested",
+    "unraid": "untested",
+    "podman": "untested"
+  },
+  "architectures": [
+    "amd64"
+  ],
+  "installable": false,
+  "installNote": "Not installable from the catalog yet. Shinobi publishes only moving image tags (dev, latest) on its GitLab registry, so no version can be pinned and re-installed identically; its default image embeds MariaDB in the application container; and its licence requires a paid subscription for commercial use or 15+ cameras. Follow the official Docker guide, then adopt the Compose project here to manage, back up and route it.",
+  "imageReference": "registry.gitlab.com/shinobi-systems/shinobi:dev@sha256:4d446a20dc2303fd6ea1d1d29d836be10043276430ced35ad755791c7b9bb000",
+  "manualSetup": [
+    "Follow https://docs.shinobi.video/installation/docker with your own Compose file (map /home/Shinobi/videos to a Docker volume or a dedicated folder).",
+    "Change the superuser login at /super immediately, then create the administrator account there.",
+    "Add cameras by their RTSP address; ONVIF discovery needs multicast, which Docker Desktop does not pass.",
+    "Adopt the Compose project on the Installed apps page to back it up and route it."
+  ],
+  "limitations": [
+    "Only moving tags (dev, latest) are published; a digest pin cannot be updated by version.",
+    "Camera discovery (ONVIF multicast) does not work through Docker Desktop; enter camera addresses manually.",
+    "Recording many cameras needs significant disk throughput and CPU; Docker Desktop on Windows is suitable for testing only."
+  ],
+  "authentication": {
+    "forwardAuth": "caution",
+    "native": [
+      "local"
+    ],
+    "notes": [
+      "The mobile app and API keys need direct access: protect only the browser interface."
+    ]
+  },
+  "exposure": {
+    "default": "local"
+  },
+  "resources": {
+    "memoryMB": 2048,
+    "diskMB": 5000
+  }
+}

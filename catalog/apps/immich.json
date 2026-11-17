@@ -4,7 +4,7 @@
   "id": "immich",
   "name": "Immich",
   "category": "photos",
-  "group": "D",
+  "group": "C",
   "description": "Self-hosted photo and video library with mobile backup, faces and smart search. Server, machine learning (optional), Valkey and its own PostgreSQL with vector extensions (immich-db).",
   "maintainer": "Immich contributors",
   "license": "AGPL-3.0",
@@ -204,5 +204,11 @@
   "resources": {
     "memoryMB": 5050,
     "diskMB": 5860
+  },
+  "testStatus": {
+    "static": "passed",
+    "live": "not-run",
+    "date": "2026-11-16",
+    "notes": "Manifest, Compose file set and route validated; not installed on a disposable deployment yet."
   }
 }

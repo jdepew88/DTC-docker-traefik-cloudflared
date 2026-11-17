@@ -52,21 +52,65 @@ function Get-EngineSnapshot([string]$ExcludePrefix) {
 $catalogDir = Join-Path $repo 'catalog'
 $apps = @(Get-CatalogApps -CatalogDir $catalogDir)
 $ids = @($apps | ForEach-Object { $_.id })
-$expected = @('echo', 'uptime-kuma', 'jellyfin', 'portainer', 'arcane', 'authelia', 'authentik', 'traefik-manager', 'homepage', 'lldap', 'openldap', 'postgresql', 'redis', 'rocketchat', 'immich', 'dispatcharr', 'dispatcharr-modular', 'channels-dvr', 'watchtower', 'whats-up-docker', 'diun')
+$expected = @('echo', 'uptime-kuma', 'jellyfin', 'portainer', 'arcane', 'authelia', 'authentik', 'traefik-manager', 'homepage', 'lldap', 'openldap', 'postgresql', 'redis', 'rocketchat', 'immich', 'dispatcharr', 'dispatcharr-modular', 'channels-dvr', 'watchtower', 'whats-up-docker', 'diun',
+  'dozzle', 'crowdsec', 'pihole', 'vaultwarden', 'plex', 'mediafusion', 'romm', 'shinobi', 'nextcloud', 'paperless-ngx', 'filebrowser', 'gitea', 'n8n', 'mealie', 'hfs')
+# Explicitly excluded from the curated catalog (never offered, never a dependency choice).
+$excluded = @('prowlarr', 'sonarr', 'radarr')
+Test-Condition 'catalog: Prowlarr, Sonarr and Radarr are not in the catalog, and Watchtower is not offered' (-not @($ids | Where-Object { $excluded -contains $_ }).Count -and (Get-ManifestAvailability (@($apps | Where-Object { $_.id -eq 'watchtower' })[0].manifest)) -ne 'offered' -and -not @($apps | Where-Object { $_.manifest -and ((@($_.manifest.PSObject.Properties | Where-Object { $_.Name -eq 'services' }).Count -and @($_.manifest.services.PSObject.Properties | Where-Object { [string]$_.Value.image -match 'prowlarr|sonarr|radarr|watchtower' }).Count) -or ([string]$(if ($_.manifest.PSObject.Properties['dependencies']) { $_.manifest.dependencies }) -match '(?i)prowlarr|sonarr|radarr')) }).Count) ''
 Test-Condition 'catalog: every requested app has an entry (groups A-E)' (@($expected | Where-Object { $ids -notcontains $_ }).Count -eq 0 -and -not @($apps | Where-Object { -not $_.manifest.group }).Count) (@($expected | Where-Object { $ids -notcontains $_ }) -join ', ')
 $bad = @($apps | Where-Object { @($_.errors).Count } | ForEach-Object { "$($_.id): $($_.errors -join '; ')" })
 Test-Condition 'catalog: every shipped manifest is valid (pinned digests, licence, https docs, one primary port)' ($bad.Count -eq 0) ($bad -join ' | ')
 $inst = @($apps | Where-Object { $_.manifest.installable })
 $listed = @($apps | Where-Object { -not $_.manifest.installable } | ForEach-Object { $_.id } | Sort-Object)
-Test-Condition 'catalog: unmaintained, beta or dependency-only entries are listed but not installable' ((($listed) -join ',') -eq 'openldap,postgresql,redis,watchtower' -and $inst.Count -eq 17) ($listed -join ',')
+Test-Condition 'catalog: unmaintained, beta or dependency-only entries are listed but not installable' ((($listed) -join ',') -eq 'postgresql,redis,shinobi,watchtower' -and $inst.Count -eq 32) ($listed -join ',')
 Test-Condition 'catalog: Watchtower is marked deprecated with a reason and alternatives' ((Get-CatalogApps -CatalogDir $catalogDir | Where-Object { $_.id -eq 'watchtower' }).manifest.deprecated -and @((Get-CatalogApps -CatalogDir $catalogDir | Where-Object { $_.id -eq 'watchtower' }).manifest.alternatives) -contains 'whats-up-docker') ''
 Test-Condition 'catalog: authentik has no Redis service and its own PostgreSQL' (-not @((Get-CatalogApp $catalogDir 'authentik').services.PSObject.Properties | Where-Object { $_.Value.image -match 'redis|valkey' }).Count -and (Get-CatalogApp $catalogDir 'authentik').services.postgresql.stateful) ''
 Test-Condition 'catalog: Immich uses its own vector-enabled database image named immich-db, in a Docker volume' ((Get-CatalogApp $catalogDir 'immich').services.'immich-db'.image -match '^ghcr\.io/immich-app/postgres:.*vectorchord' -and @((Get-CatalogApp $catalogDir 'immich').services.'immich-db'.volumes)[0].kind -eq 'volume') ''
 Test-Condition 'catalog: Rocket.Chat uses MongoDB (replica set), not Redis' ((Get-CatalogApp $catalogDir 'rocketchat').services.mongodb.image -match 'mongodb-community-server' -and (Get-CatalogApp $catalogDir 'rocketchat').services.rocketchat.environment.MONGO_URL -match 'replicaSet=rs0' -and -not @((Get-CatalogApp $catalogDir 'rocketchat').services.PSObject.Properties | Where-Object { $_.Value.image -match 'redis|valkey' }).Count) ''
 Test-Condition 'catalog: Traefik Manager gets no Docker socket and keeps its routes in its own folder' (-not (Get-CatalogApp $catalogDir 'traefik-manager').services.app.PSObject.Properties['dockerSocket'] -and (Get-CatalogApp $catalogDir 'traefik-manager').services.app.environment.CONFIG_DIR -eq '/app/config/routes' -and (Get-CatalogApp $catalogDir 'traefik-manager').web.localPort -eq 5000) ''
 $sock = @($inst | Where-Object { @($_.manifest.services.PSObject.Properties | Where-Object { $_.Value.PSObject.Properties['dockerSocket'] -and $_.Value.dockerSocket }).Count } | ForEach-Object { $_.id })
-Test-Condition 'catalog: only Portainer and Arcane mount the raw Docker socket and refuse public exposure; What''s Up Docker and Diun read it through a read-only proxy' ((($sock | Sort-Object) -join ',') -eq 'arcane,diun,portainer,whats-up-docker' -and (Get-CatalogApp $catalogDir 'diun').services.'socket-proxy'.dockerSocketReadOnly -and -not (Get-CatalogApp $catalogDir 'diun').services.app.PSObject.Properties['dockerSocket'] -and -not @($inst | Where-Object { $_.id -in 'arcane', 'portainer' -and $_.manifest.exposure.allowPublic -ne $false }).Count -and (Get-CatalogApp $catalogDir 'whats-up-docker').services.'socket-proxy'.dockerSocketReadOnly -and -not (Get-CatalogApp $catalogDir 'whats-up-docker').services.app.PSObject.Properties['dockerSocket']) ($sock -join ',')
+Test-Condition 'catalog: only Portainer and Arcane mount the raw Docker socket and refuse public exposure; What''s Up Docker, Diun, Dozzle and CrowdSec read it through a read-only proxy' ((($sock | Sort-Object) -join ',') -eq 'arcane,crowdsec,diun,dozzle,portainer,whats-up-docker' -and @('crowdsec', 'dozzle' | Where-Object { $mm = Get-CatalogApp $catalogDir $_; $mm.services.'socket-proxy'.dockerSocketReadOnly -and -not $mm.services.app.PSObject.Properties['dockerSocket'] -and $mm.services.'socket-proxy'.environment.POST -eq '0' -and $mm.services.'socket-proxy'.environment.EXEC -eq '0' }).Count -eq 2 -and (Get-CatalogApp $catalogDir 'diun').services.'socket-proxy'.dockerSocketReadOnly -and -not (Get-CatalogApp $catalogDir 'diun').services.app.PSObject.Properties['dockerSocket'] -and -not @($inst | Where-Object { $_.id -in 'arcane', 'portainer' -and $_.manifest.exposure.allowPublic -ne $false }).Count -and (Get-CatalogApp $catalogDir 'whats-up-docker').services.'socket-proxy'.dockerSocketReadOnly -and -not (Get-CatalogApp $catalogDir 'whats-up-docker').services.app.PSObject.Properties['dockerSocket']) ($sock -join ',')
 Test-Condition 'catalog: Jellyfin defaults to local only and warns about streaming through Cloudflare' ((Get-CatalogApp $catalogDir 'jellyfin').exposure.default -eq 'local' -and (Get-CatalogApp $catalogDir 'jellyfin').exposure.warning -match 'Cloudflare') ''
+# Expanded catalog: opt-in host ports, recognition of other builds and of containers started without Compose, and the
+# verification record every installable manifest carries.
+Import-Module (Join-Path $repo 'lib\AppInstances.psm1') -Force
+$gitea = Get-CatalogApp $catalogDir 'gitea'
+$off = Resolve-AppValues -Manifest $gitea -Inputs @{ enableSsh = 'false' } -Project 'g' -AppUrl 'http://127.0.0.1:3030' -LocalPort 3030
+$on = Resolve-AppValues -Manifest $gitea -Inputs @{ enableSsh = 'true'; sshPort = '2299' } -Project 'g' -AppUrl 'http://127.0.0.1:3030' -LocalPort 3030
+$cOff = (@(ConvertTo-AppComposeSet -Manifest $gitea -Project 'g' -Resolved $off -ProxyNetwork 'proxy-x' -LocalPort 3030))[0].content
+$setOn = @(ConvertTo-AppComposeSet -Manifest $gitea -Project 'g' -Resolved $on -ProxyNetwork 'proxy-x' -LocalPort 3030)
+$cOn = $setOn[0].content
+$stOn = New-AppStackManifest -Manifest $gitea -Project 'g' -ComposeSet $setOn -Resolved $on -ProxyNetwork 'proxy-x' -LocalPort 3030
+Test-Condition 'ports: an opt-in port is published only when chosen, on the chosen host port, and recorded in dtc-stack.json' ($cOff -notmatch ':22''' -and $cOn -match "'0\.0\.0\.0:2299:22'" -and $cOn -match "'127\.0\.0\.1:3030:3000'" -and @($stOn.publishedPorts | Where-Object { $_.host -eq '0.0.0.0:2299' -and $_.scope -match 'network' }).Count -eq 1) $cOn
+$ph = Get-CatalogApp $catalogDir 'pihole'
+$phOn = Resolve-AppValues -Manifest $ph -Inputs @{ publishDns = 'true'; adminPassword = 'a-long-password-1' } -Project 'p' -LocalPort 8053
+$phC = (@(ConvertTo-AppComposeSet -Manifest $ph -Project 'p' -Resolved $phOn -ProxyNetwork 'proxy-x' -LocalPort 8053))[0].content
+$phOffR = Resolve-AppValues -Manifest $ph -Inputs @{ adminPassword = 'a-long-password-1' } -Project 'p' -LocalPort 8053
+$phOff = (@(ConvertTo-AppComposeSet -Manifest $ph -Project 'p' -Resolved $phOffR -ProxyNetwork 'proxy-x' -LocalPort 8053))[0].content
+Test-Condition 'ports: Pi-hole answers DNS (53 TCP and UDP) only after opting in; by default nothing but its dashboard on 127.0.0.1' ($phC -match "'0\.0\.0\.0:53:53/udp'" -and $phC -match "'0\.0\.0\.0:53:53'" -and $phOff -notmatch ':53:53' -and $phOff -match "'127\.0\.0\.1:8053:80'") $phOff
+$plex = Get-CatalogApp $catalogDir 'plex'
+$plexR = Resolve-AppValues -Manifest $plex -Inputs @{ mediaFolder = $env:TEMP; lanAccess = 'true' } -Project 'plex' -LocalPort 32400
+$plexC = (@(ConvertTo-AppComposeSet -Manifest $plex -Project 'plex' -Resolved $plexR -ProxyNetwork 'proxy-x' -LocalPort 32400))[0].content
+Test-Condition 'ports: Plex direct access opens 32400 on the network once (no second 127.0.0.1 mapping of the same port); media is read-only' ($plexC -match "'0\.0\.0\.0:32400:32400'" -and $plexC -notmatch '127\.0\.0\.1:32400' -and $plexC -match 'target: /data\s+read_only: true') $plexC
+$badPort = [pscustomobject]@{ schema = 1; id = 'bp'; name = 'B'; description = 'd'; license = 'MIT'; maintainer = 'm'; category = 'tools'; docs = @([pscustomobject]@{ title = 't'; url = 'https://x' }); platforms = [pscustomobject]@{ 'windows-docker-desktop' = 'supported' }; installable = $true
+  architectures = @('amd64'); authentication = [pscustomobject]@{ forwardAuth = 'compatible' }; update = [pscustomobject]@{ strategy = 'pinned-digest' }; testStatus = [pscustomobject]@{ static = 'maybe'; live = 'sometimes' }
+  services = [pscustomobject]@{ app = [pscustomobject]@{ image = "x/y:1@sha256:$('a' * 64)"; ports = @([pscustomobject]@{ container = 80; protocol = 'http'; primary = $true }, [pscustomobject]@{ container = 22; protocol = 'tcp'; publish = [pscustomobject]@{ hostPort = 2222; address = 'lan' } }) } }
+  web = [pscustomobject]@{ service = 'app' }; exposure = [pscustomobject]@{ default = 'local' } }
+$bpErr = @(Test-AppManifest $badPort) -join '; '
+Test-Condition 'manifest: a port opened on the network must be opt-in; verification states are checked' ($bpErr -match 'must be opt-in' -and $bpErr -match 'testStatus\.static' -and $bpErr -match 'testStatus\.live') $bpErr
+$noVer = @($apps | Where-Object { $_.manifest -and $_.manifest.installable -and -not $_.manifest.PSObject.Properties['testStatus'] } | ForEach-Object { $_.id })
+$liveIds = @($apps | Where-Object { $_.manifest -and $_.manifest.PSObject.Properties['testStatus'] -and $_.manifest.testStatus.live -eq 'passed' } | ForEach-Object { $_.id } | Sort-Object)
+Test-Condition "catalog: every installable app records what was verified (live-tested: $($liveIds -join ', '))" ($noVer.Count -eq 0) ($noVer -join ', ')
+$validApps = @($apps | Where-Object { $_.manifest -and -not @($_.errors).Count })
+$plexLsio = @(Get-UnregisteredInstallations @([ordered]@{ name = 'plex'; project = 'media'; service = 'plex'; image = 'lscr.io/linuxserver/plex:latest'; state = 'running'; app = ''; workingDir = 'C:\x' }) $validApps @())
+Test-Condition 'detection: an existing Plex from the LinuxServer.io image is recognized as Plex (no second installation)' ($plexLsio.Count -eq 1 -and $plexLsio[0].appId -eq 'plex') ($plexLsio | ConvertTo-Json -Depth 4 -Compress)
+$mfFacts = @([ordered]@{ name = 'docker-compose-mediafusion-api-1'; project = 'docker-compose'; service = 'mediafusion-api'; image = 'mhdzumair/mediafusion:6.1.3'; state = 'running'; app = '' },
+  [ordered]@{ name = 'docker-compose-prowlarr-1'; project = 'docker-compose'; service = 'prowlarr'; image = 'ghcr.io/hotio/prowlarr:latest'; state = 'running'; app = '' },
+  [ordered]@{ name = 'docker-compose-postgres-1'; project = 'docker-compose'; service = 'postgres'; image = 'postgres:18-alpine'; state = 'running'; app = '' })
+$mf = @(Get-UnregisteredInstallations $mfFacts $validApps @())
+Test-Condition 'detection: a hand-made MediaFusion project (with Prowlarr and PostgreSQL in it) is recognized as MediaFusion, not as PostgreSQL' ($mf.Count -eq 1 -and $mf[0].appId -eq 'mediafusion' -and @($mf[0].containers).Count -eq 3) ($mf | ConvertTo-Json -Depth 4 -Compress)
+$sa = @(Get-StandaloneInstallations @([ordered]@{ name = 'vw'; project = ''; image = 'vaultwarden/server:1.30.0'; state = 'running' }, [ordered]@{ name = 'pg'; project = ''; image = 'postgres:16'; state = 'running' }) $validApps)
+Test-Condition 'detection: a container started without Compose is recognized (inspect and route only, not adoptable); building blocks are not' ($sa.Count -eq 1 -and $sa[0].appId -eq 'vaultwarden' -and $sa[0].standalone -and $sa[0].reason -match 'not adopted') ($sa | ConvertTo-Json -Depth 4 -Compress)
 
 $base = '{"schema":1,"id":"x","name":"X","description":"d","license":"MIT","maintainer":"m","category":"tools","docs":[{"title":"t","url":"https://e.example"}],"platforms":{"windows-docker-desktop":"supported"},"architectures":["amd64"],"authentication":{"forwardAuth":"compatible","native":[],"notes":[]},"update":{"strategy":"pinned-digest"},"installable":true,"inputs":[],"services":{"app":{"image":"nginx:1.27@sha256:' + ('a' * 64) + '","ports":[{"container":80,"protocol":"http","primary":true}],"volumes":[],"environment":{}}},"privileges":[],"web":{"service":"app"},"exposure":{"default":"access"}}'
 function New-Manifest([scriptblock]$Change) { $m = $base | ConvertFrom-Json; & $Change $m; return $m }
@@ -126,7 +170,7 @@ if ((Get-DockerStatus).CliFound) {
   try {
     foreach ($a in $inst) {
       $m = $a.manifest; $inputs = @{}
-      foreach ($i in @($m.inputs)) { switch ($i.type) { 'folder' { $inputs[$i.id] = $sampleFolder } 'boolean' { $inputs[$i.id] = 'true' } 'text' { $inputs[$i.id] = $(if ($i.id -eq 'adminEmail') { 'admin@example.com' } elseif ($i.id -in 'domain') { 'example.com' } elseif ($i.id -eq 'publicHost') { 'home.example.com' } elseif ($i.PSObject.Properties['default']) { $i.default } else { 'x' }) } } }
+      foreach ($i in @($m.inputs)) { switch ($i.type) { 'folder' { $inputs[$i.id] = $sampleFolder } 'boolean' { $inputs[$i.id] = 'true' } 'text' { $inputs[$i.id] = $(if ($i.id -eq 'adminEmail') { 'admin@example.com' } elseif ($i.id -in 'domain') { 'example.com' } elseif ($i.id -eq 'publicHost') { 'home.example.com' } elseif ($i.PSObject.Properties['default']) { $i.default } elseif ($i.PSObject.Properties['required'] -and $i.required) { 'x' } else { '' }) } } }
       $r = Resolve-AppValues -Manifest $m -Inputs $inputs -Project "t-$($m.id)" -AppUrl 'http://127.0.0.1:9999' -LocalPort 19999 -Context @{ traefikContainer = 'traefik-x'; proxyNetwork = 'proxy-x'; domains = 'example.com' }
       if (@($r.Errors).Count) { $bad += "$($m.id): $($r.Errors -join '; ')"; continue }
       $dir = Join-Path $tmpAll $m.id; New-Item -ItemType Directory -Force -Path $dir | Out-Null
@@ -134,7 +178,7 @@ if ((Get-DockerStatus).CliFound) {
       [IO.File]::WriteAllText("$dir\compose.yaml", $cy)
       $envAll = [ordered]@{}; foreach ($s in $r.Env.Keys) { foreach ($k in $r.Env[$s].Keys) { $envAll[$k] = $r.Env[$s][$k] } }
       [IO.File]::WriteAllText("$dir\.env", (ConvertTo-EnvFileText $envAll))
-      foreach ($k in $r.Secrets) { if ($cy.Contains([string]$envAll[$k])) { $secretsInCompose += "$($m.id):$k" } }
+      foreach ($k in $r.Secrets) { if (([string]$envAll[$k]).Length -ge 6 -and $cy.Contains([string]$envAll[$k])) { $secretsInCompose += "$($m.id):$k" } }
       # Databases, caches, brokers, socket proxies and directory servers never join the shared proxy network.
       foreach ($block in [regex]::Split($cy, '(?m)^(?=  [\w-]+:\s*$)')) {
         if ($block -match '(?m)^    image: (\S+)' -and $Matches[1] -match '(^|/)(postgres|mariadb|mysql|mongo|mongodb-community-server|redis|valkey|nats|lldap|openldap|docker-socket-proxy)(:|@|$)' -and $block -match '(?m)^    networks: \[[^\]]*\bproxy\b') { $sensitiveOnProxy += "$($m.id):$($Matches[0])" }

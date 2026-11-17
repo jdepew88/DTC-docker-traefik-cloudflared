@@ -65,6 +65,13 @@ function Get-IdentifyingRepository($Manifest) {
   return ''
 }
 
+# Pure: every image repository that identifies an application: its own (above) plus other well-known builds of the same
+# application the manifest lists in identifiedBy (e.g. the LinuxServer.io image of Plex), so an existing installation
+# made from another build is still recognized and never installed a second time.
+function Get-IdentifyingRepositories($Manifest) {
+  return @(@(Get-IdentifyingRepository $Manifest) + @(@(Get-InstProp $Manifest 'identifiedBy' @()) | ForEach-Object { Get-ImageRepository ([string]$_) }) | Where-Object { $_ } | Select-Object -Unique)
+}
+
 # Pure: Compose projects running on this PC that the registry does not know, recognized as a catalog application by
 # the manager's label or by the application's identifying image. $Containers = container facts of all projects.
 # $Exclude = project names that are not candidates (the proxy deployment itself, registered instances).
@@ -87,10 +94,10 @@ function Get-UnregisteredInstallations([object[]]$Containers, $CatalogApps, [str
     if (-not $match -and -not $proxyStack) {
       # Building blocks listed for reference (PostgreSQL, Redis) run inside many other apps: their image identifies nothing.
       foreach ($e in @($valid | Where-Object { [string](Get-InstProp $_.manifest 'availability' 'offered') -ne 'reference' })) {
-        $repo = Get-IdentifyingRepository $e.manifest
-        if (-not $repo) { continue }
-        $hit = @($cs | Where-Object { (Get-ImageRepository ([string]$_.image)) -eq $repo })
-        if ($hit.Count) { $match = $e; $how = "Container $($hit[0].name) runs $repo, the image of $($e.manifest.name) itself."; break }
+        $repos = @(Get-IdentifyingRepositories $e.manifest)
+        if (-not $repos.Count) { continue }
+        $hit = @($cs | Where-Object { $repos -contains (Get-ImageRepository ([string]$_.image)) })
+        if ($hit.Count) { $match = $e; $how = "Container $($hit[0].name) runs $(Get-ImageRepository ([string]$hit[0].image)), an image of $($e.manifest.name) itself."; break }
       }
     }
     if (-not $match) { continue }
@@ -99,6 +106,22 @@ function Get-UnregisteredInstallations([object[]]$Containers, $CatalogApps, [str
       containers = @($cs | ForEach-Object { [ordered]@{ name = $_.name; service = $_.service; image = $_.image; state = $_.state } }); reason = $how }
   }
   return $out
+}
+
+# Pure: containers started without Compose (docker run, other tools) that run a catalog application's identifying
+# image. They can be inspected and routed, but not adopted (adoption manages a Compose project). $Containers = facts of
+# containers that have no Compose project label.
+function Get-StandaloneInstallations([object[]]$Containers, $CatalogApps) {
+  $valid = @($CatalogApps | Where-Object { $_ -and $_.manifest -and [string](Get-InstProp $_.manifest 'availability' 'offered') -ne 'reference' })
+  return @(foreach ($c in @($Containers | Where-Object { $_ -and -not (Get-InstProp $_ 'project' '') })) {
+      $repo = Get-ImageRepository ([string]$c.image)
+      $e = @($valid | Where-Object { @(Get-IdentifyingRepositories $_.manifest) -contains $repo })[0]
+      if (-not $e) { continue }
+      [ordered]@{ project = ''; container = [string]$c.name; appId = $e.id; applicationId = (Get-ApplicationId $e.manifest); name = [string]$e.manifest.name; standalone = $true
+        availability = [string](Get-InstProp $e.manifest 'availability' 'offered'); folder = ''
+        containers = @([ordered]@{ name = $c.name; service = ''; image = $c.image; state = $c.state })
+        reason = "Container $($c.name) runs $repo, the image of $($e.manifest.name) itself. It was not started with Docker Compose, so it can be inspected and routed but not adopted." }
+    })
 }
 
 # Pure: existing installations of an application (registered instances, archived ones separately, and unregistered
@@ -156,4 +179,4 @@ function Get-RemovalInventory {
   }
 }
 
-Export-ModuleMember -Function Get-ImageRepository, ConvertTo-AppInstance, Get-IdentifyingRepository, Get-UnregisteredInstallations, Find-AppInstallations, Get-RemovalInventory
+Export-ModuleMember -Function Get-ImageRepository, ConvertTo-AppInstance, Get-IdentifyingRepository, Get-IdentifyingRepositories, Get-UnregisteredInstallations, Get-StandaloneInstallations, Find-AppInstallations, Get-RemovalInventory

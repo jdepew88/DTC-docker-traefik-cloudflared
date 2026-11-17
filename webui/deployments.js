@@ -348,7 +348,7 @@
     another.addEventListener('change', () => { f.anotherInstance = another.checked; f.plan = null; f.reviewed = false; onChange(); });
     label.addEventListener('change', () => { f.instanceLabel = label.value.trim(); f.plan = null; f.reviewed = false; onChange(); });
     const item = (e) => h('li', { class: 'dep-existing', 'data-project': e.project },
-      h('div', null, h('strong', null, e.project), ' ', e.archived ? plainChip('archived record', 'neutral') : e.source === 'docker' ? plainChip('not registered', 'warn') : plainChip(e.headline || e.state || 'registered', e.state === 'running' ? 'ok' : 'neutral'),
+      h('div', null, h('strong', null, e.project), ' ', e.archived ? plainChip('archived record', 'neutral') : e.source === 'docker' ? plainChip('not registered', 'warn') : e.source === 'container' ? plainChip('container without Compose', 'warn') : plainChip(e.headline || e.state || 'registered', e.state === 'running' ? 'ok' : 'neutral'),
         h('p', { class: 'small muted' }, `${e.folder || ''}${arr(e.hostnames).length ? ` · ${e.hostnames.join(', ')}` : ''}`), h('p', { class: 'small' }, e.reason)),
       h('div', { class: 'actions' },
         e.source === 'registry' && !e.archived ? h('a', { class: 'btn small', href: `#apps/${encodeURIComponent(e.project)}` }, 'Manage existing') : null,

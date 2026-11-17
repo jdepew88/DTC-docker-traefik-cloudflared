@@ -1,0 +1,140 @@
+{
+  "schema": 1,
+  "manifestVersion": "2026.11.17",
+  "id": "hfs",
+  "name": "HFS (HTTP File Server)",
+  "category": "files",
+  "group": "D",
+  "description": "Share files from one folder you choose through a web page, with accounts, upload permissions and an admin panel (HFS 3).",
+  "maintainer": "Massimo Melina (rejetto)",
+  "license": "GPL-3.0",
+  "source": {
+    "type": "curated",
+    "url": "https://github.com/rejetto/hfs"
+  },
+  "docs": [
+    {
+      "title": "HFS",
+      "url": "https://github.com/rejetto/hfs"
+    },
+    {
+      "title": "Docker",
+      "url": "https://github.com/rejetto/hfs/wiki/Docker"
+    },
+    {
+      "title": "Configuration",
+      "url": "https://github.com/rejetto/hfs/blob/main/config.md"
+    }
+  ],
+  "platforms": {
+    "windows-docker-desktop": "supported",
+    "linux-docker": "untested",
+    "unraid": "untested",
+    "podman": "untested"
+  },
+  "architectures": [
+    "amd64",
+    "arm64"
+  ],
+  "website": "https://rejetto.com/hfs/",
+  "installable": true,
+  "aliases": [
+    "http-file-server"
+  ],
+  "services": {
+    "app": {
+      "image": "rejetto/hfs:v3.4.1@sha256:42021b2e630fd6273970f8da6646f51dc051b7804ada127017509d65d5320369",
+      "role": "app",
+      "label": "HFS",
+      "ports": [
+        {
+          "container": 80,
+          "protocol": "http",
+          "primary": true
+        }
+      ],
+      "environment": {
+        "HFS_INITIAL_ADMIN_PASSWORD": "{{input:adminPassword}}",
+        "DISABLE_UPDATE": "1",
+        "TZ": "{{timezone}}"
+      },
+      "volumes": [
+        {
+          "name": "data",
+          "target": "/data",
+          "kind": "volume",
+          "description": "HFS configuration (config.yaml), accounts and logs."
+        },
+        {
+          "name": "shares",
+          "target": "/shares",
+          "kind": "folder",
+          "input": "shareFolder",
+          "description": "The folder you share."
+        }
+      ],
+      "resources": {
+        "memoryMB": 100,
+        "diskMB": 300
+      }
+    }
+  },
+  "inputs": [
+    {
+      "id": "shareFolder",
+      "type": "folder",
+      "label": "Folder to share",
+      "required": true,
+      "help": "Only this folder is available to HFS (under /shares). Choose a dedicated folder, never a whole drive."
+    },
+    {
+      "id": "adminPassword",
+      "type": "password",
+      "label": "Administrator (admin) password",
+      "help": "Used only when HFS creates its configuration on first start."
+    }
+  ],
+  "privileges": [],
+  "dependencies": [],
+  "security": [
+    "Nothing is shared until you add the folder to the virtual file system in the admin panel (/~/admin) and set permissions.",
+    "Self-update inside the container is disabled; updates come from the catalog."
+  ],
+  "authentication": {
+    "forwardAuth": "caution",
+    "native": [
+      "local"
+    ],
+    "notes": [
+      "Public share links and WebDAV clients need direct access: a sign-in gate blocks them. Protect only /~/admin if you publish it."
+    ]
+  },
+  "limitations": [
+    "Folders on Windows drives are read through Docker Desktop file sharing (slower than local disks)."
+  ],
+  "manualSetup": [
+    "Open /~/admin, sign in as admin and add /shares (or a subfolder) to the shared files with the permissions you want."
+  ],
+  "update": {
+    "strategy": "pinned-digest",
+    "notes": "Configuration and accounts live in the data volume; updates change only the image."
+  },
+  "web": {
+    "service": "app",
+    "path": "/",
+    "localPort": 8086
+  },
+  "exposure": {
+    "default": "access"
+  },
+  "resources": {
+    "memoryMB": 100,
+    "diskMB": 300
+  },
+  "testStatus": {
+    "static": "passed",
+    "live": "not-run",
+    "date": "2026-11-17",
+    "notes": "Manifest, Compose file set and route validated; not yet installed on a disposable deployment."
+  }
+}
