@@ -532,6 +532,48 @@
   // Display name of an installed instance: the application, plus its label when it has one (e.g. "Testing").
   function instanceTitle(a) { return a && a.label ? `${a.name} (${a.label})` : (a ? a.name : ''); }
 
+  // Catalog card: where an installation is reachable (public through Cloudflare, routed on a hostname, or this PC only).
+  function catalogAccessText(instance) {
+    const a = (instance && instance.access) || {};
+    const hosts = a.hostnames || [];
+    if (!instance) return { tone: 'neutral', text: '' };
+    if (instance.prepared) return { tone: 'neutral', text: 'Prepared, not started' };
+    if (a.public) return { tone: a.protected ? 'ok' : 'warn', text: `Public: ${hosts.join(', ')}${a.protected ? ' (sign-in required)' : ''}` };
+    if (hosts.length) return { tone: 'info', text: `Routed: ${hosts.join(', ')}${a.protected ? ' (sign-in required)' : ''}` };
+    return { tone: 'neutral', text: a.localUrl ? 'This PC only' : 'Not published' };
+  }
+  // Catalog card: how well generic ForwardAuth (authentik) suits the application.
+  const AUTH_FIT = {
+    compatible: { tone: 'ok', text: 'Sign-in: authentik or Cloudflare Access' },
+    caution: { tone: 'warn', text: 'Sign-in: own clients (ForwardAuth blocks them)' },
+    unsuitable: { tone: 'err', text: 'Sign-in: not with ForwardAuth' },
+    'not-applicable': { tone: 'neutral', text: 'Sign-in provider or no web interface' },
+  };
+  function authFitText(auth) { return AUTH_FIT[auth && auth.forwardAuth] || { tone: 'neutral', text: 'Sign-in: not assessed' }; }
+  // Catalog card: the worst host-compatibility check (failed > warning > ok; info alone counts as ok).
+  function compatSummary(checks) {
+    const list = checks || [];
+    const failed = list.find((c) => c.state === 'failed');
+    if (failed) return { tone: 'err', text: `Not compatible: ${failed.label}`, detail: failed.message };
+    const warn = list.find((c) => c.state === 'warning');
+    if (warn) return { tone: 'warn', text: `Limited: ${warn.label}`, detail: warn.message };
+    const arch = list.find((c) => c.label === 'CPU architecture');
+    return { tone: 'ok', text: 'Compatible with this PC', detail: arch ? arch.message : '' };
+  }
+  // Installed app: findings of the stack view, worst first.
+  const FINDING_ORDER = { error: 0, warning: 1, info: 2, ok: 3 };
+  function sortFindings(list) { return (list || []).slice().sort((x, y) => (FINDING_ORDER[x.level] ?? 9) - (FINDING_ORDER[y.level] ?? 9)); }
+  function findingTone(level) { return { error: 'err', warning: 'warn', info: 'neutral', ok: 'ok' }[level] || 'neutral'; }
+  // Installed app: a backup's one-line description.
+  const BACKUP_REASONS = { manual: 'Manual backup', 'before-update': 'Before an update', 'before-restore': 'Before a restore' };
+  function backupTitle(b) {
+    if (!b) return '';
+    const m = /^(\d{4})(\d{2})(\d{2})-(\d{2})(\d{2})(\d{2})$/.exec(b.id || '');
+    const when = m ? `${m[1]}-${m[2]}-${m[3]} ${m[4]}:${m[5]}` : b.id;
+    const size = (b.volumes || []).reduce((s, v) => s + (Number(v.sizeMB) || 0), 0);
+    return `${when} · ${BACKUP_REASONS[b.reason] || b.reason || 'Backup'} · ${(b.volumes || []).length} volume${(b.volumes || []).length === 1 ? '' : 's'}${size ? ` (${size.toFixed(1)} MB)` : ''}`;
+  }
+
   // --- New app (provisioning): Container -> Reverse proxy -> Authentication -> Review and deploy ---------------------
   // Findings the user must acknowledge before a deployment can be reviewed (block findings cannot be acknowledged).
   function provisionAckIds(findings) { return (findings || []).filter((f) => f.severity === 'high' || f.severity === 'review').map((f) => f.id); }
@@ -610,6 +652,7 @@
   return {
     ROUTING_STATES, routingState, routingEvidence, endpointAudience, endpointKind, ROUTING_HELP, routingHelp, journeyPath,
     DEPLOYMENT_STATES, deploymentState, statusTone, serviceGroups, terminationText, healthText, shortImage, roleSource, catalogInstallState, instanceTitle,
+    catalogAccessText, authFitText, compatSummary, sortFindings, findingTone, backupTitle,
     provisionAckIds, PROVISION_ACCESS, provisionWizard, provisionVerdict, suggestProvisionHostname,
     samePath, launcherNotice, launcherDefaultAction, autostartText,
     IDENTITY_STATES, identityState, googleRedirectUri, isGoogleClientId, identityNextStep, identityWizard, wizardNeighbours, CREDENTIAL_STATUS, credentialStatus,

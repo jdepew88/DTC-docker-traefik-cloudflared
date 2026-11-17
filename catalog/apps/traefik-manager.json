@@ -32,6 +32,10 @@
     "unraid": "untested",
     "podman": "untested"
   },
+  "architectures": [
+    "amd64",
+    "arm64"
+  ],
   "installable": true,
   "services": {
     "app": {
@@ -102,6 +106,16 @@
     "It reads Traefik's API at http://<traefik container>:8080 over the shared network; the API has no write operations.",
     "Never publish it without Cloudflare Access (it is an administration interface). The first sign-in runs its setup wizard."
   ],
+  "authentication": {
+    "forwardAuth": "compatible",
+    "native": [
+      "local"
+    ],
+    "notes": [
+      "Browser-only administration; keep it local or behind authentication."
+    ]
+  },
+  "limitations": [],
   "update": {
     "strategy": "pinned-digest",
     "notes": "Its settings and route drafts are in the project folder and survive updates."

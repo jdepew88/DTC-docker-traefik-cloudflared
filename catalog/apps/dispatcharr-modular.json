@@ -29,6 +29,10 @@
     "unraid": "untested",
     "podman": "untested"
   },
+  "architectures": [
+    "amd64",
+    "arm64"
+  ],
   "installable": true,
   "services": {
     "web": {
@@ -197,6 +201,18 @@
   "security": [
     "The database and cache stay on the app's private network.",
     "Uses Valkey instead of the unpinned redis:latest of the upstream file (protocol-compatible, BSD licence)."
+  ],
+  "authentication": {
+    "forwardAuth": "caution",
+    "native": [
+      "local"
+    ],
+    "notes": [
+      "M3U, EPG and HDHomeRun endpoints are fetched by media servers without a browser session; ForwardAuth blocks them. Protect the web interface only, or keep it local."
+    ]
+  },
+  "limitations": [
+    "SSDP/HDHomeRun discovery from LAN devices does not reach containers on Docker Desktop: add tuners and clients by URL."
   ],
   "update": {
     "strategy": "pinned-digest",

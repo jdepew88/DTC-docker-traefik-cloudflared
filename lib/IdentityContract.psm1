@@ -70,6 +70,14 @@ function Get-ProtectionCompatibility($Manifest) {
   $key = (@([string](Get-IcProp $Manifest 'id' ''), [string](Get-IcProp $Manifest 'name' ''), [string](Get-IcProp (Get-IcProp $Manifest 'source' $null) 'upstream' '')) -join ' ').ToLowerInvariant()
   $caution = $false
   foreach ($p in $script:ClientApps.Keys) { if ($key -match $p) { $null = $reasons.Add($script:ClientApps[$p]); $caution = $true } }
+  # A curated manifest states how ForwardAuth fits (own clients, APIs, callbacks): 'caution' and 'unsuitable' count,
+  # with the manifest's notes as reasons ('not-applicable': identity providers and headless apps are not protected).
+  $declared = Get-IcProp $Manifest 'authentication' $null
+  $fit = [string](Get-IcProp $declared 'forwardAuth' '')
+  if ($fit -in 'caution', 'unsuitable', 'not-applicable') {
+    if (-not $caution) { foreach ($n in @(Get-IcProp $declared 'notes' @())) { if ($n) { $null = $reasons.Add([string]$n) } } }
+    $caution = $true
+  }
   $envNames = @()
   $svcs = Get-IcProp $Manifest 'services' $null
   $entries = $(if ($svcs -is [System.Collections.IDictionary]) { @($svcs.Values) } elseif ($svcs) { @($svcs.PSObject.Properties | ForEach-Object { $_.Value }) } else { @() })

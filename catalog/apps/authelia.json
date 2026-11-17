@@ -32,6 +32,11 @@
     "unraid": "untested",
     "podman": "untested"
   },
+  "architectures": [
+    "amd64",
+    "arm64",
+    "arm/v7"
+  ],
   "installable": true,
   "services": {
     "app": {
@@ -171,6 +176,19 @@
   "security": [
     "Authelia protects apps only once Traefik forwards authentication to it (a forwardAuth middleware) and the portal is published over HTTPS; installing it changes no existing route.",
     "The administrator password is hashed with argon2 on this PC by Authelia itself; the plain password is kept only in credentials.txt (readable by your account)."
+  ],
+  "authentication": {
+    "forwardAuth": "not-applicable",
+    "native": [
+      "file-users",
+      "oidc-provider"
+    ],
+    "notes": [
+      "Authelia is itself a sign-in provider; its portal is never put behind ForwardAuth."
+    ]
+  },
+  "limitations": [
+    "Session cookies need a real domain with HTTPS: it protects apps only after a public or LAN hostname is configured."
   ],
   "update": {
     "strategy": "pinned-digest",

@@ -32,6 +32,10 @@
     "unraid": "untested",
     "podman": "untested"
   },
+  "architectures": [
+    "amd64",
+    "arm64"
+  ],
   "installable": true,
   "services": {
     "immich-server": {
@@ -169,6 +173,21 @@
     "Immich recommends at least 6 GB of RAM (8 GB) with machine learning; install it only when that much is free.",
     "The database stays in a Docker volume: Immich's database does not work on NTFS.",
     "Create the administrator right after the first start."
+  ],
+  "authentication": {
+    "forwardAuth": "caution",
+    "native": [
+      "local",
+      "oidc"
+    ],
+    "notes": [
+      "The mobile apps use the API with their own login; ForwardAuth blocks them. Prefer Immich's own OAuth/OIDC sign-in with authentik."
+    ]
+  },
+  "limitations": [
+    "The PostgreSQL database must be on a Docker volume (not a Windows folder) on Docker Desktop.",
+    "Machine learning runs on the CPU (no CUDA/OpenVINO variant is offered here) and needs about 2 GB of extra memory.",
+    "6-8 GB of free memory recommended with machine learning enabled."
   ],
   "update": {
     "strategy": "pinned-digest",

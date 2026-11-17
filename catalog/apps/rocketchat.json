@@ -35,6 +35,10 @@
     "unraid": "untested",
     "podman": "untested"
   },
+  "architectures": [
+    "amd64",
+    "arm64"
+  ],
   "installable": true,
   "services": {
     "rocketchat": {
@@ -204,6 +208,22 @@
     "MongoDB runs without authentication like the official compose, but only on the app's private network; it is never published.",
     "Create the administrator account in the setup wizard right after the first start.",
     "Set ROOT_URL (in .env) to the public address after publishing."
+  ],
+  "authentication": {
+    "forwardAuth": "caution",
+    "native": [
+      "local",
+      "oauth",
+      "ldap"
+    ],
+    "notes": [
+      "Desktop and mobile clients and federation use their own authentication; ForwardAuth blocks them. Use Rocket.Chat's custom OAuth with authentik instead.",
+      "WebSockets are required (Traefik passes them through)."
+    ]
+  },
+  "limitations": [
+    "MongoDB runs as a single-node replica set (no high availability).",
+    "Mobile push notifications need a Rocket.Chat Cloud registration."
   ],
   "update": {
     "strategy": "pinned-digest",

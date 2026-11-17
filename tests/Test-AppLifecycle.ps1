@@ -9,7 +9,7 @@
   of a Rocket.Chat-shaped application (three long-running services and two setup jobs, failed job, unexpectedly stopped
   service, missing health check, unknown role, dependencies), instances, duplicate detection that ignores dependency
   images, and the removal inventory (shared volumes and networks are never deleted).
-  Part 2 (throwaway instance, never started): /api/catalog lists one entry per application without Diun or Watchtower,
+  Part 2 (throwaway instance, never started): /api/catalog lists one entry per application without Watchtower,
   planning a retired app is refused, archiving a record changes nothing but the record, an existing installation
   blocks a silent second one, and an intentional second instance is allowed.
   Part 3 (Docker, small): a disposable Compose project made of the Traefik image already on this PC (a few MB per
@@ -31,6 +31,7 @@ Import-Module (Join-Path $repo 'lib\AppCatalog.psm1') -Force
 Import-Module (Join-Path $repo 'lib\ComposeLifecycle.psm1') -Force
 Import-Module (Join-Path $repo 'lib\AppInstances.psm1') -Force
 Import-Module (Join-Path $repo 'tests\WebUiTestHelpers.psm1') -Force
+Import-Module (Join-Path $repo 'tests\TestResources.psm1') -Force
 $script:Results = New-Object System.Collections.ArrayList
 function Add-Result([string]$Status, [string]$Name, [string]$Detail) {
   $null = $script:Results.Add([pscustomobject]@{ Status = $Status; Test = $Name; Detail = $Detail })
@@ -50,7 +51,8 @@ $offered = { param($id) (Get-ManifestAvailability $m[$id]) -eq 'offered' -and (G
 Test-Condition 'catalog: Arcane, Portainer and What''s Up Docker stay installable' ((& $offered 'arcane') -and (& $offered 'portainer') -and (& $offered 'whats-up-docker')) ''
 Test-Condition 'catalog: Arcane is the recommended Docker management tool, Portainer the alternative (one choice group)' ($m.arcane.choiceGroup.id -eq 'docker-management' -and $m.arcane.choiceGroup.recommended -and $m.portainer.choiceGroup.id -eq 'docker-management' -and -not $m.portainer.choiceGroup.recommended) ''
 Test-Condition 'catalog: What''s Up Docker only notifies (no update trigger, read-only socket proxy that refuses POST/DELETE)' (-not @($m.'whats-up-docker'.services.app.environment.PSObject.Properties | Where-Object { $_.Name -match '^WUD_TRIGGER_' }).Count -and $m.'whats-up-docker'.services.'socket-proxy'.environment.POST -eq '0' -and $m.'whats-up-docker'.services.'socket-proxy'.environment.DELETE -eq '0') ''
-Test-Condition 'catalog: Diun and Watchtower are retired (not offered, not installable, with a note and a replacement)' ((Get-ManifestAvailability $m.diun) -eq 'retired' -and (Get-ManifestAvailability $m.watchtower) -eq 'retired' -and -not $m.diun.installable -and -not $m.watchtower.installable -and @($m.diun.retired.replacement) -contains 'whats-up-docker' -and $m.watchtower.retired.note) ''
+Test-Condition 'catalog: Watchtower is retired (not offered, not installable, with a note and a replacement)' ((Get-ManifestAvailability $m.watchtower) -eq 'retired' -and -not $m.watchtower.installable -and @($m.watchtower.retired.replacement) -contains 'whats-up-docker' -and $m.watchtower.retired.note) ''
+Test-Condition 'catalog: Diun is offered again as a headless, notification-only app (choice group with What''s Up Docker)' ((Get-ManifestAvailability $m.diun) -eq 'offered' -and $m.diun.installable -and $m.diun.web.headless -and $m.diun.choiceGroup.id -eq $m.'whats-up-docker'.choiceGroup.id -and $m.'whats-up-docker'.choiceGroup.recommended) ''
 Test-Condition 'catalog: PostgreSQL and Redis are reference entries (building blocks), not applications' ((Get-ManifestAvailability $m.postgresql) -eq 'reference' -and (Get-ManifestAvailability $m.redis) -eq 'reference') ''
 $res = @('rocket-chat', 'rocketchat', 'Rocket.Chat', 'ROCKET_CHAT') | ForEach-Object { $e = Resolve-CatalogEntry $apps $_; if ($e) { $e.id } else { '-' } }
 Test-Condition 'identity: rocket-chat, rocketchat, Rocket.Chat and ROCKET_CHAT name the one application rocketchat' ((@($res | Select-Object -Unique) -join ',') -eq 'rocketchat' -and (Get-CatalogApp $catalogDir 'rocket-chat').id -eq 'rocketchat') ($res -join ',')
@@ -68,7 +70,7 @@ try {
   $col = @(Get-CatalogApps -CatalogDir $fx | Where-Object { $_.id -eq 'chattwo' })[0]
   Test-Condition 'identity: two manifests claiming the same alias (ignoring case and dashes) are rejected' ((@($col.errors) -join ' ') -match "already names catalog app 'chatone'") (@($col.errors) -join '; ')
 } finally { Remove-Item -LiteralPath $fx -Recurse -Force -ErrorAction SilentlyContinue }
-$bad1 = $m.diun.PSObject.Copy(); $bad1.installable = $true
+$bad1 = $m.watchtower.PSObject.Copy(); $bad1.installable = $true
 $bad2 = (Get-Content -Raw (Join-Path $catalogDir 'apps\rocketchat.json') | ConvertFrom-Json); $bad2.services.nats | Add-Member role 'janitor' -Force; $bad2.services.rocketchat | Add-Member lifecycle 'run-once' -Force
 $bad3 = (Get-Content -Raw (Join-Path $catalogDir 'apps\echo.json') | ConvertFrom-Json); $bad3.source.type = 'generated'
 Test-Condition 'manifest: a retired entry cannot be installable; unknown roles and a run-once web service are rejected; generated manifests are not installable yet' (((Test-AppManifest $bad1) -join ' ') -match 'retired manifest cannot be installable' -and ((Test-AppManifest $bad2) -join ' ') -match 'role must be one of' -and ((Test-AppManifest $bad2) -join ' ') -match 'web service cannot be a run-once job' -and ((Test-AppManifest $bad3) -join ' ') -match 'only curated manifests are installable') ''
@@ -163,7 +165,7 @@ $facts[6].app = 'rocket-chat'
 $facts += (New-Fact 'traefik' 'running' 0 '' $false 'unless-stopped' @() 'other-proxy' 'traefik:v3.6.1'), (New-Fact 'whoami' 'running' 0 '' $false 'unless-stopped' @() 'other-proxy' 'traefik/whoami:v1.12.0')
 $un = @(Get-UnregisteredInstallations $facts $apps @('traefik-ext1'))
 $byP = @{}; foreach ($u in $un) { $byP[$u.project] = $u }
-Test-Condition 'existing installations: Diun and Watchtower containers are still recognized (retired apps stay discoverable)' ($byP.ContainsKey('old-diun') -and $byP['old-diun'].appId -eq 'diun' -and $byP['old-diun'].availability -eq 'retired' -and $byP.ContainsKey('wt') -and $byP['wt'].appId -eq 'watchtower') ((@($un | ForEach-Object { "$($_.project)=$($_.appId)" })) -join ',')
+Test-Condition 'existing installations: Diun and Watchtower containers are still recognized (retired apps stay discoverable)' ($byP.ContainsKey('old-diun') -and $byP['old-diun'].appId -eq 'diun' -and $byP['old-diun'].availability -eq 'offered' -and $byP.ContainsKey('wt') -and $byP['wt'].appId -eq 'watchtower') ((@($un | ForEach-Object { "$($_.project)=$($_.appId)" })) -join ',')
 Test-Condition 'existing installations: a database inside another app (PostgreSQL, MongoDB) never makes it an installation of anything' (-not $byP.ContainsKey('ccna') -and -not $byP.ContainsKey('mydb')) ((@($un | ForEach-Object { "$($_.project)=$($_.appId)" })) -join ',')
 Test-Condition 'existing installations: a proxy deployment''s own test backend (whoami next to Traefik) is not the HTTP echo app' (-not $byP.ContainsKey('other-proxy')) ''
 Test-Condition 'existing installations: the app''s own image or the manager''s label identifies an unregistered Rocket.Chat' ($byP['chat-elsewhere'].appId -eq 'rocketchat' -and $byP['chat-elsewhere'].reason -match 'image of Rocket.Chat' -and $byP['labelled'].appId -eq 'rocketchat' -and $byP['labelled'].reason -match 'label') ''
@@ -188,6 +190,11 @@ Test-Condition 'removal inventory: an adopted project''s volumes and files are n
 # --- Part 2: web API on a throwaway instance (never started) -------------------------------------------------------------
 $id = [Guid]::NewGuid().ToString('N').Substring(0, 6)
 $work = Join-Path ([IO.Path]::GetTempPath()) "tpm-alc-$id"
+# Earlier runs killed hard (out of memory, closed window) skip `finally`: remove what their dead owners left, then
+# register this run's prefix so an interruption of this run is swept the same way (tests\Find-TestOrphans.ps1 lists them).
+foreach ($orphanLine in (Invoke-TestOrphanSweep)) { Write-Host "  [orphans] $orphanLine" -ForegroundColor DarkYellow }
+Register-TestRun -Prefix "tpm-alc-$id" -Suite 'Test-AppLifecycle'
+Register-TestRun -Prefix "tpm-alcfx-$id" -Suite 'Test-AppLifecycle'
 New-Item -ItemType Directory -Force -Path $work | Out-Null
 $ui = $null; $mock = $null; $fixProject = "tpm-alcfx-$id"; $fixDir = Join-Path $work 'fixture'; $dockerUp = $false
 $apiToken = 'mockTok_' + [Guid]::NewGuid().ToString('N')
@@ -207,11 +214,13 @@ try {
   $null = Connect-WebUi $ui
   $c = Invoke-WebUi $ui GET '/api/catalog'
   $ids = @($c.Data.apps | ForEach-Object { $_.id })
-  Test-Condition 'api catalog: Arcane, Portainer and What''s Up Docker are offered; Diun and Watchtower are not new-install choices' ($c.Status -eq 200 -and $ids -contains 'arcane' -and $ids -contains 'portainer' -and $ids -contains 'whats-up-docker' -and $ids -notcontains 'diun' -and $ids -notcontains 'watchtower' -and (@($c.Data.retired | ForEach-Object { $_.id }) -join ',') -eq 'diun,watchtower') ($ids -join ',')
+  Test-Condition 'api catalog: Arcane, Portainer, What''s Up Docker and Diun are offered; Watchtower is not a new-install choice' ($c.Status -eq 200 -and $ids -contains 'arcane' -and $ids -contains 'portainer' -and $ids -contains 'whats-up-docker' -and $ids -contains 'diun' -and $ids -notcontains 'watchtower' -and (@($c.Data.retired | ForEach-Object { $_.id }) -join ',') -eq 'watchtower') ($ids -join ',')
+  $cd = @($c.Data.apps | Where-Object { $_.id -eq 'diun' })[0]; $ce = @($c.Data.apps | Where-Object { $_.id -eq 'echo' })[0]
+  Test-Condition 'api catalog: entries carry architectures, authentication fit, limitations, components and host compatibility' ($cd.headless -and (@($cd.components) -join ',') -eq 'app,support' -and @($ce.architectures) -contains 'amd64' -and $ce.authentication.forwardAuth -eq 'compatible' -and @($ce.compatibility | Where-Object { $_.label -eq 'CPU architecture' -and $_.state -eq 'ok' }).Count -eq 1 -and $c.Data.host.architecture -eq 'amd64') ''
   $rc = @($c.Data.apps | Where-Object { $_.id -eq 'rocketchat' })[0]
   Test-Condition 'api catalog: one Rocket.Chat entry listing both installations; Dispatcharr''s modular compose is a variant under Dispatcharr' (@($c.Data.apps | Where-Object { $_.name -eq 'Rocket.Chat' }).Count -eq 1 -and (@($rc.instances | ForEach-Object { $_.project }) -join ',') -eq 'rc-one,rc-two' -and $ids -notcontains 'dispatcharr-modular' -and (@((@($c.Data.apps | Where-Object { $_.id -eq 'dispatcharr' })[0]).variants | ForEach-Object { $_.id }) -join ',') -eq 'dispatcharr-modular' -and $ids -notcontains 'postgresql') ''
-  $pd = Invoke-WebUi $ui POST '/api/catalog/plan' @{ appId = 'diun' }; $pw = Invoke-WebUi $ui POST '/api/catalog/plan' @{ appId = 'watchtower' }
-  Test-Condition 'api plan: installing a retired app is refused (410), also through the API' ($pd.Status -eq 410 -and $pw.Status -eq 410 -and $pd.Body -match 'no longer offered') $pd.Body
+  $pw = Invoke-WebUi $ui POST '/api/catalog/plan' @{ appId = 'watchtower' }
+  Test-Condition 'api plan: installing a retired app is refused (410), also through the API' ($pw.Status -eq 410 -and $pw.Body -match 'no longer offered') $pw.Body
   $df = Invoke-WebUi $ui GET '/api/catalog/defaults?id=rocketchat'
   # (On a PC that runs Rocket.Chat itself, its Compose project is also reported, as not registered in this instance.)
   Test-Condition 'api defaults: both registered installations are reported (the alias rocket-chat resolves)' ($df.Status -eq 200 -and (@($df.Data.existing | Where-Object { $_.source -eq 'registry' } | ForEach-Object { $_.project }) -join ',') -eq 'rc-one,rc-two') $df.Body
@@ -238,6 +247,27 @@ try {
   $rs = Invoke-WebUi $ui POST '/api/apps/restore' @{ project = 'rc-two'; confirm = $true }
   $a2 = Invoke-WebUi $ui GET '/api/apps'
   Test-Condition 'archive: restoring brings the record back unchanged' ($rs.Status -eq 200 -and @($a2.Data.apps).Count -eq 2 -and @($a2.Data.archived).Count -eq 0) ''
+
+  # An installation interrupted while its files were written (installState 'writing'): listed as such, not managed,
+  # and discarded on request: generated files and the record go; the user's own files and the folder holding them stay.
+  $intFolder = Join-Path $appsRoot 'int-one'
+  New-Item -ItemType Directory -Force -Path $intFolder | Out-Null
+  [IO.File]::WriteAllText((Join-Path $intFolder 'compose.yaml'), "name: int-one`nservices:`n  app:`n    image: x`n    labels:`n      org.traefik-proxy.project: int-one`n")
+  [IO.File]::WriteAllText((Join-Path $intFolder 'compose.database.yaml'), "services:`n  db:`n    image: y`n")
+  [IO.File]::WriteAllText((Join-Path $intFolder 'my-notes.txt'), 'mine')
+  $regPath = Join-Path $install 'config\apps.json'
+  $reg = [IO.File]::ReadAllText($regPath) | ConvertFrom-Json
+  $reg.apps = @($reg.apps) + [pscustomobject][ordered]@{ instanceId = 'i-int'; project = 'int-one'; appId = 'rocketchat'; name = 'Rocket.Chat'; folder = $intFolder; installedAt = '2026-11-16T10:00:00'; prepared = $true; composeFiles = @('compose.yaml', 'compose.database.yaml'); installState = 'writing' }
+  [IO.File]::WriteAllText($regPath, ($reg | ConvertTo-Json -Depth 6))
+  $li = Invoke-WebUi $ui GET '/api/apps'
+  $intView = @($li.Data.apps | Where-Object { $_.project -eq 'int-one' })[0]
+  $intStart = Invoke-WebUi $ui POST '/api/apps/action' @{ project = 'int-one'; action = 'start'; confirm = $true }
+  $intNoConfirm = Invoke-WebUi $ui POST '/api/apps/discard' @{ project = 'int-one' }
+  $notInt = Invoke-WebUi $ui POST '/api/apps/discard' @{ project = 'rc-one'; confirm = $true }
+  Test-Condition 'interrupted installation: listed with its state and Compose files; managing it is refused (409); discarding needs confirmation and only applies to interrupted ones' ($intView.installState -eq 'writing' -and (@($intView.composeFiles) -join ',') -eq 'compose.yaml,compose.database.yaml' -and $intStart.Status -eq 409 -and $intStart.Body -match 'interrupted' -and $intNoConfirm.Status -eq 400 -and $notInt.Status -eq 409) "$($intStart.Status) $($intNoConfirm.Status) $($notInt.Status)"
+  $disc = Invoke-WebUi $ui POST '/api/apps/discard' @{ project = 'int-one'; confirm = $true }
+  $after = @((Invoke-WebUi $ui GET '/api/apps').Data.apps | ForEach-Object { $_.project })
+  Test-Condition 'interrupted installation: discard removes the generated files and the record, keeps the folder with the user''s own file' ($disc.Status -eq 200 -and $disc.Data.folderKept -and -not (Test-Path -LiteralPath (Join-Path $intFolder 'compose.yaml')) -and -not (Test-Path -LiteralPath (Join-Path $intFolder 'compose.database.yaml')) -and (Test-Path -LiteralPath (Join-Path $intFolder 'my-notes.txt')) -and $after -notcontains 'int-one' -and $after -contains 'rc-one') $disc.Body
   $noConf = Invoke-WebUi $ui POST '/api/apps/archive' @{ project = 'rc-two' }
   Test-Condition 'archive: requires an explicit confirmation' ($noConf.Status -eq 400) ''
 
@@ -343,6 +373,8 @@ services:
   }
   Get-ChildItem $work -Recurse -File -ErrorAction SilentlyContinue | Where-Object IsReadOnly | ForEach-Object { $_.IsReadOnly = $false }
   Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue
+  $orphaned = @(@(Complete-TestRun "tpm-alc-$id") + @(Complete-TestRun "tpm-alcfx-$id"))
+  Test-Condition 'teardown: nothing with this run''s prefix is left (containers, volumes, networks, folder)' ($orphaned.Count -eq 0) ($orphaned -join ', ')
 }
 
 $fail = @($script:Results | Where-Object { $_.Status -eq 'FAIL' }).Count

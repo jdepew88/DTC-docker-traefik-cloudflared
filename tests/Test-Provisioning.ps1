@@ -424,6 +424,13 @@ try {
   Test-Condition 'api plan: findings that need review block the plan until acknowledged' (-not $pNoAck.Data.canApply -and @($pNoAck.Data.blockers | Where-Object { $_ -match 'Review and acknowledge' }).Count) $pNoAck.Body
   $pLocal = Invoke-WebUi $ui POST '/api/provision/plan' @{ draftId = 'aaaa1111bbbb2222'; access = 'local'; auth = 'none'; acknowledge = @($ed.Data.findings | ForEach-Object { $_.id }) }
   Test-Condition 'api plan: a reviewed local-only plan lists the Compose project, its steps and the AI usage (none)' ($pLocal.Status -eq 200 -and $pLocal.Data.container.compose -match 'acme/tool:3.0.1@sha256' -and @($pLocal.Data.steps).Count -ge 2 -and $pLocal.Data.ai.runs -eq 0 -and -not $pLocal.Data.routing) "$($pLocal.Status) canApply=$($pLocal.Data.canApply) blockers=$(@($pLocal.Data.blockers) -join ' | ')"
+  # Curated catalog applications use the same pipeline (one engine): a catalog draft, then the same plan.
+  $cdr = Invoke-WebUi $ui POST '/api/provision/catalog' @{ appId = 'uptime-kuma' }
+  $cdh = Invoke-WebUi $ui POST '/api/provision/catalog' @{ appId = 'diun' }
+  $cdw = Invoke-WebUi $ui POST '/api/provision/catalog' @{ appId = 'watchtower' }
+  Test-Condition 'api catalog draft: a curated app becomes a New app draft (kind catalog, its own manifest, deployable); headless and retired apps are refused' ($cdr.Status -eq 200 -and $cdr.Data.kind -eq 'catalog' -and $cdr.Data.id -eq 'uptime-kuma' -and $cdr.Data.deployable -and $cdr.Data.protection.forwardAuth -eq 'caution' -and $cdh.Status -eq 409 -and $cdw.Status -eq 409) "$($cdr.Status) $($cdh.Status) $($cdw.Status) deployable=$($cdr.Data.deployable) protection=$($cdr.Data.protection | ConvertTo-Json -Compress -Depth 4) errors=$(@($cdr.Data.manifestErrors) -join '; ') blocking=$(@($cdr.Data.findings | Where-Object { $_.severity -eq 'block' } | ForEach-Object { $_.message }) -join '; ') compat=$($cdr.Data.compatibility.status)"
+  $cpl = Invoke-WebUi $ui POST '/api/provision/plan' @{ draftId = $cdr.Data.draftId; access = 'local'; auth = 'none' }
+  Test-Condition 'api catalog draft: the plan installs the curated manifest (modular stack description, pinned image) through the same review' ($cpl.Status -eq 200 -and $cpl.Data.container.compose -match 'louislam/uptime-kuma:2\.5\.6@sha256' -and $cpl.Data.container.stack.project) ($cpl.Body.Substring(0, [Math]::Min(500, $cpl.Body.Length)))
   $rp = Invoke-WebUi $ui POST '/api/provision/rollback/plan' @{ operationId = 'zzzz' }
   Test-Condition 'api: operation ids are validated' ($rp.Status -eq 400) $rp.Body
 

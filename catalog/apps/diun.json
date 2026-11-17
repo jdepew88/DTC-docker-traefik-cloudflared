@@ -1,19 +1,11 @@
 {
   "schema": 1,
-  "manifestVersion": "2026.10.25",
+  "manifestVersion": "2026.11.16",
   "id": "diun",
   "name": "Diun",
   "category": "updates",
   "group": "E",
-  "availability": "retired",
-  "retired": {
-    "date": "2026-10-25",
-    "note": "No longer offered: its notifications overlap with What's Up Docker. Existing Diun containers keep running and are still recognized; nothing is removed.",
-    "replacement": [
-      "whats-up-docker"
-    ]
-  },
-  "description": "Docker Image Update Notifier: headless, notification-only image update checks (ntfy, mail, Discord, ...).",
+  "description": "Docker Image Update Notifier: headless, notification-only checks for newer image versions (ntfy, mail, Discord, webhooks, ...).",
   "maintainer": "CrazyMax",
   "license": "MIT",
   "source": {
@@ -26,8 +18,16 @@
       "url": "https://crazymax.dev/diun/"
     },
     {
-      "title": "Docker install",
-      "url": "https://github.com/crazy-max/diun/blob/v4.33.0/docs/install/docker.md"
+      "title": "Configuration",
+      "url": "https://crazymax.dev/diun/config/"
+    },
+    {
+      "title": "Docker provider",
+      "url": "https://crazymax.dev/diun/providers/docker/"
+    },
+    {
+      "title": "Notifications",
+      "url": "https://crazymax.dev/diun/notif/ntfy/"
     }
   ],
   "platforms": {
@@ -36,10 +36,132 @@
     "unraid": "untested",
     "podman": "untested"
   },
-  "installable": false,
-  "installNote": "Diun has no web interface, so it is listed for reference; What's Up Docker covers the same need with a UI and an official read-only proxy recipe. Diun's socket-proxy permissions (CONTAINERS=1, IMAGES=1) were derived from its source, not its docs.",
-  "imageReference": "crazymax/diun:4.33.0@sha256:e324b793eb32dfb7f74d3a39421ebf090141caaadee69b8f78da63112408ee25",
+  "architectures": [
+    "amd64",
+    "arm64",
+    "arm/v7",
+    "arm/v6",
+    "386",
+    "ppc64le"
+  ],
+  "installable": true,
+  "choiceGroup": {
+    "id": "update-notifications",
+    "recommended": false,
+    "note": "Headless alternative to What's Up Docker (which has a web interface). One of the two is enough; neither updates anything."
+  },
+  "privileges": [
+    {
+      "kind": "docker-socket",
+      "explain": "A socket proxy on Diun's private network gets the Docker socket read-only and allows only reading containers, images and events (no POST, exec or delete). Diun itself never sees the socket."
+    }
+  ],
+  "dependencies": [
+    "Read-only Docker socket proxy (tecnativa/docker-socket-proxy)"
+  ],
+  "security": [
+    "Notification only: Diun never pulls, updates, restarts or removes containers.",
+    "Notifier credentials (mail password, webhook URLs) go into config/diun.yml, which is readable by your Windows account only."
+  ],
+  "authentication": {
+    "forwardAuth": "not-applicable",
+    "native": [],
+    "notes": [
+      "Headless: no web interface, nothing to sign in to."
+    ]
+  },
+  "limitations": [
+    "Reads Docker through a read-only socket proxy; it notifies only and never pulls or updates anything.",
+    "Without a notifier configured in config/diun.yml, results appear only in its log."
+  ],
+  "update": {
+    "strategy": "pinned-digest",
+    "notes": "Diun keeps its state in the data volume; updates change only the image."
+  },
+  "web": {
+    "service": "app",
+    "headless": true,
+    "proxy": false
+  },
   "exposure": {
     "default": "local"
+  },
+  "inputs": [],
+  "services": {
+    "app": {
+      "image": "crazymax/diun:4.33.1@sha256:8cc638b4c54e8a0c47898a51b20dae73037ad43310168b5da543a311dc668f77",
+      "role": "app",
+      "label": "Diun",
+      "environment": {
+        "TZ": "{{timezone}}",
+        "LOG_LEVEL": "info",
+        "LOG_JSON": "false",
+        "CONFIG": "/etc/diun/diun.yml"
+      },
+      "volumes": [
+        {
+          "name": "data",
+          "target": "/data",
+          "kind": "volume",
+          "description": "Diun's database of images already seen."
+        },
+        {
+          "name": "config",
+          "target": "/etc/diun",
+          "kind": "project",
+          "source": "config",
+          "readOnly": true,
+          "description": "diun.yml: schedule, Docker provider and notifiers."
+        }
+      ],
+      "dependsOn": [
+        {
+          "service": "socket-proxy",
+          "condition": "service_started"
+        }
+      ],
+      "resources": {
+        "memoryMB": 40,
+        "diskMB": 60
+      }
+    },
+    "socket-proxy": {
+      "image": "tecnativa/docker-socket-proxy:v0.5.0@sha256:1f5038b54f06c3e18422902cf00ba21803d1c97805aae032e5e6673d532d3459",
+      "role": "support",
+      "label": "Docker socket proxy (read-only)",
+      "dockerSocket": true,
+      "dockerSocketReadOnly": true,
+      "environment": {
+        "CONTAINERS": "1",
+        "IMAGES": "1",
+        "INFO": "1",
+        "VERSION": "1",
+        "EVENTS": "1",
+        "PING": "1",
+        "POST": "0",
+        "DELETE": "0",
+        "BUILD": "0",
+        "COMMIT": "0",
+        "EXEC": "0",
+        "SECRETS": "0",
+        "SWARM": "0",
+        "SYSTEM": "0"
+      },
+      "resources": {
+        "memoryMB": 40,
+        "diskMB": 20
+      }
+    }
+  },
+  "files": [
+    {
+      "path": "config/diun.yml",
+      "secret": true,
+      "content": "# Diun configuration (https://crazymax.dev/diun/config/). Written once at installation; your edits are kept.\n# Diun only reports newer image versions. It never pulls, updates or restarts anything.\ndb:\n  path: /data/diun.db\nwatch:\n  workers: 10\n  schedule: \"0 */6 * * *\"\n  jitter: 30s\n  firstCheckNotif: false\n  runOnStartup: true\nproviders:\n  docker:\n    endpoint: tcp://{{service:socket-proxy}}:2375\n    watchByDefault: true\n    watchStopped: false\n# Notifications: uncomment one or more notifiers, fill them in, then restart Diun (Restart on the Installed apps page).\n# Without a notifier, Diun writes what it finds to its log.\n#notif:\n#  ntfy:\n#    endpoint: https://ntfy.sh\n#    topic: choose-a-private-topic\n#  discord:\n#    webhookURL: https://discord.com/api/webhooks/...\n#  mail:\n#    host: smtp.example.com\n#    port: 587\n#    username: you@example.com\n#    password: your-app-password\n#    from: diun@example.com\n#    to:\n#      - you@example.com\n"
+    }
+  ],
+  "resources": {
+    "memoryMB": 80,
+    "diskMB": 80
   }
 }

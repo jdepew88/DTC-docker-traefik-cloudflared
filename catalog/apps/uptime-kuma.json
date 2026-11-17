@@ -27,6 +27,11 @@
     "unraid": "untested",
     "podman": "untested"
   },
+  "architectures": [
+    "amd64",
+    "arm64",
+    "arm/v7"
+  ],
   "installable": true,
   "services": {
     "app": {
@@ -59,6 +64,16 @@
     "Create the admin account right after the first start: until then anyone who can open the page can claim it. Publish it behind Cloudflare Access.",
     "Keep its data in a Docker volume: its SQLite database must not live on a network share."
   ],
+  "authentication": {
+    "forwardAuth": "caution",
+    "native": [
+      "local"
+    ],
+    "notes": [
+      "Public status pages and push monitors (/api/push/...) must be reachable without a session; ForwardAuth blocks them. Protect only the dashboard, or keep it local."
+    ]
+  },
+  "limitations": [],
   "update": {
     "strategy": "pinned-digest",
     "notes": "Version 2 migrates the database on the first start; the volume is kept."

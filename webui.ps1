@@ -1570,6 +1570,9 @@ function Get-CatalogView($M) {
     files = @(@(& $field 'files' @()) | ForEach-Object { [string]$_.path }); alternatives = @(& $field 'alternatives' @()); requirements = @(& $field 'requirements' @())
     aliases = @(& $field 'aliases' @()); manifestVersion = [string](& $field 'manifestVersion' ''); availability = (Get-ManifestAvailability $M)
     variantOf = [string](& $field 'variantOf' ''); variant = (& $field 'variant' $null); choiceGroup = (& $field 'choiceGroup' $null)
+    architectures = @(& $field 'architectures' @()); authentication = (& $field 'authentication' $null); limitations = @(& $field 'limitations' @())
+    headless = [bool](Get-Prop2 (& $field 'web' $null) 'headless' $false); postInstall = @(@(& $field 'postInstall' @()) | ForEach-Object { [string](Get-Prop2 $_ 'label' '') })
+    components = @(if ($M.PSObject.Properties['services'] -and $M.services) { @($M.services.PSObject.Properties | ForEach-Object { Get-ServiceComponent $M $_.Name } | Select-Object -Unique) })
   }
 }
 
@@ -1587,6 +1590,50 @@ function Get-AppComposePath($App) {
   if (-not $name) { $name = 'compose.yaml' }
   return (Join-Path $folder $name)
 }
+
+# Modular stacks: every Compose file of an installed app, in order (compose.yaml first). The record's composeFiles
+# (written at installation) lists them; older and adopted installations have their single file. Start, stop, logs,
+# update, backup, restore and removal always pass the complete set to docker compose.
+function Get-RecordValue($Record, [string]$Name, $Default = $null) {
+  if ($Record -is [System.Collections.IDictionary]) { if ($Record.Contains($Name) -and $null -ne $Record[$Name]) { return $Record[$Name] }; return $Default }
+  return (Get-Prop2 $Record $Name $Default)
+}
+function Get-AppComposeFileNames($App) {
+  $names = @(@(Get-RecordValue $App 'composeFiles' @()) | ForEach-Object { [string]$_ } | Where-Object { $_ -match '^compose(\.[a-z0-9-]+)?\.yaml$' })
+  if ($names.Count) { return $names }
+  return @(Split-Path -Leaf (Get-AppComposePath $App))
+}
+function Get-AppComposeFiles($App) {
+  $folder = [string](Get-RecordValue $App 'folder' '')
+  return @(Get-AppComposeFileNames $App | ForEach-Object { Join-Path $folder $_ })
+}
+function Get-AppComposeArgs($App) {
+  $a = @('compose', '--project-directory', [string](Get-RecordValue $App 'folder' ''))
+  foreach ($f in (Get-AppComposeFiles $App)) { $a += @('-f', $f) }
+  return , $a
+}
+# The files as { file; content } (missing files are left out), their joined text and their fingerprint.
+function Get-AppComposeSetText($App) {
+  return @(foreach ($f in (Get-AppComposeFiles $App)) { if (Test-Path -LiteralPath $f) { [ordered]@{ file = (Split-Path -Leaf $f); content = [IO.File]::ReadAllText($f) } } })
+}
+function Get-AppComposeText($App) { return ((@(Get-AppComposeSetText $App) | ForEach-Object { $_.content }) -join "`n") }
+# Files the manager generates in an app folder (and may delete when asked to remove the app's files).
+function Test-GeneratedAppFile([string]$Name) {
+  return ($Name -in 'compose.yaml', '.env', 'README.md', 'credentials.txt', '.post-install.json', '.dtc-manifest.json', 'dtc-stack.json' -or $Name -match '^compose(\.[a-z0-9-]+)?\.yaml(\.bak-\d{8}-\d{6})?$')
+}
+# dtc-stack.json follows image changes made by an update (nothing else in it changes).
+function Update-AppStackImages($App) {
+  $p = Join-Path ([string](Get-RecordValue $App 'folder' '')) 'dtc-stack.json'
+  if (-not (Test-Path -LiteralPath $p)) { return }
+  try {
+    $st = [IO.File]::ReadAllText($p) | ConvertFrom-Json
+    $imgs = Get-ComposeServiceImages (Get-AppComposeText $App)
+    foreach ($s in @($st.services)) { if ($imgs.Contains([string]$s.name)) { $s.image = [string]$imgs[[string]$s.name] } }
+    $st | Add-Member -NotePropertyName updatedAt -NotePropertyValue (Get-Date -Format 's') -Force
+    [IO.File]::WriteAllText($p, (($st | ConvertTo-Json -Depth 12) + "`n"), (New-Object Text.UTF8Encoding($false)))
+  } catch { }
+}
+function Get-AppComposeFingerprint($App) { $set = @(Get-AppComposeSetText $App); if (-not $set.Count) { return '' }; return (Get-ComposeSetFingerprint $set) }
 
 # --- Deployments: lifecycle, instances, duplicates ----------------------------------------------------------------
 
@@ -1608,7 +1655,7 @@ function Get-InstanceLifecycle($Instance, [object[]]$Facts, $Catalog) {
   $m = Get-InstanceManifest $Instance $Catalog
   $defined = @()
   $composePath = Get-AppComposePath $Instance
-  if ($Instance.folder -and (Test-Path -LiteralPath $composePath)) { $defined = @((Get-ComposeServiceImages ([IO.File]::ReadAllText($composePath))).Keys) }
+  if ($Instance.folder -and (Test-Path -LiteralPath $composePath)) { $defined = @((Get-ComposeServiceImages (Get-AppComposeText $Instance)).Keys) }
   $inactive = @(); if ($m -and $defined.Count) { $inactive = @($m.services.PSObject.Properties | Where-Object { $defined -notcontains $_.Name } | ForEach-Object { $_.Name }) }
   return Get-DeploymentLifecycle -Containers $cs -Manifest $m -Defined $defined -Inactive $inactive -Prepared:([bool]$Instance.prepared)
 }
@@ -1645,7 +1692,18 @@ function Get-CatalogData {
   $instances = @()
   if (Test-Installed) { $instances = @(Read-AppsRegistry (Get-Settings) | ForEach-Object { ConvertTo-AppInstance $_ $valid }) }
   $offered = @($valid | Where-Object { (Get-ManifestAvailability $_.manifest) -eq 'offered' })
-  $instanceList = { param($appId) @($instances | Where-Object { $_.applicationId -eq $appId -and -not $_.archived } | ForEach-Object { [ordered]@{ project = $_.project; instanceId = $_.instanceId; label = $_.label; manifestId = $_.appId; prepared = $_.prepared; origin = $_.origin } }) }
+  # Where each installation is reachable: its local address and the service routes that point at its web container.
+  $routesReg = @(); if (Test-Installed) { $routesReg = @((Read-ServiceRegistry -Settings (Get-Settings)).services) }
+  $reach = { param($inst)
+    $mm = @($valid | Where-Object { $_.id -eq $inst.appId } | ForEach-Object { $_.manifest })[0]
+    $webC = $(if ($mm -and -not (Get-Prop2 $mm.web 'headless' $false)) { Get-AppContainerName $mm $inst.project $mm.web.service } else { '' })
+    $rs = @($routesReg | Where-Object { $webC -and $_.target.type -eq 'docker' -and $_.target.host -eq $webC })
+    [ordered]@{ localUrl = [string](Get-RecordValue $inst 'localUrl' ''); hostnames = @($rs | ForEach-Object { @($_.hostnames) }); public = [bool](@($rs | Where-Object { $_.cloudflare -and $_.cloudflare.publish }).Count)
+      protected = [bool](@($rs | Where-Object { $_.PSObject.Properties['auth'] -and $_.auth }).Count) } }
+  $instanceList = { param($appId) @($instances | Where-Object { $_.applicationId -eq $appId -and -not $_.archived } | ForEach-Object { [ordered]@{ project = $_.project; instanceId = $_.instanceId; label = $_.label; manifestId = $_.appId; prepared = $_.prepared; origin = $_.origin; access = (& $reach $_) } }) }
+  # Host facts for compatibility (architecture Docker runs, NVIDIA driver present).
+  $hostInfo = [ordered]@{ architecture = ''; nvidiaGpu = [bool](Get-Command nvidia-smi.exe -ErrorAction SilentlyContinue) }
+  $ai = Invoke-Docker info --format '{{.Architecture}}'; if ($ai.ExitCode -eq 0) { $hostInfo.architecture = ConvertTo-ImageArchitecture ((@($ai.Output) -join '').Trim()) }
   return [ordered]@{
     apps = @(foreach ($e in @($offered | Where-Object { -not (Get-Prop2 $_.manifest 'variantOf' '') })) {
         $v = Get-CatalogView $e.manifest
@@ -1654,11 +1712,13 @@ function Get-CatalogData {
         $v.instances = @(& $instanceList $e.id)
         $v.archivedInstances = @($instances | Where-Object { $_.applicationId -eq $e.id -and $_.archived }).Count
         $v.installedAs = @($v.instances | ForEach-Object { $_.project })
+        $v.compatibility = @(Get-AppHostCompatibility $e.manifest $hostInfo)
         $v
       })
     reference = @($valid | Where-Object { (Get-ManifestAvailability $_.manifest) -eq 'reference' } | ForEach-Object { [ordered]@{ id = $_.id; name = [string]$_.manifest.name; description = [string]$_.manifest.description; note = [string](Get-Prop2 $_.manifest 'installNote' '') } })
     retired = @($valid | Where-Object { (Get-ManifestAvailability $_.manifest) -eq 'retired' } | ForEach-Object { [ordered]@{ id = $_.id; name = [string]$_.manifest.name; date = [string](Get-Prop2 $_.manifest.retired 'date' ''); note = [string]$_.manifest.retired.note; replacement = @(Get-Prop2 $_.manifest.retired 'replacement' @()); installed = @(& $instanceList $_.id).Count } })
     invalid = @($apps | Where-Object { @($_.errors).Count } | ForEach-Object { [ordered]@{ file = $_.file; errors = @($_.errors) } })
+    host = $hostInfo
     sources = @([ordered]@{ type = 'curated'; name = 'Curated catalog (this manager)'; enabled = $true },
       [ordered]@{ type = 'github-compose'; name = 'GitHub Compose repositories'; enabled = $false }, [ordered]@{ type = 'docker-hub'; name = 'Docker Hub (image discovery only)'; enabled = $false },
       [ordered]@{ type = 'ghcr'; name = 'GitHub Container Registry (image discovery only)'; enabled = $false }, [ordered]@{ type = 'unraid-xml'; name = 'Unraid templates (import)'; enabled = $false },
@@ -1753,8 +1813,10 @@ function Invoke-AppPlan($Body, $Manifest = $null) {
   $insideDeployment = $folder.StartsWith($InstallPath.TrimEnd('\') + '\', [StringComparison]::OrdinalIgnoreCase) -or $folder -ieq $InstallPath
   if ($insideDeployment) { & $check 'Installation folder is outside the proxy deployment' $false 'Apps get their own folder, not one inside the proxy deployment.' }
   $hostNet = @($m.services.PSObject.Properties | Where-Object { [string](Get-Prop2 $_.Value 'networkMode' '') -eq 'host' }).Count -gt 0
+  $headless = [bool](Get-Prop2 $m.web 'headless' $false)
   $localPort = 0
-  if (-not $hostNet -and [int]::TryParse([string](Get-Field $Body 'localPort' $defaults.localPort), [ref]$localPort) -and $localPort -ne 0) {
+  if ($headless) { & $check 'No web interface' $true "$($m.name) is headless: no port is published and there is nothing to route or publish." 'info' }
+  if (-not $hostNet -and -not $headless -and [int]::TryParse([string](Get-Field $Body 'localPort' $defaults.localPort), [ref]$localPort) -and $localPort -ne 0) {
     if ($localPort -lt 1024 -or $localPort -gt 65535) { Stop-Request 400 'The local port must be between 1024 and 65535.' }
     $user = Get-PortUser $localPort
     & $check "Local port 127.0.0.1:$localPort is free" (-not $user) $(if ($user) { "In use by $user. Choose another local port." } else { 'Only this PC can open it.' })
@@ -1796,10 +1858,17 @@ function Invoke-AppPlan($Body, $Manifest = $null) {
     $freeDisk = [Math]::Min($res.projectsDiskFreeMB, $res.dockerDiskFreeMB)
     & $check 'Disk space' ($need.diskMB -lt $freeDisk) "Needs about $($need.diskMB) MB (images and first data); free: $freeDisk MB." $(if ($need.diskMB -ge $freeDisk) { $(if ($startNow) { 'failed' } else { 'warning' }) } elseif ($need.diskMB * 3 -gt $freeDisk) { 'warning' } else { 'ok' })
   }
-  $compose = $null; $envText = $null; $envAll = [ordered]@{}
+  foreach ($hc in (Get-AppHostCompatibility $m $res $resolved.Values)) { & $check $hc.label ($hc.state -ne 'failed') $hc.message $hc.state }
+  $cvOk = $res.composeVersion -match '^(\d+)\.(\d+)' -and [int]$Matches[1] -ge 2
+  & $check 'Docker Engine and Compose' $cvOk $(if ($cvOk) { "Docker $($res.dockerVersion), Compose $($res.composeVersion)." } else { "Docker Compose v2 is required (found '$($res.composeVersion)')." }) $(if ($cvOk) { 'ok' } else { 'failed' })
+  $compose = $null; $composeSet = @(); $envText = $null; $envAll = [ordered]@{}
   if (-not @($resolved.Errors).Count) {
     try {
-      $compose = ConvertTo-AppCompose -Manifest $m -Project $project -Resolved $resolved -ProxyNetwork $settings.ProxyNetwork -LocalPort $localPort
+      # One Compose project, split into small files by component for multi-service apps (modular stack).
+      $composeSet = @(ConvertTo-AppComposeSet -Manifest $m -Project $project -Resolved $resolved -ProxyNetwork $settings.ProxyNetwork -LocalPort $localPort)
+      $compose = [string]$composeSet[0].content
+      $fileEnv = Get-ComposeFileEnv @($composeSet | ForEach-Object { $_.file })
+      foreach ($k in $fileEnv.Keys) { $envAll[$k] = $fileEnv[$k] }
       foreach ($svc in $resolved.Env.Keys) { foreach ($k in $resolved.Env[$svc].Keys) { $envAll[$k] = $resolved.Env[$svc][$k] } }
       $envText = ConvertTo-EnvFileText $envAll
     } catch { & $check 'Compose file' $false $_.Exception.Message }
@@ -1811,10 +1880,12 @@ function Invoke-AppPlan($Body, $Manifest = $null) {
     $tmp = Join-Path ([IO.Path]::GetTempPath()) ("tpm-app-" + [Guid]::NewGuid().ToString('N').Substring(0, 8))
     New-Item -ItemType Directory -Force -Path $tmp | Out-Null
     try {
-      [IO.File]::WriteAllText((Join-Path $tmp 'compose.yaml'), $compose); [IO.File]::WriteAllText((Join-Path $tmp '.env'), $envText)
+      foreach ($cf in $composeSet) { [IO.File]::WriteAllText((Join-Path $tmp $cf.file), $cf.content) }
+      [IO.File]::WriteAllText((Join-Path $tmp '.env'), $envText)
       Set-SecretFileAcl (Join-Path $tmp '.env')
-      $v = Invoke-Docker compose --project-directory $tmp -f (Join-Path $tmp 'compose.yaml') config -q
-      & $check 'docker compose config' ($v.ExitCode -eq 0) $(if ($v.ExitCode -eq 0) { 'The Compose file is valid.' } else { (Hide-SecretValues @($v.Output) @($envAll.Values)) -join ' ' })
+      $cfgArgs = @('compose', '--project-directory', $tmp); foreach ($cf in $composeSet) { $cfgArgs += @('-f', (Join-Path $tmp $cf.file)) }
+      $v = Invoke-Docker @($cfgArgs + @('config', '-q'))
+      & $check 'docker compose config' ($v.ExitCode -eq 0) $(if ($v.ExitCode -ne 0) { (Hide-SecretValues @($v.Output) @($envAll.Values)) -join ' ' } elseif ($composeSet.Count -gt 1) { "The project is valid as one Compose project made of $($composeSet.Count) files: $(@($composeSet | ForEach-Object { $_.file }) -join ', ')." } else { 'The Compose file is valid.' })
     } finally { Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue }
   }
   $images = @(foreach ($sp in $active) { $present = (Invoke-Docker image inspect $sp.Value.image).ExitCode -eq 0; [ordered]@{ service = $sp.Name; image = [string]$sp.Value.image; present = $present } })
@@ -1825,12 +1896,16 @@ function Invoke-AppPlan($Body, $Manifest = $null) {
   $canApply = $compose -and -not @($checks | Where-Object { $_.state -eq 'failed' }).Count
   foreach ($k in @($State.AppPlans.Keys)) { if (((Get-Date) - $State.AppPlans[$k].Created).TotalMinutes -gt 15) { $State.AppPlans.Remove($k) } }
   $planId = New-RandomKey 12
-  if ($canApply) { $State.AppPlans[$planId] = [pscustomobject]@{ Created = (Get-Date); AppId = $m.id; Project = $project; Folder = $folder; Compose = $compose; EnvAll = $envAll; Values = $resolved.Values; Derived = @($resolved.Derived); Privileged = $privileged; Images = $images; LocalPort = $localPort; StartNow = $startNow; Label = $instanceLabel; Manifest = $Manifest } }
+  $stack = $null
+  if ($composeSet.Count) { try { $stack = New-AppStackManifest -Manifest $m -Project $project -ComposeSet $composeSet -Resolved $resolved -ProxyNetwork $settings.ProxyNetwork -LocalPort $localPort -LocalUrl $(if ($localPort) { "http://127.0.0.1:$localPort/" } else { '' }) } catch { & $check 'Stack manifest' $false $_.Exception.Message } }
+  $canApply = $compose -and $stack -and -not @($checks | Where-Object { $_.state -eq 'failed' }).Count
+  if ($canApply) { $State.AppPlans[$planId] = [pscustomobject]@{ Created = (Get-Date); AppId = $m.id; Project = $project; Folder = $folder; Compose = $compose; ComposeSet = $composeSet; Stack = $stack; EnvAll = $envAll; Values = $resolved.Values; Derived = @($resolved.Derived); Privileged = $privileged; Images = $images; LocalPort = $localPort; StartNow = $startNow; Label = $instanceLabel; Manifest = $Manifest } }
   return [ordered]@{
     planId = $(if ($canApply) { $planId } else { '' }); canApply = [bool]$canApply; appId = $m.id; name = $m.name; project = $project; folder = $folder
     container = (Get-AppContainerName $m $project $m.web.service)
     services = @($active | ForEach-Object { [ordered]@{ name = $_.Name; container = (Get-AppContainerName $m $project $_.Name); image = [string]$_.Value.image; stateful = [bool](Get-Prop2 $_.Value 'stateful' $false) } })
-    compose = $compose; envPreview = $preview; files = $filesPreview; checks = $checks.ToArray(); existingVolumes = @($volumes | Where-Object { (Invoke-Docker volume inspect $_).ExitCode -eq 0 })
+    compose = $compose; composeFiles = @($composeSet | ForEach-Object { [ordered]@{ file = $_.file; component = $_.component; services = @($_.services); content = $_.content } }); stack = $stack
+    envPreview = $preview; files = $filesPreview; checks = $checks.ToArray(); existingVolumes = @($volumes | Where-Object { (Invoke-Docker volume inspect $_).ExitCode -eq 0 })
     privileges = @(Get-Prop2 $m 'privileges' @()); security = @(Get-Prop2 $m 'security' @()); volumes = $volumes; images = $images; resources = [ordered]@{ need = $need; host = $res }
     localUrl = $(if ($localPort) { "http://127.0.0.1:$localPort/" } else { '' }); startNow = $startNow; existing = $existing; anotherInstance = $another; instanceLabel = $instanceLabel
   }
@@ -1855,13 +1930,43 @@ function Get-AppResourceEstimate($Manifest, [hashtable]$Values) {
   return [ordered]@{ memoryMB = $mem; diskMB = $disk }
 }
 
+# Pure: Docker's architecture name (x86_64, aarch64) as image platforms name it (amd64, arm64).
+function ConvertTo-ImageArchitecture([string]$Name) {
+  switch -regex ($Name.Trim()) { '^(x86_64|amd64)$' { return 'amd64' } '^(aarch64|arm64)$' { return 'arm64' } '^armv7' { return 'arm/v7' } default { return $Name.Trim() } }
+}
+
+# Pure: host compatibility of a manifest with what Docker reports: CPU architecture (every image of the stack must be
+# published for it), hardware (GPU, devices) and the platform note. Each check: label, state, message.
+function Get-AppHostCompatibility($Manifest, $HostInfo, [hashtable]$Values = @{}) {
+  $checks = @()
+  $archs = @(@(Get-Prop2 $Manifest 'architectures' @()) | ForEach-Object { ([string]$_) -replace '^linux/', '' })
+  if ($HostInfo.architecture) {
+    if (-not $archs.Count) { $checks += [ordered]@{ label = 'CPU architecture'; state = 'info'; message = "Not declared by the manifest; Docker runs $($HostInfo.architecture)." } }
+    elseif ($archs -contains $HostInfo.architecture) { $checks += [ordered]@{ label = 'CPU architecture'; state = 'ok'; message = "Every image is published for $($HostInfo.architecture) (this PC)." } }
+    else { $checks += [ordered]@{ label = 'CPU architecture'; state = 'failed'; message = "The images are published for $($archs -join ', ') only; Docker on this PC runs $($HostInfo.architecture)." } }
+  }
+  $gpu = $false; $devices = @()
+  foreach ($sp in @(if (Get-Prop2 $Manifest 'services' $null) { Get-ActiveServices $Manifest $Values })) {
+    $g = Get-Prop2 $sp.Value 'gpus' $false
+    if (($g -is [bool] -and $g) -or ($g -is [string] -and [string]$Values["input:$g"] -eq 'true')) { $gpu = $true }
+    $devices += @(Get-Prop2 $sp.Value 'devices' @())
+  }
+  if ($gpu) { $checks += [ordered]@{ label = 'GPU'; state = $(if ($HostInfo.nvidiaGpu) { 'warning' } else { 'failed' }); message = $(if ($HostInfo.nvidiaGpu) { 'An NVIDIA driver is installed; GPU access from Docker Desktop (WSL2) is experimental.' } else { 'GPU access was requested but no NVIDIA driver was found on this PC: the container would not start. Turn the GPU option off.' }) } }
+  if ($devices.Count) { $checks += [ordered]@{ label = 'Host devices'; state = 'warning'; message = "Requests $($devices -join ', '): host devices are not available inside Docker Desktop containers." } }
+  return $checks
+}
+
 # What this PC and Docker Desktop have free right now (read-only).
 function Get-HostResources {
-  $out = [ordered]@{ dockerTotalMB = 0; dockerUsedMB = 0; dockerFreeMB = 0; cpus = 0; windowsTotalMB = 0; windowsFreeMB = 0; projectsDiskFreeMB = 0; dockerDiskFreeMB = 0; running = 0; containers = @() }
+  $out = [ordered]@{ dockerTotalMB = 0; dockerUsedMB = 0; dockerFreeMB = 0; cpus = 0; windowsTotalMB = 0; windowsFreeMB = 0; projectsDiskFreeMB = 0; dockerDiskFreeMB = 0; running = 0; containers = @()
+    architecture = ''; dockerVersion = ''; composeVersion = ''; nvidiaGpu = $false }
   try { $os = Get-CimInstance Win32_OperatingSystem; $out.windowsTotalMB = [int]($os.TotalVisibleMemorySize / 1024); $out.windowsFreeMB = [int]($os.FreePhysicalMemory / 1024) } catch { }
-  $i = Invoke-Docker info --format '{{.MemTotal}}|{{.NCPU}}'
-  $line = @($i.Output | Where-Object { $_ -match '^\d+\|\d+$' })[0]
-  if ($line) { $p = $line.Split('|'); $out.dockerTotalMB = [int]([int64]$p[0] / 1MB); $out.cpus = [int]$p[1] }
+  $i = Invoke-Docker info --format '{{.MemTotal}}|{{.NCPU}}|{{.Architecture}}|{{.ServerVersion}}'
+  $line = @($i.Output | Where-Object { $_ -match '^\d+\|\d+\|' })[0]
+  if ($line) { $p = $line.Split('|'); $out.dockerTotalMB = [int]([int64]$p[0] / 1MB); $out.cpus = [int]$p[1]; $out.architecture = (ConvertTo-ImageArchitecture $p[2]); $out.dockerVersion = [string]$p[3] }
+  $cv = Invoke-Docker compose version --short; $out.composeVersion = ((@($cv.Output) -join '').Trim() -replace '^v', '')
+  # An NVIDIA GPU usable from Docker Desktop (WSL2) needs the Windows driver, which installs nvidia-smi.
+  $out.nvidiaGpu = [bool](Get-Command nvidia-smi.exe -ErrorAction SilentlyContinue)
   $st = Invoke-Docker stats --no-stream --format '{{.Name}}|{{.MemUsage}}'
   $used = 0.0
   $list = @(foreach ($l in @($st.Output)) {
@@ -1890,8 +1995,10 @@ function Get-InstalledAppsYaml($Settings) {
     $m = @(@(Resolve-CatalogEntry $catalog ([string]$a.appId)) | Where-Object { $_ } | ForEach-Object { $_.manifest })
     if (-not $m.Count -or $a.appId -eq 'homepage') { continue }
     $web = $m[0].web.service
-    $port = [int](@(@($m[0].services.$web.ports) | Where-Object { $_.PSObject.Properties['primary'] -and $_.primary })[0].container)
-    $scheme = $(if (@(@($m[0].services.$web.ports) | Where-Object { $_.PSObject.Properties['primary'] -and $_.primary -and $_.protocol -eq 'https' }).Count) { 'https' } else { 'http' })
+    # Headless apps (no web interface, e.g. Diun) get no card.
+    if ([bool](Get-Prop2 $m[0].web 'headless' $false)) { continue }
+    $port = [int](@(@(Get-Prop2 $m[0].services.$web 'ports' @()) | Where-Object { $_.PSObject.Properties['primary'] -and $_.primary } | ForEach-Object { $_.container }) + 0)[0]
+    $scheme = $(if (@(@(Get-Prop2 $m[0].services.$web 'ports' @()) | Where-Object { $_.PSObject.Properties['primary'] -and $_.primary -and $_.protocol -eq 'https' }).Count) { 'https' } else { 'http' })
     $href = $(if ($a.PSObject.Properties['localUrl'] -and $a.localUrl) { [string]$a.localUrl } elseif ($a.PSObject.Properties['localPort'] -and [int]$a.localPort) { "http://127.0.0.1:$($a.localPort)/" } else { '' })
     $name = ([string]$a.name).Replace('"', "'")
     $lines += "    - ""$name"":"
@@ -1923,7 +2030,7 @@ function Get-ResolvedPostInstall($Manifest, [hashtable]$Values) {
 
 function Invoke-AppPostInstall($Manifest, [string]$Project, [int]$LocalPort, $Hooks, $Health, [string[]]$Secrets) {
   $out = New-Object System.Collections.ArrayList
-  $scheme = $(if (@(@($Manifest.services.($Manifest.web.service).ports) | Where-Object { $_.PSObject.Properties['primary'] -and $_.primary -and $_.protocol -eq 'https' }).Count) { 'https' } else { 'http' })
+  $scheme = $(if (@(@(Get-Prop2 $Manifest.services.($Manifest.web.service) 'ports' @()) | Where-Object { $_.PSObject.Properties['primary'] -and $_.primary -and $_.protocol -eq 'https' }).Count) { 'https' } else { 'http' })
   foreach ($hook in @($Hooks)) {
     if (-not $hook) { continue }
     $name = "Post-install: $($hook.label)"
@@ -2003,13 +2110,27 @@ function Invoke-AppApply($Body) {
     try { $values["input:$d"] = Resolve-DerivedValue $m $d $values; & $step "Compute $d" 'Done' 'Computed on this PC.' }
     catch { & $step "Compute $d" 'Failed' $_.Exception.Message; return [ordered]@{ ok = $false; steps = $steps.ToArray(); project = $plan.Project; folder = $plan.Folder; health = $null; container = '' } }
   }
+  $set = @($(if ($plan.PSObject.Properties['ComposeSet'] -and @($plan.ComposeSet).Count) { $plan.ComposeSet } else { , ([ordered]@{ file = 'compose.yaml'; component = 'app'; services = @(); content = $plan.Compose }) }))
+  $fileNames = @($set | ForEach-Object { [string]$_.file })
+  $webScheme = $(if (@(@(Get-Prop2 $m.services.($m.web.service) 'ports' @()) | Where-Object { $_.PSObject.Properties['primary'] -and $_.primary -and $_.protocol -eq 'https' }).Count) { 'https' } else { 'http' })
+  $localUrl = $(if ($plan.LocalPort) { "${webScheme}://127.0.0.1:$($plan.LocalPort)/" } else { '' })
+  # The instance: its own id, the manifest it came from, who created its resources (origin 'installed': the manager
+  # created the folder, containers, named volumes and private network), its Compose files and a fingerprint of them,
+  # so later edits made with other tools (Arcane, Portainer, an editor) are noticed before the manager changes it.
+  # It is registered before any file is written (installState 'writing'): if the manager stops half-way, the
+  # Installed apps page shows an interrupted installation that can be discarded instead of an orphaned folder.
+  $record = [ordered]@{ instanceId = ('i-' + (New-SecretValue 6)); project = $plan.Project; appId = $plan.AppId; name = [string]$m.name; label = [string]$plan.Label; origin = 'installed'
+    folder = $plan.Folder; installedAt = (Get-Date -Format 's'); images = @($plan.Images | ForEach-Object { $_.image }); localPort = $plan.LocalPort; localUrl = $localUrl; prepared = (-not $plan.StartNow)
+    composeFiles = $fileNames; stackFile = 'dtc-stack.json'; composeSha256 = (Get-ComposeSetFingerprint $set); installState = 'writing' }
+  Save-AppsRegistry $settings (@(Read-AppsRegistry $settings | Where-Object { $_.project -ne $plan.Project }) + [pscustomobject]$record)
   New-Item -ItemType Directory -Force -Path $plan.Folder | Out-Null
-  [IO.File]::WriteAllText((Join-Path $plan.Folder 'compose.yaml'), $plan.Compose)
+  foreach ($cf in $set) { [IO.File]::WriteAllText((Join-Path $plan.Folder $cf.file), [string]$cf.content) }
   $envPath = Join-Path $plan.Folder '.env'
   [IO.File]::WriteAllText($envPath, '')
   Set-SecretFileAcl $envPath
   [IO.File]::WriteAllText($envPath, (ConvertTo-EnvFileText $plan.EnvAll))
-  [IO.File]::WriteAllText((Join-Path $plan.Folder 'README.md'), (New-AppReadme $m $plan.Project $plan.Folder))
+  [IO.File]::WriteAllText((Join-Path $plan.Folder 'README.md'), (New-AppReadme $m $plan.Project $plan.Folder $fileNames))
+  if ($plan.PSObject.Properties['Stack'] -and $plan.Stack) { [IO.File]::WriteAllText((Join-Path $plan.Folder 'dtc-stack.json'), (($plan.Stack | ConvertTo-Json -Depth 12) + "`n"), (New-Object Text.UTF8Encoding($false))) }
   foreach ($sp in (Get-ActiveServices $m $values)) {
     foreach ($v in @(Get-Prop2 $sp.Value 'volumes' @())) { if ((Get-Prop2 $v 'kind' 'volume') -eq 'project') { New-Item -ItemType Directory -Force -Path (Join-Path $plan.Folder ($v.source -replace '/', '\')) | Out-Null } }
   }
@@ -2026,15 +2147,9 @@ function Invoke-AppApply($Body) {
     $cp = Join-Path $plan.Folder 'credentials.txt'; [IO.File]::WriteAllText($cp, ''); Set-SecretFileAcl $cp
     [IO.File]::WriteAllText($cp, ((@("Sign-in details for $($m.name) ($($plan.Project)). Keep this file private; change the passwords after the first sign-in if you like.", '') + $creds) -join "`r`n") + "`r`n")
   }
-  & $step 'Write the Compose project' 'Done' $(if ($creds.Count) { "$($plan.Folder) (sign-in details: credentials.txt)" } else { $plan.Folder })
-  $webScheme = $(if (@(@($m.services.($m.web.service).ports) | Where-Object { $_.PSObject.Properties['primary'] -and $_.primary -and $_.protocol -eq 'https' }).Count) { 'https' } else { 'http' })
-  $localUrl = $(if ($plan.LocalPort) { "${webScheme}://127.0.0.1:$($plan.LocalPort)/" } else { '' })
-  # The instance: its own id, the manifest it came from, who created its resources (origin 'installed': the manager
-  # created the folder, containers, named volumes and private network) and a fingerprint of the generated compose.yaml,
-  # so later edits made with other tools (Arcane, Portainer, an editor) are noticed before the manager changes it.
-  $record = [ordered]@{ instanceId = ('i-' + (New-SecretValue 6)); project = $plan.Project; appId = $plan.AppId; name = [string]$m.name; label = [string]$plan.Label; origin = 'installed'
-    folder = $plan.Folder; installedAt = (Get-Date -Format 's'); images = @($plan.Images | ForEach-Object { $_.image }); localPort = $plan.LocalPort; localUrl = $localUrl; prepared = (-not $plan.StartNow)
-    composeSha256 = (Get-TextSha256 $plan.Compose) }
+  & $step 'Write the Compose project' 'Done' $(if ($set.Count -gt 1) { "$($plan.Folder): $($fileNames -join ', ') (one Compose project), .env, dtc-stack.json$(if ($creds.Count) { ', credentials.txt' })" } elseif ($creds.Count) { "$($plan.Folder) (sign-in details: credentials.txt)" } else { $plan.Folder })
+  # Every file is written: the installation is no longer interrupted.
+  $record.Remove('installState')
   Save-AppsRegistry $settings (@(Read-AppsRegistry $settings | Where-Object { $_.project -ne $plan.Project }) + [pscustomobject]$record)
   $hooks = @(Get-ResolvedPostInstall $m $values)
   if (-not $plan.StartNow) {
@@ -2043,7 +2158,7 @@ function Invoke-AppApply($Body) {
     & $step 'Prepared, not started' 'Done' 'No app container was created or started. Use Start on the Installed apps page when resources allow: it checks memory again and downloads the pinned images.'
     return [ordered]@{ ok = $true; prepared = $true; steps = $steps.ToArray(); project = $plan.Project; folder = $plan.Folder; health = $null; container = (Get-AppContainerName $m $plan.Project $m.web.service); output = ''; localUrl = $localUrl; credentialsFile = $(if ($creds.Count) { Join-Path $plan.Folder 'credentials.txt' } else { '' }) }
   }
-  $up = Invoke-Docker compose --project-directory $plan.Folder -f (Join-Path $plan.Folder 'compose.yaml') up -d
+  $up = Invoke-Docker @((Get-AppComposeArgs $record) + @('up', '-d'))
   $secrets = @(@((Read-AppEnv $envPath).Values) + @($values.Keys | Where-Object { $_ -like 'input:*' } | ForEach-Object { [string]$values[$_] }) | Where-Object { $_ -and $_.Length -ge 8 -and $_ -notmatch '^(true|false)$' -and $_ -notmatch '^[A-Za-z]:\\' })
   $upText = (Hide-SecretValues @(ConvertTo-RedactedText @($up.Output)) $secrets) -join "`n"
   & $step 'Download images and start (docker compose up -d)' $(if ($up.ExitCode -eq 0) { 'Done' } else { 'Failed' }) ($upText -split "`n" | Select-Object -Last 6 | Out-String).Trim()
@@ -2069,8 +2184,10 @@ function Get-AppHealth([string]$Project, $Manifest, $Settings, [int]$WaitSeconds
     Start-Sleep -Seconds 3
   } while ($true)
   $out = [ordered]@{ containers = $cs; web = $web; running = [bool]($w.Count -and $w[0].state -eq 'running'); allRunning = (-not @($cs | Where-Object { $_.state -ne 'running' -and $_.status -notmatch 'Exited \(0\)' }).Count); http = $null }
+  # A headless app has no web interface to probe: running (and healthy, when it has a health check) is all there is.
+  if ($out.running -and [bool](Get-Prop2 $Manifest.web 'headless' $false)) { $out.http = [ordered]@{ result = 'not-applicable'; detail = 'Headless app: no web interface. Its state and health check are shown above.' }; $out.headless = $true; return $out }
   if ($out.running) {
-    $primary = @(@($Manifest.services.($Manifest.web.service).ports) | Where-Object { $_.PSObject.Properties['primary'] -and $_.primary })[0]
+    $primary = @(@(Get-Prop2 $Manifest.services.($Manifest.web.service) 'ports' @()) | Where-Object { $_.PSObject.Properties['primary'] -and $_.primary })[0]
     $c = @(Get-DockerContainerInventory -ProxyNetwork $Settings.ProxyNetwork | Where-Object { $_.name -eq $web })
     if ($c.Count) {
       $probe = $null
@@ -2096,6 +2213,7 @@ function Find-InstalledApp([string]$Project) {
   $a = @(Read-AppsRegistry $settings | Where-Object { $_.project -eq $Project })
   if (-not $a.Count) { Stop-Request 404 "No app '$Project' was installed by this manager." }
   $compose = Get-AppComposePath $a[0]
+  if ([string](Get-Prop2 $a[0] 'installState' '') -eq 'writing') { Stop-Request 409 "The installation of '$Project' was interrupted before all files were written. Discard it on the Installed apps page and install again." }
   if ([bool](Get-Prop2 $a[0] 'archived' $false)) { Stop-Request 409 "The record of '$Project' is archived. Restore it on the Installed apps page to manage it here." }
   if ([string](Get-Prop2 $a[0] 'origin' '') -eq 'adopted') {
     # Adopted projects were not generated here: their compose.yaml is the user's own. The folder must still be the
@@ -2121,7 +2239,7 @@ function Get-AppsData {
   $views = @(foreach ($i in $instances) {
       $m = Get-InstanceManifest $i $catalog
       $composePath = Get-AppComposePath $i
-      $composeText = $(if ($i.folder -and (Test-Path -LiteralPath $composePath)) { [IO.File]::ReadAllText($composePath) } else { '' })
+      $composeText = $(if ($i.folder -and (Test-Path -LiteralPath $composePath)) { Get-AppComposeText $i } else { '' })
       $diff = @(); if ($m -and $composeText) { $diff = @(Get-AppUpdateDiff $m $composeText) }
       $cs = @($facts | Where-Object { $_.project -eq $i.project })
       $siblings = @($instances | Where-Object { $_.applicationId -eq $i.applicationId -and $_.project -ne $i.project -and -not $_.archived } | ForEach-Object { $_.project })
@@ -2132,7 +2250,8 @@ function Get-AppsData {
         lifecycle = $i.lifecycle; siblings = $siblings
         localUrl = $(if ($i.localUrl) { $i.localUrl } elseif ($i.localPort) { "http://127.0.0.1:$($i.localPort)/" } else { '' })
         routes = $i.routes; prepared = [bool]($i.prepared -and $cs.Count -eq 0)
-        composeChanged = $(if (-not $composeText -or -not $i.composeSha256) { $null } else { (Get-TextSha256 $composeText) -ne $i.composeSha256 })
+        composeChanged = $(if (-not $composeText -or -not $i.composeSha256) { $null } else { (Get-AppComposeFingerprint $i) -ne $i.composeSha256 })
+        composeFiles = @(Get-AppComposeFileNames $i); installState = [string](Get-RecordValue $i 'installState' ''); hasStack = [bool]($i.folder -and (Test-Path -LiteralPath (Join-Path $i.folder 'dtc-stack.json')))
         updateAvailable = ($diff.Count -gt 0); updates = $diff; catalog = $(if ($m) { [ordered]@{ web = $m.web; exposure = $m.exposure } } else { $null }) }
     })
   $discovered = @(Get-UnregisteredInstallations $facts $catalog (@($instances | ForEach-Object { $_.project }) + $settings.StackName))
@@ -2167,14 +2286,15 @@ function Get-AppDetailData([string]$Project) {
   $idApps = @()
   try { $id = Read-IdentityConfig -Settings $settings; $ap = Get-Prop2 (Get-Prop2 $id 'authentik' $null) 'apps' $null; if ($ap) { $idApps = @($ap.PSObject.Properties | Where-Object { @($i.routes | ForEach-Object { $_.name }) -contains $_.Name } | ForEach-Object { [ordered]@{ service = $_.Name; slug = [string](Get-Prop2 $_.Value 'slug' '') } }) } } catch { }
   $composePath = Get-AppComposePath $i
-  $composeText = $(if ($i.folder -and (Test-Path -LiteralPath $composePath)) { [IO.File]::ReadAllText($composePath) } else { '' })
+  $composeText = $(if ($i.folder -and (Test-Path -LiteralPath $composePath)) { Get-AppComposeText $i } else { '' })
   return [ordered]@{
     project = $i.project; instanceId = $i.instanceId; name = $i.name; label = $i.label; appId = $i.appId; applicationId = $i.applicationId; origin = $i.origin; folder = $i.folder; archived = $i.archived
     lifecycle = $i.lifecycle; cleanup = @(Get-JobCleanupCandidates $i.lifecycle); routes = $i.routes; networks = $networks
     published = @($cs | ForEach-Object { $c = $_; @($c.ports | Where-Object { $_.hostPort }) | ForEach-Object { [ordered]@{ container = $c.name; port = $_.container; hostIp = $_.hostIp; hostPort = $_.hostPort; localOnly = ($_.hostIp -in '127.0.0.1', '::1') } } })
     volumes = @($cs | ForEach-Object { $c = $_; @($c.mounts | Where-Object { $_.type -eq 'volume' }) | ForEach-Object { [ordered]@{ container = $c.name; name = $_.name; target = $_.target; readOnly = $_.readOnly; anonymous = [bool]($_.name -match '^[0-9a-f]{64}$') } } })
     cloudflare = $cfHosts; authentik = $idApps
-    composeChanged = $(if (-not $composeText -or -not $i.composeSha256) { $null } else { (Get-TextSha256 $composeText) -ne $i.composeSha256 })
+    composeChanged = $(if (-not $composeText -or -not $i.composeSha256) { $null } else { (Get-AppComposeFingerprint $i) -ne $i.composeSha256 })
+    composeFiles = @(Get-AppComposeFileNames $i)
     checkedAt = (Get-Date -Format 's')
   }
 }
@@ -2189,7 +2309,7 @@ function Invoke-AppAction($Body) {
     # First start of a prepared project: check memory again, then create the containers (downloads the pinned images).
     try { $mm = Get-InstanceManifest $a; $need = Get-AppResourceEstimate $mm @{}; $res = Get-HostResources; $free = [Math]::Min($res.dockerFreeMB, $res.windowsFreeMB)
       if ($need.memoryMB -gt $free -and -not [bool](Get-Field $Body 'force' $false)) { Stop-Request 409 "$($a.name) needs about $($need.memoryMB) MB but only $free MB is free. Stop other apps first." } } catch [System.Management.Automation.RuntimeException] { if ($_.Exception.Message -match 'needs about') { throw } }
-    $r = Invoke-Docker compose --project-directory $a.folder -f (Get-AppComposePath $a) up -d
+    $r = Invoke-Docker @((Get-AppComposeArgs $a) + @('up', '-d'))
     $hp = Join-Path $a.folder '.post-install.json'
     if ($r.ExitCode -eq 0 -and (Test-Path -LiteralPath $hp)) {
       $mm = Get-InstanceManifest $a
@@ -2200,7 +2320,7 @@ function Invoke-AppAction($Body) {
       if (-not @($hookSteps | Where-Object { $_.status -ne 'Done' }).Count) { Remove-Item -LiteralPath $hp -Force }
       $r.Output = @($r.Output) + @($hookSteps | ForEach-Object { "$($_.status): $($_.name) $($_.message)" })
     }
-  } else { $r = Invoke-Docker compose --project-directory $a.folder -f (Get-AppComposePath $a) $action }
+  } else { $r = Invoke-Docker @((Get-AppComposeArgs $a) + @($action)) }
   Write-Audit "app-$action" "$($a.project) exit=$($r.ExitCode)"
   return [ordered]@{ ok = ($r.ExitCode -eq 0); project = $a.project; action = $action; output = ((ConvertTo-RedactedText @($r.Output)) -join "`n"); containers = @(Get-ComposeProjectContainers $a.project) }
 }
@@ -2209,10 +2329,10 @@ function Get-AppLogsData([string]$Project, [int]$Tail, [string]$Service = '') {
   Assert-Installed
   $a = Find-InstalledApp $Project
   if ($Tail -lt 1 -or $Tail -gt 2000) { $Tail = 200 }
-  $logArgs = @('compose', '--project-directory', $a.folder, '-f', (Get-AppComposePath $a), 'logs', '--no-color', '--tail', $Tail)
+  $logArgs = @((Get-AppComposeArgs $a) + @('logs', '--no-color', '--tail', $Tail))
   # One service's logs (also of a one-time job that exited): the service must belong to this project.
   if ($Service) {
-    $known = @(@(Get-ComposeContainerFacts | Where-Object { $_.project -eq $a.project } | ForEach-Object { $_.service }) + @((Get-ComposeServiceImages ([IO.File]::ReadAllText((Get-AppComposePath $a)))).Keys))
+    $known = @(@(Get-ComposeContainerFacts | Where-Object { $_.project -eq $a.project } | ForEach-Object { $_.service }) + @((Get-ComposeServiceImages (Get-AppComposeText $a)).Keys))
     if ($Service -notmatch '^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}$' -or $known -notcontains $Service) { Stop-Request 404 "No service '$Service' in $($a.project)." }
     $logArgs += $Service
   }
@@ -2238,15 +2358,17 @@ function Get-ImageMajor([string]$Image) {
 # into <app folder>\backups\<time>\ (readable by the current user, SYSTEM and Administrators only). Apps with a database
 # are stopped for the copy and started again, so the database files are consistent. Media and other volumes marked
 # backup:false (caches, libraries, recordings) are skipped: they are the user's data, not configuration.
-function Invoke-AppBackupCore($App, $Manifest, $Settings) {
+function Invoke-AppBackupCore($App, $Manifest, $Settings, [string]$Reason = 'manual') {
   $dir = Join-Path $App.folder ("backups\" + (Get-Date -Format 'yyyyMMdd-HHmmss'))
   New-Item -ItemType Directory -Force -Path $dir | Out-Null
   $copyFile = { param($from, $name) if (Test-Path -LiteralPath $from) { $to = Join-Path $dir $name; [IO.File]::WriteAllText($to, ''); Set-SecretFileAcl $to; [IO.File]::WriteAllBytes($to, [IO.File]::ReadAllBytes($from)) } }
-  & $copyFile (Get-AppComposePath $App) 'compose.yaml'
+  $fileNames = @(Get-AppComposeFileNames $App)
+  foreach ($fn in $fileNames) { & $copyFile (Join-Path $App.folder $fn) $fn }
   & $copyFile (Join-Path $App.folder '.env') '.env'
+  & $copyFile (Join-Path $App.folder 'dtc-stack.json') 'dtc-stack.json'
   $values = @{}; foreach ($i in @(Get-Prop2 $Manifest 'inputs' @())) { if ($i.type -eq 'boolean') { $values["input:$($i.id)"] = 'true' } }
   $active = @(Get-ActiveServices $Manifest $values)
-  $compose = [IO.File]::ReadAllText((Get-AppComposePath $App))
+  $compose = Get-AppComposeText $App
   $volumes = @(); $skipped = @(); $folders = @()
   foreach ($sp in $active) {
     if ($compose -notmatch "(?m)^  $([regex]::Escape($sp.Name)):\s*$") { continue }
@@ -2263,7 +2385,7 @@ function Invoke-AppBackupCore($App, $Manifest, $Settings) {
   $stateful = @($active | Where-Object { Get-Prop2 $_.Value 'stateful' $false }).Count -gt 0
   $stopped = $false
   if ($stateful -and $volumes.Count) {
-    $null = Invoke-Docker compose --project-directory $App.folder -f (Get-AppComposePath $App) stop
+    $null = Invoke-Docker @((Get-AppComposeArgs $App) + @('stop'))
     $stopped = $true
   }
   $results = @()
@@ -2276,9 +2398,10 @@ function Invoke-AppBackupCore($App, $Manifest, $Settings) {
       $results += [ordered]@{ volume = $vn; ok = ($r.ExitCode -eq 0 -and (Test-Path -LiteralPath $file)); sizeMB = $(if (Test-Path -LiteralPath $file) { [Math]::Round((Get-Item -LiteralPath $file).Length / 1MB, 1) } else { 0 }) }
     }
   } finally {
-    if ($stopped) { $null = Invoke-Docker compose --project-directory $App.folder -f (Get-AppComposePath $App) start }
+    if ($stopped) { $null = Invoke-Docker @((Get-AppComposeArgs $App) + @('start')) }
   }
-  $info = [ordered]@{ app = $App.appId; project = $App.project; createdAt = (Get-Date -Format 's'); volumes = $results; skipped = $skipped; folders = @($folders | Select-Object -Unique); stoppedForBackup = $stopped }
+  $info = [ordered]@{ app = $App.appId; project = $App.project; createdAt = (Get-Date -Format 's'); reason = $Reason; composeFiles = $fileNames; composeSha256 = (Get-AppComposeFingerprint $App)
+    volumes = $results; skipped = $skipped; folders = @($folders | Select-Object -Unique); stoppedForBackup = $stopped }
   [IO.File]::WriteAllText((Join-Path $dir 'backup.json'), ($info | ConvertTo-Json -Depth 5))
   Write-Audit 'app-backup' "$($App.project) $dir volumes=$(@($results).Count)"
   return [ordered]@{ ok = -not @($results | Where-Object { -not $_.ok }).Count; folder = $dir; volumes = $results; skipped = $skipped; folders = $info.folders; stopped = $stopped }
@@ -2295,7 +2418,7 @@ function Invoke-AppBackup($Body) {
 # Update preview: what the catalog would change, plus a notification when the registry now has a newer build under the
 # same tag. Nothing is pulled. Database (stateful) services never change their major version through this path.
 function Get-AppUpdateItems($App, $Manifest, [switch]$Registry) {
-  $text = [IO.File]::ReadAllText((Get-AppComposePath $App))
+  $text = Get-AppComposeText $App
   $installed = Get-ComposeServiceImages $text
   $items = @()
   foreach ($sp in $Manifest.services.PSObject.Properties) {
@@ -2330,7 +2453,7 @@ function Invoke-AppUpdatePreview($Body) {
   $notes = $(if ($m.PSObject.Properties['update'] -and $m.update.PSObject.Properties['notes']) { [string]$m.update.notes } else { '' })
   # compose.yaml edited outside the manager (Arcane, Portainer, an editor) since it was generated or last updated here.
   $baseline = [string](Get-Prop2 $a 'composeSha256' '')
-  $external = $(if ($baseline) { (Get-TextSha256 ([IO.File]::ReadAllText((Get-AppComposePath $a)))) -ne $baseline } else { $null })
+  $external = $(if ($baseline) { (Get-AppComposeFingerprint $a) -ne $baseline } else { $null })
   return [ordered]@{ project = $a.project; changes = $applicable; blocked = @($items | Where-Object { $_.blocked }); previewKey = $(if ($applicable.Count) { $key } else { '' }); notes = $notes
     externalChanges = $external; externalNote = $(if ($external) { 'compose.yaml was changed outside the manager since it was written here. The update changes only the image lines and keeps those edits; review them before continuing.' } elseif ($null -eq $external) { 'No fingerprint of compose.yaml was recorded (installed by an earlier version), so changes made with other tools cannot be detected.' } else { '' })
     releaseNotes = @(@(if ($m.PSObject.Properties['docs']) { $m.docs }) | Select-Object -First 1)
@@ -2347,22 +2470,26 @@ function Invoke-AppUpdateApply($Body) {
   if (-not $items.Count -or $key -ne [string](Get-Field $Body 'previewKey' '')) { Stop-Request 409 'The installed project, the catalog or the registry changed since the preview. Preview again.' }
   $settings = Get-Settings
   $baseline = [string](Get-Prop2 $a 'composeSha256' '')
-  if ($baseline -and (Get-TextSha256 ([IO.File]::ReadAllText((Get-AppComposePath $a)))) -ne $baseline -and -not [bool](Get-Field $Body 'acknowledgeExternalChanges' $false)) { Stop-Request 409 'compose.yaml was changed outside the manager. Review the changes and confirm that the update may proceed (only image lines change; your edits are kept).' }
-  $backup = Invoke-AppBackupCore $a $m $settings
+  if ($baseline -and (Get-AppComposeFingerprint $a) -ne $baseline -and -not [bool](Get-Field $Body 'acknowledgeExternalChanges' $false)) { Stop-Request 409 'compose.yaml was changed outside the manager. Review the changes and confirm that the update may proceed (only image lines change; your edits are kept).' }
+  $backup = Invoke-AppBackupCore $a $m $settings 'before-update'
   if (-not $backup.ok) { Stop-Request 500 "The backup before the update failed ($($backup.folder)); nothing was updated." }
-  $path = Get-AppComposePath $a
-  $text = [IO.File]::ReadAllText($path)
-  $bak = "$path.bak-$(Get-Date -Format 'yyyyMMdd-HHmmss')"
-  Copy-Item -LiteralPath $path -Destination $bak
-  foreach ($c in $items) { $text = $text.Replace("    image: $($c.from)", "    image: $($c.to)") }
-  Write-TextFileAtomic $path $text
-  # The updated file is the new baseline for detecting edits made with other tools.
+  # Only image lines change, in whichever file of the stack defines the service; every file is saved first.
+  $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+  $bak = ''
+  foreach ($path in (Get-AppComposeFiles $a)) {
+    if (-not (Test-Path -LiteralPath $path)) { continue }
+    $text = [IO.File]::ReadAllText($path)
+    $new = $text; foreach ($c in $items) { $new = $new.Replace("    image: $($c.from)", "    image: $($c.to)") }
+    if ($new -ne $text) { Copy-Item -LiteralPath $path -Destination "$path.bak-$stamp"; if (-not $bak) { $bak = "$path.bak-$stamp" }; Write-TextFileAtomic $path $new }
+  }
+  # The updated files are the new baseline for detecting edits made with other tools.
   $records = @(Read-AppsRegistry $settings)
-  foreach ($rec in @($records | Where-Object { $_.project -eq $a.project })) { $rec | Add-Member -NotePropertyName composeSha256 -NotePropertyValue (Get-TextSha256 $text) -Force }
+  foreach ($rec in @($records | Where-Object { $_.project -eq $a.project })) { $rec | Add-Member -NotePropertyName composeSha256 -NotePropertyValue (Get-AppComposeFingerprint $a) -Force }
   Save-AppsRegistry $settings $records
-  $up = Invoke-Docker compose --project-directory $a.folder -f $path up -d
+  Update-AppStackImages $a
+  $up = Invoke-Docker @((Get-AppComposeArgs $a) + @('up', '-d'))
   Write-Audit 'app-update' "$($a.project) $(($items | ForEach-Object { $_.to }) -join ',') exit=$($up.ExitCode)"
-  return [ordered]@{ ok = ($up.ExitCode -eq 0); project = $a.project; backup = (Split-Path -Leaf $bak); dataBackup = $backup.folder; changes = $items
+  return [ordered]@{ ok = ($up.ExitCode -eq 0); project = $a.project; backup = $(if ($bak) { Split-Path -Leaf $bak } else { '' }); dataBackup = $backup.folder; backupId = (Split-Path -Leaf $backup.folder); changes = $items
     output = ((Hide-SecretValues @(ConvertTo-RedactedText @($up.Output)) @((Read-AppEnv (Join-Path $a.folder '.env')).Values)) -join "`n")
     health = $(if ($up.ExitCode -eq 0) { Get-AppHealth $a.project $m $settings 60 } else { $null }) }
 }
@@ -2386,13 +2513,13 @@ function Invoke-AppRemove($Body) {
   $cs = @(Get-ComposeProjectContainers $a.project | ForEach-Object { $_.name })
   $routes = @((Read-ServiceRegistry -Settings $settings).services | Where-Object { $_.target.type -eq 'docker' -and $cs -contains $_.target.host } | ForEach-Object { $_.name })
   if ($routes.Count) { Stop-Request 409 "Remove the service route(s) $($routes -join ', ') on the Services page first, so the hostname does not answer 502." }
-  $args2 = @('compose', '--project-directory', $a.folder, '-f', (Get-AppComposePath $a), 'down')
+  $args2 = @((Get-AppComposeArgs $a) + @('down'))
   if ($deleteVolumes) { $args2 += '-v' }
   $r = Invoke-Docker @args2
   if ($r.ExitCode -ne 0) { Stop-Request 500 "docker compose down failed: $((ConvertTo-RedactedText @($r.Output)) -join ' ')" }
   $folderRemoved = $false
   if ($deleteFolder) {
-    foreach ($f in @(Get-ChildItem -LiteralPath $a.folder -Force -File)) { if ($f.Name -in 'compose.yaml', '.env', 'README.md', 'credentials.txt', '.post-install.json', '.dtc-manifest.json' -or $f.Name -like 'compose.yaml.bak-*') { $f.IsReadOnly = $false; Remove-Item -LiteralPath $f.FullName -Force } }
+    foreach ($f in @(Get-ChildItem -LiteralPath $a.folder -Force -File)) { if (Test-GeneratedAppFile $f.Name) { $f.IsReadOnly = $false; Remove-Item -LiteralPath $f.FullName -Force } }
     if (-not @(Get-ChildItem -LiteralPath $a.folder -Force).Count) { Remove-Item -LiteralPath $a.folder -Force; $folderRemoved = $true }
   }
   Save-AppsRegistry $settings @(Read-AppsRegistry $settings | Where-Object { $_.project -ne $a.project })
@@ -2422,7 +2549,7 @@ function Get-AppRemovalInventory($Record, $Settings) {
   $cf = Read-CloudflareConfig -Settings $Settings
   $cfHosts = @(); if ($cf.PSObject.Properties['managed'] -and $cf.managed) { $cfHosts = @($cf.managed.PSObject.Properties | Where-Object { $hosts -contains $_.Name } | ForEach-Object { $_.Name }) }
   $idApps = @(); try { $ap = Get-Prop2 (Get-Prop2 (Read-IdentityConfig -Settings $Settings) 'authentik' $null) 'apps' $null; if ($ap) { $idApps = @($ap.PSObject.Properties | Where-Object { @($routes | ForEach-Object { $_.name }) -contains $_.Name } | ForEach-Object { [string](Get-Prop2 $_.Value 'slug' $_.Name) }) } } catch { }
-  $files = @(); if ($inst.folder -and (Test-Path -LiteralPath $inst.folder)) { $files = @(Get-ChildItem -LiteralPath $inst.folder -Force -File | Where-Object { $_.Name -in 'compose.yaml', '.env', 'README.md', 'credentials.txt', '.post-install.json', '.dtc-manifest.json' -or $_.Name -like 'compose.yaml.bak-*' } | ForEach-Object { $_.Name }) }
+  $files = @(); if ($inst.folder -and (Test-Path -LiteralPath $inst.folder)) { $files = @(Get-ChildItem -LiteralPath $inst.folder -Force -File | Where-Object { Test-GeneratedAppFile $_.Name } | ForEach-Object { $_.Name }) }
   return Get-RemovalInventory -Instance $inst -Containers $cs -All $all -Routes $routes -CloudflareHosts $cfHosts -IdentityApps $idApps -ProxyNetwork $Settings.ProxyNetwork -FolderFiles $files
 }
 
@@ -2542,6 +2669,272 @@ function Invoke-AppCleanup($Body) {
     })
   Write-Audit 'app-cleanup' "$($plan.project) $(@($results | Where-Object { $_.ok } | ForEach-Object { $_.container }) -join ',')"
   return [ordered]@{ ok = -not @($results | Where-Object { -not $_.ok }).Count; project = $plan.project; results = $results }
+}
+
+# --- Installed apps: restore and roll back, interrupted installations, stack and routing diagnostics -----------------
+
+# Backups of one app (<app folder>\backups\<yyyyMMdd-HHmmss>\backup.json), newest first.
+function Get-AppBackupList($App) {
+  $root = Join-Path ([string]$App.folder) 'backups'
+  if (-not (Test-Path -LiteralPath $root)) { return @() }
+  return @(Get-ChildItem -LiteralPath $root -Directory | Where-Object { $_.Name -match '^\d{8}-\d{6}$' -and (Test-Path -LiteralPath (Join-Path $_.FullName 'backup.json')) } | Sort-Object Name -Descending | ForEach-Object {
+      $info = $null; try { $info = [IO.File]::ReadAllText((Join-Path $_.FullName 'backup.json')) | ConvertFrom-Json } catch { }
+      $files = @(Get-ChildItem -LiteralPath $_.FullName -File | Where-Object { Test-GeneratedAppFile $_.Name } | ForEach-Object { $_.Name })
+      [ordered]@{ id = $_.Name; createdAt = [string](Get-Prop2 $info 'createdAt' ''); reason = [string](Get-Prop2 $info 'reason' 'manual')
+        volumes = @(@(Get-Prop2 $info 'volumes' @()) | ForEach-Object { [ordered]@{ volume = [string]$_.volume; ok = [bool]$_.ok; sizeMB = $_.sizeMB } })
+        files = $files; composeFiles = @(Get-Prop2 $info 'composeFiles' @()); folders = @(Get-Prop2 $info 'folders' @()); valid = [bool]$info }
+    })
+}
+
+function Get-AppBackupsData([string]$Project) {
+  Assert-Installed
+  $a = Find-InstalledApp $Project
+  return [ordered]@{ project = $a.project; folder = (Join-Path $a.folder 'backups'); backups = @(Get-AppBackupList $a) }
+}
+
+# What restoring a backup would do. Only volumes of this project ("<project>_...") and files the manager generates are
+# ever restored; a safety backup of the current state is made first, so a restore can itself be undone.
+function Get-AppRestorePlan($Body) {
+  Assert-Installed
+  $a = Find-InstalledApp ([string](Get-Field $Body 'project' ''))
+  if ([string](Get-Prop2 $a 'origin' '') -eq 'adopted') { Stop-Request 409 'This project was adopted: the manager did not create its data and does not restore it. Use your own backup tools.' }
+  $id = [string](Get-Field $Body 'backup' '')
+  if ($id -notmatch '^\d{8}-\d{6}$') { Stop-Request 400 'Choose a backup.' }
+  $b = @(Get-AppBackupList $a | Where-Object { $_.id -eq $id })
+  if (-not $b.Count -or -not $b[0].valid) { Stop-Request 404 "No backup '$id' of $($a.project)." }
+  $b = $b[0]
+  $dir = Join-Path $a.folder "backups\$id"
+  $restoreFiles = [bool](Get-Field $Body 'restoreFiles' $true)
+  $vols = @(foreach ($v in $b.volumes) {
+      $file = Join-Path $dir "$($v.volume).tar.gz"
+      $own = $v.volume.StartsWith("$($a.project)_")
+      [ordered]@{ volume = $v.volume; sizeMB = $v.sizeMB; available = ($v.ok -and (Test-Path -LiteralPath $file)); ownVolume = $own; exists = ((Invoke-Docker volume inspect $v.volume).ExitCode -eq 0) }
+    })
+  $bad = @($vols | Where-Object { -not $_.ownVolume })
+  if ($bad.Count) { Stop-Request 409 "The backup names volumes that do not belong to $($a.project) ($(@($bad | ForEach-Object { $_.volume }) -join ', ')); it is not restored." }
+  $files = @(if ($restoreFiles) { @($b.files | Where-Object { $_ -ne 'credentials.txt' }) })
+  $folders = @($b.folders | Where-Object { [string]$_ -match '^[A-Za-z0-9][A-Za-z0-9_./-]*$' -and [string]$_ -notmatch '\.\.' -and (Test-Path -LiteralPath (Join-Path $dir (([string]$_) -replace '/', '_'))) })
+  $key = Get-TextSha256 ("$($a.project)|$id|$restoreFiles|" + ((@($vols | ForEach-Object { "$($_.volume):$($_.sizeMB)" }) + $files + $folders) -join ','))
+  return [ordered]@{ project = $a.project; backup = $id; createdAt = $b.createdAt; reason = $b.reason; restoreFiles = $restoreFiles; volumes = $vols; files = $files; folders = $folders; key = $key
+    steps = @('Back up the current state first (safety backup, so this restore can be undone).', "Stop the app's containers.", 'Replace the contents of each data volume with the backup.',
+      $(if ($files.Count) { "Put back $($files -join ', ') from the backup (the Compose files as they were then)." } else { 'Keep the current Compose files and .env.' }),
+      $(if ($folders.Count) { "Copy back the configuration folders: $($folders -join ', ')." } else { $null }), 'Start the app again (docker compose up -d) and check its health.') | Where-Object { $_ }
+    keeps = @('Folders you chose (media, photos, recordings) are never touched.', 'Routes, Cloudflare and authentik settings are not changed.', 'Other apps and their volumes are not touched.') }
+}
+
+function Invoke-AppRestore($Body) {
+  Assert-Installed
+  Assert-Confirmed $Body
+  $settings = Get-Settings
+  $plan = Get-AppRestorePlan $Body
+  if ($plan.key -ne [string](Get-Field $Body 'key' '')) { Stop-Request 409 'The backup or the app changed since the preview. Preview again.' }
+  $a = Find-InstalledApp $plan.project
+  $m = Get-InstanceManifest $a
+  $steps = New-Object System.Collections.ArrayList
+  $step = { param($name, $status, $message) $null = $steps.Add([ordered]@{ name = $name; status = $status; message = $message }) }
+  $safety = Invoke-AppBackupCore $a $m $settings 'before-restore'
+  if (-not $safety.ok) { Stop-Request 500 "The safety backup failed ($($safety.folder)); nothing was restored." }
+  & $step 'Safety backup of the current state' 'Done' (Split-Path -Leaf $safety.folder)
+  $stop = Invoke-Docker @((Get-AppComposeArgs $a) + @('stop'))
+  & $step 'Stop the app' $(if ($stop.ExitCode -eq 0) { 'Done' } else { 'Failed' }) ((ConvertTo-RedactedText @($stop.Output | Select-Object -Last 2)) -join ' ')
+  $dir = Join-Path $a.folder "backups\$($plan.backup)"
+  $ok = $true
+  foreach ($v in @($plan.volumes | Where-Object { $_.available })) {
+    $r = Invoke-Docker run --rm --pull never --network none -v "$($v.volume):/v" -v "${dir}:/b:ro" --entrypoint sh $settings.TraefikImage -c "cd /v && rm -rf ./* ./.[!.]* ./..?* && tar xzf '/b/$($v.volume).tar.gz' -C /v"
+    if ($r.ExitCode -ne 0) { $ok = $false }
+    & $step "Restore volume $($v.volume)" $(if ($r.ExitCode -eq 0) { 'Done' } else { 'Failed' }) "$($v.sizeMB) MB"
+  }
+  if ($plan.files.Count) {
+    foreach ($f in $plan.files) {
+      $target = Join-Path $a.folder $f
+      $bytes = [IO.File]::ReadAllBytes((Join-Path $dir $f))
+      if ($f -eq '.env' -or -not (Test-Path -LiteralPath $target)) { [IO.File]::WriteAllText($target, ''); if ($f -eq '.env') { Set-SecretFileAcl $target } }
+      [IO.File]::WriteAllBytes($target, $bytes)
+    }
+    # The Compose file set of the backup becomes the app's set again; files only the current set had are kept on disk
+    # but no longer used (they stay visible in the folder).
+    $names = @($plan.files | Where-Object { $_ -match '^compose(\.[a-z0-9-]+)?\.yaml$' })
+    $records = @(Read-AppsRegistry $settings)
+    foreach ($rec in @($records | Where-Object { $_.project -eq $a.project })) {
+      if ($names.Count) { $rec | Add-Member -NotePropertyName composeFiles -NotePropertyValue @($names | Sort-Object { if ($_ -eq 'compose.yaml') { 0 } else { 1 } }, { $_ }) -Force }
+      $rec | Add-Member -NotePropertyName composeSha256 -NotePropertyValue (Get-AppComposeFingerprint $rec) -Force
+    }
+    Save-AppsRegistry $settings $records
+    $a = Find-InstalledApp $plan.project
+    & $step 'Restore the Compose files and .env' 'Done' ($plan.files -join ', ')
+  }
+  foreach ($f in $plan.folders) {
+    $src = Join-Path $dir (([string]$f) -replace '/', '_')
+    $dst = Join-Path $a.folder (([string]$f) -replace '/', '\')
+    New-Item -ItemType Directory -Force -Path $dst | Out-Null
+    Copy-Item -Path (Join-Path $src '*') -Destination $dst -Recurse -Force
+    & $step "Restore folder $f" 'Done' ''
+  }
+  $up = Invoke-Docker @((Get-AppComposeArgs $a) + @('up', '-d'))
+  & $step 'Start the app (docker compose up -d)' $(if ($up.ExitCode -eq 0) { 'Done' } else { 'Failed' }) ((Hide-SecretValues @(ConvertTo-RedactedText @($up.Output | Select-Object -Last 4)) @((Read-AppEnv (Join-Path $a.folder '.env')).Values)) -join ' ')
+  $health = $null; if ($up.ExitCode -eq 0) { $health = Get-AppHealth $a.project $m $settings 60 }
+  Write-Audit 'app-restore' "$($a.project) backup=$($plan.backup) files=$($plan.files.Count) volumes=$(@($plan.volumes).Count) safety=$(Split-Path -Leaf $safety.folder)"
+  return [ordered]@{ ok = ($ok -and $up.ExitCode -eq 0); project = $a.project; backup = $plan.backup; safetyBackup = (Split-Path -Leaf $safety.folder); steps = $steps.ToArray(); health = $health }
+}
+
+# An installation interrupted before all its files were written (installState 'writing'): what is there, and
+# discarding it (its containers if any, the files the manager generates, the folder when empty, and the record).
+# Data volumes are kept unless the project name is typed; folders you chose are never touched.
+function Invoke-AppDiscardInterrupted($Body) {
+  Assert-Installed
+  Assert-Confirmed $Body
+  $settings = Get-Settings
+  $project = [string](Get-Field $Body 'project' '')
+  $rec = @(Read-AppsRegistry $settings | Where-Object { $_.project -eq $project })
+  if (-not $rec.Count) { Stop-Request 404 "No app '$project' is registered in this manager." }
+  $rec = $rec[0]
+  if ([string](Get-Prop2 $rec 'installState' '') -ne 'writing') { Stop-Request 409 "'$project' is not an interrupted installation." }
+  $removed = @()
+  if (@(Get-ComposeProjectContainers $project).Count -and @(Get-AppComposeFiles $rec | Where-Object { Test-Path -LiteralPath $_ }).Count) {
+    $null = Invoke-Docker @((Get-AppComposeArgs $rec) + @('down'))
+    $removed += 'containers'
+  }
+  if ($rec.folder -and (Test-Path -LiteralPath $rec.folder)) {
+    foreach ($f in @(Get-ChildItem -LiteralPath $rec.folder -Force -File)) { if (Test-GeneratedAppFile $f.Name) { $f.IsReadOnly = $false; Remove-Item -LiteralPath $f.FullName -Force; $removed += $f.Name } }
+    if (-not @(Get-ChildItem -LiteralPath $rec.folder -Recurse -Force -File).Count) { Remove-Item -LiteralPath $rec.folder -Recurse -Force; $removed += 'folder' }
+  }
+  Save-AppsRegistry $settings @(Read-AppsRegistry $settings | Where-Object { $_.project -ne $project })
+  Write-Audit 'app-discard-interrupted' "$project removed=$($removed -join ',')"
+  return [ordered]@{ ok = $true; project = $project; removed = $removed; folderKept = [bool]($rec.folder -and (Test-Path -LiteralPath $rec.folder)) }
+}
+
+# Pure: the blocks of a generated Traefik file, split into routers, services and middlewares (each with its YAML), so
+# one app's routing can be inspected piece by piece.
+function Split-TraefikRouteYaml([string]$Text) {
+  $out = [ordered]@{ routers = @(); services = @(); middlewares = @() }
+  $section = ''; $cur = $null; $items = @{ routers = New-Object System.Collections.ArrayList; services = New-Object System.Collections.ArrayList; middlewares = New-Object System.Collections.ArrayList }
+  foreach ($line in ($Text -split "`r?`n")) {
+    if ($line -match '^  (routers|services|middlewares):\s*$') { $section = $Matches[1]; $cur = $null; continue }
+    if ($line -match '^\S') { $section = ''; $cur = $null; continue }
+    if (-not $section) { continue }
+    if ($line -match '^    ([A-Za-z0-9@_.-]+):\s*$') { $cur = [ordered]@{ name = $Matches[1]; lines = New-Object System.Collections.ArrayList }; $null = $items[$section].Add($cur); $null = $cur.lines.Add($line.Substring(4)); continue }
+    if ($cur -and $line -match '^      ') { $null = $cur.lines.Add($line.Substring(4)) }
+  }
+  foreach ($k in @('routers', 'services', 'middlewares')) {
+    $out[$k] = @(foreach ($it in $items[$k]) {
+        $o = [ordered]@{ name = $it.name; yaml = (@($it.lines) -join "`n") }
+        $rule = @($it.lines | Where-Object { $_ -match '^\s+rule:\s*' } | ForEach-Object { ($_ -replace '^\s+rule:\s*', '').Trim("'") })[0]
+        if ($rule) { $o.rule = $rule }
+        $url = @($it.lines | Where-Object { $_ -match '^\s+- url:\s*' } | ForEach-Object { ($_ -replace '^\s+- url:\s*', '').Trim("'") })
+        if ($url.Count) { $o.urls = $url }
+        $o
+      })
+  }
+  return $out
+}
+
+# Stack description of an installation without dtc-stack.json (installed by an earlier version, or adopted): read from
+# its own Compose files with `docker compose config --no-interpolate` (no .env values are read or returned).
+function Get-DerivedAppStack($App, $Manifest, $Settings) {
+  $r = Invoke-Docker @((Get-AppComposeArgs $App) + @('config', '--format', 'json', '--no-interpolate'))
+  if ($r.ExitCode -ne 0) { return $null }
+  try { $cfg = (@($r.Output) -join "`n") | ConvertFrom-Json } catch { return $null }
+  $svcs = @(foreach ($sp in @($cfg.services.PSObject.Properties)) {
+      $s = $sp.Value
+      $decl = $(if ($Manifest -and $Manifest.services.PSObject.Properties[$sp.Name]) { Get-ServiceDeclaredLifecycle $Manifest.services.PSObject.Properties[$sp.Name].Value } else { [ordered]@{ role = ''; lifecycle = '' } })
+      $nets = @(); $n = Get-Prop2 $s 'networks' $null; if ($n) { $nets = @($n.PSObject.Properties | ForEach-Object { $k = $_.Name; $def = Get-Prop2 $cfg.networks $k $null; $nm = [string](Get-Prop2 $def 'name' ''); if ($nm) { $nm } else { "$($App.project)_$k" } }) }
+      [ordered]@{ name = $sp.Name; container = [string](Get-Prop2 $s 'container_name' "$($App.project)-$($sp.Name)-1"); role = $decl.role; lifecycle = $decl.lifecycle; image = [string](Get-Prop2 $s 'image' '')
+        networks = $nets; volumes = @(@(Get-Prop2 $s 'volumes' @()) | ForEach-Object { [ordered]@{ type = [string]$_.type; name = $(if ($_.type -eq 'volume') { $vd = Get-Prop2 $cfg.volumes ([string]$_.source) $null; $vn = [string](Get-Prop2 $vd 'name' ''); if ($vn) { $vn } else { "$($App.project)_$($_.source)" } } else { '' }); source = $(if ($_.type -eq 'bind') { [string]$_.source } else { '' }); target = [string]$_.target } })
+        ports = @(@(Get-Prop2 $s 'ports' @()) | ForEach-Object { [ordered]@{ container = [int]$_.target; published = $(if ($_.PSObject.Properties['published'] -and $_.published) { "$(Get-Prop2 $_ 'host_ip' '0.0.0.0'):$($_.published)" } else { '' }) } })
+        dependsOn = @($(if ($s.PSObject.Properties['depends_on'] -and $s.depends_on) { $s.depends_on.PSObject.Properties | ForEach-Object { [ordered]@{ service = $_.Name; condition = [string](Get-Prop2 $_.Value 'condition' 'service_started') } } }))
+        healthcheck = [bool]($s.PSObject.Properties['healthcheck'] -and $s.healthcheck); environment = @($(if ($s.PSObject.Properties['environment'] -and $s.environment) { $s.environment.PSObject.Properties | ForEach-Object { $_.Name } })) }
+    })
+  return [ordered]@{ schema = 1; kind = 'dtc-stack'; derived = $true; project = $App.project; origin = [string](Get-Prop2 $App 'origin' 'installed')
+    application = [ordered]@{ id = [string]$App.appId; name = [string]$App.name; publisher = [string](Get-Prop2 $Manifest 'maintainer' ''); source = [string](Get-Prop2 (Get-Prop2 $Manifest 'source' $null) 'url' '') }
+    composeFiles = @(Get-AppComposeFileNames $App | ForEach-Object { [ordered]@{ file = $_; component = $(if ($_ -eq 'compose.yaml') { 'app' } else { ($_ -replace '^compose\.|\.yaml$', '') }); services = @() } })
+    services = $svcs; startOrder = @(Get-StackStartOrder $svcs)
+    dependencies = @($svcs | Where-Object { $_.role -in 'database', 'cache', 'messaging', 'support' } | ForEach-Object { [ordered]@{ service = $_.name; role = $_.role; image = $_.image } })
+    networks = [ordered]@{ shared = @(@($svcs | ForEach-Object { $_.networks }) | Where-Object { $_ -eq $Settings.ProxyNetwork } | Select-Object -Unique); private = @(@($svcs | ForEach-Object { $_.networks }) | Where-Object { $_ -ne $Settings.ProxyNetwork } | Select-Object -Unique) }
+    routing = [ordered]@{ owner = 'deployment-manager'; provider = 'traefik-file'; dockerLabels = $false }
+    authentication = $(if ($Manifest) { Get-Prop2 $Manifest 'authentication' $null } else { $null }) }
+}
+
+# One app's stack, routing and diagnostics: its Compose files (no .env values), the stack description, every route
+# that points at it split into routers / services / middlewares, whether the file provider actually loads those files
+# and Traefik serves them, its health, and findings with what to do about them. Read-only.
+function Get-AppStackData([string]$Project) {
+  Assert-Installed
+  $settings = Get-Settings
+  $a = Find-InstalledApp $Project
+  $m = $null; try { $m = Get-InstanceManifest $a } catch { }
+  $findings = New-Object System.Collections.ArrayList
+  $find = { param($level, $message, $fix) $null = $findings.Add([ordered]@{ level = $level; message = $message; fix = $fix }) }
+  $files = @(foreach ($f in (Get-AppComposeFiles $a)) {
+      $exists = Test-Path -LiteralPath $f
+      if (-not $exists) { & $find 'error' "$(Split-Path -Leaf $f) is missing from $($a.folder)." 'Restore it from a backup (Back up / Restore), or remove and reinstall the app.' }
+      [ordered]@{ file = (Split-Path -Leaf $f); exists = $exists; content = $(if ($exists) { [IO.File]::ReadAllText($f) } else { '' }) }
+    })
+  $stackPath = Join-Path $a.folder 'dtc-stack.json'
+  $stack = $null; $source = 'none'
+  if (Test-Path -LiteralPath $stackPath) { try { $stack = [IO.File]::ReadAllText($stackPath) | ConvertFrom-Json; $source = 'file' } catch { & $find 'warning' 'dtc-stack.json is not valid JSON.' 'Write it again with "Describe this stack".' } }
+  if (-not $stack) { $stack = Get-DerivedAppStack $a $m $settings; if ($stack) { $source = 'derived' } }
+  $fp = Get-AppComposeFingerprint $a
+  $changed = $(if ($a.PSObject.Properties['composeSha256'] -and $a.composeSha256 -and $fp) { $fp -ne $a.composeSha256 } else { $null })
+  if ($changed) { & $find 'warning' 'The Compose files were changed outside the manager since they were written here.' 'Review the change; updates keep it but change image lines only.' }
+  # Routes: explicit file-provider definitions in traefik\dynamic (the directory Traefik loads; it does not look into
+  # sub-folders), and whether Traefik serves their routers.
+  $dynDir = Join-Path $settings.InstallPath 'traefik\dynamic'
+  $catalog = @(Get-CatalogApps -CatalogDir $CatalogDir | Where-Object { -not @($_.errors).Count })
+  $inst = @(Get-InstalledInstances $settings $catalog @(Get-ComposeContainerFacts) | Where-Object { $_.project -eq $a.project })[0]
+  $routers = $null; try { $routers = Get-TraefikApi $settings '/api/http/routers' } catch { }
+  $routes = @(foreach ($rt in @($inst.routes)) {
+      $fileName = Get-ServiceFileName $rt.name
+      $path = Join-Path $dynDir $fileName
+      $exists = Test-Path -LiteralPath $path
+      $parts = $(if ($exists) { Split-TraefikRouteYaml ([IO.File]::ReadAllText($path)) } else { [ordered]@{ routers = @(); services = @(); middlewares = @() } })
+      $served = @(foreach ($r in $parts.routers) { $live = $(if ($null -ne $routers) { @($routers | Where-Object { $_.name -eq "$($r.name)@file" })[0] } else { $null }); [ordered]@{ router = $r.name; served = [bool]$live; status = $(if ($live) { [string](Get-Prop2 $live 'status' '') } elseif ($null -eq $routers) { 'unknown' } else { 'missing' }) } })
+      if (-not $exists) { & $find 'error' "Route '$($rt.name)': $fileName is missing from traefik\dynamic." 'Apply the service plan again on the Services page (it regenerates the file).' }
+      elseif ($null -ne $routers -and @($served | Where-Object { -not $_.served }).Count) { & $find 'error' "Route '$($rt.name)': Traefik does not serve $(@($served | Where-Object { -not $_.served } | ForEach-Object { $_.router }) -join ', ')." 'Open the Traefik dashboard for configuration errors; the Services page validates and re-applies the route.' }
+      [ordered]@{ name = $rt.name; hostnames = @($rt.hostnames); publish = $rt.publish; authProvider = $rt.authProvider; file = "traefik\dynamic\$fileName"; exists = $exists
+        loadedByFileProvider = [bool]($exists -and $fileName -match '\.ya?ml$'); routers = $parts.routers; services = $parts.services; middlewares = $parts.middlewares; traefik = $served }
+    })
+  $health = $null
+  if ($m) { try { $health = Get-AppHealth $a.project $m $settings 0 } catch { } }
+  $lc = $inst.lifecycle
+  if ($a.PSObject.Properties['prepared'] -and $a.prepared -and -not @(Get-ComposeProjectContainers $a.project).Count) { & $find 'info' 'Prepared, not started: nothing has been downloaded or started yet.' 'Press Start when there is enough memory; it checks again first.' }
+  elseif ($health -and -not $health.running) { & $find 'error' "The web service $($health.web) is not running." 'Start or restart the app; read its logs (Logs) for the reason.' }
+  elseif ($health -and $health.http -and $health.http.result -notin 'http', 'https', 'not-applicable') { & $find 'warning' "The web interface did not answer on the shared network: $($health.http.detail)" 'Wait for the first start to finish (some apps migrate their database first), then check the logs.' }
+  foreach ($s in @(Get-Prop2 $lc 'services' @())) {
+    $st = [string](Get-Prop2 (Get-Prop2 $s 'status' $null) 'key' '')
+    if ($st -in 'job-failed', 'stopped-unexpectedly', 'unhealthy', 'restarting') { & $find 'error' "$($s.name): $([string](Get-Prop2 $s.status 'label' $st))." "Read the logs of $($s.name) (Logs, choose the service)." }
+  }
+  # A database, cache or broker attached to the shared proxy network is reachable by every other app on it.
+  $facts = @(Get-ComposeContainerFacts | Where-Object { $_.project -eq $a.project })
+  foreach ($c in $facts) {
+    $role = $(if ($m -and $m.services.PSObject.Properties[[string]$c.service]) { [string](Get-Prop2 $m.services.PSObject.Properties[[string]$c.service].Value 'role' '') } else { '' })
+    if ($role -in 'database', 'cache', 'messaging' -and @($c.networks | Where-Object { $_.name -eq $settings.ProxyNetwork }).Count) { & $find 'warning' "$($c.name) ($role) is on the shared proxy network '$($settings.ProxyNetwork)'." 'Only web front ends belong there; recreate the app with its generated Compose files.' }
+  }
+  if (-not $findings.Count) { & $find 'ok' 'No problems found.' '' }
+  return [ordered]@{ project = $a.project; name = $a.name; folder = $a.folder; composeFiles = $files; stack = $stack; stackSource = $source; composeChanged = $changed
+    env = [ordered]@{ file = '.env'; variables = @((Read-AppEnv (Join-Path $a.folder '.env')).Keys); note = 'Names only; values are never shown here.' }
+    routing = [ordered]@{ directory = 'traefik\dynamic'; recursive = $false; dockerProvider = 'not used for apps (no traefik.* labels are generated)'; routes = $routes; traefikReachable = ($null -ne $routers) }
+    health = $health; lifecycle = $lc; findings = $findings.ToArray(); backups = @(Get-AppBackupList $a | Select-Object -First 10); checkedAt = (Get-Date -Format 's') }
+}
+
+# Writes dtc-stack.json for an installation that has none (installed by an earlier version, or adopted), derived from
+# its own Compose files. Nothing else in the folder changes: existing installations are described, never moved.
+function Invoke-AppStackDescribe($Body) {
+  Assert-Installed
+  Assert-Confirmed $Body
+  $settings = Get-Settings
+  $a = Find-InstalledApp ([string](Get-Field $Body 'project' ''))
+  $p = Join-Path $a.folder 'dtc-stack.json'
+  if (Test-Path -LiteralPath $p) { Stop-Request 409 "$($a.project) already has dtc-stack.json." }
+  $m = $null; try { $m = Get-InstanceManifest $a } catch { }
+  $stack = Get-DerivedAppStack $a $m $settings
+  if (-not $stack) { Stop-Request 409 'docker compose could not read the project; nothing was written.' }
+  $stack.generatedAt = (Get-Date -Format 's')
+  [IO.File]::WriteAllText($p, (($stack | ConvertTo-Json -Depth 12) + "`n"), (New-Object Text.UTF8Encoding($false)))
+  $records = @(Read-AppsRegistry $settings)
+  foreach ($rec in @($records | Where-Object { $_.project -eq $a.project })) { $rec | Add-Member -NotePropertyName stackFile -NotePropertyValue 'dtc-stack.json' -Force }
+  Save-AppsRegistry $settings $records
+  Write-Audit 'app-stack-describe' "$($a.project) (dtc-stack.json written; nothing else changed)"
+  return [ordered]@{ ok = $true; project = $a.project; file = $p; unchanged = @('Compose files', '.env', 'containers', 'volumes', 'networks', 'routes') }
 }
 
 # --- Docker discovery and publishing ----------------------------------------------------------------------
@@ -3833,11 +4226,13 @@ function Get-ProvisionDraftView($Draft) {
     })
   $inputs = @(@(Get-Prop2 $m 'inputs' @()) | ForEach-Object { [ordered]@{ id = [string]$_.id; type = [string]$_.type; label = [string](Get-Prop2 $_ 'label' $_.id); required = [bool](Get-Prop2 $_ 'required' $false); default = $(if ([string]$_.type -in 'text', 'timezone', 'boolean') { [string](Get-Prop2 $_ 'default' '') } else { '' }) } })
   $aiRuns = @(@(Get-Prop2 $Draft 'ai' @()))
+  # Import notes exist only on imported drafts; a curated catalog manifest has none.
+  $importNotes = Get-Prop2 $m 'draft' $null
   $blocked = @($findings | Where-Object { $_.severity -eq 'block' }).Count -or $errors.Count -or $compat.status -eq 'incompatible' -or -not [bool](Get-Prop2 $m 'installable' $false)
   return [ordered]@{ draftId = $Draft.draftId; createdAt = $Draft.createdAt; url = $Draft.url; kind = $Draft.kind; id = [string]$m.id; name = [string]$m.name; description = [string]$m.description
     license = [string]$m.license; maintainer = [string]$m.maintainer; source = $m.source; docs = @($m.docs); architectures = @(Get-Prop2 $m 'architectures' @())
     services = $svcs; web = (Get-Prop2 $m 'web' $null); inputs = $inputs; privileges = @(Get-Prop2 $m 'privileges' @())
-    unresolved = @(Get-Prop2 $m.draft 'unresolved' @()); unsupported = @(Get-Prop2 $m.draft 'unsupported' @()); evidence = @(Get-Prop2 $m.draft 'evidence' @()); assumptions = @(Get-Prop2 $m.draft 'assumptions' @())
+    unresolved = @(Get-Prop2 $importNotes 'unresolved' @()); unsupported = @(Get-Prop2 $importNotes 'unsupported' @()); evidence = @(Get-Prop2 $importNotes 'evidence' @()); assumptions = @(Get-Prop2 $importNotes 'assumptions' @())
     knownIssues = @(Get-Prop2 $m 'knownIssues' @()); verification = (Get-Prop2 $m 'verification' $null); findings = $findings; compatibility = $compat; manifestErrors = $errors
     protection = (Get-ProtectionCompatibility $m); catalogMatch = (Get-Prop2 $Draft 'catalogMatch' $null)
     ai = [ordered]@{ runs = $aiRuns.Count; usd = [Math]::Round((@($aiRuns | ForEach-Object { [double](Get-Prop2 (Get-Prop2 $_ 'usage' $null) 'usd' 0) }) | Measure-Object -Sum).Sum, 5) }
@@ -3848,7 +4243,7 @@ function Get-ProvisionData {
   Assert-Installed
   $settings = Get-Settings
   $drafts = @(Get-ChildItem -LiteralPath (Get-ProvisionDir 'drafts') -Filter '*.json' -File | Sort-Object LastWriteTime -Descending | Select-Object -First 50 | ForEach-Object {
-      try { $d = [IO.File]::ReadAllText($_.FullName) | ConvertFrom-Json; [ordered]@{ draftId = $d.draftId; name = [string]$d.manifest.name; kind = $d.kind; url = $d.url; createdAt = $d.createdAt; unresolved = @(Get-Prop2 $d.manifest.draft 'unresolved' @()).Count } } catch { }
+      try { $d = [IO.File]::ReadAllText($_.FullName) | ConvertFrom-Json; [ordered]@{ draftId = $d.draftId; name = [string]$d.manifest.name; kind = $d.kind; url = $d.url; createdAt = $d.createdAt; unresolved = @(Get-Prop2 (Get-Prop2 $d.manifest 'draft' $null) 'unresolved' @()).Count } } catch { }
     })
   $ops = @(Get-ChildItem -LiteralPath (Get-ProvisionDir 'operations') -Filter '*.json' -File | Sort-Object LastWriteTime -Descending | Select-Object -First 20 | ForEach-Object {
       try { $j = [IO.File]::ReadAllText($_.FullName) | ConvertFrom-Json; [ordered]@{ operationId = $j.operationId; summary = $j.summary; state = $j.state; startedAt = $j.startedAt } } catch { }
@@ -3874,6 +4269,21 @@ function Invoke-ProvisionImport($Body) {
   $saved = ($draft | ConvertTo-Json -Depth 30) | ConvertFrom-Json
   Save-ProvisionDraft $saved
   Write-Audit 'provision-import' "$($r.Kind) $($r.Manifest.id) draft=$($draft.draftId)"
+  return (Get-ProvisionDraftView $saved)
+}
+
+# A curated catalog application as a New app draft: the same review, plan, apply (install -> backend check -> route ->
+# authentik -> publish -> verify), journal and rollback as imported applications, with the catalog's own manifest.
+function Invoke-ProvisionCatalogDraft($Body) {
+  Assert-Installed
+  $appId = [string](Get-Field $Body 'appId' '')
+  try { $m = Get-CatalogApp -CatalogDir $CatalogDir -Id $appId } catch { Stop-Request 404 $_.Exception.Message }
+  if ((Get-ManifestAvailability $m) -ne 'offered' -or -not [bool](Get-Prop2 $m 'installable' $false)) { Stop-Request 409 "$($m.name) is not offered for installation." }
+  if ([bool](Get-Prop2 $m.web 'headless' $false) -or -not [bool](Get-Prop2 $m.web 'proxy' $true)) { Stop-Request 409 "$($m.name) is never routed or published (no web interface on the shared network): install it from the App Catalog." }
+  $draft = [ordered]@{ version = 1; draftId = (New-SecretValue 8); createdAt = (Get-Date -Format 's'); url = [string](Get-Prop2 $m.source 'url' ''); kind = 'catalog'; catalogId = [string]$m.id; catalogMatch = $null; manifest = $m; ai = @() }
+  $saved = ($draft | ConvertTo-Json -Depth 30) | ConvertFrom-Json
+  Save-ProvisionDraft $saved
+  Write-Audit 'provision-catalog' "$($m.id) draft=$($draft.draftId)"
   return (Get-ProvisionDraftView $saved)
 }
 
@@ -3916,7 +4326,7 @@ function Invoke-ProvisionAiEstimate($Body) {
   $cfg = Read-AiConfig $settings
   if ($cfg.provider -eq 'none') { Stop-Request 409 'AI assistance is off. Turn it on with your own API key, or answer the open questions yourself.' }
   $d = Read-ProvisionDraft ([string](Get-Field $Body 'draftId' ''))
-  if (-not @(Get-Prop2 $d.manifest.draft 'unresolved' @()).Count) { Stop-Request 409 'This draft has no open questions; AI is not needed.' }
+  if (-not @(Get-Prop2 (Get-Prop2 $d.manifest 'draft' $null) 'unresolved' @()).Count) { Stop-Request 409 'This draft has no open questions; AI is not needed.' }
   $req = New-AiPlanningRequest -Manifest $d.manifest -Documentation (Get-ProvisionDocumentation $d.manifest) -PrivateNames (Get-ProvisionPrivateNames $settings) -MaxChars $cfg.maxContextChars
   $escalate = [bool](Get-Field $Body 'escalate' $false)
   if ($escalate -and -not $cfg.allowEscalation) { Stop-Request 400 'Escalation to the larger model is not allowed in your AI settings.' }
@@ -4072,7 +4482,11 @@ function Invoke-ProvisionPlan($Body) {
   $draftId = [string](Get-Field $Body 'draftId' ''); $appId = [string](Get-Field $Body 'appId' '')
   $imported = [bool]$draftId
   $d = $null
-  if ($imported) { $d = Read-ProvisionDraft $draftId; $m = $d.manifest }
+  if ($imported) {
+    $d = Read-ProvisionDraft $draftId; $m = $d.manifest
+    # A catalog draft installs the curated manifest itself (not an imported copy).
+    if ([string](Get-Prop2 $d 'catalogId' '')) { $imported = $false; try { $m = Get-CatalogApp -CatalogDir $CatalogDir -Id ([string]$d.catalogId) } catch { Stop-Request 404 $_.Exception.Message } }
+  }
   elseif ($appId) { try { $m = Get-CatalogApp -CatalogDir $CatalogDir -Id $appId } catch { Stop-Request 404 $_.Exception.Message } }
   else { Stop-Request 400 'Choose an imported draft or a catalog application.' }
   $access = [string](Get-Field $Body 'access' 'local')
@@ -4244,8 +4658,7 @@ function Get-ProvisionVerification($Journal) {
   $plan = $Journal.plan
   $rec = @(Read-AppsRegistry $settings | Where-Object { $_.project -eq $plan.project })[0]
   if (-not $rec) { & $add 'containers' 'failed' 'The application is no longer registered.'; return @($out) }
-  $compose = Get-AppComposePath $rec
-  $cfgCheck = Invoke-Docker compose --project-directory $rec.folder -f $compose config -q
+  $cfgCheck = Invoke-Docker @((Get-AppComposeArgs $rec) + @('config', '-q'))
   & $add 'compose' $(if ($cfgCheck.ExitCode -eq 0) { 'passed' } else { 'failed' }) 'docker compose config'
   $imgs = @($rec.images); $missingImg = @($imgs | Where-Object { (Invoke-Docker image inspect $_).ExitCode -ne 0 })
   & $add 'images' $(if ($missingImg.Count) { 'failed' } else { 'passed' }) $(if ($missingImg.Count) { "missing: $($missingImg -join ', ')" } else { "$($imgs.Count) image(s) present, pinned by digest" })
@@ -4470,6 +4883,12 @@ function Invoke-ApiRoute($Request, $Body) {
     'POST /api/apps/update/apply' { return Invoke-AppUpdateApply $Body }
     'POST /api/apps/remove' { return Invoke-AppRemove $Body }
     'POST /api/apps/backup' { return Invoke-AppBackup $Body }
+    'GET /api/apps/backups' { return Get-AppBackupsData ([string]$Request.Query['project']) }
+    'POST /api/apps/restore-data/plan' { return Get-AppRestorePlan $Body }
+    'POST /api/apps/restore-data' { return Invoke-AppRestore $Body }
+    'POST /api/apps/discard' { return Invoke-AppDiscardInterrupted $Body }
+    'GET /api/apps/stack' { return Get-AppStackData ([string]$Request.Query['project']) }
+    'POST /api/apps/stack/describe' { return Invoke-AppStackDescribe $Body }
     'GET /api/system/resources' { return Get-HostResources }
     'GET /api/identity' { Assert-Installed; return Get-IdentityData -Deep:([string]$Request.Query['deep'] -eq '1') -ProbeApps:([string]$Request.Query['probe'] -eq 'apps') }
     'GET /api/routing' { return Get-RoutingView $Request.Query }
@@ -4504,6 +4923,7 @@ function Invoke-ApiRoute($Request, $Body) {
     'POST /api/identity/unprotect/apply' { return Invoke-IdentityProtectApply $Body -Remove }
     'GET /api/provision' { return Get-ProvisionData }
     'POST /api/provision/import' { return Invoke-ProvisionImport $Body }
+    'POST /api/provision/catalog' { return Invoke-ProvisionCatalogDraft $Body }
     'GET /api/provision/draft' { Assert-Installed; return Get-ProvisionDraftView (Read-ProvisionDraft ([string]$Request.Query['id'])) }
     'POST /api/provision/draft/web' { return Invoke-ProvisionDraftEdit $Body }
     'POST /api/provision/draft/delete' { return Remove-ProvisionDraftRequest $Body }

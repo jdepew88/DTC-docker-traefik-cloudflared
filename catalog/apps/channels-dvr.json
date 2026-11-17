@@ -32,6 +32,11 @@
     "unraid": "untested",
     "podman": "untested"
   },
+  "architectures": [
+    "amd64",
+    "arm64",
+    "arm/v7"
+  ],
   "installable": true,
   "services": {
     "app": {
@@ -79,6 +84,21 @@
     "Docker Desktop has no host networking for Bonjour, no /dev/dri transcoding and no LAN broadcast: Channels apps must connect by IP address and HDHomeRun tuners must be added by IP. The native Windows server has none of these limits.",
     "The server updates itself inside its volume, so the image digest does not pin the server version.",
     "Requires a Channels DVR subscription."
+  ],
+  "authentication": {
+    "forwardAuth": "caution",
+    "native": [
+      "none"
+    ],
+    "notes": [
+      "Channels apps on TVs and phones talk to the server API directly; ForwardAuth or Cloudflare Access blocks them. Keep it local."
+    ]
+  },
+  "limitations": [
+    "Docker Desktop has no Bonjour/mDNS from the LAN: Channels apps must be pointed at the server by IP.",
+    "No /dev/dri: hardware transcoding is not available in Docker Desktop.",
+    "HDHomeRun tuners must be added by IP address.",
+    "Needs a Channels DVR subscription; the native Windows server is recommended."
   ],
   "update": {
     "strategy": "self-updating",

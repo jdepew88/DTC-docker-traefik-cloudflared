@@ -27,6 +27,12 @@
     "unraid": "untested",
     "podman": "untested"
   },
+  "architectures": [
+    "amd64",
+    "arm64",
+    "arm/v7",
+    "riscv64"
+  ],
   "installable": true,
   "services": {
     "app": {
@@ -92,6 +98,20 @@
   "security": [
     "Change the default administrator password on first sign-in (see Arcane's documentation).",
     "Never publish it without Cloudflare Access in front of its own login."
+  ],
+  "authentication": {
+    "forwardAuth": "compatible",
+    "native": [
+      "local",
+      "oidc"
+    ],
+    "notes": [
+      "Browser-only administration: ForwardAuth adds a second sign-in in front of its own.",
+      "Controls Docker: keep it local or behind authentication; never public without it."
+    ]
+  },
+  "limitations": [
+    "Needs the Docker socket (full control of Docker on this PC)."
   ],
   "update": {
     "strategy": "pinned-digest",

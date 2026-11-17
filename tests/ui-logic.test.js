@@ -521,5 +521,21 @@ test('launcher: default deployment, start notices and autostart text', () => {
   assert.strictEqual(L.autostartText({ enabled: true, allowedByWindows: true, pointsHere: true, windowless: true }).tone, 'ok');
 });
 
+test('app catalog: access, sign-in fit, host compatibility, findings and backups', () => {
+  assert.strictEqual(L.catalogAccessText({ access: { localUrl: 'http://127.0.0.1:3001/', hostnames: [] } }).text, 'This PC only');
+  assert.strictEqual(L.catalogAccessText({ prepared: true, access: {} }).text, 'Prepared, not started');
+  assert.strictEqual(L.catalogAccessText({ access: { hostnames: ['a.example.com'], public: true, protected: false } }).tone, 'warn', 'public without sign-in is flagged');
+  assert.match(L.catalogAccessText({ access: { hostnames: ['a.example.com'], public: true, protected: true } }).text, /sign-in required/);
+  assert.match(L.catalogAccessText({ access: { hostnames: ['a.lan'], public: false } }).text, /^Routed: a\.lan/);
+  assert.strictEqual(L.authFitText({ forwardAuth: 'caution' }).tone, 'warn');
+  assert.strictEqual(L.authFitText(null).text, 'Sign-in: not assessed');
+  assert.strictEqual(L.compatSummary([{ label: 'CPU architecture', state: 'ok', message: 'ok' }]).tone, 'ok');
+  assert.strictEqual(L.compatSummary([{ label: 'CPU architecture', state: 'ok' }, { label: 'GPU', state: 'warning', message: 'x' }]).text, 'Limited: GPU');
+  assert.strictEqual(L.compatSummary([{ label: 'CPU architecture', state: 'failed', message: 'arm only' }, { label: 'GPU', state: 'warning' }]).tone, 'err');
+  assert.deepStrictEqual(L.sortFindings([{ level: 'ok' }, { level: 'error' }, { level: 'warning' }]).map((f) => f.level), ['error', 'warning', 'ok']);
+  assert.strictEqual(L.findingTone('error'), 'err');
+  assert.strictEqual(L.backupTitle({ id: '20261116-201500', reason: 'before-update', volumes: [{ sizeMB: 1.5 }, { sizeMB: 2 }] }), '2026-11-16 20:15 · Before an update · 2 volumes (3.5 MB)');
+});
+
 console.log(`\n${passed} passed, ${failures.length} failed`);
 process.exit(failures.length ? 1 : 0);

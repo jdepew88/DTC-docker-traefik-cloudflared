@@ -23,6 +23,7 @@ $repo = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
 Import-Module (Join-Path $repo 'lib\TraefikProxy.psm1') -Force
 Import-Module (Join-Path $repo 'lib\AppCatalog.psm1') -Force
 Import-Module (Join-Path $repo 'tests\WebUiTestHelpers.psm1') -Force
+Import-Module (Join-Path $repo 'tests\TestResources.psm1') -Force
 Import-Module (Join-Path $repo 'tests\EdgeCdp.psm1') -Force
 $script:Results = New-Object System.Collections.ArrayList
 function Add-Result([string]$Status, [string]$Name, [string]$Detail) {
@@ -37,6 +38,7 @@ function Invoke-Ps([string]$Script, [string[]]$Arguments) {
   finally { $ErrorActionPreference = $previous }
   return [pscustomobject]@{ ExitCode = $code; Text = (@($out) -join "`n") }
 }
+function Get-ComposeProjectNames([string]$Project) { return @((Invoke-Docker ps --filter "label=com.docker.compose.project=$Project" --format '{{.Names}}').Output | Where-Object { $_ }) }
 function Get-EngineSnapshot([string]$ExcludePrefix) {
   $map = @{}
   foreach ($line in (Invoke-Docker ps -a --format '{{.Names}}').Output) {
@@ -56,17 +58,17 @@ $bad = @($apps | Where-Object { @($_.errors).Count } | ForEach-Object { "$($_.id
 Test-Condition 'catalog: every shipped manifest is valid (pinned digests, licence, https docs, one primary port)' ($bad.Count -eq 0) ($bad -join ' | ')
 $inst = @($apps | Where-Object { $_.manifest.installable })
 $listed = @($apps | Where-Object { -not $_.manifest.installable } | ForEach-Object { $_.id } | Sort-Object)
-Test-Condition 'catalog: unmaintained, beta or dependency-only entries are listed but not installable' ((($listed) -join ',') -eq 'diun,openldap,postgresql,redis,watchtower' -and $inst.Count -eq 16) ($listed -join ',')
+Test-Condition 'catalog: unmaintained, beta or dependency-only entries are listed but not installable' ((($listed) -join ',') -eq 'openldap,postgresql,redis,watchtower' -and $inst.Count -eq 17) ($listed -join ',')
 Test-Condition 'catalog: Watchtower is marked deprecated with a reason and alternatives' ((Get-CatalogApps -CatalogDir $catalogDir | Where-Object { $_.id -eq 'watchtower' }).manifest.deprecated -and @((Get-CatalogApps -CatalogDir $catalogDir | Where-Object { $_.id -eq 'watchtower' }).manifest.alternatives) -contains 'whats-up-docker') ''
 Test-Condition 'catalog: authentik has no Redis service and its own PostgreSQL' (-not @((Get-CatalogApp $catalogDir 'authentik').services.PSObject.Properties | Where-Object { $_.Value.image -match 'redis|valkey' }).Count -and (Get-CatalogApp $catalogDir 'authentik').services.postgresql.stateful) ''
 Test-Condition 'catalog: Immich uses its own vector-enabled database image named immich-db, in a Docker volume' ((Get-CatalogApp $catalogDir 'immich').services.'immich-db'.image -match '^ghcr\.io/immich-app/postgres:.*vectorchord' -and @((Get-CatalogApp $catalogDir 'immich').services.'immich-db'.volumes)[0].kind -eq 'volume') ''
 Test-Condition 'catalog: Rocket.Chat uses MongoDB (replica set), not Redis' ((Get-CatalogApp $catalogDir 'rocketchat').services.mongodb.image -match 'mongodb-community-server' -and (Get-CatalogApp $catalogDir 'rocketchat').services.rocketchat.environment.MONGO_URL -match 'replicaSet=rs0' -and -not @((Get-CatalogApp $catalogDir 'rocketchat').services.PSObject.Properties | Where-Object { $_.Value.image -match 'redis|valkey' }).Count) ''
 Test-Condition 'catalog: Traefik Manager gets no Docker socket and keeps its routes in its own folder' (-not (Get-CatalogApp $catalogDir 'traefik-manager').services.app.PSObject.Properties['dockerSocket'] -and (Get-CatalogApp $catalogDir 'traefik-manager').services.app.environment.CONFIG_DIR -eq '/app/config/routes' -and (Get-CatalogApp $catalogDir 'traefik-manager').web.localPort -eq 5000) ''
 $sock = @($inst | Where-Object { @($_.manifest.services.PSObject.Properties | Where-Object { $_.Value.PSObject.Properties['dockerSocket'] -and $_.Value.dockerSocket }).Count } | ForEach-Object { $_.id })
-Test-Condition 'catalog: only Portainer and Arcane mount the raw Docker socket and refuse public exposure; What''s Up Docker reads it through a read-only proxy' ((($sock | Sort-Object) -join ',') -eq 'arcane,portainer,whats-up-docker' -and -not @($inst | Where-Object { $_.id -in 'arcane', 'portainer' -and $_.manifest.exposure.allowPublic -ne $false }).Count -and (Get-CatalogApp $catalogDir 'whats-up-docker').services.'socket-proxy'.dockerSocketReadOnly -and -not (Get-CatalogApp $catalogDir 'whats-up-docker').services.app.PSObject.Properties['dockerSocket']) ($sock -join ',')
+Test-Condition 'catalog: only Portainer and Arcane mount the raw Docker socket and refuse public exposure; What''s Up Docker and Diun read it through a read-only proxy' ((($sock | Sort-Object) -join ',') -eq 'arcane,diun,portainer,whats-up-docker' -and (Get-CatalogApp $catalogDir 'diun').services.'socket-proxy'.dockerSocketReadOnly -and -not (Get-CatalogApp $catalogDir 'diun').services.app.PSObject.Properties['dockerSocket'] -and -not @($inst | Where-Object { $_.id -in 'arcane', 'portainer' -and $_.manifest.exposure.allowPublic -ne $false }).Count -and (Get-CatalogApp $catalogDir 'whats-up-docker').services.'socket-proxy'.dockerSocketReadOnly -and -not (Get-CatalogApp $catalogDir 'whats-up-docker').services.app.PSObject.Properties['dockerSocket']) ($sock -join ',')
 Test-Condition 'catalog: Jellyfin defaults to local only and warns about streaming through Cloudflare' ((Get-CatalogApp $catalogDir 'jellyfin').exposure.default -eq 'local' -and (Get-CatalogApp $catalogDir 'jellyfin').exposure.warning -match 'Cloudflare') ''
 
-$base = '{"schema":1,"id":"x","name":"X","description":"d","license":"MIT","maintainer":"m","category":"tools","docs":[{"title":"t","url":"https://e.example"}],"platforms":{"windows-docker-desktop":"supported"},"installable":true,"inputs":[],"services":{"app":{"image":"nginx:1.27@sha256:' + ('a' * 64) + '","ports":[{"container":80,"protocol":"http","primary":true}],"volumes":[],"environment":{}}},"privileges":[],"web":{"service":"app"},"exposure":{"default":"access"}}'
+$base = '{"schema":1,"id":"x","name":"X","description":"d","license":"MIT","maintainer":"m","category":"tools","docs":[{"title":"t","url":"https://e.example"}],"platforms":{"windows-docker-desktop":"supported"},"architectures":["amd64"],"authentication":{"forwardAuth":"compatible","native":[],"notes":[]},"update":{"strategy":"pinned-digest"},"installable":true,"inputs":[],"services":{"app":{"image":"nginx:1.27@sha256:' + ('a' * 64) + '","ports":[{"container":80,"protocol":"http","primary":true}],"volumes":[],"environment":{}}},"privileges":[],"web":{"service":"app"},"exposure":{"default":"access"}}'
 function New-Manifest([scriptblock]$Change) { $m = $base | ConvertFrom-Json; & $Change $m; return $m }
 Test-Condition 'manifest: a valid minimal manifest passes' (@(Test-AppManifest ($base | ConvertFrom-Json)).Count -eq 0) ((Test-AppManifest ($base | ConvertFrom-Json)) -join '; ')
 $e1 = Test-AppManifest (New-Manifest { param($m) $m.services.app.image = 'nginx:latest' })
@@ -120,6 +122,7 @@ if ((Get-DockerStatus).CliFound) {
   $tmpAll = Join-Path ([IO.Path]::GetTempPath()) ('tpm-cfgall-' + [Guid]::NewGuid().ToString('N').Substring(0, 6))
   $sampleFolder = (New-Item -ItemType Directory -Force -Path (Join-Path $tmpAll 'folder')).FullName
   $bad = @(); $secretsInCompose = @(); $n = 0; $sensitiveOnProxy = @(); $lldapCompose = ''
+  $setBad = @(); $setN = 0; $setSummary = @(); $routeBad = @(); $routeN = 0
   try {
     foreach ($a in $inst) {
       $m = $a.manifest; $inputs = @{}
@@ -140,9 +143,47 @@ if ((Get-DockerStatus).CliFound) {
       $vals = $r.Values.Clone(); $vals['installedApps'] = "- Apps: []`n"; $null = Get-AppFiles $m $vals
       $v = Invoke-Docker compose --project-directory $dir -f "$dir\compose.yaml" config -q
       if ($v.ExitCode -ne 0) { $bad += "$($m.id): $($v.Output -join ' ')" } else { $n++ }
+
+      # The modular form of the same project: one file per component, used together by plain `docker compose` through
+      # COMPOSE_FILE in .env. It must describe exactly the services of the single file; only the web front end joins the
+      # shared proxy network; no secret value appears in any Compose file or in dtc-stack.json; no Docker labels route.
+      $set = @(ConvertTo-AppComposeSet -Manifest $m -Project "t-$($m.id)" -Resolved $r -ProxyNetwork 'proxy-x' -LocalPort 19999)
+      $mdir = Join-Path $tmpAll "$($m.id)-set"; New-Item -ItemType Directory -Force -Path $mdir | Out-Null
+      foreach ($f in $set) { [IO.File]::WriteAllText((Join-Path $mdir $f.file), $f.content) }
+      $envSet = [ordered]@{}; foreach ($k in $envAll.Keys) { $envSet[$k] = $envAll[$k] }
+      $fe = Get-ComposeFileEnv @($set | ForEach-Object { $_.file }); foreach ($k in $fe.Keys) { $envSet[$k] = $fe[$k] }
+      [IO.File]::WriteAllText("$mdir\.env", (ConvertTo-EnvFileText $envSet))
+      Push-Location $mdir
+      try { $cj = Invoke-Docker compose config --format json } finally { Pop-Location }
+      if ($cj.ExitCode -ne 0) { $setBad += "$($m.id): plain docker compose with COMPOSE_FILE failed: $($cj.Output -join ' ')"; continue }
+      $cfg = ($cj.Output -join "`n") | ConvertFrom-Json
+      $single = @((Invoke-Docker compose --project-directory $dir -f "$dir\compose.yaml" config --services).Output | Where-Object { $_ } | Sort-Object)
+      $multi = @($cfg.services.PSObject.Properties | ForEach-Object { $_.Name } | Sort-Object)
+      if (($single -join ',') -ne ($multi -join ',')) { $setBad += "$($m.id): file set has services $($multi -join ',') but the single file $($single -join ',')" }
+      if ($cfg.name -ne "t-$($m.id)") { $setBad += "$($m.id): project name '$($cfg.name)' from the file set" }
+      if (@($set | Where-Object { $_.file -ne 'compose.yaml' -and $_.content -match '(?m)^name:' }).Count) { $setBad += "$($m.id): only compose.yaml may set name:" }
+      $proxyKeys = @($cfg.networks.PSObject.Properties | Where-Object { [string]$_.Value.name -eq 'proxy-x' } | ForEach-Object { $_.Name })
+      $onProxy = @($cfg.services.PSObject.Properties | Where-Object { $sv = $_.Value; $sv.PSObject.Properties['networks'] -and @($sv.networks.PSObject.Properties | Where-Object { $proxyKeys -contains $_.Name }).Count } | ForEach-Object { $_.Name })
+      $stackM = New-AppStackManifest -Manifest $m -Project "t-$($m.id)" -ComposeSet $set -Resolved $r -ProxyNetwork 'proxy-x' -LocalPort 19999
+      $front = [string]$stackM.frontend.service
+      $expectProxy = @(if ($stackM.frontend.proxyNetwork) { $front })
+      if (($onProxy -join ',') -ne ($expectProxy -join ',')) { $setBad += "$($m.id): on the shared network: $($onProxy -join ',') (expected only the front end '$($expectProxy -join ',')')" }
+      $stackJson = $stackM | ConvertTo-Json -Depth 12
+      foreach ($k in $r.Secrets) { $val = [string]$envAll[$k]; if ($val.Length -ge 6 -and ($stackJson.Contains($val) -or @($set | Where-Object { $_.content.Contains($val) }).Count)) { $setBad += "$($m.id): secret $k appears in a Compose file or dtc-stack.json" } }
+      if (@($set | Where-Object { $_.content -match 'traefik\.(enable|http\.)' }).Count) { $setBad += "$($m.id): Docker labels for Traefik in a Compose file" }
+      if (-not @($setBad | Where-Object { $_ -like "$($m.id):*" }).Count) { $setN++ }
+      $setSummary += "$($m.id)=$($set.Count)"
+      # The explicit Traefik route (file provider) for the front end: backend by Docker DNS name, never localhost.
+      if ($stackM.frontend.backendUrl) {
+        $routeYaml = ConvertTo-TraefikRouteYaml (ConvertTo-ServiceDefinition @{ name = "t-$($m.id)"; hostnames = @("$($m.id).example.test"); target = @{ type = 'docker'; host = $stackM.frontend.container; port = [int]$stackM.frontend.port; protocol = $stackM.frontend.scheme } })
+        if ($routeYaml -match [regex]::Escape("$($stackM.frontend.backendUrl)") -and $routeYaml -match [regex]::Escape("Host(``$($m.id).example.test``)") -and $routeYaml -notmatch '127\.0\.0\.1|localhost') { $routeN++ } else { $routeBad += "$($m.id): $($routeYaml -replace '\s+', ' ')" }
+      } elseif (-not ($stackM.frontend.headless -or -not [bool]$(if ($m.web.PSObject.Properties['proxy']) { $m.web.proxy } else { $true }))) { $routeBad += "$($m.id): no backend URL on the shared network" }
     }
   } finally { Remove-Item -LiteralPath $tmpAll -Recurse -Force -ErrorAction SilentlyContinue }
   Test-Condition "compose: all $($inst.Count) installable templates generate a valid project (docker compose config) with their files" ($bad.Count -eq 0 -and $n -eq $inst.Count) ($bad -join ' | ')
+  Write-Host "  modular file sets: $($setSummary -join ', ')"
+  Test-Condition "modular: all $($inst.Count) templates as file sets: plain docker compose (COMPOSE_FILE) sees the same services and project, only the front end on the shared network, no secret in any file or dtc-stack.json, no Traefik labels" ($setBad.Count -eq 0 -and $setN -eq $inst.Count) ($setBad -join ' | ')
+  Test-Condition "routing: every proxied front end gets an explicit file-provider route to its Docker DNS name ($routeN apps)" ($routeBad.Count -eq 0 -and $routeN -gt 10) ($routeBad -join ' | ')
   Test-Condition 'compose: no database, cache, broker, socket proxy or directory service joins the shared proxy network' ($sensitiveOnProxy.Count -eq 0) ($sensitiveOnProxy -join ' | ')
   Test-Condition 'compose: LLDAP (web.proxy false) has only a private network of its own and its web port on 127.0.0.1' ($lldapCompose -match 'networks: \[internal\]' -and $lldapCompose -notmatch 'proxy-x' -and $lldapCompose -match "127\.0\.0\.1:19999:17170" -and $lldapCompose -match '(?m)^  internal: \{\}') $lldapCompose
   Test-Condition 'compose: no template writes a secret into compose.yaml' ($secretsInCompose.Count -eq 0) ($secretsInCompose -join ', ')
@@ -163,6 +204,13 @@ elseif (-not (Get-DockerStatus).EngineRunning) { Add-Result 'SKIP' 'disposable i
 else {
   $id = [Guid]::NewGuid().ToString('N').Substring(0, 6)
   $stack = "tpx-ct-$id"; $network = "$stack-proxy"
+  # Earlier runs killed hard (out of memory, closed window) skip `finally`: remove what their dead owners left, then
+  # register this run's prefix so an interruption of this run is swept the same way (tests\Find-TestOrphans.ps1 lists them).
+  foreach ($orphanLine in (Invoke-TestOrphanSweep)) { Write-Host "  [orphans] $orphanLine" -ForegroundColor DarkYellow }
+  Register-TestRun -Prefix $stack -Suite 'Test-Catalog'
+  # The fixture app's id is unique per run: a container left behind by an interrupted earlier run (labelled with its
+  # app id) must not count as an existing installation of this run's app.
+  $notesId = "notes-$id"
   $work = Join-Path ([IO.Path]::GetTempPath()) $stack
   $installPath = Join-Path $work 'instance'
   $appsRoot = Join-Path $work 'apps'
@@ -176,25 +224,25 @@ else {
   $fixtureDir = Join-Path $work 'catalog'
   Copy-Item -LiteralPath (Join-Path $catalogDir 'apps\echo.json') -Destination (Join-Path $fixtureDir 'apps\echo.json')
   $traefikRef = ([regex]::Match([IO.File]::ReadAllText((Join-Path $repo 'compose.yaml')), 'image: (traefik:v[0-9.]+@sha256:[0-9a-f]{64})')).Groups[1].Value
-  $notes = [ordered]@{ schema = 1; id = 'notes'; name = 'Notes (test)'; description = 'Test app: serves an id stored in its data volume.'; license = 'MIT'; maintainer = 'tests'; category = 'tools'
-    docs = @([ordered]@{ title = 'tests'; url = 'https://example.invalid/' }); platforms = [ordered]@{ 'windows-docker-desktop' = 'supported' }; installable = $true
+  $notes = [ordered]@{ schema = 1; id = $notesId; name = 'Notes (test)'; description = 'Test app: serves an id stored in its data volume.'; license = 'MIT'; maintainer = 'tests'; category = 'tools'
+    docs = @([ordered]@{ title = 'tests'; url = 'https://example.invalid/' }); platforms = [ordered]@{ 'windows-docker-desktop' = 'supported' }; architectures = @('amd64', 'arm64'); authentication = [ordered]@{ forwardAuth = 'compatible'; native = @(); notes = @() }; installable = $true
     inputs = @([ordered]@{ id = 'token'; type = 'generated'; bytes = 24; label = 'Token' })
     services = [ordered]@{ app = [ordered]@{ image = $traefikRef; ports = @([ordered]@{ container = 8080; protocol = 'http'; primary = $true })
         volumes = @([ordered]@{ name = 'data'; target = '/data'; kind = 'volume'; description = 'ids' }); environment = [ordered]@{ NOTE_TOKEN = '{{input:token}}' }
         command = @('sh', '-c', 'echo starting with token $$NOTE_TOKEN; mkdir -p /data; [ -f /data/id ] || cat /proc/sys/kernel/random/uuid > /data/id; while true; do { printf ''HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\n\r\n''; cat /data/id; } | nc -l -p 8080; done') } }
     privileges = @(); security = @(); update = [ordered]@{ strategy = 'pinned-digest'; notes = 'test' }; web = [ordered]@{ service = 'app' }; exposure = [ordered]@{ default = 'local' } }
-  [IO.File]::WriteAllText((Join-Path $fixtureDir 'apps\notes.json'), ($notes | ConvertTo-Json -Depth 8))
+  [IO.File]::WriteAllText((Join-Path $fixtureDir "apps\$notesId.json"), ($notes | ConvertTo-Json -Depth 8))
   [IO.File]::WriteAllText((Join-Path $fixtureDir 'apps\broken.json'), '{"schema":1,"id":"broken","name":"Broken"}')
   # A two-service app: a web front end (shared network) and a stateful 'db' on a private network only, with a
   # sign-in password, generated configuration files, a post-install command and a dependency.
   $whoamiRef = (Get-Content -Raw (Join-Path $catalogDir 'apps\echo.json') | ConvertFrom-Json).services.app.image
   $stackApp = [ordered]@{ schema = 1; id = 'stack'; name = 'Stack (test)'; description = 'Test app with two services.'; license = 'MIT'; maintainer = 'tests'; category = 'tools'; group = 'D'
-    docs = @([ordered]@{ title = 'tests'; url = 'https://example.invalid/' }); platforms = [ordered]@{ 'windows-docker-desktop' = 'supported' }; installable = $true
+    docs = @([ordered]@{ title = 'tests'; url = 'https://example.invalid/' }); platforms = [ordered]@{ 'windows-docker-desktop' = 'supported' }; architectures = @('amd64', 'arm64'); authentication = [ordered]@{ forwardAuth = 'compatible'; native = @(); notes = @() }; installable = $true
     inputs = @([ordered]@{ id = 'adminPassword'; type = 'password'; label = 'Admin password' }, [ordered]@{ id = 'secret'; type = 'generated'; bytes = 16; label = 'Secret' })
     services = [ordered]@{
       web = [ordered]@{ image = $whoamiRef; ports = @([ordered]@{ container = 80; protocol = 'http'; primary = $true }); volumes = @([ordered]@{ name = 'cfg'; target = '/cfg'; kind = 'project'; source = 'config'; readOnly = $true })
         dependsOn = @([ordered]@{ service = 'db'; condition = 'service_started' }); resources = [ordered]@{ memoryMB = 20; diskMB = 10 } }
-      db = [ordered]@{ image = $traefikRef; stateful = $true; command = @('sh', '-c', 'mkdir -p /data; [ -f /data/id ] || cat /proc/sys/kernel/random/uuid > /data/id; exec sleep 1000000')
+      db = [ordered]@{ image = $traefikRef; role = 'database'; stateful = $true; command = @('sh', '-c', 'mkdir -p /data; [ -f /data/id ] || cat /proc/sys/kernel/random/uuid > /data/id; exec sleep 1000000')
         volumes = @([ordered]@{ name = 'dbdata'; target = '/data'; kind = 'volume'; description = 'db' }); resources = [ordered]@{ memoryMB = 20; diskMB = 10 } } }
     files = @([ordered]@{ path = 'config/app.yml'; content = "project: {{project}}`nweb: {{service:web}}`n{{installedApps}}" }, [ordered]@{ path = 'secrets/SECRET'; secret = $true; content = '{{input:secret}}' })
     postInstall = @([ordered]@{ service = 'db'; label = 'mark the database'; command = @('sh', '-c', 'echo hooked > /data/hook') })
@@ -215,14 +263,14 @@ else {
     $ui = & $startUi
     $null = Connect-WebUi $ui
     $c = Invoke-WebUi $ui GET '/api/catalog'
-    Test-Condition 'api: the catalog lists valid apps and reports invalid manifests separately' ($c.Status -eq 200 -and @($c.Data.apps | ForEach-Object { $_.id }) -contains 'notes' -and @($c.Data.invalid).Count -eq 1 -and $c.Data.invalid[0].file -eq 'broken.json') $c.Body.Substring(0, [Math]::Min(300, $c.Body.Length))
+    Test-Condition 'api: the catalog lists valid apps and reports invalid manifests separately' ($c.Status -eq 200 -and @($c.Data.apps | ForEach-Object { $_.id }) -contains $notesId -and @($c.Data.invalid).Count -eq 1 -and $c.Data.invalid[0].file -eq 'broken.json') $c.Body.Substring(0, [Math]::Min(300, $c.Body.Length))
     $folder1 = Join-Path $appsRoot 'notes'
-    $plan = Invoke-WebUi $ui POST '/api/catalog/plan' @{ appId = 'notes'; project = $p1; folder = $folder1 }
+    $plan = Invoke-WebUi $ui POST '/api/catalog/plan' @{ appId = $notesId; project = $p1; folder = $folder1 }
     Test-Condition 'plan: compose.yaml, masked .env, checks; nothing written yet' ($plan.Status -eq 200 -and $plan.Data.canApply -and $plan.Data.compose -match "name: $p1" -and $plan.Data.envPreview -match 'NOTE_TOKEN=<secret, stored only in .env>' -and -not (Test-Path -LiteralPath $folder1)) ($plan.Body.Substring(0, [Math]::Min(600, $plan.Body.Length)))
     Test-Condition 'plan: docker compose config ran and passed' (@($plan.Data.checks | Where-Object { $_.label -eq 'docker compose config' -and $_.state -eq 'ok' }).Count -eq 1) ''
-    $pUnc = Invoke-WebUi $ui POST '/api/catalog/plan' @{ appId = 'notes'; project = "$stack-x"; folder = '\\server\share\x' }
-    $pTaken = Invoke-WebUi $ui POST '/api/catalog/plan' @{ appId = 'notes'; project = $stack; folder = (Join-Path $appsRoot 'y') }
-    $pInside = Invoke-WebUi $ui POST '/api/catalog/plan' @{ appId = 'notes'; project = "$stack-z"; folder = (Join-Path $installPath 'apps\z') }
+    $pUnc = Invoke-WebUi $ui POST '/api/catalog/plan' @{ appId = $notesId; project = "$stack-x"; folder = '\\server\share\x' }
+    $pTaken = Invoke-WebUi $ui POST '/api/catalog/plan' @{ appId = $notesId; project = $stack; folder = (Join-Path $appsRoot 'y') }
+    $pInside = Invoke-WebUi $ui POST '/api/catalog/plan' @{ appId = $notesId; project = "$stack-z"; folder = (Join-Path $installPath 'apps\z') }
     $pAuth = Invoke-WebUi $ui POST '/api/catalog/plan' @{ appId = 'authelia' }
     Test-Condition 'plan: network paths refused; an existing project name and folders inside the deployment block the plan; unknown apps 404' ($pUnc.Status -eq 400 -and -not $pTaken.Data.canApply -and -not $pInside.Data.canApply -and $pAuth.Status -eq 404) "$($pUnc.Status) $($pTaken.Data.canApply) $($pInside.Data.canApply) $($pAuth.Status)"
     $noConfirm = Invoke-WebUi $ui POST '/api/catalog/apply' @{ planId = $plan.Data.planId }
@@ -267,7 +315,7 @@ else {
     # Update: the catalog now references the same image by digest only (a new reference for the same content).
     $digestOnly = 'traefik@' + ($traefikRef -split '@')[1]
     $notes.services.app.image = $digestOnly
-    [IO.File]::WriteAllText((Join-Path $fixtureDir 'apps\notes.json'), ($notes | ConvertTo-Json -Depth 8))
+    [IO.File]::WriteAllText((Join-Path $fixtureDir "apps\$notesId.json"), ($notes | ConvertTo-Json -Depth 8))
     $pv = Invoke-WebUi $ui POST '/api/apps/update/preview' @{ project = $p1; registry = $false }
     Test-Condition 'update: the preview names the image change and what is kept' ($pv.Status -eq 200 -and @($pv.Data.changes).Count -eq 1 -and $pv.Data.changes[0].to -eq $digestOnly -and $pv.Data.previewKey) ($pv.Body)
     $stale = Invoke-WebUi $ui POST '/api/apps/update/apply' @{ project = $p1; previewKey = 'x'; confirm = $true; registry = $false }
@@ -276,6 +324,13 @@ else {
     $id2 = ((Invoke-Docker exec $p1 cat /data/id).Output -join '').Trim()
     $img = ((Invoke-Docker inspect $p1 --format '{{.Config.Image}}').Output -join '').Trim()
     Test-Condition 'update: a stale preview is refused; applying backs up compose.yaml, recreates the container and keeps the data' ($stale.Status -eq 409 -and $up.Data.ok -and (Test-Path -LiteralPath (Join-Path $folder1 $up.Data.backup)) -and $img -eq $digestOnly -and $id2 -eq $id0) "$($stale.Status) $img $id2"
+    # Roll back: restoring the backup made before the update puts the previous Compose file (image) back.
+    $rbp = Invoke-WebUi $ui POST '/api/apps/restore-data/plan' @{ project = $p1; backup = $up.Data.backupId }
+    $rb = Invoke-WebUi $ui POST '/api/apps/restore-data' @{ project = $p1; backup = $up.Data.backupId; key = $rbp.Data.key; confirm = $true }
+    $imgRb = ((Invoke-Docker inspect $p1 --format '{{.Config.Image}}').Output -join '').Trim()
+    $idRb = ((Invoke-Docker exec $p1 cat /data/id).Output -join '').Trim()
+    $lsRb = @((Invoke-WebUi $ui GET '/api/apps').Data.apps | Where-Object { $_.project -eq $p1 })[0]
+    Test-Condition 'rollback: restoring the pre-update backup brings the previous image back with the data; the restored files are the new baseline' ($rb.Status -eq 200 -and $rb.Data.ok -and $imgRb -eq $traefikRef -and $idRb -eq $id0 -and $lsRb.composeChanged -eq $false) "$($rb.Body) image=$imgRb"
 
     # Publish it through Traefik, then removal is blocked until the route is gone.
     $pub = Invoke-WebUiChange $ui @{ op = 'add'; name = 'notes'; service = @{ name = 'notes'; hostnames = @('notes.example.test'); target = @{ type = 'docker'; host = $p1; port = 8080; protocol = 'http' }; cloudflare = @{ publish = $false; access = $false } }; cloudflare = @{ automate = $false } }
@@ -290,8 +345,8 @@ else {
     $rmKeep = Invoke-WebUi $ui POST '/api/apps/remove' @{ project = $p1; confirm = $true; deleteFolder = $true; confirmText = $p1 }
     $volLeft = (Invoke-Docker volume inspect "${p1}_data").ExitCode -eq 0
     Test-Condition 'remove: deleting files needs the typed project name; by default the data volume is kept' ($rmWrong.Status -eq 400 -and $rmKeep.Status -eq 200 -and $volLeft -and -not (Test-Path -LiteralPath (Join-Path $folder1 'compose.yaml')) -and -not (Test-Path -LiteralPath (Join-Path $folder1 '.env')) -and (Test-Path -LiteralPath (Join-Path $folder1 'backups')) -and (Invoke-Docker inspect $p1).ExitCode -ne 0) ($rmKeep.Body)
-    $re = Invoke-WebUi $ui POST '/api/catalog/plan' @{ appId = 'notes'; project = $p1; folder = $folder1 }
-    $reuse = Invoke-WebUi $ui POST '/api/catalog/plan' @{ appId = 'notes'; project = $p1; folder = $folder1; reuseData = $true }
+    $re = Invoke-WebUi $ui POST '/api/catalog/plan' @{ appId = $notesId; project = $p1; folder = $folder1 }
+    $reuse = Invoke-WebUi $ui POST '/api/catalog/plan' @{ appId = $notesId; project = $p1; folder = $folder1; reuseData = $true }
     Test-Condition 'reinstall: an existing data volume blocks the plan unless reusing it is chosen' (-not $re.Data.canApply -and @($re.Data.existingVolumes) -contains "${p1}_data" -and $reuse.Data.canApply) ''
     $ap2 = Invoke-WebUi $ui POST '/api/catalog/apply' @{ planId = $reuse.Data.planId; confirm = $true }
     $id3 = ((Invoke-Docker exec $p1 cat /data/id).Output -join '').Trim()
@@ -308,7 +363,16 @@ else {
     $cfgText = [IO.File]::ReadAllText((Join-Path $folder3 'config\app.yml'))
     Test-Condition 'files: templates resolve (project, service names, installed apps list)' ($cfgText -match "project: $p3" -and $cfgText -match "web: $p3-web" -and $cfgText -match '- Apps:') $cfgText
     $composeText = [IO.File]::ReadAllText((Join-Path $folder3 'compose.yaml'))
-    Test-Condition 'compose: the web service joins the shared network; the database only the private network' ($composeText -match '(?ms)  web:.*?networks: \[proxy, internal\]' -and $composeText -match '(?ms)  db:.*?networks: \[internal\]' -and $composeText -match 'condition: service_started') ''
+    $dbFile = Join-Path $folder3 'compose.database.yaml'
+    $dbText = $(if (Test-Path -LiteralPath $dbFile) { [IO.File]::ReadAllText($dbFile) } else { '' })
+    Test-Condition 'compose: the web service joins the shared network; the database only the private network' ($composeText -match '(?ms)  web:.*?networks: \[proxy, internal\]' -and $dbText -match '(?ms)  db:.*?networks: \[internal\]' -and $composeText -match 'condition: service_started') ''
+    # Modular stack: one Compose project in two files (application, database), listed in .env and dtc-stack.json.
+    $envText3 = [IO.File]::ReadAllText((Join-Path $folder3 '.env'))
+    $stack3 = $(if (Test-Path -LiteralPath (Join-Path $folder3 'dtc-stack.json')) { [IO.File]::ReadAllText((Join-Path $folder3 'dtc-stack.json')) } else { '' })
+    $stack3o = $(if ($stack3) { $stack3 | ConvertFrom-Json } else { $null })
+    $secret3 = ([IO.File]::ReadAllText((Join-Path $folder3 'secrets\SECRET'))).Trim()
+    Test-Condition 'modular stack: compose.yaml holds the web service and the project name, compose.database.yaml the database' ($composeText -match '(?m)^name: ' -and $composeText -notmatch '(?m)^  db:' -and $dbText -match '(?m)^  db:' -and $dbText -notmatch '(?m)^name: ' -and $dbText -match 'Part 2 of 2') ''
+    Test-Condition 'modular stack: COMPOSE_FILE in .env lists both files; dtc-stack.json describes files, services, networks and volumes without secrets' ($envText3 -match '(?m)^COMPOSE_FILE=compose\.yaml:compose\.database\.yaml$' -and $stack3o -and (@($stack3o.composeFiles | ForEach-Object { $_.file }) -join ',') -eq 'compose.yaml,compose.database.yaml' -and (@($stack3o.startOrder) -join ',') -eq 'db,web' -and $stack3o.frontend.service -eq 'web' -and @($stack3o.networks.private) -contains "${p3}_internal" -and @($stack3o.dependencies | ForEach-Object { $_.service }) -contains 'db' -and $stack3o.routing.dockerLabels -eq $false -and -not ($secret3 -and $stack3.Contains($secret3))) $stack3
     $lp3 = @((Invoke-WebUi $ui GET '/api/apps').Data.apps | Where-Object { $_.project -eq $p3 })[0]
     Test-Condition 'apps: a prepared app is listed as prepared, not running' ($lp3.prepared -and $lp3.total -eq 0) ''
     [IO.File]::AppendAllText((Join-Path $folder3 'config\app.yml'), "# my edit`n")
@@ -331,6 +395,26 @@ else {
     Test-Condition 'backup: the archive contains the database files' ($tarList -match 'id' -and $tarList -match 'hook') $tarList
     $id3b = ((Invoke-Docker exec "$p3-db" cat /data/id).Output -join '').Trim()
     Test-Condition 'backup: data is unchanged after the backup' ($id3a -and $id3b -eq $id3a) "$id3a $id3b"
+    Test-Condition 'backup: every Compose file of the stack and dtc-stack.json are saved' ((Test-Path -LiteralPath (Join-Path $bk.Data.folder 'compose.yaml')) -and (Test-Path -LiteralPath (Join-Path $bk.Data.folder 'compose.database.yaml')) -and (Test-Path -LiteralPath (Join-Path $bk.Data.folder 'dtc-stack.json'))) ''
+    # Plain docker compose in the folder uses the complete file set (COMPOSE_FILE), like the manager does.
+    Push-Location $folder3; try { $plainPs = @((Invoke-Docker compose ps --all --services).Output | Where-Object { $_ }) } finally { Pop-Location }
+    Test-Condition 'modular stack: plain `docker compose ps` in the folder sees both services' ((@($plainPs | Sort-Object) -join ',') -eq 'db,web') ($plainPs -join ',')
+    $bl = Invoke-WebUi $ui GET "/api/apps/backups?project=$p3"
+    Test-Condition 'backups: listed with their volumes and files' ($bl.Status -eq 200 -and @($bl.Data.backups).Count -ge 1 -and @($bl.Data.backups[0].files) -contains 'compose.database.yaml') $bl.Body
+    # Restore: the data changes, then the backup is restored (with a safety backup of the changed state first).
+    $null = Invoke-Docker exec "$p3-db" sh -c 'echo changed > /data/id'
+    $bid = Split-Path -Leaf $bk.Data.folder
+    $rp = Invoke-WebUi $ui POST '/api/apps/restore-data/plan' @{ project = $p3; backup = $bid }
+    $rpBad = Invoke-WebUi $ui POST '/api/apps/restore-data/plan' @{ project = $p3; backup = '..\x' }
+    $rrStale = Invoke-WebUi $ui POST '/api/apps/restore-data' @{ project = $p3; backup = $bid; key = 'x'; confirm = $true }
+    $rr = Invoke-WebUi $ui POST '/api/apps/restore-data' @{ project = $p3; backup = $bid; key = $rp.Data.key; confirm = $true }
+    $id3c = ((Invoke-Docker exec "$p3-db" cat /data/id).Output -join '').Trim()
+    $safetyTar = $(if ($rr.Data.safetyBackup) { ((Invoke-Docker run --rm --network none -v "$(Join-Path $folder3 "backups\$($rr.Data.safetyBackup)"):/b:ro" --entrypoint sh $traefikRef -c "tar xzf /b/${p3}_dbdata.tar.gz -O ./id").Output -join '').Trim() } else { '' })
+    Test-Condition 'restore: the preview lists volumes and files; a stale key or a bad backup name is refused' ($rp.Status -eq 200 -and @($rp.Data.volumes | ForEach-Object { $_.volume }) -contains "${p3}_dbdata" -and @($rp.Data.files) -contains 'compose.database.yaml' -and $rpBad.Status -eq 400 -and $rrStale.Status -eq 409) "$($rp.Body) $($rpBad.Status) $($rrStale.Status)"
+    Test-Condition 'restore: the data volume is back to the backup; the replaced state was saved in a safety backup first; the app runs again' ($rr.Status -eq 200 -and $rr.Data.ok -and $id3c -eq $id3a -and $safetyTar -eq 'changed' -and (@(Get-ComposeProjectNames $p3).Count -eq 2)) "$($rr.Body) id=$id3c safety=$safetyTar"
+    # Stack and routing diagnostics (read-only): files, stack description, variable names only, findings.
+    $sd = Invoke-WebUi $ui GET "/api/apps/stack?project=$p3"
+    Test-Condition 'stack view: Compose files, dtc-stack.json, .env variable names (never values), routing and findings' ($sd.Status -eq 200 -and $sd.Data.stackSource -eq 'file' -and @($sd.Data.composeFiles).Count -eq 2 -and @($sd.Data.env.variables) -contains 'COMPOSE_FILE' -and -not ($secret3 -and $sd.Body.Contains($secret3)) -and $sd.Data.routing.recursive -eq $false -and @($sd.Data.findings).Count -ge 1) ($sd.Body.Substring(0, [Math]::Min(600, $sd.Body.Length)))
     $rmStack = Invoke-WebUi $ui POST '/api/apps/remove' @{ project = $p3; confirm = $true; deleteVolumes = $true; deleteFolder = $true; confirmText = $p3 }
     Test-Condition 'remove: a multi-service app and its volume are removed; backups in its folder are kept' ($rmStack.Status -eq 200 -and (Test-Path -LiteralPath $bk.Data.folder) -and (Invoke-Docker volume inspect "${p3}_dbdata").ExitCode -ne 0) ($rmStack.Body)
     $rs = Invoke-WebUi $ui GET '/api/system/resources'
@@ -357,7 +441,7 @@ else {
       $cards = @(Invoke-PageScript $cdp "[...document.querySelectorAll('.cat-card')].map((c) => c.getAttribute('aria-label'))")
       Test-Condition 'browser: the catalog shows the valid apps as cards with an Install action' ($ok -and $cards -contains 'Notes (test)' -and $cards -contains 'HTTP echo (whoami)' -and [bool](Invoke-PageScript $cdp "!!document.querySelector('a[aria-label=""Install Notes (test)""]')")) ($cards -join ', ')
       if ($ScreenshotDir) { Save-PageScreenshot $cdp (Join-Path $ScreenshotDir 'catalog-1366.png') }
-      $ok = & $go 'install/notes' "document.querySelector('#inst-project')"
+      $ok = & $go "install/$notesId" "document.querySelector('#inst-project')"
       $null = Invoke-PageScript $cdp "(() => { const p = document.querySelector('#inst-project'); p.value = '$stack-ui'; p.dispatchEvent(new Event('input', { bubbles: true })); p.dispatchEvent(new Event('change', { bubbles: true })); })(); true"
       $null = Invoke-PageScript $cdp "(() => { const f = document.querySelector('#inst-folder'); f.value = $(ConvertTo-Json (Join-Path $appsRoot 'ui')); f.dispatchEvent(new Event('input', { bubbles: true })); f.dispatchEvent(new Event('change', { bubbles: true })); })(); true"
       $storage = [string](Invoke-PageScript $cdp "document.querySelector('#inst-3').closest('section').innerText")
@@ -384,7 +468,9 @@ else {
       if ($ScreenshotDir) { Save-PageScreenshot $cdp (Join-Path $ScreenshotDir 'install-done-1366.png') }
       $ok = & $go 'apps' "document.querySelector('.disc-card')"
       $at = [string](Invoke-PageScript $cdp "document.querySelector('main').innerText")
-      Test-Condition 'browser: installed apps with status and actions' ($ok -and $at -match 'Notes \(test\)' -and $at -match 'running 1/1' -and $at -match 'Restart' -and $at -match 'Logs' -and $at -match 'Updates' -and $at -match 'Remove') ''
+      $missing = @(@('Notes \(test\)', '1/1 running', 'Restart', 'Logs', 'Updates', 'Remove') | Where-Object { $at -notmatch $_ })
+      # The status headline is the server's "<running>/<expected> running" (setup jobs counted separately).
+      Test-Condition 'browser: installed apps with status and actions' ($ok -and -not $missing.Count) ("ok=$ok missing: $($missing -join ', ') | " + ($at -replace '\s+', ' ').Substring(0, [Math]::Min(800, ($at -replace '\s+', ' ').Length)))
       $null = Invoke-PageScript $cdp "document.querySelector('button[aria-label=""Logs of Notes (test)""]').click(); true"
       $ok = Wait-PageCondition $cdp "document.querySelector('article[aria-label=""Notes (test)""] .app-out details')" 20
       $lt = [string](Invoke-PageScript $cdp "document.querySelector('article[aria-label=""Notes (test)""] .app-out').innerText")
@@ -433,6 +519,8 @@ else {
     Test-Condition "other containers untouched ($($before.Count) checked: same IDs, start times, states)" ($changed.Count -eq 0 -and $added.Count -eq 0) ("changed: $($changed -join ', ') added: $($added -join ', ')")
     Get-ChildItem -LiteralPath $work -Recurse -File -Force -ErrorAction SilentlyContinue | Where-Object { $_.IsReadOnly } | ForEach-Object { $_.IsReadOnly = $false }
     Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue
+    $orphaned = @(Complete-TestRun $stack)
+    Test-Condition 'teardown: nothing with this run''s prefix is left (containers, volumes, networks, folder)' ($orphaned.Count -eq 0) ($orphaned -join ', ')
   }
 }
 

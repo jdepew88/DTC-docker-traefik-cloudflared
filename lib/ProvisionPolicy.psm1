@@ -84,8 +84,10 @@ function Get-HostCompatibility($Manifest, $Adapter) {
   $support = [string](Get-PpProp (Get-PpProp $Manifest 'platforms' $null) ([string](Get-PpProp $Adapter 'id' '')) 'untested')
   if ($support -eq 'unsupported') { & $add 'incompatible' "The application is marked unsupported on $(Get-PpProp $Adapter 'name' '')." }
   elseif ($support -eq 'limited') { & $add 'limited' "The application is marked limited on $(Get-PpProp $Adapter 'name' '')." }
-  $archs = @(Get-PpProp $Manifest 'architectures' @())
-  $hostArchs = @(Get-PpProp $Adapter 'architectures' @())
+  # Curated manifests name architectures as Docker does (amd64), imported drafts and host adapters as platforms
+  # (linux/amd64): compare without the OS part.
+  $archs = @(@(Get-PpProp $Manifest 'architectures' @()) | ForEach-Object { ([string]$_) -replace '^linux/', '' })
+  $hostArchs = @(@(Get-PpProp $Adapter 'architectures' @()) | ForEach-Object { ([string]$_) -replace '^linux/', '' })
   if ($archs.Count -and $hostArchs.Count -and -not @($archs | Where-Object { $a = $_; @($hostArchs | Where-Object { $a -like "$_*" }).Count }).Count) { & $add 'incompatible' "The image is published for $($archs -join ', '), not for this host ($($hostArchs -join ', '))." }
   $hw = Get-PpProp $Manifest 'hardware' $null
   $gpuNeeded = [bool](Get-PpProp $hw 'gpu' $false)
