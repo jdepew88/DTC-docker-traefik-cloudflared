@@ -1,53 +1,124 @@
-# App Catalog inventory (2026-11-16)
+# App Catalog inventory (2026-11-17)
 
-Status of every requested application on the development branch, tested on **Windows 11 with Docker Desktop (WSL2)**
-only. "Installed in isolation" means `tests\Test-CatalogInstall.ps1` installed the real catalog application on a
-disposable proxy deployment (own stack, network, ports and folder; production untouched) and ran its whole lifecycle:
-plan with host compatibility, install, health, the application's own API or log, network isolation, the stack on
-disk (all Compose files, `dtc-stack.json` without secrets, plain `docker compose` with `COMPOSE_FILE`), stop/start, an
-explicit Traefik file-provider route through the disposable Traefik with the per-app routing view, backup + restore
-(where it has data), and removal with its data. "Compose-validated" means the generated file set passed
-`docker compose config` (tests\Test-Catalog.ps1) but the application was not started in this round.
+Every curated application, what the catalog does with it, and what has actually been demonstrated. Tested on
+**Windows 11 with Docker Desktop (WSL2)** only; other platforms are recorded as *untested* in each manifest.
 
-Versions are the pins of 2026-10-21/11-16 (tag and digest). Newer upstream releases found on 2026-11-16 are listed
-under *Remaining*; they were not adopted because the pinned images are the ones tested here, and most of them are
-already on this PC (the system drive has about 8 GB free, so no large downloads were made).
+- **Live install: Passed** means `tests\Test-CatalogInstall.ps1` installed exactly the pinned images on a disposable
+  proxy deployment (own project, network, ports and folder; production untouched) and ran the whole lifecycle: plan
+  with host compatibility, install, health, the application's own API or log, network isolation, the modular stack on
+  disk (`dtc-stack.json` without secrets, plain `docker compose` with `COMPOSE_FILE`), stop/start, an explicit Traefik
+  file-provider route through the disposable Traefik, backup and restore of its data, and removal with its data.
+- **Static checks: Passed** means `tests\Test-Catalog.ps1` validated the manifest, generated its file set, ran
+  `docker compose config` on it, checked that only the web front end joins the shared proxy network, that no secret is
+  in any Compose file or `dtc-stack.json`, and that its Traefik file-provider route points at its Docker DNS name.
+  A statically validated app has **not** been shown to install or run.
+- **On this PC** is a read-only inspection of the Compose projects and containers on this PC on 2026-11-17. Installed
+  applications are offered for management or adoption on their catalog card, never installed a second time silently.
 
-## Applications
+Summary: 36 manifests; 30 installable applications (plus the HTTP echo test app and one variant),
+1 listed with manual setup (Shinobi), 2 building blocks (PostgreSQL, Redis/Valkey) and 1 retired entry
+(Watchtower). Live-tested: Authelia, CrowdSec (detection), Diun, Dozzle, File Browser, Gitea, HFS (HTTP File Server), LLDAP (directory), Mealie, OpenLDAP, Pi-hole, Uptime Kuma, Vaultwarden, n8n. Statically validated only: Arcane, Channels DVR Server, Homepage, Immich, Jellyfin, MediaFusion, Nextcloud, Paperless-ngx, Plex Media Server, Portainer CE, Rocket.Chat, RomM, Traefik Manager, What's Up Docker, authentik.
 
-Compose files: the modular file set the manager writes (`compose.yaml` plus one `compose.<component>.yaml` per further
-component). Sign-in fit: how authentik ForwardAuth suits the app (`compatible`; `caution`: own clients, APIs or
-webhooks that a browser sign-in would block; `not-applicable`: identity providers and apps without a web interface).
+### A. Docker management, infrastructure and monitoring
 
-| Group | Application | Pinned version | Compose files | Sign-in fit | Status (2026-11-16) | Notes |
-| --- | --- | --- | --- | --- | --- | --- |
-| A | HTTP echo (whoami) | traefik/whoami v1.12.0 | 1 | compatible | **Installed in isolation**, whole lifecycle, incl. the Cloudflare publication preview (mock API: DNS, tunnel route and Access planned, nothing written) | Test fixture app. |
-| A | Uptime Kuma | 2.5.6 | 1 | caution | **Installed in isolation** (entry-page API, Traefik route, backup + restore) | First administrator and monitors are set up in the app. Status pages and push monitors must stay reachable without sign-in. |
-| A | Arcane | v2.16.1 | 1 | compatible | Compose-validated (file set, route) | Docker socket through its own socket proxy. Arcane 3.0.1 is available upstream (major release, not adopted). |
-| A | Homepage | v2.6.0 | 1 | compatible | Compose-validated | Generated `services.yaml` skips apps without a web interface. 2.8.0 available upstream. |
-| A | Portainer CE | 2.45.2 | 1 | compatible | Compose-validated | 2.45.3 available upstream. |
-| A | Traefik Manager | 1.15.4 | 1 | compatible | Compose-validated | 1.15.7 available upstream. |
-| B | Authelia | 4.39.28 | 1 | not-applicable | **Installed in isolation** (`/api/health`, Traefik route, backup + restore) | Installed as an application; using Authelia as the ForwardAuth provider is not implemented (it needs HTTPS on a real domain to verify). |
-| B | LLDAP (directory) | v0.6.3 | 1 | not-applicable | **Installed in isolation** (administrator login API, backup + restore) | Directory port stays on the app's private network. |
-| B | authentik | 2026.8.5 + PostgreSQL 16 | 3 (app, database, workers) | not-applicable | Compose-validated; its live suite (`Test-IdentityLive.ps1`) was not rerun this round (memory) | Identity & Access adopts it; existing installations are never changed. |
-| C | Dispatcharr | 0.32.0 | 1 | caution | Installed in isolation **up to the Traefik route**; backup/restore and removal not reached (the run was stopped by low system memory) | 0.34.0 available upstream. |
-| C | Dispatcharr (modular) | 0.32.0 + PostgreSQL 17 + Valkey 9.1.2 | 4 (app, database, cache, workers) | caution | Compose-validated | Database and cache images not on this PC. |
-| C | Jellyfin | 12.2 (20261005) | 1 | caution | Compose-validated; not started (image not on this PC, ~1 GB) | Media clients use their own sign-in; ForwardAuth blocks them. 12.4 available upstream. |
-| C | Channels DVR Server | `latest` (vendor publishes only `latest`) | 1 | caution | Compose-validated | Discovery (mDNS/DLNA) is limited on Docker Desktop. |
-| D | Immich | v3.3.5 (+ machine learning, Valkey 9, PostgreSQL 14 with VectorChord) | 4 (app, database, cache, workers) | caution | Compose-validated as a file set; **live install deferred** (needs several GB of memory) | Mobile apps use the API; ForwardAuth blocks them. 3.4.1 available upstream. |
-| D | Rocket.Chat | 8.9.0 + MongoDB 8.2 + NATS 2.11 | 4 (app, database, messaging, setup) | caution | Compose-validated as a file set; **live install deferred** (needs several GB of memory) | Desktop and mobile clients use the API. 9.0.0 available upstream (major release). |
-| E | What's Up Docker | 9.5.0 + socket proxy | 2 (app, support) | compatible | Compose-validated | Recommended for update notifications; it never updates containers. 9.8.0 available upstream. |
-| E | Diun | 4.33.1 + socket proxy | 2 (app, support) | not-applicable | **Installed in isolation** (headless: log "Found N images", backup + restore) | No web interface: never routed or published. Notifications are configured in `config/diun.yml`. |
+| Application | Pinned version | Dependencies (own stack) | On this PC (read-only check) | Catalog status | Windows (Docker Desktop) | Sign-in | Static checks | Live install | Backup/restore | Known limitations |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Arcane | `getarcaneapp/manager:v2.16.1` | - | Installed, managed (arcane, v2.16.1) | Installable | supported | ForwardAuth OK | Passed | Not run | Not tested live | Needs the Docker socket (full control of Docker on this PC). |
+| CrowdSec (detection) | `crowdsecurity/crowdsec:v1.8.2` | docker-socket-proxy:v0.5.0 | Not installed | Installable | supported | n/a (no web sign-in) | Passed | Passed (2026-11-17) | Tested (backup, restore, app works after) | Firewall bouncers (iptables/nftables) cannot protect a Windows host through Docker Desktop; blocking would have to happen in Traefik.; HTTP scenarios need Traefik's access log on its standard output; without it CrowdSec sees only Traefik's own messages. |
+| Diun | `crazymax/diun:4.33.1` | docker-socket-proxy:v0.5.0 | Not installed | Installable | supported | n/a (no web sign-in) | Passed | Passed (2026-11-16) | Tested (backup, restore, app works after) | Reads Docker through a read-only socket proxy; it notifies only and never pulls or updates anything.; Without a notifier configured in config/diun.yml, results appear only in its log. |
+| Dozzle | `amir20/dozzle:v11.4.3` | docker-socket-proxy:v0.5.0 | Not installed | Installable | supported | ForwardAuth OK | Passed | Passed (2026-11-17) | Tested (backup, restore, app works after) | Shows the containers of this PC only (one Docker host). |
+| Homepage | `ghcr.io/gethomepage/homepage:v2.6.0` | - | Installed, managed (homepage) | Installable | supported | ForwardAuth OK | Passed | Not run | Not tested live | Resource widgets show the Docker Desktop VM, not Windows. |
+| Pi-hole | `pihole/pihole:2026.11.0` | - | Not installed | Installable | supported | ForwardAuth with care (own clients) | Passed | Passed (2026-11-17) | Tested (backup, restore, app works after) | Docker Desktop puts DNS clients behind its network proxy: queries may all appear to come from one address, so per-device statistics and DHCP do not work.; Port 53 can be in use on Windows (Internet Connection Sharing, Hyper-V DNS proxy); the plan checks it before installing. |
+| Portainer CE | `portainer/portainer-ce:2.45.2` | - | Installed, managed (portainer) | Installable | supported | ForwardAuth OK | Passed | Not run | Not tested live | Needs the Docker socket (full control of Docker on this PC).; Uses a self-signed HTTPS certificate on its local port. |
+| Traefik Manager | `ghcr.io/chr0nzz/traefik-manager:1.15.4` | - | Installed, managed by the production manager (project traefik-manager) | Installable | supported | ForwardAuth OK | Passed | Not run | Not tested live | - |
+| Uptime Kuma | `louislam/uptime-kuma:2.5.6` | - | Installed, managed (uptime-kuma) | Installable | supported | ForwardAuth with care (own clients) | Passed | Passed (2026-11-16) | Tested (backup, restore, app works after) | - |
+| What's Up Docker | `getwud/wud:9.5.0` | docker-socket-proxy:v0.5.0 | Registered (whats-up-docker) but no containers on this PC | Installable | supported | ForwardAuth OK | Passed | Not run | Not tested live | Reads Docker through a read-only socket proxy; it reports updates but never applies them here. |
 
-All 17 installable templates are also checked on every `Test-Catalog.ps1` run as modular file sets: plain
-`docker compose` with `COMPOSE_FILE` sees the same project and services as the single file, only the web front end is
-on the shared proxy network, no secret value appears in any Compose file or `dtc-stack.json`, no Docker labels route,
-and every proxied front end gets an explicit Traefik file-provider route to its Docker DNS name.
+### B. Sign-in, passwords and directories
 
-## Not offered
+| Application | Pinned version | Dependencies (own stack) | On this PC (read-only check) | Catalog status | Windows (Docker Desktop) | Sign-in | Static checks | Live install | Backup/restore | Known limitations |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Authelia | `authelia/authelia:4.39.28` | - | Installed, managed (authelia) | Installable | supported | n/a (no web sign-in) | Passed | Passed (2026-11-16) | Tested (backup, restore, app works after) | Session cookies need a real domain with HTTPS: it protects apps only after a public or LAN hostname is configured. |
+| authentik | `ghcr.io/goauthentik/server:2026.8.5` | server:2026.8.5, postgres:16-alpine | Installed, managed (authentik; Identity & Access, Google sign-in) | Installable | supported | n/a (no web sign-in) | Passed | Not run | Not tested live | - |
+| LLDAP (directory) | `lldap/lldap:v0.6.3` | - | Installed, managed (lldap) | Installable | supported | n/a (no web sign-in) | Passed | Passed (2026-11-16) | Tested (backup, restore, app works after) | The LDAP port is not published: only containers on its private network, or clients you connect explicitly, can use it. |
+| OpenLDAP | `ghcr.io/intechcore/openldap:2.6.16-6` | - | Not installed | Installable | supported | n/a (no web sign-in) | Passed | Passed (2026-11-17) | Tested (backup, restore, app works after) | The container comes from a small vendor (intechcore) that packages the official Symas OpenLDAP 2.6 LTS builds; osixia/openldap is unmaintained and the free Bitnami images were withdrawn.; No web interface: manage entries with LDAP tools (ldapadd, Apache Directory Studio) or use LLDAP for a simpler directory with a web interface. |
+| Vaultwarden | `vaultwarden/server:1.37.5` | - | Not installed | Installable | supported | Not with ForwardAuth | Passed | Passed (2026-11-17) | Tested (backup, restore, app works after) | Over plain http on a LAN address or hostname, the web vault refuses to sign in; use http://127.0.0.1 locally or publish it with HTTPS.; Bitwarden clients need version 2026.7.0 or later for Vaultwarden 1.37. |
+
+### C. Media and personal libraries
+
+| Application | Pinned version | Dependencies (own stack) | On this PC (read-only check) | Catalog status | Windows (Docker Desktop) | Sign-in | Static checks | Live install | Backup/restore | Known limitations |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Channels DVR Server | `fancybits/channels-dvr:latest` | - | Installed, managed (channels-dvr) | Installable | limited | ForwardAuth with care (own clients) | Passed | Not run | Not tested live | Docker Desktop has no Bonjour/mDNS from the LAN: Channels apps must be pointed at the server by IP.; No /dev/dri: hardware transcoding is not available in Docker Desktop. |
+| Dispatcharr | `ghcr.io/dispatcharr/dispatcharr:0.32.0` | - | Installed, managed (dispatcharr) | Installable | supported | ForwardAuth with care (own clients) | Passed | Partial (2026-11-16) | Not reached | SSDP/HDHomeRun discovery from LAN devices does not reach containers on Docker Desktop: add tuners and clients by URL. |
+| Dispatcharr (modular) | `ghcr.io/dispatcharr/dispatcharr:0.32.0` | dispatcharr:0.32.0, postgres:17, valkey:9.1.2-alpine | Not installed | Variant of Dispatcharr | supported | ForwardAuth with care (own clients) | Passed | Not run | Not tested live | SSDP/HDHomeRun discovery from LAN devices does not reach containers on Docker Desktop: add tuners and clients by URL. |
+| Immich | `ghcr.io/immich-app/immich-server:v3.3.5` | immich-machine-learning:v3.3.5 (optional), valkey:9, postgres:14-vectorchord0.4.3-pgvectors0.2.0 | Installed, managed (immich) | Installable | supported | ForwardAuth with care (own clients) | Passed | Not run | Not tested live | The PostgreSQL database must be on a Docker volume (not a Windows folder) on Docker Desktop.; Machine learning runs on the CPU (no CUDA/OpenVINO variant is offered here) and needs about 2 GB of extra memory. |
+| Jellyfin | `jellyfin/jellyfin:12.2.20261005-225228` | - | Not installed | Installable | supported | ForwardAuth with care (own clients) | Passed | Not run | Not tested live | Hardware transcoding: only NVIDIA GPUs through WSL2 (experimental); Intel Quick Sync and VA-API (/dev/dri) are not available in Docker Desktop.; DLNA and client auto-discovery do not cross the Docker Desktop VM. |
+| MediaFusion | `mhdzumair/mediafusion:6.2.0` | mediafusion:6.2.0, postgres:18-alpine, valkey:9 | Detected: hand-made Compose project `docker-compose` (MediaFusion 6.1.3 + PostgreSQL 18 + Redis + Prowlarr); offered for adoption, not reinstalled | Installable | supported | Not with ForwardAuth | Passed | Not run | Not tested live | Results stay sparse for the first hour while the background scrapers fill the database.; Changing the secret key later invalidates every add-on link already installed in Stremio. |
+| Plex Media Server | `plexinc/pms-docker:1.43.5.11079-b3b13e506` | - | Not installed | Installable | supported | Not with ForwardAuth | Passed | Not run | Not tested live | Plex does not recommend Docker on Windows; this keeps its database in a Docker volume inside WSL2, which avoids the file-locking problem.; Local discovery (GDM, DLNA) needs multicast, which Docker Desktop does not pass: apps may need the server address entered or found through plex.tv. |
+| RomM | `rommapp/romm:5.4.1` | mariadb:11.8 | Not installed | Installable | supported | ForwardAuth with care (own clients) | Passed | Not run | Not tested live | Large libraries on a Windows drive are read through Docker Desktop file sharing: scans are slower, and new files may not be noticed automatically (scan manually). |
+
+### D. Productivity, files and communication
+
+| Application | Pinned version | Dependencies (own stack) | On this PC (read-only check) | Catalog status | Windows (Docker Desktop) | Sign-in | Static checks | Live install | Backup/restore | Known limitations |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| File Browser | `filebrowser/filebrowser:v2.63.23` | - | Not installed | Installable (deprecated upstream) | supported | ForwardAuth OK | Passed | Passed (2026-11-17) | Tested (backup, restore, app works after) | Archived upstream: no further releases or security fixes.; Folders on Windows drives are accessed through Docker Desktop file sharing and are slower than Docker volumes. |
+| Gitea | `gitea/gitea:28.4.0` | postgres:18-alpine | Not installed | Installable | supported | ForwardAuth with care (own clients) | Passed | Passed (2026-11-17) | Tested (backup, restore, app works after) | Port 22 on Windows is usually taken; SSH uses 2222 by default.; Real-time notifications use WebSockets: the route must allow them (Traefik does by default). |
+| HFS (HTTP File Server) | `rejetto/hfs:v3.4.1` | - | Not installed | Installable | supported | ForwardAuth with care (own clients) | Passed | Passed (2026-11-17) | Tested (backup, restore, app works after) | Folders on Windows drives are read through Docker Desktop file sharing (slower than local disks). |
+| Mealie | `ghcr.io/mealie-recipes/mealie:v3.31.0` | - | Not installed | Installable | supported | ForwardAuth with care (own clients) | Passed | Passed (2026-11-17) | Tested (backup, restore, app works after) | SQLite suits a household; for many concurrent users switch to PostgreSQL (not offered by this recipe). |
+| n8n | `n8nio/n8n:2.48.4` | postgres:18-alpine | Not installed | Installable | supported | ForwardAuth with care (own clients) | Passed | Passed (2026-11-17) | Tested (backup, restore, app works after) | n8n 3.0 is in beta (one-way upgrade); this catalog stays on the 2.x stable line.; Webhook URLs use the address chosen at installation; after publishing it, set WEBHOOK_URL and N8N_EDITOR_BASE_URL in .env to the https address and restart. |
+| Nextcloud | `nextcloud:34.0.6-apache` | nextcloud:34.0.6-apache, postgres:18-alpine, valkey:9 | Not installed | Installable | supported | ForwardAuth with care (own clients) | Passed | Not run | Not tested live | User files stay in a Docker volume: Windows folders (NTFS) fail Nextcloud's ownership and permission checks and are slow through Docker Desktop.; Big uploads through Cloudflare are limited to 100 MB per request on free plans; the sync clients upload in chunks, browsers may not. |
+| Paperless-ngx | `ghcr.io/paperless-ngx/paperless-ngx:3.4.2` | postgres:18-alpine, valkey:9, gotenberg:8.38 (optional), tika:3.3.1.0 (optional) | Not installed | Installable | supported | ForwardAuth with care (own clients) | Passed | Not run | Not tested live | On x86 the CPU needs SSE4.2 (any PC from the last decade).; Windows folders do not deliver file-change events into Docker: the inbox is polled every 10 seconds instead. |
+| Rocket.Chat | `registry.rocket.chat/rocketchat/rocket.chat:8.9.0` | mongodb-community-server:8.2-ubi8, mongodb-community-server:8.2-ubi8, mongodb-community-server:8.2-ubi8, nats:2.11-alpine | Installed, managed (rocket-chat) | Installable | supported | ForwardAuth with care (own clients) | Passed | Not run | Not tested live | MongoDB runs as a single-node replica set (no high availability).; Mobile push notifications need a Rocket.Chat Cloud registration. |
+
+### E. Cameras and surveillance
+
+| Application | Pinned version | Dependencies (own stack) | On this PC (read-only check) | Catalog status | Windows (Docker Desktop) | Sign-in | Static checks | Live install | Backup/restore | Known limitations |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Shinobi | `registry.gitlab.com/shinobi-systems/shinobi:dev` | - | Not installed | Listed, manual setup | supported | ForwardAuth with care (own clients) | Passed | - | - | Only moving tags (dev, latest) are published; a digest pin cannot be updated by version.; Camera discovery (ONVIF multicast) does not work through Docker Desktop; enter camera addresses manually. |
+
+The HTTP echo test app (`traefik/whoami`, group A) is live-tested on every run and used for route, tunnel and Access
+checks.
+
+## Core infrastructure (not catalog applications)
+
+| Component | Role | Notes |
+| --- | --- | --- |
+| Traefik | Reverse proxy of each deployment | Explicit file-provider routes (`traefik/dynamic/svc-<route>.yml`); catalog apps never use Docker labels. The production `compose.yaml` keeps its Docker provider setting; it is not changed by catalog work. |
+| Cloudflared | Cloudflare Tunnel connector | Publication (DNS, tunnel route, Access) only after explicit approval; previews against the mock API in tests |
+| Docker socket proxy | Read-only Docker API for apps that need it | Per app (What's Up Docker, Diun, Dozzle, CrowdSec), on the app's private network, POST/exec/delete refused |
+| PostgreSQL, MariaDB, MongoDB, Valkey/Redis, NATS | Building blocks | Generated inside each application's own stack (own container, volume, credentials and private network); never shared between applications, never published |
+
+## Not in the catalog
 
 | Application | Status | Why |
 | --- | --- | --- |
-| Watchtower | Retired (recognized if installed; not offered) | `containrrr/watchtower` was archived in 2025-12 (last release v1.7.1, 2023). A maintained fork exists (`nicholas-fedor/watchtower` v1.24.0, 2026-11-04), but Watchtower updates containers unattended, which this manager does not do; What's Up Docker or Diun notify instead and updates stay backup-first and approved. |
-| OpenLDAP | Listed only | `osixia/openldap` 1.5.0 dates from 2021 (v2 is beta) and the free Bitnami images are gone; no maintained, suitably licensed image was found. LLDAP covers the "small directory for other apps" case; OpenLDAP is for full LDAP schemas and replication, which this manager does not configure. |
-| PostgreSQL, Redis/Valkey | Building blocks | Generated inside each application that needs them (own container, own volume, private network, health check, backup with the app). Never shared between apps, never published. |
+| Watchtower | Retired, not offered | Archived upstream; it updates containers unattended, which the manager does not do. Existing installations are still recognized and never removed. |
+| Prowlarr, Sonarr, Radarr | Excluded | Not part of the curated collection; never offered or used as dependencies. A Prowlarr container that already runs (inside the hand-made MediaFusion project) is left alone. |
+
+## Manual setup and host-specific notes
+
+Each card lists its manual steps (*Requires manual setup* filter). The most important ones:
+
+- **Plex**: claim token from https://www.plex.tv/claim/ right before installing (or finish setup from this PC); local
+  discovery (GDM/DLNA) and Intel Quick Sync do not work through Docker Desktop; NVIDIA transcoding through WSL2 untested.
+- **Pi-hole**: installing changes no DNS setting. DNS on port 53 is opt-in; Docker Desktop hides client addresses.
+- **CrowdSec**: detection only; HTTP scenarios need Traefik's access log on standard output; blocking (a bouncer) is a
+  separate, deliberate step.
+- **Vaultwarden**: create your account, then turn sign-ups off; the web vault needs HTTPS (or http://127.0.0.1).
+- **Nextcloud / Paperless-ngx / n8n**: after publishing on a hostname, set the published https address in `.env`
+  (`overwriteprotocol`, `PAPERLESS_URL`, `WEBHOOK_URL`) and restart.
+- **Mealie**: change the default administrator (changeme@example.com / MyPassword) immediately.
+- **File Browser**: archived upstream (no security fixes); the generated admin password is in its log.
+- **Shinobi**: not installable from the catalog (moving image tags only, MariaDB inside the app image, licence limits
+  commercial use); install it with the official guide and adopt the Compose project.
+- **Authelia**: installs and runs; using it as the ForwardAuth provider for other apps is not implemented (needs a real
+  domain with HTTPS to verify).
+
+## Versions not adopted (2026-11-17)
+
+Pinned versions are the ones validated here. Newer upstream releases seen on 2026-11-17 and not adopted: Rocket.Chat
+9.0.0 (major: LDAP/SAML/custom OAuth become premium, several logins removed), Arcane 3.0.1 (major: requires 2.17.3
+first, all settings renamed with an `ARCANE_` prefix, agents re-enrolled), Nextcloud 35 (not yet promoted to its
+stable tag), Paperless-ngx 3.5.0 (released the same day), n8n 3.x (beta), RomM 5.5 (alpha), Uptime Kuma 2.5.11,
+Homepage 2.8.0, Immich 3.4.1, Jellyfin 12.4, Dispatcharr 0.34.0, What's Up Docker 9.8.0, MediaFusion (the catalog pins
+6.2.0; the existing hand-made installation runs 6.1.3 and is not changed).

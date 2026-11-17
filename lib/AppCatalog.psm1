@@ -178,6 +178,7 @@ function Test-AppManifest($M, [switch]$AllowImported) {
         & $checkTemplates $where ([string]$ev.Value) @()
       } }
     foreach ($c in @(Get-Prop $s 'command' @())) { & $checkTemplates $where ([string]$c) @() }
+    if ((Get-Prop $s 'nofile' $null) -and ([int]$s.nofile -lt 256 -or [int]$s.nofile -gt 1048576)) { & $add "${where}: nofile must be between 256 and 1048576" }
     if ((Get-Prop $s 'user' '') -and [string](Get-Prop $s 'user' '') -notmatch '^(\d{1,6}(:\d{1,6})?|[a-z_][a-z0-9_-]{0,31}(:[a-z_][a-z0-9_-]{0,31})?)$') { & $add "${where}: user must be uid[:gid] or a user name" }
     $needs = @()
     if (Get-Prop $s 'dockerSocket' $false) { $needs += 'docker-socket' }
@@ -614,6 +615,8 @@ function New-AppComposeText {
     }
     if ($tmpfs.Count) { $L.Add('    tmpfs:'); foreach ($t in $tmpfs) { $L.Add("      - $($t.target)") } }
     if (Get-Prop $s 'shmSize' '') { $L.Add("    shm_size: '$($s.shmSize)'") }
+    # Open-file limit: some servers (slapd) size their memory by it, and Docker's default is very high.
+    if (Get-Prop $s 'nofile' $null) { $L.Add('    ulimits:'); $L.Add('      nofile:'); $L.Add("        soft: $([int]$s.nofile)"); $L.Add("        hard: $([int]$s.nofile)") }
     if (@(Get-Prop $s 'devices' @()).Count) { $L.Add('    devices:'); foreach ($d in @($s.devices)) { $L.Add("      - $($d):$($d)") } }
     $g = Get-Prop $s 'gpus' $false
     if (($g -is [bool] -and $g) -or ($g -is [string] -and [string]$Resolved.Values["input:$g"] -eq 'true')) { $L.Add('    gpus: all') }

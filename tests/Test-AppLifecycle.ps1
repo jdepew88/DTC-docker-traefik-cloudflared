@@ -334,6 +334,10 @@ services:
       Test-Condition 'docker: real inspect facts: app healthy, bus running without a health check' ($st['app'].status.key -eq 'healthy' -and $st['bus'].status.key -eq 'running-unverified') "app=$($st['app'].status.key) bus=$($st['bus'].status.key)"
       Test-Condition 'docker: migrate is a completed job because app waits for it (Compose), perms is inferred from on-failure' ($st['migrate'].status.key -eq 'completed' -and $st['migrate'].roleSource -eq 'compose' -and $st['perms'].status.key -eq 'completed' -and $st['perms'].roleSource -eq 'inferred') "migrate=$($st['migrate'].roleSource) perms=$($st['perms'].roleSource)"
       Test-Condition 'docker: a setup job that failed (exit 3 after its retry) is reported as failed' ($st['seed'].status.key -eq 'job-failed' -and $st['seed'].exitCode -eq 3 -and $lr.state -eq 'failed' -and $lr.headline -match "2/2 running $dot 2 setup jobs completed $dot 1 setup job failed") $lr.headline
+      # Before adoption the catalog card shows it as detected on this PC (Review and adopt), not as available.
+      $catD = Invoke-WebUi $ui GET '/api/catalog'
+      $echoD = @($catD.Data.apps | Where-Object { $_.id -eq 'echo' })[0]
+      Test-Condition 'api catalog: a hand-made Compose project of a catalog app is listed on its card as detected (not managed), with its containers' ($catD.Status -eq 200 -and $echoD -and @($echoD.detected | Where-Object { $_.project -eq $fixProject -and -not $_.standalone -and @($_.containers).Count -ge 2 }).Count -eq 1 -and -not @($echoD.instances | Where-Object { $_.project -eq $fixProject }).Count) ($(if ($echoD) { $echoD.detected | ConvertTo-Json -Depth 4 -Compress } else { $catD.Body.Substring(0, [Math]::Min(300, $catD.Body.Length)) }))
       # Adopt it through the API (review, then adopt): the manager did not generate it, and its file is
       # docker-compose.yml, one of the four standard Compose file names.
       $ap = Invoke-WebUi $ui POST '/api/apps/adopt/plan' @{ project = $fixProject }

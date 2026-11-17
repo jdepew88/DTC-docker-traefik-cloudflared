@@ -25,7 +25,11 @@ through the existing Cloudflare Tunnel (Cloudflare Access by default).
 ## Applications
 
 Images, ports, volumes and required settings were taken from each project's official compose files, documentation and
-registry metadata on 2026-10-21. RAM figures are the manager's planning estimates.
+registry metadata on 2026-10-21 (groups A-E as first shipped) and 2026-11-17 (the applications added in the second
+round). RAM figures are the manager's planning estimates. Groups follow the curated collection: **A** Docker
+management, infrastructure and monitoring; **B** sign-in, passwords and directories; **C** media and personal
+libraries; **D** productivity, files and communication; **E** cameras and surveillance. What has been verified for each
+entry (static checks or a live installation) is in [catalog-inventory.md](catalog-inventory.md).
 
 | Group | App | Image (pinned) | Local URL (127.0.0.1) | Dependencies | Notes |
 | --- | --- | --- | --- | --- | --- |
@@ -44,11 +48,26 @@ registry metadata on 2026-10-21. RAM figures are the manager's planning estimate
 | C | Channels DVR | `fancybits/channels-dvr:latest` (digest) | :8089 | | Limited on Docker Desktop (no Bonjour, no `/dev/dri`, tuners by IP); subscription; native Windows server recommended |
 | D | Immich | `ghcr.io/immich-app/immich-server:v3.3.5` + machine learning (optional) | :2283 | `immich-db` (`ghcr.io/immich-app/postgres:14-vectorchord0.4.3-pgvectors0.2.0`), `immich-redis` (Valkey 9) | 6-8 GB RAM recommended; database must be a Docker volume on Windows; library in a volume or a chosen folder |
 | D | Rocket.Chat (id `rocketchat`, alias `rocket-chat`) | `registry.rocket.chat/rocketchat/rocket.chat:8.9.0` | :3100 | MongoDB 8.2 (official `mongodb-community-server`, replica set), NATS 2.11; two setup jobs (MongoDB permissions, replica-set initialization) | Monitoring stack of the official compose left out; MongoDB never published |
-| E | What's Up Docker | `getwud/wud:9.5.0` | :3200 | read-only Docker socket proxy (`tecnativa/docker-socket-proxy:v0.5.0`) | Notification only: no update trigger, and the proxy refuses POST/DELETE |
-| - | OpenLDAP | listed | | | osixia 1.5.0 is from 2021, v2 is beta; free Bitnami images are gone |
+| A | What's Up Docker | `getwud/wud:9.5.0` | :3200 | read-only Docker socket proxy (`tecnativa/docker-socket-proxy:v0.5.0`) | Notification only: no update trigger, and the proxy refuses POST/DELETE |
+| B | OpenLDAP | `ghcr.io/intechcore/openldap:2.6.16-6` (Symas OpenLDAP 2.6 LTS packages) | none (LDAP; optional 127.0.0.1:3389) | | Headless: never routed; osixia is unmaintained and the free Bitnami images are gone, so a small maintained vendor image is used |
 | - | PostgreSQL, Redis/Valkey | building blocks (`availability: reference`) | | | Bundled inside the apps that need them; never shared or published; never identify an installation |
-| E | Diun | `crazymax/diun:4.33.1` (headless) | none (no web interface) | read-only Docker socket proxy (`tecnativa/docker-socket-proxy:v0.5.0`) | Offered again (2026-11-16) as the headless alternative to What's Up Docker (choice group *update notifications*); notification only; notifiers in `config/diun.yml` (written once, your edits kept) |
-| E | Watchtower | no longer offered (`availability: retired`, 2026-10-25) | | | Archived (2025-12), fails on current Docker; unattended updates are not recommended; existing containers are still recognized |
+| A | Diun | `crazymax/diun:4.33.1` (headless) | none (no web interface) | read-only Docker socket proxy (`tecnativa/docker-socket-proxy:v0.5.0`) | Offered again (2026-11-16) as the headless alternative to What's Up Docker (choice group *update notifications*); notification only; notifiers in `config/diun.yml` (written once, your edits kept) |
+| A | Dozzle | `amir20/dozzle:v11.4.3` | :8087 | read-only Docker socket proxy | Live log viewer; actions and shell disabled; no login of its own (protect with authentik or Access) |
+| A | CrowdSec (detection) | `crowdsecurity/crowdsec:v1.8.2` (headless) | none | read-only Docker socket proxy | Reads the Traefik container's log (`config/acquis.d/traefik.yaml`); offline by default; no bouncer or firewall rule is installed |
+| A | Pi-hole | `pihole/pihole:2026.11.0` | :8053 (`/admin/`) | | DNS on port 53 only when chosen (opt-in, LAN); no DNS setting of the PC or router is changed |
+| B | Vaultwarden | `vaultwarden/server:1.37.5` | :8222 | | SQLite in a volume; signups on for the first account; `/admin` disabled; ForwardAuth unsuitable (Bitwarden clients) |
+| C | Plex Media Server | `plexinc/pms-docker:1.43.5.11079-b3b13e506` | :32400 (`/web`) | | Media folder read-only; config in a volume (file locking); optional LAN port 32400, claim token, NVIDIA GPU; LinuxServer.io/hotio installations are recognized |
+| C | MediaFusion | `mhdzumair/mediafusion:6.2.0` (API + worker) | :8001 | PostgreSQL 18, Valkey 9 | No Prowlarr; Stremio/Kodi clients need direct access |
+| C | RomM | `rommapp/romm:5.4.1` | :8095 | MariaDB 11.8 | No games or BIOS included; optional IGDB/SteamGridDB keys |
+| D | Nextcloud | `nextcloud:34.0.6-apache` (+ cron) | :8090 | PostgreSQL 18, Valkey 9 | Installed with the administrator from the form; user files in a Docker volume; 34 is the production line |
+| D | Paperless-ngx | `ghcr.io/paperless-ngx/paperless-ngx:3.4.2` | :8010 | PostgreSQL 18, Valkey 9; optional Gotenberg 8.38 and Tika 3.3 | Inbox folder polled every 10 s; 3.5.0 (released 2026-11-17) not adopted yet |
+| D | File Browser | `filebrowser/filebrowser:v2.63.23` | :8085 | | Deprecated: archived upstream 2026-09; one chosen folder only |
+| D | Gitea | `gitea/gitea:28.4.0` | :3030 | PostgreSQL 18 | Optional Git over SSH on a chosen port (default 2222, LAN) |
+| D | n8n | `n8nio/n8n:2.48.4` | :5678 | PostgreSQL 18 | 2.x stable line (3.0 is beta); webhooks need the published address in `.env` |
+| D | Mealie | `ghcr.io/mealie-recipes/mealie:v3.31.0` | :9925 | | SQLite; default administrator must be changed at once |
+| D | HFS | `rejetto/hfs:v3.4.1` | :8086 | | One chosen folder under `/shares`; nothing shared until set in `/~/admin`; self-update disabled |
+| E | Shinobi | listed only (manual setup) | | | Only moving tags (`dev`, `latest`), MariaDB embedded in the app image, licence restricts commercial use; adopt a hand-made project instead |
+| - | Watchtower | no longer offered (`availability: retired`, 2026-10-25) | | | Archived (2025-12), fails on current Docker; unattended updates are not recommended; existing containers are still recognized |
 
 ## Modular application stacks
 
@@ -145,6 +164,20 @@ Every installation preview (and every catalog card) checks the manifest against 
 Shared manifests carry no Windows-specific values: host paths, ports and the proxy network come from the plan, and
 `limitations` lists what is limited on *this* host (Docker Desktop on Windows) in words.
 
+## Existing installations in the catalog
+
+Before anything is offered, the catalog page inspects this PC read-only (`docker inspect` of every container) and puts
+on each card what it finds: installations managed here (**Managed here**: *Manage*), Compose projects that run the
+application but were made elsewhere (**Detected on this PC**: *Review and adopt*, never a plain *Install*), and
+containers started without Compose (*Inspect and route*: they can be routed but not adopted, because adoption manages a
+Compose project). An application is recognized by the manager's label or by the image of its own web service
+(plus `identifiedBy`); an image that is only a dependency (PostgreSQL inside MediaFusion, Prowlarr next to it) never
+makes a project an installation of anything else. Disposable test deployments are ignored. Installing anyway needs the
+explicit *Install another, separate instance* choice; adoption keeps the containers, files and data as they are and
+records only what the manager will operate (start, stop, logs, backup, routing). The state filter shows *Available*,
+*Already installed* (managed or detected), *Managed here*, *Detected on this PC*, *Requires manual setup* and *Not
+supported on this PC*. Retired entries (Watchtower) appear only while an installation of them exists.
+
 ## Headless applications
 
 An app without a web interface (`web.headless: true`, e.g. Diun) has no primary port, no local port and no route. Its
@@ -224,7 +257,8 @@ installable; there is no public registry, voting, moderation or AI builder yet.
 
 ## Installation groups and resources
 
-Install one group at a time (A: management, B: identity, C: media, D: heavy services, E: updates). The catalog page
+Install one application at a time (heavy ones such as Immich, Rocket.Chat, Nextcloud and Paperless-ngx only with
+several GB free). The catalog page
 shows free Docker and Windows memory and disk; every installation checks the app's estimate against the lower of
 Docker's and Windows' free memory and refuses to start an app that does not fit. **Prepare only** writes the complete
 project (files, secrets, credentials) without downloading or starting anything; *Start* on the Installed apps page
@@ -310,6 +344,11 @@ How the files are written:
 | `privileges` | `docker-socket`, `host-network`, `device`, `gpu`, `privileged`, with an explanation the user confirms |
 | `web` (`service`, `localPort`, `status`, `proxy`: false keeps the app off the shared network, `headless`: no web interface), `exposure` (`default`, `allowPublic`, `warning`), `resources`, `security`, `update` (required) | |
 | `services.<name>.component` | Optional: the Compose file of a modular stack (`compose.<component>.yaml`); default from the role |
+| `services.<name>.ports[].publish` | Optional extra host port, off unless chosen: `hostPort`, `address` (`local` = 127.0.0.1, `lan` = every interface; `lan` must be opt-in with `when`), `when` (boolean input), `input` (text input holding the host port). The plan checks the port (TCP or UDP) is free; `dtc-stack.json` lists it under `publishedPorts` |
+| `identifiedBy` | Other image repositories of the same application (e.g. the LinuxServer.io Plex image), so an existing installation made from them is recognized |
+| `testStatus` | What was demonstrated: `static` (`passed`/`not-run`), `live` (`passed`, `partial`, `not-run`, `failed`), `date`, `notes`. Shown on the card ("Live-tested" or "Static checks only") |
+| `manualSetup` | Steps the user does in the app itself (claim token, first administrator, setting the published address); shown before installing and filterable as *Requires manual setup* |
+| `website` | The project's home page (optional) |
 
 `tests\Test-AppLifecycle.ps1` covers identity, lifecycle, instances, duplicates, archiving, removal inventories,
 interrupted installations and a small disposable Compose project; `tests\Test-AppsBrowser.ps1` the catalog and

@@ -1699,8 +1699,10 @@ function Get-DetectedInstallations($Valid, [string[]]$Exclude) {
   $r = Invoke-Docker inspect $ids
   if ($r.ExitCode -ne 0) { return @() }
   $facts = @(foreach ($x in ((@($r.Output) -join "`n") | ConvertFrom-Json)) { ConvertFrom-ContainerInspect $x })
-  # Disposable test deployments (tests\TestResources.psm1 prefixes) are never shown as installations.
-  $facts = @($facts | Where-Object { $_.name -notmatch '^tp[xm]-[a-z]+-[0-9a-f]{6,8}' -and [string]$_.project -notmatch '^tp[xm]-[a-z]+-[0-9a-f]{6,8}' })
+  # Disposable test deployments (tests\TestResources.psm1 prefixes) are never shown as installations, unless this manager
+  # itself runs a disposable test deployment (then its fixtures are what it should see).
+  $self = $(if (Test-Installed) { [string](Get-Settings).StackName } else { '' })
+  if ($self -notmatch '^tp[xm]-[a-z]+-[0-9a-f]{6,8}') { $facts = @($facts | Where-Object { $_.name -notmatch '^tp[xm]-[a-z]+-[0-9a-f]{6,8}' -and [string]$_.project -notmatch '^tp[xm]-[a-z]+-[0-9a-f]{6,8}' }) }
   return @(@(Get-UnregisteredInstallations @($facts | Where-Object { $_.project }) $Valid $Exclude) + @(Get-StandaloneInstallations @($facts | Where-Object { -not $_.project }) $Valid))
 }
 

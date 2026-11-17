@@ -92,6 +92,9 @@ $plex = Get-CatalogApp $catalogDir 'plex'
 $plexR = Resolve-AppValues -Manifest $plex -Inputs @{ mediaFolder = $env:TEMP; lanAccess = 'true' } -Project 'plex' -LocalPort 32400
 $plexC = (@(ConvertTo-AppComposeSet -Manifest $plex -Project 'plex' -Resolved $plexR -ProxyNetwork 'proxy-x' -LocalPort 32400))[0].content
 Test-Condition 'ports: Plex direct access opens 32400 on the network once (no second 127.0.0.1 mapping of the same port); media is read-only' ($plexC -match "'0\.0\.0\.0:32400:32400'" -and $plexC -notmatch '127\.0\.0\.1:32400' -and $plexC -match 'target: /data\s+read_only: true') $plexC
+$ol = Get-CatalogApp $catalogDir 'openldap'
+$olC = (@(ConvertTo-AppComposeSet -Manifest $ol -Project 'ol' -Resolved (Resolve-AppValues -Manifest $ol -Inputs @{ adminPassword = 'a-long-password-1' } -Project 'ol') -ProxyNetwork 'proxy-x'))[0].content
+Test-Condition 'compose: OpenLDAP gets an open-file limit of 1024 (slapd sizes its memory by it); it stays off the shared network and publishes nothing by default' ($olC -match 'ulimits:\s+nofile:\s+soft: 1024\s+hard: 1024' -and $olC -notmatch 'proxy-x' -and $olC -notmatch 'ports:') $olC
 $badPort = [pscustomobject]@{ schema = 1; id = 'bp'; name = 'B'; description = 'd'; license = 'MIT'; maintainer = 'm'; category = 'tools'; docs = @([pscustomobject]@{ title = 't'; url = 'https://x' }); platforms = [pscustomobject]@{ 'windows-docker-desktop' = 'supported' }; installable = $true
   architectures = @('amd64'); authentication = [pscustomobject]@{ forwardAuth = 'compatible' }; update = [pscustomobject]@{ strategy = 'pinned-digest' }; testStatus = [pscustomobject]@{ static = 'maybe'; live = 'sometimes' }
   services = [pscustomobject]@{ app = [pscustomobject]@{ image = "x/y:1@sha256:$('a' * 64)"; ports = @([pscustomobject]@{ container = 80; protocol = 'http'; primary = $true }, [pscustomobject]@{ container = 22; protocol = 'tcp'; publish = [pscustomobject]@{ hostPort = 2222; address = 'lan' } }) } }

@@ -115,7 +115,7 @@
       "environment": {
         "CONTAINERS": "1",
         "IMAGES": "0",
-        "INFO": "0",
+        "INFO": "1",
         "VERSION": "1",
         "EVENTS": "1",
         "PING": "1",
@@ -152,7 +152,7 @@
   "privileges": [
     {
       "kind": "docker-socket",
-      "explain": "A socket proxy on CrowdSec's private network gets the Docker socket read-only and allows only reading containers and their logs (no POST, exec or delete), so CrowdSec can read Traefik's log."
+      "explain": "A socket proxy on CrowdSec's private network gets the Docker socket read-only and allows only reading Docker's version and info, containers and their logs (no POST, exec or delete), so CrowdSec can read Traefik's log."
     }
   ],
   "dependencies": [
@@ -199,8 +199,8 @@
   },
   "testStatus": {
     "static": "passed",
-    "live": "not-run",
+    "live": "passed",
     "date": "2026-11-17",
-    "notes": "Manifest, Compose file set and route validated; not yet installed on a disposable deployment."
+    "notes": "Installed in isolation (headless): health, its own check (cscli lapi status / ldapwhoami as cn=admin), network isolation, modular stack, stop/start, backup and restore, removal with data. No web route (by design)."
   }
 }

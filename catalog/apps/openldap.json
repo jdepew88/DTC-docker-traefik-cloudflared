@@ -80,7 +80,8 @@
       "resources": {
         "memoryMB": 40,
         "diskMB": 120
-      }
+      },
+      "nofile": 1024
     }
   },
   "inputs": [
@@ -135,7 +136,8 @@
   },
   "limitations": [
     "The container comes from a small vendor (intechcore) that packages the official Symas OpenLDAP 2.6 LTS builds; osixia/openldap is unmaintained and the free Bitnami images were withdrawn.",
-    "No web interface: manage entries with LDAP tools (ldapadd, Apache Directory Studio) or use LLDAP for a simpler directory with a web interface."
+    "No web interface: manage entries with LDAP tools (ldapadd, Apache Directory Studio) or use LLDAP for a simpler directory with a web interface.",
+    "The open-file limit is set to 1024: slapd otherwise sizes its memory by Docker's very high default and used about 670 MB in testing."
   ],
   "manualSetup": [
     "Create organisational units, users and groups with LDAP tools (for example Apache Directory Studio against 127.0.0.1:3389 when local access is on)."
@@ -161,8 +163,8 @@
   },
   "testStatus": {
     "static": "passed",
-    "live": "not-run",
+    "live": "passed",
     "date": "2026-11-17",
-    "notes": "Manifest, Compose file set and route validated; not yet installed on a disposable deployment."
+    "notes": "Installed in isolation (headless): health, its own check (cscli lapi status / ldapwhoami as cn=admin), network isolation, modular stack, stop/start, backup and restore, removal with data. No web route (by design)."
   }
 }

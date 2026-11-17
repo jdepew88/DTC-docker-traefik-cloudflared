@@ -264,7 +264,10 @@ try {
     Test-Condition "${app}: network isolation (dependencies private: $(@($deps | ForEach-Object { $_.name }) -join ', '); web front end on the shared network only when proxied)" ($leak.Count -eq 0 -and ($headless -or ($webOnProxy -eq [bool]$web.proxyNetwork))) "leaks: $($leak -join ', ') web: $webNets"
     # Stack files: the set on disk, COMPOSE_FILE for plain docker compose, dtc-stack.json without secrets.
     $stackJson = [IO.File]::ReadAllText((Join-Path $folder 'dtc-stack.json'))
-    $secrets = @((Read-AppEnv (Join-Path $folder '.env')).GetEnumerator() | Where-Object { [string]$_.Value -and ([string]$_.Value).Length -ge 12 -and $_.Key -ne 'COMPOSE_FILE' } | ForEach-Object { [string]$_.Value })
+    # The values of the variables the stack declares secret (generated or typed secrets); addresses such as the app's
+    # own URL are configuration, not secrets, and do appear in dtc-stack.json (frontend.localUrl).
+    $secretKeys = @($plan.Data.stack.envFile.secrets)
+    $secrets = @((Read-AppEnv (Join-Path $folder '.env')).GetEnumerator() | Where-Object { $secretKeys -contains $_.Key -and ([string]$_.Value).Length -ge 6 } | ForEach-Object { [string]$_.Value })
     Push-Location $folder; try { $plain = @((Invoke-Docker compose ps --all --services).Output | Where-Object { $_ }) } finally { Pop-Location }
     $defined = @($plan.Data.stack.services | ForEach-Object { $_.name })
     Test-Condition "${app}: modular stack on disk ($($files -join ', ')); plain docker compose sees every service; dtc-stack.json holds no secret" (@($files | Where-Object { -not (Test-Path -LiteralPath (Join-Path $folder $_)) }).Count -eq 0 -and (@($plain | Sort-Object) -join ',') -eq (@($defined | Sort-Object) -join ',') -and -not @($secrets | Where-Object { $stackJson.Contains($_) }).Count) "plain: $($plain -join ',') defined: $($defined -join ',')"
@@ -280,7 +283,7 @@ try {
       $svc = @{ name = $app; hostnames = @($hostName); target = @{ type = 'docker'; host = $web.container; port = [int]$web.port; protocol = $web.scheme }; cloudflare = @{ publish = $false; access = $false }; middlewares = @('default-headers@file') }
       if ($web.scheme -eq 'https') { $svc.target.tlsSkipVerify = $true }
       $rt = Invoke-WebUiChange $ui @{ op = 'add'; name = $app; service = $svc; cloudflare = @{ automate = $false } }
-      $via = Wait-Http $httpPort '/' { param($r) $r.Status -gt 0 -and $r.Status -notin 404, 502, 503, 504 } 60 -HostHeader $hostName
+      $via = Wait-Http $httpPort ([string](Get-Prop2 $m.web 'path' '/')) { param($r) $r.Status -gt 0 -and $r.Status -notin 404, 502, 503, 504 } 60 -HostHeader $hostName
       $sv = Invoke-WebUi $ui GET "/api/apps/stack?project=$project"
       $route = @($sv.Data.routing.routes | Where-Object { $_.name -eq $app })[0]
       $served = $route -and @($route.traefik | Where-Object { $_.served }).Count -ge 1
