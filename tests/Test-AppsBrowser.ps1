@@ -157,11 +157,25 @@ try {
   Test-Condition 'catalog: Arcane is recommended; Dispatcharr''s modular compose is listed under Dispatcharr, not as its own card' ([string](Js "document.querySelector('.cat-card[data-app=arcane]').innerText") -match 'Recommended' -and $cards -notmatch 'dispatcharr-modular' -and [string](Js "document.querySelector('.cat-card[data-app=dispatcharr]').innerText") -match 'other ways to install') $cards
   Test-Condition 'catalog: PostgreSQL and Redis are building blocks, not app cards' ($cards -notmatch 'postgresql|redis' -and [string](Js "(document.querySelector('#cat-reference') || {}).textContent || ''") -match 'PostgreSQL') ''
   Shot 'catalog-offered'
-  $null = Go 'catalog?level=advanced' "!!document.querySelector('#cat-retired')"
-  $null = Js "document.querySelector('#cat-retired').open = true; document.querySelector('#cat-retired').scrollIntoView(); true"
-  $ret = [string](Js "document.querySelector('#cat-retired').innerText")
-  Test-Condition 'catalog (advanced): Watchtower is explained as no longer offered, existing installations kept' ($ret -notmatch 'Diun' -and $ret -match 'Watchtower' -and $ret -match 'never removed' -and [int](Js "document.querySelectorAll('#cat-retired a[href^=\'#install\']').length") -eq 0) $ret
-  Shot 'catalog-no-longer-offered'
+  # Retired entries are no longer part of the catalog: without an installation of them, not even the advanced view names them.
+  $null = Go 'catalog?level=advanced' "document.querySelectorAll('.cat-card').length > 5"
+  Test-Condition 'catalog (advanced): Watchtower appears nowhere while it is not installed (no card, no retired section, no install link)' (-not [bool](Js "!!document.querySelector('#cat-retired')") -and [int](Js "document.querySelectorAll('.cat-card[data-app=watchtower], a[href=\'#install/watchtower\']').length") -eq 0) ''
+  # Installation-state filter: one state per card; manual-setup entries never get an install action.
+  $null = Js "(() => { const s = document.querySelector('#cat-state'); s.value = 'manual'; s.dispatchEvent(new Event('change')); return true; })()"
+  $manual = [string](Js "[...document.querySelectorAll('.cat-card')].map((c) => c.dataset.app + ':' + c.dataset.state).join(',')")
+  $shin = [string](Js "(document.querySelector('.cat-card[data-app=shinobi]') || {}).innerText || ''")
+  Test-Condition 'catalog filter: "Requires manual setup" lists Shinobi (listed only, no install action) and installable apps with setup steps' ($manual -match 'shinobi:manual' -and $shin -match 'Requires manual setup' -and $shin -match 'moving image tags' -and [int](Js "document.querySelectorAll('a[href=\'#install/shinobi\'], [data-provision=shinobi]').length") -eq 0 -and $manual -match 'plex:') $manual
+  Shot 'catalog-filter-manual'
+  $null = Js "(() => { const s = document.querySelector('#cat-state'); s.value = 'installed'; s.dispatchEvent(new Event('change')); return true; })()"
+  $inst2 = @([string](Js "[...document.querySelectorAll('.cat-card')].map((c) => c.dataset.installed + ':' + c.dataset.state).join(',')") -split ',' | Where-Object { $_ })
+  Test-Condition 'catalog filter: "Already installed" shows only managed or detected apps (Rocket.Chat managed)' ($inst2.Count -ge 1 -and -not @($inst2 | Where-Object { $_ -notmatch '^true:(managed|detected)$' }).Count -and [bool](Js "!!document.querySelector('.cat-card[data-app=rocketchat][data-state=managed]')")) ($inst2 -join ',')
+  $det = [string](Js "[...document.querySelectorAll('.cat-card[data-state=detected]')].map((c) => c.dataset.app + '|' + [...c.querySelectorAll('.actions a.btn.primary')].map((a) => a.textContent).join('/')).join(',')")
+  Test-Condition 'catalog: a detected (not managed) installation offers Review and adopt or Inspect and route as its primary action, never a plain Install' (-not @(($det -split ',') | Where-Object { $_ -and $_ -notmatch '\|(Review and adopt|Inspect and route)' }).Count) $det
+  Shot 'catalog-filter-installed'
+  $null = Js "(() => { const s = document.querySelector('#cat-state'); s.value = ''; s.dispatchEvent(new Event('change')); return true; })()"
+  $vw = [string](Js "(document.querySelector('.cat-card[data-app=vaultwarden]') || {}).innerText || ''")
+  $nc = [string](Js "(document.querySelector('.cat-card[data-app=nextcloud]') || {}).innerText || ''")
+  Test-Condition 'catalog: cards show what was verified (Vaultwarden live-tested, otherwise static checks only)' ($vw -match 'Live-tested' -and ($nc -match 'Static checks only' -or $nc -match 'Live-tested')) "$vw | $nc"
 
   # --- Installed apps -----------------------------------------------------------------------------------------------------
   $ok = Go 'apps?level=intermediate' "document.querySelectorAll('.dep-card').length >= 3"

@@ -30,6 +30,7 @@ Import-Module (Join-Path $repo 'lib\TraefikProxy.psm1') -Force
 Import-Module (Join-Path $repo 'lib\Authentik.psm1') -Force
 Import-Module (Join-Path $repo 'tests\WebUiTestHelpers.psm1') -Force
 Import-Module (Join-Path $repo 'tests\EdgeCdp.psm1') -Force
+Import-Module (Join-Path $repo 'tests\TestResources.psm1') -Force
 $script:Results = New-Object System.Collections.ArrayList
 function Add-Result([string]$Status, [string]$Name, [string]$Detail) {
   $null = $script:Results.Add([pscustomobject]@{ Status = $Status; Test = $Name; Detail = $Detail })
@@ -85,6 +86,9 @@ if (-not (Get-DockerStatus).EngineRunning) { Add-Result 'SKIP' 'identity live te
 
 $id = [Guid]::NewGuid().ToString('N').Substring(0, 6)
 $stack = "tpx-id-$id"; $network = "$stack-proxy"
+# Leftovers of earlier runs killed hard are swept first; this run is registered so its own are swept the same way.
+foreach ($orphanLine in (Invoke-TestOrphanSweep)) { Write-Host "  [orphans] $orphanLine" -ForegroundColor DarkYellow }
+Register-TestRun -Prefix $stack -Suite 'Test-IdentityLive'
 $work = Join-Path ([IO.Path]::GetTempPath()) $stack
 $installPath = Join-Path $work 'instance'
 $akProject = "$stack-ak"; $akFolder = Join-Path $work 'authentik'
@@ -115,9 +119,14 @@ try {
 
   # --- Fresh installation through the App Catalog ---------------------------------------------------------------------------
   $plan = Invoke-WebUi $ui POST '/api/catalog/plan' @{ appId = 'authentik'; project = $akProject; folder = $akFolder; localPort = $akPort; timezone = 'UTC'; inputs = @{ adminEmail = 'admin@idtest.example' }; startNow = $false }
+  # authentik already installed on this PC (production) blocks a silent second installation; the test then installs a
+  # deliberate, separate instance with its own project, folder, volumes and port (the existing one is never touched).
+  $dup = @($plan.Data.checks | Where-Object { $_.label -eq 'Not already installed' -and $_.state -eq 'failed' })[0]
+  if ($dup) { $plan = Invoke-WebUi $ui POST '/api/catalog/plan' @{ appId = 'authentik'; project = $akProject; folder = $akFolder; localPort = $akPort; timezone = 'UTC'; inputs = @{ adminEmail = 'admin@idtest.example' }; startNow = $false; anotherInstance = $true; instanceLabel = 'Identity test' } }
   $cc = @($plan.Data.checks | Where-Object { $_.label -eq 'docker compose config' })[0]
   Test-Condition 'install: Compose project validated by docker compose config' ($plan.Status -eq 200 -and $cc -and $cc.state -eq 'ok') ($plan.Body)
-  $compose = [string]$plan.Data.compose
+  # Modular stack: the server and worker in compose.yaml, PostgreSQL in compose.database.yaml; check the whole set.
+  $compose = (@($plan.Data.composeFiles | ForEach-Object { [string]$_.content }) -join "`n")
   Test-Condition 'install: images pinned by digest; no Docker socket; PostgreSQL only on the private network' ($compose -match 'goauthentik/server:2026\.8\.5@sha256:' -and $compose -match 'postgres:16-alpine@sha256:' -and $compose -notmatch 'docker\.sock' -and ($compose -split "`n" | Select-String -Pattern '^\s+networks: \[internal\]$').Count -eq 2) ''
   Test-Condition 'install: bootstrap administrator and API token come from .env, masked in the preview' ($compose -match 'AUTHENTIK_BOOTSTRAP_TOKEN: \$\{AUTHENTIK_BOOTSTRAP_TOKEN\}' -and $plan.Data.envPreview -match 'AUTHENTIK_BOOTSTRAP_TOKEN=<secret' -and $plan.Data.envPreview -match 'AUTHENTIK_BOOTSTRAP_PASSWORD=<secret') ($plan.Data.envPreview)
   $apply = Invoke-WebUi $ui POST '/api/catalog/apply' @{ planId = $plan.Data.planId; confirm = $true }
@@ -524,7 +533,9 @@ try {
   # --- Persistence and bootstrap semantics ----------------------------------------------------------------------------------
   $akadmin = @(Get-AuthentikList $conn '/core/users/?username=akadmin')[0]
   $null = Invoke-AuthentikApi $conn POST "/core/users/$($akadmin.pk)/set_password/" @{ password = 'Changed-Admin-Pass-55z' }
-  $rr = Invoke-Docker compose --project-directory $akFolder -f (Join-Path $akFolder 'compose.yaml') restart
+  # All Compose files of the modular stack (server in compose.yaml, worker and database in their own files).
+  $rargs = @('compose', '--project-directory', $akFolder); foreach ($f in @(Get-ChildItem -LiteralPath $akFolder -Filter 'compose*.yaml' -File | Sort-Object { $_.Name -ne 'compose.yaml' }, Name)) { $rargs += @('-f', $f.FullName) }
+  $rr = Invoke-Docker @($rargs + 'restart')
   $null = Wait-Until { (Get-AuthentikHealth -BaseUrl "http://127.0.0.1:$akPort").Ready } 240 5000
   $null = Wait-Until { @(Get-AuthentikList $conn '/sources/oauth/?slug=google').Count -eq 1 } 120 5000
   Test-Condition 'persistence: after restarting server, worker and database the configuration is still there' ($rr.ExitCode -eq 0 -and @(Get-AuthentikList $conn '/sources/oauth/?slug=google').Count -eq 1 -and @(Get-AuthentikList $conn '/core/users/?username=alice').Count -eq 1) ''
@@ -663,7 +674,12 @@ try {
   } else {
     $null = Invoke-Docker rm -f $app "$stack-echo2"
     foreach ($n in 1..7) { $null = Invoke-Docker rm -f "$stack-b$n" }
-    if (Test-Path -LiteralPath (Join-Path $akFolder 'compose.yaml')) { $null = Invoke-Docker compose --project-directory $akFolder -f (Join-Path $akFolder 'compose.yaml') down -v --remove-orphans }
+    # authentik is a modular stack: down needs the complete file set (compose.yaml alone does not parse: its depends_on
+    # names services of the other files). Anything still labelled with the project is removed afterwards.
+    $akFiles = @(Get-ChildItem -LiteralPath $akFolder -Filter 'compose*.yaml' -File -ErrorAction SilentlyContinue | Sort-Object { $_.Name -ne 'compose.yaml' }, Name)
+    if ($akFiles.Count) { $dargs = @('compose', '--project-directory', $akFolder); foreach ($f in $akFiles) { $dargs += @('-f', $f.FullName) }; $null = Invoke-Docker @($dargs + @('down', '-v', '--remove-orphans')) }
+    foreach ($c in @((Invoke-Docker ps -a -q --filter "label=com.docker.compose.project=$akProject").Output | Where-Object { $_ })) { $null = Invoke-Docker rm -f $c }
+    foreach ($n in @((Invoke-Docker network ls -q --filter "name=${akProject}_").Output | Where-Object { $_ })) { $null = Invoke-Docker network rm $n }
     $null = Invoke-Docker volume rm "${akProject}_database"
     if ($installed) { $null = Invoke-Ps (Join-Path $installPath 'install.ps1') @('-InstallPath', $installPath, '-Stop'); $null = Invoke-Docker rm -f "$stack-whoami" }
     $null = Invoke-Docker network rm $network
@@ -677,6 +693,8 @@ try {
     Test-Condition "other containers untouched ($($before.Count) checked: same IDs, start times, states)" ($changed.Count -eq 0 -and $added.Count -eq 0) ("changed: $($changed -join ', ') added: $($added -join ', ')")
     Get-ChildItem -LiteralPath $work -Recurse -File -ErrorAction SilentlyContinue | Where-Object { $_.IsReadOnly } | ForEach-Object { $_.IsReadOnly = $false }
     Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue
+    $orphaned = @(Complete-TestRun $stack)
+    Test-Condition 'teardown: nothing with this run''s prefix is left (containers, volumes, networks, folder)' ($orphaned.Count -eq 0) ($orphaned -join ', ')
   }
 }
 

@@ -153,9 +153,18 @@ function Test-AppFunction([string]$App, [string]$Project, [int]$Port, [string]$F
       $acq = Invoke-Docker exec "$Project-app" cscli metrics show acquisition
       return @(($r.ExitCode -eq 0), "cscli lapi status: exit $($r.ExitCode); acquisition: $((@($acq.Output) | Where-Object { $_ -match 'docker' } | Select-Object -First 2) -join ' | ')")
     }
+    'jellyfin' { $w = Wait-Http $Port '/health' { param($r) $r.Status -eq 200 -and $r.Body -match 'Healthy' } 240; return @($w.Ok, "/health: $($w.Response.Body)") }
+    'arcane' { $w = Wait-Http $Port '/' { param($r) $r.Status -in 200, 302 } 180; return @($w.Ok, "HTTP $($w.Response.Status)") }
+    'channels-dvr' { $w = Wait-Http $Port '/' { param($r) $r.Status -in 200, 302 } 240; return @($w.Ok, "HTTP $($w.Response.Status)") }
     'plex' { $w = Wait-Http $Port '/identity' { param($r) $r.Status -eq 200 -and $r.Body -match 'MediaContainer' } 240; return @($w.Ok, "/identity: HTTP $($w.Response.Status)") }
     'nextcloud' { $w = Wait-Http $Port '/status.php' { param($r) $r.Status -eq 200 -and $r.Body -match '"installed":\s*true' } 600; return @($w.Ok, "/status.php: $($w.Response.Body)") }
-    'paperless-ngx' { $w = Wait-Http $Port '/api/' { param($r) $r.Status -in 200, 401, 403 } 420; return @($w.Ok, "/api/: HTTP $($w.Response.Status)") }
+    'paperless-ngx' {
+      # The administrator from the installation form gets an API token (the web server, database and broker all work).
+      $env2 = Read-AppEnv (Join-Path $Folder '.env')
+      $body = 'username=' + [uri]::EscapeDataString([string]$env2['PAPERLESS_ADMIN_USER']) + '&password=' + [uri]::EscapeDataString([string]$env2['PAPERLESS_ADMIN_PASSWORD'])
+      $w = Wait-Http $Port '/api/token/' { param($r) $r.Status -eq 200 -and $r.Body -match '"token"' } 420 -Method 'POST' -Body $body -Headers @{ 'Content-Type' = 'application/x-www-form-urlencoded' }
+      return @($w.Ok, "administrator API token: HTTP $($w.Response.Status)")
+    }
     'romm' { $w = Wait-Http $Port '/api/heartbeat' { param($r) $r.Status -eq 200 } 300; return @($w.Ok, "/api/heartbeat: HTTP $($w.Response.Status)") }
     'mediafusion' { $w = Wait-Http $Port '/health' { param($r) $r.Status -eq 200 } 600; return @($w.Ok, "/health: HTTP $($w.Response.Status) $($w.Response.Body)") }
     default { return @($true, 'no app-specific check') }
@@ -217,14 +226,15 @@ try {
     $m = $entry.manifest
     $missing = @($m.services.PSObject.Properties | Where-Object { -not (Get-ImagePresent $_.Value.image) } | ForEach-Object { $_.Name })
     if ($missing.Count -and -not $AllowPull) { Add-Result 'SKIP' "$app" "images not on this PC ($($missing -join ', ')); -AllowPull downloads them"; continue }
-    $project = "$stack-$app"; $folder = Join-Path $appsRoot $app; $projects += [pscustomobject]@{ project = $project; folder = $folder }
+    $project = "$stack-$(if ($app.Length -gt 18) { $app.Substring(0, 15).TrimEnd('-') } else { $app })"; $folder = Join-Path $appsRoot $app; $projects += [pscustomobject]@{ project = $project; folder = $folder }
     $headless = [bool](Get-Prop2 $m.web 'headless' $false)
     $port = $(if ($headless) { 0 } else { Get-FreeTcpPort })
     $inputs = @{}
     # A disposable folder for apps that need one (shared files, media); never a real folder of this PC.
     $sample = Join-Path $work "folder-$app"; New-Item -ItemType Directory -Force -Path $sample | Out-Null
     switch ($app) { 'authelia' { $inputs = @{ domain = 'example.test'; adminEmail = 'admin@example.test' } } 'immich' { $inputs = @{ enableMl = 'false' } }
-      'filebrowser' { $inputs = @{ rootFolder = $sample } } 'hfs' { $inputs = @{ shareFolder = $sample } } 'plex' { $inputs = @{ mediaFolder = $sample; lanAccess = 'false' } } }
+      'filebrowser' { $inputs = @{ rootFolder = $sample } } 'hfs' { $inputs = @{ shareFolder = $sample } } 'plex' { $inputs = @{ mediaFolder = $sample; lanAccess = 'false' } }
+      'jellyfin' { $inputs = @{ mediaFolder = $sample } } 'channels-dvr' { $inputs = @{ recordingsFolder = $sample } } }
     # Memory of the services this installation runs (optional services switched off by an input are left out).
     $need = 0; $perService = $false
     foreach ($sp in $m.services.PSObject.Properties) {
@@ -236,6 +246,7 @@ try {
     if ($need + $ReserveMB -gt (Get-FreeMemoryMB)) { Add-Result 'SKIP' "$app" "needs about $need MB plus $ReserveMB MB reserve; $(Get-FreeMemoryMB) MB free"; continue }
     $t0 = Get-Date
     $plan = Invoke-WebUi $ui POST '/api/catalog/plan' @{ appId = $app; project = $project; folder = $folder; localPort = $port; inputs = $inputs; startNow = $true }
+    if ($plan.Status -ne 200) { Add-Result 'FAIL' "${app}: plan request" "HTTP $($plan.Status): $($plan.Body)"; continue }
     # The same application already installed on this PC (e.g. a production installation) blocks a silent duplicate; the
     # test then installs a deliberate, separate instance with its own project, folder, volumes and port.
     $dup = @($plan.Data.checks | Where-Object { $_.label -eq 'Not already installed' -and $_.state -eq 'failed' })[0]

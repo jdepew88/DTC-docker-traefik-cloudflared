@@ -363,7 +363,7 @@ against the mock Cloudflare API.
 It checks free memory before each application (and memory and system-drive space before it starts) and skips what does
 not fit, reported as SKIP rather than forced.
 
-These four suites register their run prefix (`tpx-ci-<id>`, `tpx-ct-<id>`, `tpm-alc-<id>`, ...) with its process
+These suites (Catalog, CatalogInstall, AppLifecycle, AppsBrowser and IdentityLive) register their run prefix (`tpx-ci-<id>`, `tpx-ct-<id>`, `tpm-alc-<id>`, `tpx-id-<id>`, ...) with its process
 ID and sweeps first: containers, volumes, networks and the `%TEMP%` folder of an earlier run whose process is gone (killed
 for low memory, closed window) are removed before anything new is created. `tests\Find-TestOrphans.ps1` lists such
 leftovers (`-Remove` removes them; prefixes without an ownership record need `-IncludeUnregistered`). Only names with a

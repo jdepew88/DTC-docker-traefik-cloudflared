@@ -133,8 +133,8 @@
   },
   "testStatus": {
     "static": "passed",
-    "live": "not-run",
-    "date": "2026-11-16",
-    "notes": "Manifest, Compose file set and route validated; not installed on a disposable deployment yet."
+    "live": "passed",
+    "date": "2026-11-17",
+    "notes": "Installed in isolation: health, its web interface, network isolation, stack on disk, stop/start, Traefik file route, backup and restore, removal with data."
   }
 }

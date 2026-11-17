@@ -117,8 +117,8 @@
   },
   "testStatus": {
     "static": "passed",
-    "live": "partial",
-    "date": "2026-11-16",
-    "notes": "Installed in isolation up to the Traefik route; backup, restore and removal not yet run (2026-11-16)."
+    "live": "passed",
+    "date": "2026-11-17",
+    "notes": "Installed in isolation: health, own API, network isolation, modular stack, stop/start, Traefik file route, backup and restore, removal with data."
   }
 }

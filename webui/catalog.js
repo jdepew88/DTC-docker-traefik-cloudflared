@@ -123,7 +123,7 @@
         ['Source', source ? h('a', { href: source, target: '_blank', rel: 'noopener noreferrer' }, source.replace(/^https:\/\//, ''), ' ', icon('external')) : '-'],
         ['Images', h('span', { class: 'mono small' }, arr(a.services).map((s) => `${s.name}: ${L.shortImage(s.image)}`).join('; '))],
         ['CPU architectures', arr(a.architectures).join(', ') || 'not declared'],
-        ['Compatibility', `${compat.text}${compat.detail ? ` (${compat.detail})` : ''}`],
+        ['Compatibility', a.installable ? `${compat.text}${compat.detail ? ` (${compat.detail})` : ''}` : 'Not assessed: not installable from the catalog'],
         ['Requirements', `about ${mb(res.memoryMB || 0)} memory, ${mb(res.diskMB || 0)} disk${arr(a.dependencies).length ? `; also runs ${a.dependencies.join(', ')}` : ''}`],
         ['Compose files', arr(a.components).map((c) => COMPONENT[c] || `compose.${c}.yaml`).join(', ') || 'compose.yaml'],
         ['Data', vols.length ? vols.map((v) => `${v.name} → ${v.target}`).join('; ') : 'none'],

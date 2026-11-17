@@ -264,8 +264,8 @@
   },
   "testStatus": {
     "static": "passed",
-    "live": "not-run",
-    "date": "2026-11-16",
-    "notes": "Manifest, Compose file set and route validated; not installed on a disposable deployment yet."
+    "live": "partial",
+    "date": "2026-11-17",
+    "notes": "Installed from the catalog on a disposable deployment by tests\\Test-IdentityLive.ps1 (108/116): install, readiness, private database, bootstrap token, Google source setup, restart persistence, teardown. Catalog backup/restore not run for it; 8 ForwardAuth protect-path checks fail identically on the previous commit (see the inventory)."
   }
 }

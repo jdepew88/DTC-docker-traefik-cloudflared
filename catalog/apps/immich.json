@@ -207,8 +207,8 @@
   },
   "testStatus": {
     "static": "passed",
-    "live": "not-run",
-    "date": "2026-11-16",
-    "notes": "Manifest, Compose file set and route validated; not installed on a disposable deployment yet."
+    "live": "passed",
+    "date": "2026-11-17",
+    "notes": "Installed in isolation with machine learning off (server, database, Valkey): /api/server/ping, network isolation, modular stack, stop/start, Traefik file route, backup and restore, removal with data. The machine-learning service (about 2.5 GB more) was not started."
   }
 }

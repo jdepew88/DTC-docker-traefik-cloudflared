@@ -243,8 +243,8 @@
   },
   "testStatus": {
     "static": "passed",
-    "live": "not-run",
-    "date": "2026-11-16",
-    "notes": "Manifest, Compose file set and route validated; not installed on a disposable deployment yet."
+    "live": "passed",
+    "date": "2026-11-17",
+    "notes": "Installed in isolation (Rocket.Chat 8.9.0, MongoDB replica set, NATS, setup jobs): /api/info, network isolation, 4-file modular stack, stop/start, Traefik file route, backup and restore, removal with data."
   }
 }
