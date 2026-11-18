@@ -312,6 +312,12 @@ every sign-in redirect points there: it works only on the PC running authentik. 
 - reports such a redirect as **misrouted** (not "sign-in required") in every check, and a current failed check outranks
   older sign-in evidence.
 
+The application's own address (the proxy provider's external host, the return address after signing in, and the Host
+every check sends through Traefik) uses the scheme and port of the public sign-in address: `https://<host>` in
+production. authentik's outpost matches the forwarded Host, port included, against the provider's address and answers
+404 for anything else, so the two must agree. After protecting, the manager waits up to a minute for the outpost to
+reload a corrected sign-in address before reporting the result.
+
 ### Cloudflare Access left in front
 
 Turning **Require Cloudflare Access** off (on the Services page, or *Remove Cloudflare Access* when protecting) now deletes

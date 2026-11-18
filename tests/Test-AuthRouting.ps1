@@ -132,6 +132,14 @@ try {
   Test-Condition 'model: an unreachable public sign-in page fails' ((Get-Stage (Get-RoutingModel $f) 'signin').state -eq 'failed') ''
   $f = New-Facts; $f.identity.publicUrl = 'http://192.168.1.20:9000'
   Test-Condition 'model: a LAN address as the public sign-in page fails' ((Get-Stage (Get-RoutingModel $f) 'signin').state -eq 'failed') ''
+  # Applications share the entry point of the sign-in page: a sign-in address with a port expects the provider on that port.
+  $f = New-Facts; $f.identity.publicUrl = 'http://auth.example.com:8080'; $f.authentik.providerExternalHost = 'http://notflix.example.com:8080'
+  $mp = Get-RoutingModel $f
+  Test-Condition 'model: on an entry point with a port the provider address with that port is accepted (authentik stage not failed)' ((Get-Stage $mp 'authentik').state -ne 'failed' -and $mp.appUrl -eq 'http://notflix.example.com:8080') "$((Get-Stage $mp 'authentik').summary) $($mp.appUrl)"
+  $f = New-Facts; $f.identity.publicUrl = 'http://auth.example.com:8080'
+  Test-Condition 'model: on an entry point with a port a provider without that port fails (authentik answers 404 for the real Host)' ((Get-Stage (Get-RoutingModel $f) 'authentik').state -eq 'failed') ''
+  $f = New-Facts
+  Test-Condition 'model: in production the application address stays https://<host>' ((Get-RoutingModel $f).appUrl -eq 'https://notflix.example.com' -and (Get-Stage (Get-RoutingModel $f) 'authentik').state -ne 'failed') ''
   $f = New-Facts; $f.challenge.Location = (Get-RedactedUrl $good.Replace('notflix.example.com%2F', 'other.example.com%2F'))
   Test-Condition 'model: a return address other than the original application fails "Return to the application"' ((Get-Stage (Get-RoutingModel $f) 'callback').state -eq 'failed') ''
   $f = New-Facts; $f.route.outpostRouter = $false

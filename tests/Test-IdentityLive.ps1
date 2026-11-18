@@ -419,9 +419,9 @@ try {
   $null = Invoke-AuthentikApi $conn PATCH "/providers/proxy/$($prov2.pk)/" @{ mode = 'forward_single'; external_host = "http://${appHost2}:$httpPort" }
   $null = Sync-AuthentikOutpost -Conn $conn -PublicUrl "http://${authHost}:$httpPort"
   # This test publishes the sign-in page as http://<auth host>:<port>; record that as the public address, so protecting
-  # an application keeps (and, if needed, restores) the outpost on it.
+  # an application keeps (and, if needed, restores) the outpost and the application addresses on it.
   $idPath = Join-Path $installPath 'config\identity.json'
-  $idj = [IO.File]::ReadAllText($idPath) | ConvertFrom-Json; $idj.authentik.publicUrl = "http://${authHost}:$httpPort"
+  $idj = [IO.File]::ReadAllText($idPath) | ConvertFrom-Json; $publicUrlBefore = [string]$idj.authentik.publicUrl; $idj.authentik.publicUrl = "http://${authHost}:$httpPort"
   [IO.File]::WriteAllText($idPath, (ConvertTo-Json -InputObject $idj -Depth 10))
   # Wait until the outpost has reloaded the test addresses (it refreshes a few seconds after a change).
   $null = Wait-Until { @($appHost, $appHost2 | Where-Object { $x = Test-ForwardAuthChallenge -TraefikPort $httpPort -Hostname $_ -HostPort $httpPort -AuthHostname $authHost; $x.State -eq 'auth' -and $x.Location -match "^http://${authHost}:$httpPort/" }).Count -eq 2 } 90 2000
@@ -446,7 +446,7 @@ try {
   $fa = Invoke-WebUi $ui POST '/api/identity/protect/apply' @{ planId = $fx.Data.planId; confirm = $true }
   $null = Wait-Until { (Test-ForwardAuthChallenge -TraefikPort $httpPort -Hostname $appHost -HostPort $httpPort -AuthHostname $authHost).State -eq 'auth' } 90 2000
   $fixed = Test-ForwardAuthChallenge -TraefikPort $httpPort -Hostname $appHost -HostPort $httpPort -AuthHostname $authHost
-  Test-Condition 'protect: applying restores the public sign-in redirect, the return address and every access rule' ($fa.Data.ok -and $fixed.State -eq 'auth' -and $fixed.Location -match "^http://${authHost}:$httpPort/" -and $fixed.Location -match [regex]::Escape("redirect_uri=http://${appHost}:$httpPort/outpost.goauthentik.io/callback") -and @(Get-AuthentikList $conn '/policies/bindings/').Count -eq $bindsBefore) ($fixed | ConvertTo-Json -Compress)
+  Test-Condition 'protect: applying restores the public sign-in redirect, the return address and every access rule' ($fa.Data.ok -and $fixed.State -eq 'auth' -and $fixed.Location -match "^http://${authHost}:$httpPort/" -and $fixed.Location -match [regex]::Escape("redirect_uri=http://${appHost}:$httpPort/outpost.goauthentik.io/callback") -and @(Get-AuthentikList $conn '/policies/bindings/').Count -eq $bindsBefore) "$($fixed | ConvertTo-Json -Compress) apply: $(@($fa.Data.results | ForEach-Object { "$($_.service) ok=$($_.ok) $($_.message)" }) -join '; ')"
   $so = Invoke-SignIn $httpPort $authHost $appHost 'owner' 'Owner-Live-Test-55q' $work
   Test-Condition 'owner-only: the owner reaches the newly protected application (identity headers passed)' ($so.Login -eq 'xak-flow-redirect' -and $so.ReachedApp -and $so.Body -match 'X-Authentik-Username: owner') "$($so.Status) $($so.Url)"
   $sa = Invoke-SignIn $httpPort $authHost $appHost 'alice' 'Alice-Live-Test-91x' $work
@@ -481,6 +481,9 @@ try {
   $null = Invoke-AuthentikApi $conn PATCH "/providers/proxy/$($prov.pk)/" @{ mode = 'forward_single'; external_host = "https://$appHost" }
   $null = Invoke-AuthentikApi $conn PATCH "/providers/proxy/$($prov2.pk)/" @{ mode = 'forward_single'; external_host = "https://$appHost2" }
   $null = Sync-AuthentikOutpost -Conn $conn -PublicUrl "https://$authHost"
+  # ... and the recorded public sign-in address with them (the manager derives application addresses from it).
+  $idj = [IO.File]::ReadAllText($idPath) | ConvertFrom-Json; $idj.authentik.publicUrl = $publicUrlBefore
+  [IO.File]::WriteAllText($idPath, (ConvertTo-Json -InputObject $idj -Depth 10))
 
   # Loop detection: a hand-written route that redirects to itself.
   $loopFile = Join-Path $installPath 'traefik\dynamic\zz-loop-test.yml'

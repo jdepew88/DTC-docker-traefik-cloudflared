@@ -3135,7 +3135,7 @@ function Get-RoutingFacts($Settings, $Svc, [switch]$Probe) {
   }
   if ($Probe) {
     $facts.health = Get-ServiceHealth -Settings $Settings -Service $Svc -Public:([bool]$Svc.cloudflare.publish)
-    if ($authP -eq 'authentik' -and $Svc.enabled) { $facts.challenge = Test-ForwardAuthChallenge -TraefikPort $Settings.HttpPort -Hostname $h -AuthHostname ([string]$cfg.authentik.hostname) }
+    if ($authP -eq 'authentik' -and $Svc.enabled) { $facts.challenge = Test-ForwardAuthChallenge -TraefikPort $Settings.HttpPort -Hostname $h -HostPort (Get-IdentityAppAddress ([string]$cfg.authentik.publicUrl) $h).HostPort -AuthHostname ([string]$cfg.authentik.hostname) }
     if ($authP -eq 'authentik' -and $cfg.authentik.publicUrl) {
       $pr = Invoke-ProbeRequest "$(([string]$cfg.authentik.publicUrl).TrimEnd('/'))/-/health/live/"
       $facts.publicAuth = [ordered]@{ status = $pr.Status; location = (Get-RedactedUrl $pr.Location); error = $pr.Error }
@@ -3618,7 +3618,7 @@ function Get-IdentityContext([switch]$Deep, [switch]$ProbeApps) {
     $check = $(if ($State.IdpChecks.ContainsKey($s.name)) { $State.IdpChecks[$s.name] } else { $null })
     # -ProbeApps (the wizard's protection step and summary): one anonymous request through Traefik per application, so
     # completion is shown from what Traefik and authentik do now, not from stored flags. Read-only.
-    if (($Deep -or $ProbeApps) -and $s.enabled) { $check = Test-ForwardAuthChallenge -TraefikPort $settings.HttpPort -Hostname @($s.hostnames)[0] -AuthHostname $cfg.authentik.hostname; $State.IdpChecks[$s.name] = $check }
+    if (($Deep -or $ProbeApps) -and $s.enabled) { $check = Test-ForwardAuthChallenge -TraefikPort $settings.HttpPort -Hostname @($s.hostnames)[0] -HostPort (Get-IdentityAppAddress ([string]$cfg.authentik.publicUrl) @($s.hostnames)[0]).HostPort -AuthHostname $cfg.authentik.hostname; $State.IdpChecks[$s.name] = $check }
     # ForwardAuth in the configuration: the route file attaches the authentik middleware, and Traefik has loaded it.
     $rf = Get-RouteFileFacts (Join-Path $InstallPath "traefik\dynamic\svc-$($s.name).yml") $s.name
     $rt = @($routers | Where-Object { $null -ne $_ -and $_.name -eq "svc-$($s.name)@file" })
@@ -4097,7 +4097,8 @@ function Get-ProtectRequest([string]$Name, $Ctx, [string]$AccessChoice = 'keep',
 # none is set and the outpost would send browsers to an address that only works on this PC).
 function Get-ProtectDesired($Svc) {
   $pub = ''; try { $pub = [string](Read-IdentityConfig -Settings (Get-Settings)).authentik.publicUrl } catch { }
-  return [pscustomobject]@{ Service = $Svc.name; DisplayName = $(if ($Svc.PSObject.Properties['displayName']) { $Svc.displayName } else { $Svc.name }); Hostname = @($Svc.hostnames)[0]; PublicUrl = $pub }
+  $h = @($Svc.hostnames)[0]
+  return [pscustomobject]@{ Service = $Svc.name; DisplayName = $(if ($Svc.PSObject.Properties['displayName']) { $Svc.displayName } else { $Svc.name }); Hostname = $h; PublicUrl = $pub; ExternalUrl = (Get-IdentityAppAddress $pub $h).Url }
 }
 
 # Preview for "Protect selected with authentik" (services: [...]) or for removing protection from one (service).
@@ -4179,13 +4180,16 @@ function Invoke-IdentityProtectApply($Body, [switch]$Remove) {
       Set-IdentityApp $cfg $name ([pscustomobject][ordered]@{ slug = $r.Slug; providerPk = $r.ProviderPk; applicationPk = $r.ApplicationPk; initialAccess = $r.Access; protectedAt = (Get-Date -Format 's'); verifiedAt = ''; verifiedBy = '' })
       Save-IdentityConfig -Settings $ctx.Settings -Config $cfg
       # The route switches only once the embedded outpost has loaded the provider (otherwise it would answer 404).
-      $wait = Wait-AuthentikOutpost -BaseUrl $ctx.BaseUrl -Hostname @($plan.New.hostnames)[0] -Seconds 90
+      $wait = Wait-AuthentikOutpost -BaseUrl $ctx.BaseUrl -Hostname (Get-IdentityAppAddress ([string]$cfg.authentik.publicUrl) @($plan.New.hostnames)[0]).HostHeader -Seconds 90
       if (-not $wait.Ready) { $out.ok = $false; $out.message = "authentik's embedded outpost has not loaded the application yet (HTTP $($wait.Status)). The Traefik route was not changed; protect it again in a minute (nothing is created twice)."; $results += $out; continue }
       if ($plan.Traefik.FileChanges -gt 0 -or $plan.Traefik.RegistryChanged) { $out.traefik = Invoke-ChangePlanSteps $plan $confirmed } else { $out.traefik = [ordered]@{ ok = $true; steps = @(); warnings = @() } }
       if (-not $out.traefik.ok) { $out.ok = $false; $out.message = 'Traefik did not accept the change; the route is unchanged.' }
       else {
-        $deadline = (Get-Date).AddSeconds(20)
-        do { $out.challenge = Test-ForwardAuthChallenge -TraefikPort $ctx.Settings.HttpPort -Hostname @($plan.New.hostnames)[0] -AuthHostname $cfg.authentik.hostname; if ($out.challenge.State -ne 'open') { break }; Start-Sleep -Seconds 2 } while ((Get-Date) -lt $deadline)
+        # Traefik reloads the route and the outpost reloads its sign-in address a few seconds after a change: until then an
+        # anonymous request may still pass ('open') or be sent to the previous address ('misrouted'). Anything else, and
+        # either state after the deadline, is reported as not verified.
+        $deadline = (Get-Date).AddSeconds(60)
+        do { $out.challenge = Test-ForwardAuthChallenge -TraefikPort $ctx.Settings.HttpPort -Hostname @($plan.New.hostnames)[0] -HostPort (Get-IdentityAppAddress ([string]$cfg.authentik.publicUrl) @($plan.New.hostnames)[0]).HostPort -AuthHostname $cfg.authentik.hostname; if ($out.challenge.State -notin 'open', 'misrouted') { break }; Start-Sleep -Seconds 2 } while ((Get-Date) -lt $deadline)
         $State.IdpChecks[$name] = $out.challenge
         if ($out.challenge.State -ne 'auth') { $out.ok = $false; $out.message = "ForwardAuth is not verified: $($out.challenge.Message)" }
         else { $out.message = 'Protected: an unauthenticated request is sent to sign in.' }
@@ -4451,7 +4455,7 @@ function Get-IdentityProtectionPreview([string]$ServiceName, [string]$Hostname, 
   $ctx = Get-IdentityContext
   Assert-IdentityConnection $ctx
   if ($Hostname -and $ctx.Config.authentik.hostname -and $Hostname -eq $ctx.Config.authentik.hostname) { Stop-Request 400 "$Hostname is authentik's own sign-in address; it cannot be protected by authentik." }
-  $desired = [pscustomobject]@{ Service = $ServiceName; DisplayName = $DisplayName; Hostname = $Hostname; PublicUrl = [string]$ctx.Config.authentik.publicUrl }
+  $desired = [pscustomobject]@{ Service = $ServiceName; DisplayName = $DisplayName; Hostname = $Hostname; PublicUrl = [string]$ctx.Config.authentik.publicUrl; ExternalUrl = (Get-IdentityAppAddress ([string]$ctx.Config.authentik.publicUrl) $Hostname).Url }
   $r = Sync-AuthentikAppProtection -Conn $ctx.Conn -Desired $desired -WhatIf
   return [ordered]@{ actions = @(ConvertTo-AkActionView $r.Actions); reuses = @($r.Actions | Where-Object { $_.Kind -eq 'none' } | ForEach-Object { "$($_.Object) $($_.Name)" }); creates = @($r.Actions | Where-Object { $_.Kind -eq 'create' } | ForEach-Object { "$($_.Object) $($_.Name)" }) }
 }
@@ -4472,7 +4476,7 @@ function Request-IdentityProtection([string]$ServiceName) {
 function Test-IdentityProtection([string]$Hostname) {
   $settings = Get-Settings
   $cfg = Read-IdentityConfig -Settings $settings
-  return (Test-ForwardAuthChallenge -TraefikPort $settings.HttpPort -Hostname $Hostname -AuthHostname $cfg.authentik.hostname)
+  return (Test-ForwardAuthChallenge -TraefikPort $settings.HttpPort -Hostname $Hostname -HostPort (Get-IdentityAppAddress ([string]$cfg.authentik.publicUrl) $Hostname).HostPort -AuthHostname $cfg.authentik.hostname)
 }
 
 # 7. Rollback of protection set up by one operation: the route stops asking authentik (Traefik first), then the

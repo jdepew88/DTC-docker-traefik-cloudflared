@@ -116,12 +116,15 @@ Each card lists its manual steps (*Requires manual setup* filter). The most impo
 
 ## Known issues found in this round (2026-11-17)
 
-- **authentik ForwardAuth re-protection (pre-existing):** `tests\Test-IdentityLive.ps1` fails 8 of 116 checks, all after
-  its "misroute" step (outpost pointed at 127.0.0.1, then protected again): the re-protected application answers 404
-  through Traefik, so owner-only access, rollback reuse and authentik-side verification are not demonstrated in that
-  sequence. The same 8 checks fail identically on the previous commit (f989dbf); they are not caused by the catalog
-  work, which does not touch the identity code. Not fixed in this round; protecting a fresh application, fail-closed
-  behaviour, loop detection, unprotect and restart persistence pass.
+- **authentik ForwardAuth re-protection (fixed 2026-11-17):** `tests\Test-IdentityLive.ps1` failed 8 of 116 checks after
+  its "misroute" step (also on f989dbf). Cause: the manager assumed every protected application is at `https://<host>`.
+  Protecting again rewrote the authentik provider from the deployment's real address (`http://<host>:<port>` on the
+  test entry point) to `https://<host>`; authentik's outpost matches the forwarded Host, port included, against that
+  address, so it answered 404 (passed through by Traefik ForwardAuth). The application address now follows the scheme
+  and port of the public sign-in address (unchanged in production: `https://<host>`), in the provider, the routing view
+  and every probe; apply also waits for the outpost to reload a corrected sign-in address. A re-run was stopped by
+  Claude Code for low PC memory after 103 passed checks with 2 failures (both fixed afterwards, covered by unit tests);
+  the complete live re-run is still pending.
 - **Immich** was live-tested with machine learning off; the machine-learning service (about 2.5 GB) was not started.
 - **Paperless-ngx** Gotenberg and Tika (optional office-document services) were not started.
 - **Plex** was tested without a claim token and without GPU; claiming and hardware transcoding are not verified.

@@ -266,6 +266,6 @@
     "static": "passed",
     "live": "partial",
     "date": "2026-11-17",
-    "notes": "Installed from the catalog on a disposable deployment by tests\\Test-IdentityLive.ps1 (108/116): install, readiness, private database, bootstrap token, Google source setup, restart persistence, teardown. Catalog backup/restore not run for it; 8 ForwardAuth protect-path checks fail identically on the previous commit (see the inventory)."
+    "notes": "Installed from the catalog on a disposable deployment by tests\\Test-IdentityLive.ps1: install, readiness, private database, bootstrap token, Google source setup, ForwardAuth protection and sign-ins, restart persistence, teardown. Catalog backup/restore not run for it. The 8 re-protection failures (404) were fixed on 2026-11-17; the complete live re-run is pending (the last run was stopped for low PC memory)."
   }
 }
