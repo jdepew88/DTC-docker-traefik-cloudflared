@@ -689,7 +689,7 @@ function Sync-AuthentikLoginPage {
   else {
     Add-AkAction $actions 'create' 'stage' $iname 'Create the sign-in form: "Google" first, email or username with password below'
     if (-not $WhatIf) {
-      $ident = Invoke-AuthentikApi $Conn POST '/stages/identification/' @{ name = $iname; user_fields = @($defIdent.user_fields); password_stage = (Get-AkProp $defIdent 'password_stage' $null); captcha_stage = (Get-AkProp $defIdent 'captcha_stage' $null)
+      $ident = Invoke-AuthentikApi $Conn POST '/stages/identification/' @{ name = $iname; user_fields = @($defIdent.user_fields); password_stage = (Get-AkProp $defIdent 'password_stage' $null); captcha_stage = $null
         case_insensitive_matching = $true; show_matched_user = [bool](Get-AkProp $defIdent 'show_matched_user' $true); enrollment_flow = $null; recovery_flow = (Get-AkProp $defIdent 'recovery_flow' $null)
         passwordless_flow = (Get-AkProp $defIdent 'passwordless_flow' $null); sources = @([string]$src.pk); show_source_labels = $true; pretend_user_exists = $true; enable_remember_me = [bool](Get-AkProp $defIdent 'enable_remember_me' $false) }
       Set-AkActionDone $actions

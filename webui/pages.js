@@ -358,7 +358,7 @@
       pub.append(h('p', null, ext(d.publicUrl)), h('p', { class: 'muted small' }, 'Cloudflare asks for a login first; only /dashboard/ and /api are routed. Requests that did not pass Cloudflare Access get 404 from Traefik.'),
         h('div', { class: 'actions' }, h('button', { type: 'button', class: 'btn danger-outline', onclick: (e) => ctx.startDashboardPlan({ disable: true }, e.currentTarget) }, 'Remove public dashboard…')));
     } else if (!d.cloudflareReady) {
-      pub.append(h('p', { class: 'muted' }, 'Publishing needs Cloudflare automation (API token with the Access permission, account and tunnel). It is always protected by a Cloudflare Access login; Turnstile is not a login and is never used instead.'));
+      pub.append(h('p', { class: 'muted' }, 'Publishing needs Cloudflare automation (API token with the Access permission, account and tunnel). It is always protected by a Cloudflare Access login.'));
     } else {
       const f = s.forms.pubdash || (s.forms.pubdash = { sub: d.subdomain, custom: d.subdomainCustom, zoneId: d.zoneId, emails: arr(d.accessEmails).join(', ') || d.contactEmail || '' });
       const sub = h('input', { value: f.sub, spellcheck: 'false', autocomplete: 'off', id: 'dash-sub-ops' });

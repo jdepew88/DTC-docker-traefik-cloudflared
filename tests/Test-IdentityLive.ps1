@@ -369,7 +369,7 @@ try {
   $brandNow = @(Get-AuthentikList $conn '/core/brands/' | Where-Object { $_.default })[0]
   $dmFlow = Invoke-AuthentikApi $conn GET '/flows/instances/dm-authentication/'
   $dmIdent = @(Get-AuthentikList $conn '/stages/identification/?name=dm-identification')[0]
-  Test-Condition 'sign-in page: Google first (promoted source with label), email/password below, domain title, used by the brand' ($lpa.Data.ok -and [string]$brandNow.flow_authentication -eq [string]$dmFlow.pk -and $brandNow.branding_title -eq 'Sign in to idtest.example' -and @($dmIdent.sources) -contains [string]$src.pk -and $dmIdent.show_source_labels -and @($dmIdent.user_fields).Count -ge 1) ($lpp.Body)
+  Test-Condition 'sign-in page: Google first (promoted source with label), email/password below, no CAPTCHA, domain title, used by the brand' ($lpa.Data.ok -and -not $dmIdent.captcha_stage -and [string]$brandNow.flow_authentication -eq [string]$dmFlow.pk -and $brandNow.branding_title -eq 'Sign in to idtest.example' -and @($dmIdent.sources) -contains [string]$src.pk -and $dmIdent.show_source_labels -and @($dmIdent.user_fields).Count -ge 1) ($lpp.Body)
   $defFlowAfter = @(Get-AuthentikList $conn "/flows/bindings/?target=$((Invoke-AuthentikApi $conn GET '/flows/instances/default-authentication-flow/').pk)" | ForEach-Object { "$($_.stage):$($_.order)" } | Sort-Object) -join ','
   Test-Condition 'sign-in page: the default flow is untouched and still signs akadmin in (local recovery route)' ($defFlowAfter -eq $defFlowBefore -and (& $localSignIn 'akadmin' $adminPass) -eq 'xak-flow-redirect') "$defFlowBefore -> $defFlowAfter"
   $lpr = Invoke-WebUi $ui POST '/api/identity/loginpage/restore' @{ confirm = $true }

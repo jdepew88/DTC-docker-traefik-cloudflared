@@ -610,7 +610,7 @@
         summary: 'Outbound tunnel, Access login, recovery points',
         content: () => h('ul', null,
           h('li', null, 'The tunnel is an outbound connection from this PC: no router port is opened and your IP address is not published.'),
-          wantDash ? h('li', null, 'The public dashboard requires a Cloudflare Access login. Turnstile or a CAPTCHA is not a login and is never used instead.') : null,
+          wantDash ? h('li', null, 'The public dashboard requires a Cloudflare Access login.') : null,
           h('li', null, 'A recovery point is saved before every change. Resources this tool creates are recorded (config\\cloudflare.json) so they can be removed again without touching anything else.'),
           h('li', null, 'The API token never leaves this PC except in calls to api.cloudflare.com.')) })));
     const overwrites = dashActions.filter((a) => a.overwrite);
