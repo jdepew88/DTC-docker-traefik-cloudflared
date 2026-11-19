@@ -829,6 +829,9 @@ volumes: { dbdata: {} }
     $null = Invoke-Docker rm -f $recApp
     $idj = [IO.File]::ReadAllText($idPath) | ConvertFrom-Json; $idj.authentik.publicUrl = $rPublicBefore
     [IO.File]::WriteAllText($idPath, (ConvertTo-Json -InputObject $idj -Depth 10))
+    # The outpost goes back to the recorded public address as well: later sections (the identity wizard in the browser)
+    # treat a mismatch as an unfinished "Public sign-in address" step.
+    $null = Sync-AuthentikOutpost -Conn $conn -PublicUrl $(if ($rPublicBefore) { $rPublicBefore } else { "https://$authHost" })
   }
 
   # --- Secrets never leak ---------------------------------------------------------------------------------------------------
