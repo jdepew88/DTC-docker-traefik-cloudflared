@@ -151,6 +151,17 @@ by the application's tool is explained with the lines to change there, never app
    backend change detected with a proposed repair, the repair applied to the DTC-owned route, the integration
    removed, the original project unchanged (same container id, Compose files untouched).
 
+Results on 2026-11-19 (this PC, Windows 11 + Docker Desktop, production running alongside and untouched):
+
+- Proof 1, Miniflux (an RSS reader, not in the catalog) imported from
+  `https://github.com/miniflux/v2/blob/main/contrib/docker-compose/basic.yml`: 19 passed, 0 failed. Two services,
+  images pinned, the example database password embedded in `DATABASE_URL` linked to the generated database secret,
+  `compose.yaml` + `compose.database.yaml`, database only on the private network without a host port, route through
+  Traefik, anonymous API requests refused (401) and the generated administrator accepted (200), data written,
+  backed up, deleted, restored, then removed (only the backups folder you made is kept).
+- Proof 2, a Compose project with Portainer's access-control label: 17 passed, 0 failed, 2 not tested (proof 1 was
+  skipped in that run; authentik needs a real identity environment).
+
 authentik protection of both is verified against a real authentik only in `tests\Test-IdentityLive.ps1`; the
 universal test reports it as not tested unless an identity environment is ready.
 
