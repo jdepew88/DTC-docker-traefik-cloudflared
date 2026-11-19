@@ -81,6 +81,8 @@ Import-Module (Join-Path $here 'lib\ProvisionPolicy.psm1') -Force
 Import-Module (Join-Path $here 'lib\IdentityContract.psm1') -Force
 Import-Module (Join-Path $here 'lib\AiAssist.psm1') -Force
 Import-Module (Join-Path $here 'lib\Recipes.psm1') -Force
+Import-Module (Join-Path $here 'lib\AppContract.psm1') -Force
+Import-Module (Join-Path $here 'lib\Reconcile.psm1') -Force
 Import-Module (Join-Path $here 'lib\Launcher.psm1') -Force
 if (-not $CatalogDir) { $CatalogDir = Join-Path $here 'catalog' }
 Import-Module (Join-Path $here 'lib\LocalHttp.psm1') -Force
@@ -125,6 +127,7 @@ $State = @{
   IdpPlans  = @{}
   IdpChecks = @{}
   ProvisionPlans = @{}
+  IntegrationPlans = @{}
   AiEstimates = @{}
   Remembered = @{}
   Cookie    = "tpx_session_$Port"
@@ -157,6 +160,7 @@ $StaticFiles = @{
   '/discover.js' = @('discover.js', 'text/javascript; charset=utf-8')
   '/catalog.js' = @('catalog.js', 'text/javascript; charset=utf-8')
   '/provision.js' = @('provision.js', 'text/javascript; charset=utf-8')
+  '/applications.js' = @('applications.js', 'text/javascript; charset=utf-8')
   '/credentials.js' = @('credentials.js', 'text/javascript; charset=utf-8')
   '/identity.js' = @('identity.js', 'text/javascript; charset=utf-8')
   '/routing.js' = @('routing.js', 'text/javascript; charset=utf-8')
@@ -505,7 +509,8 @@ function Invoke-BackendResolve($Body) {
 }
 
 # Builds the Traefik + Cloudflare plan for a change request. Pure read: nothing is written.
-function Build-ChangePlan($Body) {
+# $Owner (internal callers only, never from the browser): the integration that owns a new route.
+function Build-ChangePlan($Body, $Owner = $null) {
   Assert-Installed
   $settings = Get-Settings
   $registry = Read-ServiceRegistry -Settings $settings
@@ -518,6 +523,7 @@ function Build-ChangePlan($Body) {
     'add' {
       $parsed = Get-ServiceFromBody $Body
       $new = $parsed.Service
+      if ($Owner) { $new | Add-Member -NotePropertyName owner -NotePropertyValue ([pscustomobject]$Owner) -Force; $new = ConvertTo-ServiceDefinition $new }
       if ($parsed.Note) { $notes += $parsed.Note }
       $list = @($services) + $new
       $summary = "Add service '$($new.name)'"
@@ -529,6 +535,8 @@ function Build-ChangePlan($Body) {
       if ($parsed.Note) { $notes += $parsed.Note }
       if ($new.name -ne $previous.name) { Stop-Request 400 'A service cannot be renamed; remove it and add it again.' }
       if (-not $parsed.HasAuth -and $previous.PSObject.Properties['auth']) { $new | Add-Member -NotePropertyName auth -NotePropertyValue $previous.auth -Force }
+      # The owner of a route is kept on every edit (the browser cannot set or change it).
+      if ($previous.PSObject.Properties['owner']) { $new | Add-Member -NotePropertyName owner -NotePropertyValue $previous.owner -Force }
       $list = @($services | ForEach-Object { if ($_.name -eq $previous.name) { $new } else { $_ } })
       $summary = "Update service '$($new.name)'"
     }
@@ -4277,6 +4285,7 @@ function Get-ProvisionDraftView($Draft) {
     unresolved = @(Get-Prop2 $importNotes 'unresolved' @()); unsupported = @(Get-Prop2 $importNotes 'unsupported' @()); evidence = @(Get-Prop2 $importNotes 'evidence' @()); assumptions = @(Get-Prop2 $importNotes 'assumptions' @())
     knownIssues = @(Get-Prop2 $m 'knownIssues' @()); verification = (Get-Prop2 $m 'verification' $null); findings = $findings; compatibility = $compat; manifestErrors = $errors
     protection = (Get-ProtectionCompatibility $m); catalogMatch = (Get-Prop2 $Draft 'catalogMatch' $null)
+    trust = (Get-RecipeTrust $m); authOptions = (Get-AuthenticationOptions -Manifest $m -IdentityReady $(try { [bool](Get-IdentityContractStatus).readiness.ready } catch { $false })); reused = $false
     ai = [ordered]@{ runs = $aiRuns.Count; usd = [Math]::Round((@($aiRuns | ForEach-Object { [double](Get-Prop2 (Get-Prop2 $_ 'usage' $null) 'usd' 0) }) | Measure-Object -Sum).Sum, 5) }
     deployable = (-not $blocked) }
 }
@@ -4294,7 +4303,7 @@ function Get-ProvisionData {
   $key = Get-ProtectedSecretInfo -Settings $settings -Name (Get-AiKeySecretName)
   $domains = @(); try { $domains = @((Read-CloudflareConfig -Settings $settings).domains | ForEach-Object { [string]$_.name }) } catch { }
   return [ordered]@{ drafts = $drafts; operations = $ops; domains = $domains; host = (Get-CurrentHostAdapter); hosts = @(Get-HostAdapters | ForEach-Object { [ordered]@{ id = $_.id; name = $_.name; status = $_.status; tested = $_.tested } })
-    sources = @('Docker Hub (hub.docker.com links or image names)', 'GitHub repositories and Compose files', 'GitHub Container Registry, Quay and lscr.io image names', 'Unraid template XML (raw links)', 'awesome-selfhosted entries')
+    sources = @('Docker Hub (hub.docker.com links or image names)', 'GitHub repositories and Compose files', 'GitHub Container Registry, Quay and lscr.io image names', 'Unraid template XML (raw links or pasted)', 'Compose files (pasted: a main file and up to 3 overrides)', 'awesome-selfhosted entries')
     ai = [ordered]@{ provider = $ai.provider; model = $ai.model; escalationModel = $ai.escalationModel; allowEscalation = [bool]$ai.allowEscalation; monthlyLimitUsd = $ai.monthlyLimitUsd; perRequestLimitUsd = $ai.perRequestLimitUsd; maxOutputTokens = $ai.maxOutputTokens
       keyStored = [bool]$key.Stored; providers = @(Get-AiProviders); prices = (Get-AiPrices); month = (Get-AiMonthSpend (Read-AiUsage $settings) ([double]$ai.monthlyLimitUsd)) }
     identity = (Get-IdentityContractStatus); recipes = @(Get-LocalRecipes $settings).Count; registry = (Get-RecipeRegistryInfo) }
@@ -4303,11 +4312,23 @@ function Get-ProvisionData {
 function Invoke-ProvisionImport($Body) {
   Assert-Installed
   $url = ([string](Get-Field $Body 'url' '')).Trim()
-  if (-not $url) { Stop-Request 400 'Paste a link or an image name.' }
+  # Pasted text instead of a link: Compose (main file + overrides) or an Unraid template, with an optional project link.
+  $texts = @(@(Get-Field $Body 'texts' @()) | ForEach-Object { [string]$_ } | Where-Object { $_.Trim() })
+  $one = [string](Get-Field $Body 'text' '')
+  if ($one.Trim()) { $texts = @($one) + $texts }
+  if (-not $url -and -not $texts.Count) { Stop-Request 400 'Paste a link, an image name, a Compose file or an Unraid template.' }
   $catalog = @(Get-CatalogApps -CatalogDir $CatalogDir | Where-Object { -not @($_.errors).Count })
   $r = $null
-  try { $r = Import-AppSource -Text $url -CatalogApps $catalog } catch { Stop-Request 422 $_.Exception.Message }
-  $draft = [ordered]@{ version = 1; draftId = (New-SecretValue 8); createdAt = (Get-Date -Format 's'); url = $url; kind = $r.Kind; catalogMatch = $r.CatalogMatch; manifest = $r.Manifest; ai = @() }
+  try {
+    if ($texts.Count) { $r = Import-AppSourceText -Format ([string](Get-Field $Body 'format' 'auto')) -Texts $texts -SourceUrl ([string](Get-Field $Body 'sourceUrl' '')) -Name ([string](Get-Field $Body 'name' '')) -CatalogApps $catalog }
+    else { $r = Import-AppSource -Text $url -CatalogApps $catalog }
+  } catch { Stop-Request 422 $_.Exception.Message }
+  # Importing the same link or text again returns the existing draft instead of a duplicate.
+  foreach ($f in @(Get-ChildItem -LiteralPath (Get-ProvisionDir 'drafts') -Filter '*.json' -File)) {
+    try { $old = [IO.File]::ReadAllText($f.FullName) | ConvertFrom-Json } catch { continue }
+    if ([string](Get-Prop2 $old 'importKey' '') -eq $r.ImportKey) { $v = Get-ProvisionDraftView $old; $v.reused = $true; return $v }
+  }
+  $draft = [ordered]@{ version = 1; draftId = (New-SecretValue 8); createdAt = (Get-Date -Format 's'); url = $(if ($texts.Count) { [string](Get-Field $Body 'sourceUrl' '') } else { $url }); kind = $r.Kind; importKey = $r.ImportKey; catalogMatch = $r.CatalogMatch; manifest = $r.Manifest; ai = @() }
   $saved = ($draft | ConvertTo-Json -Depth 30) | ConvertFrom-Json
   Save-ProvisionDraft $saved
   Write-Audit 'provision-import' "$($r.Kind) $($r.Manifest.id) draft=$($draft.draftId)"
@@ -4836,6 +4857,363 @@ function Get-ProvisionRecipes($Query) {
   return [ordered]@{ recipes = @($ranked | ForEach-Object { [ordered]@{ id = $_.Recipe.id; application = $_.Recipe.application; host = $_.Recipe.host; trust = $_.Recipe.trust; origin = $_.Recipe.provenance.origin; score = $_.Score; reasons = $_.Reasons; compatible = $_.Compatible } }); registry = (Get-RecipeRegistryInfo) }
 }
 
+# --- Applications: one model for managed, integrated and observed applications (docs/universal-apps.md) -------------
+# lib\AppContract.psm1 (recipes, instances, integrations, ownership modes) and lib\Reconcile.psm1 (drift and repairs).
+# Integrations reuse the service change pipeline (Build-ChangePlan / Invoke-ChangePlanSteps: validation in a throwaway
+# Traefik, backups, Cloudflare plans) and the identity contract; they never recreate a container or edit the files of
+# the tool that owns it.
+
+function Assert-ContractInstanceId([string]$Value) { if ($Value -notmatch '^(x|i)-[0-9a-f]{6,12}$|^legacy-[a-z0-9][a-z0-9_.-]{0,62}$') { Stop-Request 400 'Invalid application id.' }; return $Value }
+
+function Get-ManagedContractRecords($Settings, $Catalog) {
+  return @(Read-AppsRegistry $Settings | Where-Object { -not [bool](Get-Prop2 $_ 'archived' $false) } | ForEach-Object {
+      $inst = ConvertTo-AppInstance $_ $Catalog
+      $m = $null; try { $m = Get-InstanceManifest $_ $Catalog } catch { }
+      $web = ''; if ($m -and (Get-Prop2 $m 'web' $null)) { try { $web = Get-AppContainerName $m $inst.project ([string]$m.web.service) } catch { } }
+      $o = [ordered]@{}; foreach ($k in $inst.Keys) { $o[$k] = $inst[$k] }
+      $o.manifest = $m; $o.webContainer = $web
+      $o
+    })
+}
+
+function Get-ContractContext {
+  Assert-Installed
+  $settings = Get-Settings
+  if (-not (Get-DockerStatus).EngineRunning) { Stop-Request 503 'The Docker engine is not reachable. Start Docker Desktop.' }
+  $catalog = @(Get-CatalogApps -CatalogDir $CatalogDir | Where-Object { -not @($_.errors).Count })
+  try { $registry = Read-ContractRegistry $settings } catch { Stop-Request 409 $_.Exception.Message }
+  return [pscustomobject]@{ Settings = $settings; Catalog = $catalog; Registry = $registry
+    Managed = @(Get-ManagedContractRecords $settings $catalog); Services = @((Read-ServiceRegistry -Settings $settings).services)
+    Containers = @(Get-DockerContainerInventory -ProxyNetwork $settings.ProxyNetwork); Own = @(@((Get-StackContainerNames $settings).Values) + @($settings.WhoamiContainer)) }
+}
+
+function Get-ApplicationsData {
+  $c = Get-ContractContext
+  $inv = Get-ApplicationInventory -Managed $c.Managed -Registry $c.Registry -Services $c.Services -Containers $c.Containers -StackName $c.Settings.StackName -OwnContainers $c.Own -ProxyNetwork $c.Settings.ProxyNetwork
+  $inv.proxyNetwork = $c.Settings.ProxyNetwork
+  $inv.entryPoints = @(
+    [ordered]@{ id = 'catalog'; label = 'Browse curated applications'; href = '#catalog' }
+    [ordered]@{ id = 'link'; label = 'Paste a Docker Hub or GitHub link'; href = '#provision' }
+    [ordered]@{ id = 'compose'; label = 'Import Compose'; href = '#provision?source=compose' }
+    [ordered]@{ id = 'unraid'; label = 'Import an Unraid template'; href = '#provision?source=unraid' }
+    [ordered]@{ id = 'discover'; label = 'Discover existing Docker applications'; href = '#applications' })
+  return $inv
+}
+
+# The container a request names, refused when it belongs to this deployment, is proxy/tunnel infrastructure or a
+# database-like private service.
+function Get-IntegrableContainer($Ctx, [string]$Name) {
+  if ($Name -notmatch '^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$') { Stop-Request 400 'Invalid container name.' }
+  $c = @($Ctx.Containers | Where-Object { $_.name -eq $Name })
+  if (-not $c.Count) { Stop-Request 404 "No container named '$Name'." }
+  $c = $c[0]
+  if ($Ctx.Own -contains $c.name -or ([string]$c.compose.project -and [string]$c.compose.project -eq [string]$Ctx.Settings.StackName)) { Stop-Request 400 "$Name is part of this deployment; it is managed by its compose.yaml." }
+  if ($c.infrastructure) { Stop-Request 400 "$Name looks like proxy or tunnel infrastructure; it is not integrated as an application." }
+  if ($c.privateService) { Stop-Request 400 "$Name is a database, cache, message broker or directory server: it stays private." }
+  if (@($Ctx.Managed | Where-Object { [string]$_.project -and [string]$_.project -eq [string]$c.compose.project }).Count) { Stop-Request 409 "$Name belongs to an application DTC manages; use the Installed apps page." }
+  return $c
+}
+
+function Find-ContractInstance($Ctx, [string]$InstanceId) {
+  $i = @(@($Ctx.Registry.instances) | Where-Object { [string]$_.instanceId -eq $InstanceId })
+  if ($i.Count) { return $i[0] }
+  return $null
+}
+
+# DTC Observed: record a container or project for monitoring only. Nothing is changed.
+function Invoke-ApplicationObserve($Body) {
+  $ctx = Get-ContractContext
+  $c = Get-IntegrableContainer $ctx ([string](Get-Field $Body 'container' ''))
+  $dup = @(@($ctx.Registry.instances) | Where-Object { $_.target.container -eq $c.name -or ($c.compose.project -and $_.target.project -eq $c.compose.project -and $_.target.service -eq $c.compose.service) })
+  if ($dup.Count) { Stop-Request 409 "$($c.name) is already recorded as $($dup[0].mode)." }
+  $auth = Get-ManagementAuthority $c
+  $inst = New-ContractInstance 'observed' $c $auth ([string](Get-Field $Body 'name' '')) (New-ObservedBaseline $c 0 '' $ctx.Settings.ProxyNetwork $auth)
+  $ctx.Registry.instances = @(@($ctx.Registry.instances) + $inst)
+  Save-ContractRegistry $ctx.Settings $ctx.Registry
+  Write-Audit 'app-observe' "$($c.name) authority=$($auth.id) id=$($inst.instanceId)"
+  return [ordered]@{ ok = $true; instance = $inst }
+}
+
+# Forgets an observed instance (only the record; integrated ones must have their integrations removed first).
+function Invoke-ApplicationForget($Body) {
+  $ctx = Get-ContractContext
+  $id = Assert-ContractInstanceId ([string](Get-Field $Body 'instanceId' ''))
+  $inst = Find-ContractInstance $ctx $id
+  if (-not $inst) { Stop-Request 404 'No such application record.' }
+  if (@($inst.integrations).Count) { Stop-Request 409 'Remove its integrations first (routes, sign-in, publication).' }
+  $ctx.Registry.instances = @(@($ctx.Registry.instances) | Where-Object { $_.instanceId -ne $id })
+  Save-ContractRegistry $ctx.Settings $ctx.Registry
+  Write-Audit 'app-forget' $id
+  return [ordered]@{ ok = $true }
+}
+
+# DTC Integrated: a separately owned route (and optionally Cloudflare publication) for an application another tool
+# owns. The plan is the ordinary service change plan with the route's owner recorded.
+function Build-IntegrationChange($Body, [string]$InstanceId = '', [string]$IntegrationId = '') {
+  $ctx = Get-ContractContext
+  $c = Get-IntegrableContainer $ctx ([string](Get-Field $Body 'container' ''))
+  $existing = @(@($ctx.Registry.instances) | Where-Object { $_.target.container -eq $c.name -or ($c.compose.project -and $_.target.project -eq $c.compose.project -and $_.target.service -eq $c.compose.service) })
+  if ($existing.Count -and [string]$existing[0].mode -eq 'observed' -and -not [bool](Get-Field $Body 'switchToIntegrated' $false)) { Stop-Request 409 "$($c.name) is observed. Confirm switching it to Integrated (DTC then manages only the route it creates)." }
+  $port = 0; if (-not [int]::TryParse([string](Get-Field $Body 'port' ''), [ref]$port) -or $port -lt 1 -or $port -gt 65535) { Stop-Request 400 'Choose the web port (1-65535).' }
+  if ($port -in 2375, 2376) { Stop-Request 400 'The Docker Engine API port is never routed.' }
+  if (-not @($c.exposed | Where-Object { [int]$_.port -eq $port -and $_.proto -eq 'tcp' }).Count) { Stop-Request 400 "$($c.name) does not expose TCP port $port." }
+  $protocol = [string](Get-Field $Body 'protocol' 'http'); if ($protocol -notin 'http', 'https') { Stop-Request 400 'Protocol must be http or https.' }
+  $hostname = ([string](Get-Field $Body 'hostname' '')).Trim().ToLowerInvariant()
+  $routeName = ([string](Get-Field $Body 'name' $(if ($c.compose.project) { $c.compose.project } else { $c.name }))).ToLowerInvariant() -replace '[^a-z0-9-]', '-' -replace '-+', '-'
+  $routeName = $routeName.Trim('-'); if ($routeName.Length -gt 40) { $routeName = $routeName.Substring(0, 40).Trim('-') }
+  $publish = [bool](Get-Field $Body 'publish' $false)
+  $instId = $(if ($existing.Count) { [string]$existing[0].instanceId } elseif ($InstanceId) { $InstanceId } else { New-ContractId 'x' })
+  $intId = $(if ($IntegrationId) { $IntegrationId } else { New-ContractId 'int' })
+  $owner = [ordered]@{ kind = 'integration'; instanceId = $instId; integrationId = $intId }
+  $svc = [pscustomobject]@{ name = $routeName; displayName = ([string](Get-Field $Body 'displayName' '')); description = "Integrated application ($((Get-ManagementAuthority $c).label) owns the containers)"
+    enabled = $true; hostnames = @($hostname); middlewares = @('default-headers@file')
+    target = [pscustomobject]@{ type = 'docker'; host = $c.name; port = $port; protocol = $protocol }
+    cloudflare = [pscustomobject]@{ publish = $publish; access = [bool](Get-Field $Body 'access' $publish) } }
+  $changeBody = [pscustomobject]@{ op = 'add'; service = $svc; cloudflare = [pscustomobject]@{ automate = $publish } }
+  $plan = Build-ChangePlan $changeBody $owner
+  $auth = Get-ManagementAuthority $c
+  $view = ConvertTo-PlanView $plan ''
+  $warnings = @()
+  if (-not $c.onProxyNetwork) {
+    $warnings += "$($c.name) is not on '$($ctx.Settings.ProxyNetwork)', so Traefik cannot reach it. Add the network to the service in its owner's Compose file (DTC does not edit it), redeploy it there, then preview again."
+    $view.canApply = $false
+  }
+  $ready = $false; try { $ready = [bool](Get-IdentityContractStatus).readiness.ready } catch { }
+  return [pscustomobject]@{ Ctx = $ctx; Container = $c; Authority = $auth; Plan = $plan; View = $view; Owner = $owner; ChangeBody = $changeBody; RouteName = $routeName; Hostname = $hostname; Port = $port; Protocol = $protocol; Publish = $publish
+    Warnings = $warnings; AuthOptions = (Get-AuthenticationOptions -Image $c.image -IdentityReady $ready -Public $publish); Existing = $(if ($existing.Count) { $existing[0] } else { $null }) }
+}
+
+function Get-IntegrationPlan($Body) {
+  $x = Build-IntegrationChange $Body
+  foreach ($k in @($State.IntegrationPlans.Keys)) { if (((Get-Date) - $State.IntegrationPlans[$k].Created).TotalMinutes -gt 15) { $State.IntegrationPlans.Remove($k) } }
+  $id = New-RandomKey 12
+  $State.IntegrationPlans[$id] = [pscustomobject]@{ Created = (Get-Date); Body = ($Body | ConvertTo-Json -Depth 8 -Compress); InstanceId = $x.Owner.instanceId; IntegrationId = $x.Owner.integrationId; TraefikKey = $x.Plan.TraefikKey; CfFingerprint = $x.Plan.Cloudflare.Fingerprint }
+  $x.View.planId = $id
+  return [ordered]@{ planId = $id; plan = $x.View; container = $x.Container.name; route = $x.RouteName; hostname = $x.Hostname; backendUrl = "$($x.Protocol)://$($x.Container.name):$($x.Port)"
+    ownership = [ordered]@{ mode = 'integrated'; authority = $x.Authority; rights = (Get-OwnershipModes).integrated; instanceId = $x.Owner.instanceId
+      keeps = @("$($x.Container.name) and its Compose project stay with $($x.Authority.label): DTC does not recreate, restart or edit them.", 'Only the route created here (and sign-in or publication you add to it) belongs to DTC; removing the integration removes only those.') }
+    authentication = $x.AuthOptions; warnings = @($x.Warnings); canApply = [bool]$x.View.canApply; needsBackendAck = [bool]$x.View.needsBackendAck }
+}
+
+function Invoke-IntegrationApply($Body) {
+  Assert-Confirmed $Body
+  $id = [string](Get-Field $Body 'planId' '')
+  if (-not $id -or -not $State.IntegrationPlans.ContainsKey($id)) { Stop-Request 409 'This preview has expired or was already applied. Preview the integration again.' }
+  $stored = $State.IntegrationPlans[$id]; $State.IntegrationPlans.Remove($id)
+  $x = Build-IntegrationChange ($stored.Body | ConvertFrom-Json) $stored.InstanceId $stored.IntegrationId
+  if ($x.Plan.TraefikKey -ne $stored.TraefikKey -or $x.Plan.Cloudflare.Fingerprint -ne $stored.CfFingerprint) { Stop-Request 409 'The configuration changed since the preview. Preview the integration again.' }
+  if (-not $x.View.canApply) { Stop-Request 400 "This integration cannot be applied: $((@($x.Warnings) + @($x.View.traefik.issues | Where-Object { $_.Level -eq 'Error' } | ForEach-Object { $_.Message })) -join ' ')" }
+  if ($x.View.needsBackendAck -and -not [bool](Get-Field $Body 'acceptUnverifiedBackend' $false)) { $State.IntegrationPlans[$id] = $stored; Stop-Request 409 "The backend did not pass the connection test from Traefik's network: $($x.Plan.Backend.message)" @{ needsBackendAck = $true } }
+  $confirmed = @(@(Get-Field $Body 'confirmOverwrites' @()) | ForEach-Object { [string]$_ })
+  $result = Invoke-ChangePlanSteps $x.Plan $confirmed
+  if (-not $result.ok -and -not @((Read-ServiceRegistry -Settings $x.Ctx.Settings).services | Where-Object { $_.name -eq $x.RouteName }).Count) { Write-Audit 'integration-failed' "$($x.Container.name) route=$($x.RouteName)"; return [ordered]@{ ok = $false; result = $result } }
+  $reg = Read-ContractRegistry $x.Ctx.Settings
+  $inst = @(@($reg.instances) | Where-Object { $_.instanceId -eq $x.Owner.instanceId })
+  if ($inst.Count) { $inst = $inst[0]; $inst.mode = 'integrated'; $inst.authority = $x.Authority; $inst.baseline = (New-ObservedBaseline $x.Container $x.Port $x.Protocol $x.Ctx.Settings.ProxyNetwork $x.Authority); $inst.updatedAt = (Get-Date).ToUniversalTime().ToString('s') + 'Z' }
+  else {
+    $inst = New-ContractInstance 'integrated' $x.Container $x.Authority ([string](Get-Field ($stored.Body | ConvertFrom-Json) 'displayName' '')) (New-ObservedBaseline $x.Container $x.Port $x.Protocol $x.Ctx.Settings.ProxyNetwork $x.Authority)
+    $inst.instanceId = $x.Owner.instanceId
+    $reg.instances = @(@($reg.instances) + $inst)
+  }
+  $spec = ConvertTo-OrderedTree ($x.Plan.New | ConvertTo-Json -Depth 8 | ConvertFrom-Json)
+  $inst.integrations = @(@($inst.integrations) + [ordered]@{ integrationId = $x.Owner.integrationId; kind = 'traefik-route'; route = $x.RouteName; spec = $spec; createdAt = (Get-Date).ToUniversalTime().ToString('s') + 'Z'
+      protection = $null; publication = [ordered]@{ hostname = $x.Hostname; cloudflare = $x.Publish } })
+  Save-ContractRegistry $x.Ctx.Settings $reg
+  Write-Audit 'integration-apply' "$($x.Container.name) route=$($x.RouteName) id=$($x.Owner.instanceId) authority=$($x.Authority.id) ok=$($result.ok)"
+  return [ordered]@{ ok = [bool]$result.ok; result = $result; instanceId = $x.Owner.instanceId; integrationId = $x.Owner.integrationId; route = $x.RouteName }
+}
+
+function Find-IntegrationRoute($Ctx, $Inst, [string]$Route) {
+  $g = @(@($Inst.integrations) | Where-Object { [string]$_.route -eq $Route })
+  if (-not $g.Count) { Stop-Request 404 "The route '$Route' does not belong to this integration." }
+  $svc = @($Ctx.Services | Where-Object { $_.name -eq $Route -and $_.PSObject.Properties['owner'] -and $_.owner.instanceId -eq $Inst.instanceId })
+  if (-not $svc.Count) { Stop-Request 409 "The route '$Route' is no longer owned by this integration (it was removed or changed elsewhere). Check drift first." }
+  return [pscustomobject]@{ Integration = $g[0]; Service = $svc[0] }
+}
+
+# Sign-in in front of an integrated application, through the identity contract (only routes the integration owns).
+function Invoke-IntegrationProtect($Body) {
+  Assert-Confirmed $Body
+  $ctx = Get-ContractContext
+  $inst = Find-ContractInstance $ctx (Assert-ContractInstanceId ([string](Get-Field $Body 'instanceId' '')))
+  if (-not $inst -or $inst.mode -ne 'integrated') { Stop-Request 404 'No such integrated application.' }
+  $r = Find-IntegrationRoute $ctx $inst ([string](Get-Field $Body 'route' ''))
+  $st = Get-IdentityContractStatus
+  if (-not $st.readiness.ready) { Stop-Request 409 ('Identity & Access is not ready: ' + ((@($st.readiness.missing) | ForEach-Object { $_.message }) -join ' ')) }
+  $res = Request-IdentityProtection $r.Service.name
+  $check = $null; try { $check = Test-IdentityProtection (@($r.Service.hostnames)[0]) } catch { }
+  $reg = Read-ContractRegistry $ctx.Settings
+  $i2 = @(@($reg.instances) | Where-Object { $_.instanceId -eq $inst.instanceId })[0]
+  foreach ($g in @($i2.integrations)) { if ($g.route -eq $r.Service.name) { $g.protection = [ordered]@{ provider = 'authentik'; created = @($res.created); verified = [bool]($check -and $check.State -eq 'auth'); checkedAt = (Get-Date).ToUniversalTime().ToString('s') + 'Z' } } }
+  Save-ContractRegistry $ctx.Settings $reg
+  Write-Audit 'integration-protect' "$($inst.instanceId) route=$($r.Service.name) ok=$($res.ok) challenge=$(if ($check) { $check.State })"
+  return [ordered]@{ ok = [bool]$res.ok; message = $res.message; challenge = $check }
+}
+
+function Get-IntegrationRemovePlan($Body) {
+  $ctx = Get-ContractContext
+  $inst = Find-ContractInstance $ctx (Assert-ContractInstanceId ([string](Get-Field $Body 'instanceId' '')))
+  if (-not $inst -or $inst.mode -ne 'integrated') { Stop-Request 404 'No such integrated application.' }
+  $owned = @($ctx.Services | Where-Object { $_.PSObject.Properties['owner'] -and $_.owner.instanceId -eq $inst.instanceId })
+  return [ordered]@{ instanceId = $inst.instanceId; name = $inst.name
+    removes = @($owned | ForEach-Object { [ordered]@{ route = $_.name; hostnames = @($_.hostnames); protection = $(if ($_.PSObject.Properties['auth']) { $_.auth.provider } else { '' }); cloudflare = [bool]$_.cloudflare.publish } })
+    keeps = @("The containers, Compose files, volumes and networks of $($inst.name) ($([string]$inst.authority.label)) are not touched.", 'Shared middleware, the authentik outpost, flows and other applications are not touched.')
+    key = (Get-TextSha256 ((@($owned | ForEach-Object { "$($_.name)|$(ConvertTo-RegistryJson @($_))" })) -join ',')) }
+}
+
+function Invoke-IntegrationRemove($Body) {
+  Assert-Confirmed $Body
+  $plan = Get-IntegrationRemovePlan $Body
+  if ($plan.key -ne [string](Get-Field $Body 'key' '')) { Stop-Request 409 'The integration changed since the preview. Review it again.' }
+  $settings = Get-Settings
+  $steps = @()
+  $reg = Read-ContractRegistry $settings
+  $inst = @(@($reg.instances) | Where-Object { $_.instanceId -eq $plan.instanceId })[0]
+  foreach ($r in $plan.removes) {
+    $g = @(@($inst.integrations) | Where-Object { $_.route -eq $r.route })
+    if ($r.protection -eq 'authentik') {
+      $created = [bool]($g.Count -and $g[0].protection -and @($g[0].protection.created).Count)
+      try { $steps += @(Undo-IdentityProtection $r.route $created) } catch { $steps += "Sign-in of $($r.route) could not be removed: $($_.Exception.Message)"; return [ordered]@{ ok = $false; steps = $steps } }
+    }
+    $p = Build-ChangePlan ([pscustomobject]@{ op = 'remove'; name = $r.route; cloudflare = [pscustomobject]@{ automate = [bool]$r.cloudflare; cleanup = $true } })
+    $res = Invoke-ChangePlanSteps $p @()
+    $steps += "Route $($r.route): $(if ($res.ok) { 'removed' } else { 'not removed' })"
+    if (-not $res.ok) { return [ordered]@{ ok = $false; steps = $steps; result = $res } }
+  }
+  $keep = [bool](Get-Field $Body 'keepObserved' $false)
+  if ($keep) { $inst.mode = 'observed'; $inst.integrations = @(); $inst.updatedAt = (Get-Date).ToUniversalTime().ToString('s') + 'Z' }
+  else { $reg.instances = @(@($reg.instances) | Where-Object { $_.instanceId -ne $plan.instanceId }) }
+  Save-ContractRegistry $settings $reg
+  Write-Audit 'integration-remove' "$($plan.instanceId) routes=$((@($plan.removes) | ForEach-Object { $_.route }) -join ',') keepObserved=$keep"
+  return [ordered]@{ ok = $true; steps = $steps; kept = @($plan.keeps) }
+}
+
+# Drift of one application: observations gathered here, decisions in lib\Reconcile.psm1.
+function Get-ApplicationDrift($Ctx, [string]$InstanceId) {
+  $settings = $Ctx.Settings
+  $inst = Find-ContractInstance $Ctx $InstanceId
+  $container = $null; $authority = $null; $routes = @(); $expectedVolumes = @(); $volumes = $null
+  if ($inst) {
+    $container = Find-InstanceContainer $inst $Ctx.Containers
+    if ($container) { $authority = Get-ManagementAuthority $container @($Ctx.Managed | ForEach-Object { [string]$_.project }) $settings.StackName }
+    $names = @(@($inst.integrations) | ForEach-Object { [string]$_.route })
+    $routes = @($Ctx.Services | Where-Object { ($_.PSObject.Properties['owner'] -and $_.owner.instanceId -eq $inst.instanceId) -or $names -contains $_.name -or ($container -and $_.target.type -eq 'docker' -and $_.target.host -eq $container.name) })
+  } else {
+    $m = @($Ctx.Managed | Where-Object { $_.instanceId -eq $InstanceId })
+    if (-not $m.Count) { Stop-Request 404 'No such application.' }
+    $m = $m[0]
+    $web = [string]$m.webContainer
+    $svcName = $(if ($m.manifest -and (Get-Prop2 $m.manifest 'web' $null)) { [string]$m.manifest.web.service } else { '' })
+    $inst = [ordered]@{ instanceId = $m.instanceId; mode = 'managed'; name = $m.name; target = [ordered]@{ project = $m.project; service = $svcName; container = $web }; integrations = @(); authority = [ordered]@{ id = 'dtc'; label = 'DTC' } }
+    $container = Find-InstanceContainer $inst $Ctx.Containers
+    $authority = [ordered]@{ id = 'dtc'; label = 'DTC'; confidence = 'certain'; evidence = @() }
+    $hosts = @($Ctx.Containers | Where-Object { $_.compose.project -eq $m.project } | ForEach-Object { $_.name }) + @($web)
+    $routes = @($Ctx.Services | Where-Object { $_.target.type -eq 'docker' -and $hosts -contains $_.target.host })
+    if ($m.folder -and (Test-Path -LiteralPath (Join-Path $m.folder 'dtc-stack.json'))) {
+      try { $stack = [IO.File]::ReadAllText((Join-Path $m.folder 'dtc-stack.json')) | ConvertFrom-Json; $expectedVolumes = @(@($stack.volumes) | Where-Object { $_.type -eq 'volume' } | ForEach-Object { [string]$_.name }) } catch { }
+      if ($expectedVolumes.Count) { $volumes = @((Invoke-Docker volume ls -q).Output | Where-Object { $_ } | ForEach-Object { [string]$_ }) }
+    }
+  }
+  $loaded = $null
+  try { $rt = Get-TraefikApi $settings '/api/http/routers'; if ($null -ne $rt) { $loaded = @(@($rt) | ForEach-Object { ([string]$_.name) -replace '^svc-', '' }) } } catch { }
+  $files = @($routes | Where-Object { Test-Path -LiteralPath (Join-Path $settings.InstallPath "traefik\dynamic\svc-$($_.name).yml") } | ForEach-Object { $_.name })
+  $probes = @{}
+  if ($container -and $container.state -eq 'running' -and $container.onProxyNetwork) {
+    foreach ($r in @($routes | Where-Object { $_.enabled -and $_.target.type -eq 'docker' })) {
+      $k = "$($r.target.host):$($r.target.port)"
+      if ($probes.ContainsKey($k) -or @($container.exposed | Where-Object { [int]$_.port -eq [int]$r.target.port }).Count -eq 0) { continue }
+      try { $pr = Test-ContainerPort -Container $container -Port ([int]$r.target.port) -ProxyNetwork $settings.ProxyNetwork -Image $settings.TraefikImage -NamePrefix $settings.StackName -Schemes @([string]$r.target.protocol); $probes[$k] = @{ result = $pr.result; status = $pr.status; message = $pr.detail } } catch { }
+    }
+  }
+  # A route port the container no longer exposes: probe its exposed ports, so a repair uses a port that answers.
+  $portProbes = @{}
+  if ($container -and $container.state -eq 'running' -and $container.onProxyNetwork -and @($routes | Where-Object { $rp = [int]$_.target.port; $_.enabled -and -not @($container.exposed | Where-Object { [int]$_.port -eq $rp }).Count }).Count) {
+    foreach ($ep in @($container.exposed | Where-Object { $_.proto -eq 'tcp' -and [int]$_.port -notin 2375, 2376 } | Select-Object -First 6)) {
+      try { $pr = Test-ContainerPort -Container $container -Port ([int]$ep.port) -ProxyNetwork $settings.ProxyNetwork -Image $settings.TraefikImage -NamePrefix $settings.StackName -Schemes @('http'); $portProbes[[string]$ep.port] = @{ result = $pr.result; status = $pr.status } } catch { }
+    }
+  }
+  $claims = @{}
+  $labelled = @($Ctx.Containers | Where-Object { @($_.traefik.routers).Count })
+  foreach ($r in $routes) { foreach ($h in @($r.hostnames)) { $claims[[string]$h] = @(Find-HostnameClaims -Hostname $h -Services $Ctx.Services -Routers @() -Containers $labelled -OwnService $r.name) } }
+  $protection = @{}
+  foreach ($g in @($inst.integrations)) { if ($g.protection -and [string]$g.protection.provider) { $protection[[string]$g.route] = $g.protection } }
+  $findings = @(Get-DriftFindings -Instance $inst -Container $container -Authority $authority -Routes $routes -LoadedRouters $loaded -RouteFiles $files -Probes $probes -Middlewares @(Get-AvailableMiddlewares $settings) -Claims $claims -ProxyNetwork $settings.ProxyNetwork -Volumes $volumes -ExpectedVolumes $expectedVolumes -Protection $protection -PortProbes $portProbes)
+  return [pscustomobject]@{ Instance = $inst; Container = $container; Routes = $routes; Findings = $findings; Summary = (Get-DriftSummary $findings); Repair = (Get-RepairPlan $findings $routes) }
+}
+
+function Invoke-ApplicationDriftRequest($Body) {
+  $ctx = Get-ContractContext
+  $id = Assert-ContractInstanceId ([string](Get-Field $Body 'instanceId' ''))
+  $d = Get-ApplicationDrift $ctx $id
+  return [ordered]@{ instanceId = $id; mode = [string]$d.Instance.mode; summary = $d.Summary; findings = @($d.Findings); repair = $d.Repair; checkedAt = (Get-Date -Format 's') }
+}
+
+# The change bodies of a repair: route updates, re-syncs and re-creations of DTC-owned routes only.
+function Get-RepairChangeBodies($Ctx, $Drift) {
+  $bodies = @()
+  foreach ($c in @($Drift.Repair.routeChanges)) {
+    $cur = @($Ctx.Services | Where-Object { $_.name -eq $c.route })[0]
+    $def = ConvertTo-ServiceDefinition ($cur | ConvertTo-Json -Depth 8 | ConvertFrom-Json)
+    $def.target.host = [string]$c.after.host; $def.target.port = [int]$c.after.port; $def.middlewares = @($c.after.middlewares)
+    $bodies += [pscustomobject]@{ Summary = "Update route '$($c.route)'"; Body = [pscustomobject]@{ op = 'update'; name = $c.route; service = $def; cloudflare = [pscustomobject]@{ automate = $false } }; Owner = $null }
+  }
+  foreach ($rn in @($Drift.Repair.resync)) {
+    if (@($Drift.Repair.routeChanges | Where-Object { $_.route -eq $rn }).Count) { continue }
+    $cur = @($Ctx.Services | Where-Object { $_.name -eq $rn })[0]
+    if ($cur) { $bodies += [pscustomobject]@{ Summary = "Rewrite route '$rn'"; Body = [pscustomobject]@{ op = 'update'; name = $rn; service = $cur; cloudflare = [pscustomobject]@{ automate = $false } }; Owner = $null } }
+  }
+  foreach ($rn in @($Drift.Repair.recreate)) {
+    $g = @(@($Drift.Instance.integrations) | Where-Object { $_.route -eq $rn -and $_.spec })[0]
+    if ($g) {
+      $spec = $g.spec | ConvertTo-Json -Depth 8 | ConvertFrom-Json
+      $bodies += [pscustomobject]@{ Summary = "Create route '$rn' again"; Body = [pscustomobject]@{ op = 'add'; service = $spec; cloudflare = [pscustomobject]@{ automate = $false } }; Owner = [ordered]@{ kind = 'integration'; instanceId = $Drift.Instance.instanceId; integrationId = [string]$g.integrationId } }
+    }
+  }
+  return $bodies
+}
+
+function Get-ApplicationRepairPlan($Body) {
+  $ctx = Get-ContractContext
+  $id = Assert-ContractInstanceId ([string](Get-Field $Body 'instanceId' ''))
+  $d = Get-ApplicationDrift $ctx $id
+  $bodies = @(Get-RepairChangeBodies $ctx $d)
+  $views = @(foreach ($b in $bodies) { $p = Build-ChangePlan $b.Body $b.Owner; [ordered]@{ summary = $b.Summary; plan = (ConvertTo-PlanView $p ''); key = $p.TraefikKey } })
+  $key = Get-TextSha256 ((@($views | ForEach-Object { $_.key })) -join '|')
+  return [ordered]@{ instanceId = $id; summary = $d.Summary; findings = @($d.Findings); routeChanges = @($views | ForEach-Object { [ordered]@{ summary = $_.summary; plan = $_.plan } })
+    external = @($d.Repair.external); protection = @($d.Repair.protection); notes = @($d.Repair.notes); canApply = [bool]($views.Count -and -not @($views | Where-Object { -not $_.plan.hasWork -or @($_.plan.traefik.issues | Where-Object { $_.Level -eq 'Error' }).Count }).Count); key = $key }
+}
+
+function Invoke-ApplicationRepair($Body) {
+  Assert-Confirmed $Body
+  $plan = Get-ApplicationRepairPlan $Body
+  if (-not $plan.canApply) { Stop-Request 409 'There is no repair DTC can apply; see the instructions for the application''s owner.' }
+  if ($plan.key -ne [string](Get-Field $Body 'key' '')) { Stop-Request 409 'The application changed since the preview. Review the repair again.' }
+  $ctx = Get-ContractContext
+  $d = Get-ApplicationDrift $ctx $plan.instanceId
+  $results = @()
+  foreach ($b in @(Get-RepairChangeBodies $ctx $d)) {
+    $p = Build-ChangePlan $b.Body $b.Owner
+    $r = Invoke-ChangePlanSteps $p @()
+    $results += [ordered]@{ summary = $b.Summary; ok = [bool]$r.ok; steps = @($r.steps) }
+    if (-not $r.ok) { break }
+  }
+  $ok = -not @($results | Where-Object { -not $_.ok }).Count
+  # A repaired integration records what it now relies on, so the next check compares against the repaired state.
+  if ($ok -and $d.Instance.mode -eq 'integrated' -and $d.Container) {
+    $reg = Read-ContractRegistry $ctx.Settings
+    $i2 = @(@($reg.instances) | Where-Object { $_.instanceId -eq $plan.instanceId })[0]
+    $route = @((Read-ServiceRegistry -Settings $ctx.Settings).services | Where-Object { $_.PSObject.Properties['owner'] -and $_.owner.instanceId -eq $plan.instanceId })[0]
+    if ($i2 -and $route) {
+      $i2.baseline = New-ObservedBaseline $d.Container ([int]$route.target.port) ([string]$route.target.protocol) $ctx.Settings.ProxyNetwork (Get-ManagementAuthority $d.Container)
+      foreach ($g in @($i2.integrations)) { if ($g.route -eq $route.name) { $g.spec = ConvertTo-OrderedTree ($route | ConvertTo-Json -Depth 8 | ConvertFrom-Json) } }
+      $i2.updatedAt = (Get-Date).ToUniversalTime().ToString('s') + 'Z'
+      Save-ContractRegistry $ctx.Settings $reg
+    }
+  }
+  Write-Audit 'app-repair' "$($plan.instanceId) ok=$ok $((@($results | ForEach-Object { "$($_.summary)=$($_.ok)" })) -join '; ')"
+  return [ordered]@{ ok = $ok; results = $results }
+}
+
 # --- Router ----------------------------------------------------------------------------------------------------
 
 function Invoke-ApiRoute($Request, $Body) {
@@ -4963,6 +5341,17 @@ function Invoke-ApiRoute($Request, $Body) {
     'POST /api/identity/protect/apply' { return Invoke-IdentityProtectApply $Body }
     'POST /api/identity/unprotect/plan' { return Invoke-IdentityProtectPlan $Body -Remove }
     'POST /api/identity/unprotect/apply' { return Invoke-IdentityProtectApply $Body -Remove }
+    'GET /api/applications' { return Get-ApplicationsData }
+    'POST /api/applications/observe' { return Invoke-ApplicationObserve $Body }
+    'POST /api/applications/forget' { return Invoke-ApplicationForget $Body }
+    'POST /api/applications/drift' { return Invoke-ApplicationDriftRequest $Body }
+    'POST /api/applications/repair/plan' { return Get-ApplicationRepairPlan $Body }
+    'POST /api/applications/repair/apply' { return Invoke-ApplicationRepair $Body }
+    'POST /api/integrations/plan' { return Get-IntegrationPlan $Body }
+    'POST /api/integrations/apply' { return Invoke-IntegrationApply $Body }
+    'POST /api/integrations/protect' { return Invoke-IntegrationProtect $Body }
+    'POST /api/integrations/remove/plan' { return Get-IntegrationRemovePlan $Body }
+    'POST /api/integrations/remove' { return Invoke-IntegrationRemove $Body }
     'GET /api/provision' { return Get-ProvisionData }
     'POST /api/provision/import' { return Invoke-ProvisionImport $Body }
     'POST /api/provision/catalog' { return Invoke-ProvisionCatalogDraft $Body }

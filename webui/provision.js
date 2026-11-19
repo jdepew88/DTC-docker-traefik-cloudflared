@@ -35,6 +35,8 @@
   P.provision = async (main, ctx, sub) => {
     fill(main, head('New app', 'Loading…'));
     st.data = await api('GET', '/api/provision');
+    const q = new URLSearchParams((location.hash.split('?')[1] || ''));
+    if (['link', 'compose', 'unraid'].includes(q.get('source'))) st.source = q.get('source');
     if (sub && /^[a-f0-9]{8,32}$/.test(sub) && (!st.draft || st.draft.draftId !== sub)) {
       try { resetFor(await api('GET', `/api/provision/draft?id=${sub}`)); } catch (e) { toast(e.message, true); }
     }
@@ -69,6 +71,34 @@
 
   // --- 1. Container ---------------------------------------------------------------------------------------------------
   function containerStep(rerender) {
+    const src = st.source || 'link';
+    const tabs = h('div', { class: 'segmented', role: 'radiogroup', 'aria-label': 'Where the application comes from', id: 'prov-source' },
+      [['link', 'Link or image'], ['compose', 'Paste Compose'], ['unraid', 'Paste Unraid template']].map(([id, label]) => {
+        const r = h('input', { type: 'radio', name: 'prov-source', value: id, checked: src === id });
+        r.addEventListener('change', () => { st.source = id; rerender(); });
+        return h('label', null, r, h('span', null, label));
+      }));
+    if (src !== 'link') return [tabs, pasteForm(src, rerender), st.draft ? draftView(st.draft, rerender) : h('p', { class: 'muted' }, 'Nothing imported yet.')];
+    return [tabs, ...linkStep(rerender)];
+  }
+
+  // Pasted Compose (a main file plus up to 3 overrides) or an Unraid template: parsed on the server with
+  // `docker compose config` (no interpolation, no env files, no paths); nothing in it is run.
+  function pasteForm(src, rerender) {
+    const areas = (src === 'compose' ? [0, 1] : [0]).map((i) => h('textarea', { id: `prov-text-${i}`, rows: i ? 5 : 12, class: 'mono', spellcheck: 'false', placeholder: i ? 'Optional override file (compose.override.yaml)' : (src === 'compose' ? 'services:\n  app:\n    image: …' : '<?xml version="1.0"?>\n<Container version="2">…') }));
+    const link = h('input', { type: 'url', id: 'prov-source-url', placeholder: 'https://github.com/owner/app', autocomplete: 'off', spellcheck: 'false' });
+    const btn = h('button', { type: 'submit', class: 'btn primary', id: 'prov-import-text' }, icon('download'), 'Import');
+    return h('form', { class: 'prov-import', onsubmit: (e) => { e.preventDefault(); withBusy(btn, async () => {
+      const d = await api('POST', '/api/provision/import', { texts: areas.map((a) => a.value).filter((v) => v.trim()), format: src, sourceUrl: link.value.trim() });
+      resetFor(d); if (d.reused) toast('This was imported before: the existing draft is shown.');
+      history.replaceState(null, '', `#provision/${st.draft.draftId}`); rerender(); }); } },
+      field({ id: 'prov-text-0', label: src === 'compose' ? 'Compose file' : 'Unraid template XML', control: areas[0], hint: src === 'compose' ? 'include:, extends: and build: are not imported. Variables become settings; example passwords become generated secrets.' : 'One <Container> template. Plugins are refused; Unraid paths become named volumes.' }),
+      areas[1] ? field({ id: 'prov-text-1', label: 'Override file (optional)', control: areas[1], minLevel: 'intermediate', hint: 'Merged after the main file, as docker compose -f main -f override would.' }) : null,
+      field({ id: 'prov-source-url', label: 'Project page (https)', control: link, hint: 'Its documentation link. Without it the draft cannot be installed: documentation is never invented.' }),
+      h('div', { class: 'actions' }, btn));
+  }
+
+  function linkStep(rerender) {
     const url = h('input', { type: 'url', id: 'prov-url', placeholder: 'https://hub.docker.com/r/owner/app or https://github.com/owner/app', autocomplete: 'off', spellcheck: 'false' });
     const btn = h('button', { type: 'submit', class: 'btn primary', id: 'prov-import' }, icon('download'), 'Import');
     const form = h('form', { class: 'prov-import', onsubmit: (e) => { e.preventDefault(); withBusy(btn, async () => { resetFor(await api('POST', '/api/provision/import', { url: url.value })); history.replaceState(null, '', `#provision/${st.draft.draftId}`); rerender(); }); } },
@@ -86,6 +116,8 @@
       h('p', null, d.description),
       kv([['Source', h('a', { href: d.url.startsWith('https://') ? d.url : '#provision', rel: 'noopener noreferrer', target: '_blank' }, d.url)], ['Licence', d.license], ['Publisher', d.maintainer],
         ['Documentation', h('span', null, arr(d.docs).map((x) => h('a', { href: x.url, rel: 'noopener noreferrer', target: '_blank', class: 'link-gap' }, x.title)))], ['Platforms', arr(d.architectures).join(', ') || 'unknown', 'advanced']]),
+      d.trust ? h('p', { class: 'chips', id: 'prov-trust' }, plainChip(`Recipe trust: ${d.trust.level}`, d.trust.level === 'curated' || d.trust.level === 'verified-local' ? 'ok' : 'warn'), plainChip(`Status: ${d.trust.status}`, d.trust.status === 'draft' ? 'warn' : 'neutral'),
+        h('span', { class: 'small muted' }, ` ${arr(d.trust.reasons).join(' ')}`)) : null,
       d.catalogMatch ? h('div', { class: 'callout ok', id: 'prov-catalog-match' }, h('p', null, h('strong', null, 'A curated recipe exists: '), `${d.catalogMatch.name} is in the App Catalog, tested for this manager. It is the better choice.`), h('a', { class: 'btn', href: '#catalog' }, 'Open the catalog')) : null,
       h('h3', null, 'Services'),
       h('div', { class: 'table-wrap' }, h('table', { class: 'table', id: 'prov-services' }, h('thead', null, h('tr', null, ['Service', 'Role', 'Image', 'Ports', 'Storage'].map((x) => h('th', null, x)))),

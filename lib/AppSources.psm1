@@ -179,16 +179,24 @@ function Get-RegistryImageFacts([string]$Image) {
 # path resolution, nothing created. Directives that would read other files on this PC are refused first.
 # $DockerInvoker (tests) is a scriptblock that receives the docker arguments and returns { ExitCode; Output }.
 function ConvertFrom-ComposeText {
-  param([Parameter(Mandatory = $true)][string]$Text, $DockerInvoker = $null)
-  if ($Text.Length -gt 256KB) { throw 'The Compose file is larger than 256 KB.' }
-  if ($Text -match '(?m)^include\s*:') { throw 'This Compose file includes other files (include:), which are not imported. Paste the main file of a self-contained stack.' }
-  if ($Text -match '(?m)^\s+extends\s*:') { throw 'This Compose file extends other definitions (extends:), which are not imported.' }
+  # $Overrides: further files of the same project (compose.override.yaml style), merged by Compose in order.
+  param([Parameter(Mandatory = $true)][string]$Text, [string[]]$Overrides = @(), $DockerInvoker = $null)
+  $all = @($Text) + @($Overrides | Where-Object { $_ })
+  if ($all.Count -gt 4) { throw 'Paste at most 4 Compose files (the main file and up to 3 overrides).' }
+  if ((($all | ForEach-Object { $_.Length }) | Measure-Object -Sum).Sum -gt 256KB) { throw 'The Compose file is larger than 256 KB.' }
+  foreach ($t in $all) {
+    if ($t -match '(?m)^include\s*:') { throw 'This Compose file includes other files (include:), which are not imported. Paste the main file of a self-contained stack.' }
+    if ($t -match '(?m)^\s+extends\s*:') { throw 'This Compose file extends other definitions (extends:), which are not imported.' }
+  }
   $tmp = Join-Path ([IO.Path]::GetTempPath()) ('dm-import-' + [Guid]::NewGuid().ToString('N').Substring(0, 10))
   New-Item -ItemType Directory -Path $tmp -Force | Out-Null
   try {
     $f = Join-Path $tmp 'compose.yaml'
     [IO.File]::WriteAllText($f, $Text, (New-Object Text.UTF8Encoding($false)))
-    $args2 = @('compose', '--project-directory', $tmp, '-f', $f, '-p', 'import-preview', 'config', '--format', 'json', '--no-interpolate', '--no-path-resolution', '--no-env-resolution')
+    $fileArgs = @('-f', $f)
+    $n = 0
+    foreach ($o in @($Overrides | Where-Object { $_ })) { $n++; $of = Join-Path $tmp "compose.override-$n.yaml"; [IO.File]::WriteAllText($of, $o, (New-Object Text.UTF8Encoding($false))); $fileArgs += @('-f', $of) }
+    $args2 = @('compose', '--project-directory', $tmp) + $fileArgs + @('-p', 'import-preview', 'config', '--format', 'json', '--no-interpolate', '--no-path-resolution', '--no-env-resolution')
     $r = $(if ($DockerInvoker) { & $DockerInvoker $args2 } else { $saved = $ErrorActionPreference; $ErrorActionPreference = 'Continue'; try { $o = & docker @args2 2>&1 | ForEach-Object { "$_" }; [pscustomobject]@{ ExitCode = $LASTEXITCODE; Output = @($o) } } finally { $ErrorActionPreference = $saved } })
     if ($r.ExitCode -ne 0) { throw ('The Compose file is not valid: ' + ((@($r.Output) | Select-Object -First 3) -join ' ').Replace($tmp, '.')) }
     $json = (@($r.Output) | Where-Object { $_ -notmatch '^\s*(time=|level=|WARN)' }) -join "`n"
@@ -446,6 +454,28 @@ function ConvertFrom-ComposeModel {
     $nonWebPorts = @($s.ports | Where-Object { -not $_.Contains('primary') })
     if ($nonWebPorts.Count -and ($k -ne $web -or $nonWebPorts.Count)) {
       if (@($nonWebPorts | Where-Object { $_.protocol -eq 'udp' }).Count -and $k -eq $web) { $null = $notes.Add("'$k' also listens on UDP $(@($nonWebPorts | Where-Object { $_.protocol -eq 'udp' } | ForEach-Object { $_.container }) -join ', '); only the web interface is published, so clients that need those ports directly will not reach them.") }
+    }
+  }
+  # Credentials embedded in URLs (postgres://user:secret@db/...): when the password is the example value of a setting
+  # that became a generated secret, the URL uses that same secret, so the application and its database keep matching.
+  # Any other embedded credential is kept but reported; it is never silently published or invented.
+  $literal = @{}
+  foreach ($i in $inputs) { if ($i.Contains('replaces') -and [string]$i.replaces) { $literal[[string]$i.replaces] = [string]$i.id } }
+  foreach ($k in @($services.Keys)) {
+    $e = $(if ($services[$k].Contains('environment')) { $services[$k].environment } else { $null })
+    if (-not ($e -is [System.Collections.IDictionary])) { continue }
+    foreach ($name in @($e.Keys)) {
+      $v = [string]$e[$name]
+      $m = [regex]::Match($v, '^[A-Za-z][A-Za-z0-9+.-]*://[^:/@\s]*:([^@\s]+)@')
+      if (-not $m.Success -or $m.Groups[1].Value -match '^\{\{input:[A-Za-z0-9]+\}\}$') { continue }
+      $pw = $m.Groups[1].Value
+      if ($literal.ContainsKey($pw)) {
+        $e[$name] = $v.Substring(0, $m.Groups[1].Index) + "{{input:$($literal[$pw])}}" + $v.Substring($m.Groups[1].Index + $m.Groups[1].Length)
+        & $ev "services.$k.environment.$name" '(generated)' 'the password embedded in this URL is the example value of another setting; the same generated secret is used'
+      } else {
+        & $unres "services.$k.environment.$name" "$name contains a password inside a URL that matches no other setting; replace it with a secret before installing."
+        $null = $notes.Add("Service '$k': $name embeds a credential in a URL.")
+      }
     }
   }
   # Keep only dependencies that name imported services.
@@ -790,6 +820,8 @@ function Import-GitHubSource($Kind, [string]$SourceUrl, $DockerInvoker = $null) 
     try { $x = Get-GitHubRaw $o $r $ref "$folder$e" 64KB; $envDefaults = ConvertFrom-EnvExample $x.Text; $facts.Documents = @($facts.Documents) + [ordered]@{ url = $x.Url; kind = 'env-example'; sha256 = $x.Sha256 }; break } catch { }
   }
   $facts.Name = $(if ($facts.Name) { $facts.Name } else { $r })
+  # Repositories named like a version (miniflux/v2) are named after their owner.
+  if ($facts.Name -match '^v?\d+(\.\d+)*$') { $facts.Evidence = @($facts.Evidence) + [ordered]@{ field = 'name'; value = $o; source = 'GitHub'; how = "the repository name '$($facts.Name)' is a version; the owner's name is used" }; $facts.Name = $o }
   return (Complete-ImportedImages (Import-ComposeSource $f.Text $facts $envDefaults "GitHub $o/$r/$path" $DockerInvoker))
 }
 
@@ -862,19 +894,62 @@ function Import-AppSource {
       throw 'Paste a Docker Hub, GitHub, Compose-file, Unraid template (.xml) or awesome-selfhosted link, or an image name such as ghcr.io/owner/app:1.0.'
     }
   }
-  # A curated recipe for the same application wins (highest trust); the user may still keep the import.
-  $match = $null
-  if (@($CatalogApps).Count) {
-    foreach ($ref in @($m.name, $m.id, ([string]$m.source.upstream -replace '^.*/', ''))) {
-      if (-not $ref) { continue }
-      $key = ($ref.ToLowerInvariant() -replace '[^a-z0-9]', '')
-      $hit = @($CatalogApps | Where-Object { $_.manifest -and (([string]$_.id -replace '[^a-z0-9]', '') -eq $key -or @(@(Get-AsProp $_.manifest 'aliases' @()) | ForEach-Object { ([string]$_).ToLowerInvariant() -replace '[^a-z0-9]', '' }) -contains $key -or (([string]$_.manifest.name).ToLowerInvariant() -replace '[^a-z0-9]', '') -eq $key) })
-      if ($hit.Count) { $match = [ordered]@{ id = $hit[0].id; name = [string]$hit[0].manifest.name; installable = [bool](Get-AsProp $hit[0].manifest 'installable' $false) }; break }
-    }
+  return [pscustomobject]@{ Manifest = $m; Kind = $k.Kind; CatalogMatch = (Find-CatalogMatch $m $CatalogApps); ImportKey = (Get-AsSha256 ('link|' + $k.Kind + '|' + $k.Url.Trim().TrimEnd('/').ToLowerInvariant())) }
+}
+
+# Pure: a curated catalog entry for the same application (highest trust); the user may still keep the import.
+function Find-CatalogMatch($Manifest, $CatalogApps) {
+  if (-not @($CatalogApps).Count) { return $null }
+  foreach ($ref in @($Manifest.name, $Manifest.id, ([string]$Manifest.source.upstream -replace '^.*/', ''))) {
+    if (-not $ref) { continue }
+    $key = ($ref.ToLowerInvariant() -replace '[^a-z0-9]', '')
+    $hit = @($CatalogApps | Where-Object { $_.manifest -and (([string]$_.id -replace '[^a-z0-9]', '') -eq $key -or @(@(Get-AsProp $_.manifest 'aliases' @()) | ForEach-Object { ([string]$_).ToLowerInvariant() -replace '[^a-z0-9]', '' }) -contains $key -or (([string]$_.manifest.name).ToLowerInvariant() -replace '[^a-z0-9]', '') -eq $key) })
+    if ($hit.Count) { return [ordered]@{ id = $hit[0].id; name = [string]$hit[0].manifest.name; installable = [bool](Get-AsProp $hit[0].manifest 'installable' $false) } }
   }
-  return [pscustomobject]@{ Manifest = $m; Kind = $k.Kind; CatalogMatch = $match }
+  return $null
+}
+
+# Pasted text instead of a link: Compose (a main file plus up to 3 override files, merged by Compose) or one Unraid
+# template. $Format: compose | unraid | auto. $SourceUrl (optional, https): the project's page, used as documentation
+# and provenance; without it the draft says so and cannot be installed (documentation is never invented). Nothing in
+# the text is executed; Compose is parsed by `docker compose config` with no interpolation, env files or paths.
+# Returns { Manifest; Kind; CatalogMatch; ImportKey } like Import-AppSource.
+function Import-AppSourceText {
+  param([string]$Format = 'auto', [string[]]$Texts = @(), [string]$SourceUrl = '', [string]$Name = '', $CatalogApps = @(), $DockerInvoker = $null)
+  $list = @($Texts | Where-Object { $_ -and $_.Trim() })
+  if (-not $list.Count) { throw 'Paste a Compose file or an Unraid template.' }
+  if ($list.Count -gt 4) { throw 'Paste at most 4 Compose files (the main file and up to 3 overrides).' }
+  if ((($list | ForEach-Object { $_.Length }) | Measure-Object -Sum).Sum -gt 256KB) { throw 'The pasted text is larger than 256 KB.' }
+  $fmt = ([string]$Format).ToLowerInvariant()
+  if ($fmt -eq 'auto' -or -not $fmt) { $fmt = $(if ($list[0].TrimStart() -match '^(<\?xml[^>]*\?>\s*)?(<!DOCTYPE[^>]*>\s*)?<(Container|PLUGIN)\b') { 'unraid' } else { 'compose' }) }
+  if ($fmt -notin 'compose', 'unraid') { throw "Unknown format '$Format' (compose or unraid)." }
+  $SourceUrl = ([string]$SourceUrl).Trim()
+  if ($SourceUrl -and $SourceUrl -notmatch '^https://[A-Za-z0-9.-]+(:443)?(/[^\s<>"]*)?$') { throw 'The project link must be an https:// address.' }
+  $docKind = $(if ($fmt -eq 'unraid') { 'unraid-template' } else { 'compose' })
+  $n = 0
+  $documents = @(foreach ($t in $list) { $n++; [ordered]@{ url = "pasted:$docKind-$n"; kind = $docKind; sha256 = (Get-AsSha256 $t) } })
+  if ($fmt -eq 'unraid') {
+    if ($list.Count -gt 1) { throw 'Paste one Unraid template at a time.' }
+    $m = Import-UnraidSource ([pscustomobject]@{ Owner = '' }) $SourceUrl $DockerInvoker $list[0]
+    $m.source.kind = 'unraid'
+  } else {
+    $model = ConvertFrom-ComposeText -Text $list[0] -Overrides @($list | Select-Object -Skip 1) -DockerInvoker $DockerInvoker
+    $conv = ConvertFrom-ComposeModel -Model $model -Origin 'pasted Compose file'
+    $top = [regex]::Match($list[0], '(?m)^name:\s*["'']?([A-Za-z0-9][A-Za-z0-9_.-]{0,40})')
+    $nm = $(if ($Name) { $Name } elseif ($top.Success) { $top.Groups[1].Value } elseif ($conv.Web) { [string]$conv.Web.service } else { @($conv.Services.Keys)[0] })
+    $facts = @{ Name = $nm; Publisher = 'unknown (pasted)'; SourceUrl = $SourceUrl; SourceKind = 'compose'; SourceKindLabel = 'a pasted Compose file'; Upstream = $SourceUrl
+      Docs = @(if ($SourceUrl) { [ordered]@{ title = 'Project'; url = $SourceUrl } }); Documents = @(); Evidence = @(); Notes = @() }
+    if ($list.Count -gt 1) { $facts.Notes = @("Merged from $($list.Count) Compose files (main file and overrides, in the order pasted).") }
+    $m = Complete-ImportedImages (New-NormalizedManifest -Conversion $conv -Facts $facts)
+  }
+  $m.provenance.documents = @($documents)
+  if (-not $SourceUrl) {
+    $m.docs = @(@($m.docs) | Where-Object { [string]$_.url -match '^https://' })
+    if (-not @($m.docs).Count) { $m.draft.unresolved = @($m.draft.unresolved) + [ordered]@{ field = 'docs'; reason = 'Pasted text has no documentation link. Import again with the project''s https link so its documentation can be checked.' } }
+  }
+  return [pscustomobject]@{ Manifest = $m; Kind = $fmt; CatalogMatch = (Find-CatalogMatch $m $CatalogApps); ImportKey = (Get-AsSha256 ("text|$fmt|$($SourceUrl.ToLowerInvariant())|" + ($list -join "`n---dtc---`n"))) }
 }
 
 Export-ModuleMember -Function ConvertTo-AppId, ConvertTo-InputId, Get-AppSourceKind, ConvertTo-ImageReference, Get-RegistryToken, Get-RegistryImageFacts, ConvertFrom-ComposeText, ConvertFrom-EnvExample,
   Get-ComposeVariables, Resolve-ComposeDefaults, Get-ImageRole, Split-CommandLine, ConvertFrom-ComposeModel, ConvertFrom-SafeXml, ConvertFrom-UnraidTemplate, ConvertTo-PlainObject, ConvertFrom-DirectoryYaml,
-  Get-CategoryFromHints, New-NormalizedManifest, ConvertTo-OrderedTree, Set-DraftWebPort, Complete-ImportedImages, Find-MarkdownCompose, Select-ImageTag, Import-DockerHubSource, Import-GitHubSource, Import-UnraidSource, Import-DirectorySource, Import-AppSource
+  Get-CategoryFromHints, New-NormalizedManifest, ConvertTo-OrderedTree, Set-DraftWebPort, Complete-ImportedImages, Find-MarkdownCompose, Select-ImageTag, Import-DockerHubSource, Import-GitHubSource, Import-UnraidSource, Import-DirectorySource, Import-AppSource, Import-AppSourceText, Find-CatalogMatch

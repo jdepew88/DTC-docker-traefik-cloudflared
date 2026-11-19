@@ -61,6 +61,10 @@ function Get-ManifestSecurityFindings($Manifest) {
       if ($joined -match '(^|\s)(sh|bash|ash|/bin/sh|/bin/bash)\s+-c\b' -or $joined -match '(curl|wget)[^|]*\|\s*(sh|bash)') { & $add "shell:$n" 'review' 'commands' "'$n' starts a shell command inside its container: $(if ($joined.Length -gt 160) { $joined.Substring(0, 160) + '...' } else { $joined })" }
       else { & $add "command:$n" 'info' 'commands' "'$n' runs: $(if ($joined.Length -gt 160) { $joined.Substring(0, 160) + '...' } else { $joined })" }
     }
+    # Credentials written into settings (a password inside a URL that is not a generated secret).
+    foreach ($e in (Get-PpEntries (Get-PpProp $s 'environment' $null))) {
+      if ([string]$e.Value -match '^[A-Za-z][A-Za-z0-9+.-]*://[^:/@\s]*:([^@\s]+)@' -and $Matches[1] -notmatch '^\{\{input:[A-Za-z0-9]+\}\}$') { & $add "credential:${n}:$($e.Name)" 'high' 'secrets' "'$n' has a fixed password inside $($e.Name). Example credentials are public; replace it with a secret before installing." }
+    }
     $hc = Get-PpProp $s 'healthcheck' $null
     if ($hc -and @(Get-PpProp $hc 'test' @())[0] -eq 'CMD-SHELL') { & $add "hcshell:$n" 'info' 'commands' "'$n' has a shell health check (runs inside the container)." }
     foreach ($v in @(Get-PpProp $s 'volumes' @())) { if ([string](Get-PpProp $v 'kind' 'volume') -eq 'folder' -or (Get-PpProp $v 'input' '')) { & $add "folder:${n}:$(Get-PpProp $v 'name' '')" 'info' 'storage' "'$n' can use a folder of this PC for $(Get-PpProp $v 'target' '') (only a folder you choose; otherwise a Docker volume)." } }

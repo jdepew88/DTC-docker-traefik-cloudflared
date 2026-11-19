@@ -45,6 +45,8 @@ installers.
 | GitHub | repository URL, `/tree/<ref>/<dir>`, `/blob/<ref>/<file>`, raw links | repository API (description, licence, topics, archived), latest release, Compose file in the root, `docker/`, `deploy/`, `docker-compose/`, `compose/`, `contrib/docker/`, `.env.example` defaults | `build:`-only services are unsupported (published images only) |
 | Other registries | `ghcr.io/…`, `quay.io/…`, `lscr.io/…` image names | OCI distribution API with the standard anonymous bearer challenge | Private images are refused |
 | Unraid | raw template XML (`raw.githubusercontent.com/...xml` or GitHub blob links) | `<Container version="2">`: Repository, Network, Privileged, WebUI, Config (Port, Path, Variable, Device), ExtraParams, Overview, Project, Support, Licence | Parsed without DTDs or external entities. Plugins (`<PluginURL>`, `.plg`) are refused. Community Applications web pages are not scraped: paste the template link |
+| Pasted Compose | a main Compose file and up to 3 override files (256 KB in total), plus an optional https project link | services, dependencies, networks, volumes, ports, health checks, environment references; overrides merged by `docker compose config` | Without a project link the draft cannot be installed (no invented documentation). Repeated imports of the same text reuse the draft |
+| Pasted Unraid template | one `<Container>` template | as for template links | Same translation and refusals as template links |
 | awesome-selfhosted | entries in `awesome-selfhosted-data/software/*.yml` | name, description, licences, website, `source_code_url` | Discovery only: the source repository is imported; attribution (CC BY-SA 3.0) is kept |
 
 Unraid translation on Docker Desktop: `/mnt/user/appdata/...` becomes a named volume; other shares become a named
@@ -57,6 +59,14 @@ behind Traefik; devices and `--cap-add` are reported (devices are not available 
 --format json`), call `ConvertFrom-ComposeModel` and `New-NormalizedManifest`, then `Complete-ImportedImages`; add the
 link pattern to `Get-AppSourceKind`, the host to the SafeFetch allow-list, fixtures and tests to
 `tests\Test-Provisioning.ps1`. Never run anything from the source; never add an undocumented endpoint.
+
+Credentials embedded in URLs (`postgres://user:secret@db/...`): when the password is the example value of a setting
+that became a generated secret, the URL uses that same secret (the application and its database keep matching); any
+other fixed credential is a high finding and an open question. GitHub repositories named like a version (`miniflux/v2`)
+are named after their owner.
+
+Applications other tools own (Arcane, Portainer, Compose, docker run), ownership modes, drift detection and repairs:
+[universal-apps.md](universal-apps.md).
 
 ## Normalized manifest
 
@@ -223,7 +233,7 @@ store, file permissions, GPU, devices, host networking, UDP ports, firewall, sta
 
 Building images from source; applications that need extra host ports (DNS servers, game servers, UDP discovery);
 `network_mode: service:<x>` (VPN sidecars); capabilities and sysctls; devices on Docker Desktop; private registries;
-multi-file Compose projects (`include`, `extends`, external env files); Kubernetes/Helm; CA web pages (use template
+`include`, `extends` and external env files (a main file plus override files can be pasted); Kubernetes/Helm; CA web pages (use template
 links); LAN access while Traefik listens on 127.0.0.1; native OIDC/SAML wiring (recognized and recommended, configured
 in authentik and the application by you); Authelia protection; remote-server access; automatic dependency proposals
 from AI; a community recipe server.
