@@ -42,11 +42,12 @@ function New-Repair([string]$Kind, [string]$Owner, [string]$Description, $Change
 #   -Volumes         names of volumes that exist (managed instances), $null when not checked
 #   -ExpectedVolumes volumes the stack declares (managed instances)
 #   -Protection      { "<route>" = { provider; verified } } recorded protection state per route
+#   -IdentityEndpoint the current internal address of the identity provider (authentik), '' when unknown
 #   -PortProbes      { "<port>" = { result } } probes of the container's exposed ports from Traefik's network; when given,
 #                    a changed port is repaired only to the one port that really answers HTTP
 function Get-DriftFindings {
   param($Instance, $Container, $Authority = $null, [object[]]$Routes = @(), [string[]]$LoadedRouters = $null, [string[]]$RouteFiles = $null, $Probes = @{},
-    [string[]]$Middlewares = @(), $Claims = @{}, [string]$ProxyNetwork = '', [string[]]$Volumes = $null, [string[]]$ExpectedVolumes = @(), $Protection = @{}, $PortProbes = @{})
+    [string[]]$Middlewares = @(), $Claims = @{}, [string]$ProxyNetwork = '', [string[]]$Volumes = $null, [string[]]$ExpectedVolumes = @(), $Protection = @{}, $PortProbes = @{}, [string]$IdentityEndpoint = '')
   $f = New-Object System.Collections.ArrayList
   $mode = [string](Get-RcnProp $Instance 'mode' 'integrated')
   $base = Get-RcnProp $Instance 'baseline' $null
@@ -87,6 +88,10 @@ function Get-DriftFindings {
     $bimg = [string](Get-RcnProp $base 'image' '')
     if ($bimg -and $bimg -ne [string](Get-RcnProp $Container 'image' '')) {
       $null = $f.Add((New-DriftFinding 'image-changed' 'info' 'The image changed' "$owner now runs $([string]$Container.image) (was $bimg). Updates are the owner's decision; DTC only notes it." "image: $bimg -> $([string]$Container.image)" $null))
+    }
+    $lostMounts = @(@(Get-RcnProp $base 'mounts' @()) | Where-Object { @(Get-RcnProp $Container 'mounts' @()) -notcontains [string]$_ })
+    if ($lostMounts.Count) {
+      $null = $f.Add((New-DriftFinding 'mount-lost' 'error' 'Storage is no longer mounted' "$($lostMounts -join ', ') was mounted when DTC recorded the application and is missing now: the application may run with empty data." "mounts: $((@(Get-RcnProp $Container 'mounts' @())) -join ', ')" (New-Repair 'advice' $(if ($external) { 'external' } else { 'dtc' }) "Restore the volume or bind mount in $owner's configuration before using the application.")))
     }
     $ba = [string](Get-RcnProp $base 'authority' '')
     if ($Authority -and $ba -and $ba -ne [string]$Authority.id) {
@@ -141,6 +146,11 @@ function Get-DriftFindings {
       $null = $f.Add((New-DriftFinding 'middleware-missing' 'error' "The route '$rn' references middleware that does not exist" "$($bad -join ', ') is not defined in this Traefik, so the route is rejected." "middlewares: $($bad -join ', ')" `
           (New-Repair 'route-update' $repairOwner "Remove $($bad -join ', ') from the route (shared middleware is never deleted or rewritten)." ([ordered]@{ route = $rn; middlewares = @(@(Get-RcnProp $r 'middlewares' @()) | Where-Object { $bad -notcontains [string]$_ }) }))))
     }
+    $ep = [string](Get-RcnProp (Get-RcnProp $r 'auth' $null) 'endpoint' '')
+    if ($IdentityEndpoint -and $ep -and [string](Get-RcnProp (Get-RcnProp $r 'auth' $null) 'provider' '') -eq 'authentik' -and $ep.TrimEnd('/') -ne $IdentityEndpoint.TrimEnd('/')) {
+      $null = $f.Add((New-DriftFinding 'auth-endpoint-stale' 'error' "The sign-in check of '$rn' asks an old authentik address" "The route sends ForwardAuth requests to $ep, but authentik now answers at $IdentityEndpoint (the installation was replaced or renamed). Requests fail closed until it is corrected." "auth endpoint: $ep" `
+          (New-Repair 'route-update' $repairOwner "Point the sign-in check at $IdentityEndpoint." ([ordered]@{ route = $rn; authEndpoint = $IdentityEndpoint.TrimEnd('/') }))))
+    }
     $prot = $(if ($Protection -is [System.Collections.IDictionary] -and $Protection.Contains($rn)) { $Protection[$rn] } else { $null })
     $want = [string](Get-RcnProp $prot 'provider' '')
     $have = [string](Get-RcnProp (Get-RcnProp $r 'auth' $null) 'provider' '')
@@ -186,11 +196,13 @@ function Get-RepairPlan([object[]]$Findings, [object[]]$Routes = @()) {
       'route-update' {
         $cur = @($Routes | Where-Object { [string]$_.name -eq $rn })[0]
         if (-not $cur) { continue }
-        if (-not $changes.Contains($rn)) { $changes[$rn] = [ordered]@{ route = $rn; findings = @(); before = [ordered]@{ host = [string]$cur.target.host; port = [int]$cur.target.port; middlewares = @($cur.middlewares) }; after = [ordered]@{ host = [string]$cur.target.host; port = [int]$cur.target.port; middlewares = @($cur.middlewares) } } }
+        $curEp = [string](Get-RcnProp (Get-RcnProp $cur 'auth' $null) 'endpoint' '')
+        if (-not $changes.Contains($rn)) { $changes[$rn] = [ordered]@{ route = $rn; findings = @(); before = [ordered]@{ host = [string]$cur.target.host; port = [int]$cur.target.port; middlewares = @($cur.middlewares); authEndpoint = $curEp }; after = [ordered]@{ host = [string]$cur.target.host; port = [int]$cur.target.port; middlewares = @($cur.middlewares); authEndpoint = $curEp } } }
         $changes[$rn].findings += [string]$x.id
         if (Get-RcnProp $c 'host' '') { $changes[$rn].after.host = [string]$c.host }
         if ([int](Get-RcnProp $c 'port' 0)) { $changes[$rn].after.port = [int]$c.port }
         if ($c -is [System.Collections.IDictionary] -and $c.Contains('middlewares')) { $changes[$rn].after.middlewares = @($c.middlewares) }
+        if (Get-RcnProp $c 'authEndpoint' '') { $changes[$rn].after.authEndpoint = [string]$c.authEndpoint }
       }
       'route-resync' { if ($resync -notcontains $rn) { $resync += $rn } }
       'route-recreate' { if ($recreate -notcontains $rn) { $recreate += $rn } }

@@ -629,6 +629,8 @@
     public: { label: 'A public address (Cloudflare Tunnel)', text: 'An explicit Traefik route, published through your existing Cloudflare Tunnel.' },
   };
   // Pure: step states of the wizard. s: { draft, acknowledged[], access, hostname, auth, review, result }.
+  // Pure: the Add application wizard (one wizard for every source). Eight stages; the informational ones (stack,
+  // storage, publication) are complete as soon as the stage before them is, so they never add mandatory clicks.
   function provisionWizard(s) {
     const st = s || {};
     const draft = st.draft || null;
@@ -639,14 +641,47 @@
     const proxyDone = containerDone && (st.access === 'local' || ((st.access === 'lan' || st.access === 'public') && hostOk));
     const authDone = proxyDone && !!st.auth && !(st.access === 'public' && st.auth === 'none') && !(st.access === 'local' && st.auth !== 'none' && st.auth !== 'native');
     const deployed = !!(st.result && st.result.ok);
+    const verdict = deployed ? provisionVerdict(((st.result || {}).journal || {}).verification) : null;
     const steps = [
-      { id: 'container', number: 1, title: 'Container', done: containerDone, available: true, missing: !draft ? 'Import an application' : !draft.deployable ? 'The draft cannot be deployed yet' : pending.length ? `${pending.length} item(s) to review` : '' },
-      { id: 'proxy', number: 2, title: 'Reverse proxy', done: proxyDone, available: containerDone, missing: proxyDone ? '' : (st.access && st.access !== 'local' && !hostOk ? 'Enter a host name' : 'Choose where it is reachable') },
-      { id: 'auth', number: 3, title: 'Authentication', done: authDone, available: proxyDone, missing: authDone ? '' : 'Choose who has access' },
-      { id: 'review', number: 4, title: 'Review and deploy', done: deployed, available: authDone, missing: deployed ? '' : 'Review, then deploy' },
+      { id: 'container', number: 1, title: 'Application source', done: containerDone, available: true, missing: !draft ? 'Import an application' : !draft.deployable ? 'The draft cannot be deployed yet' : pending.length ? `${pending.length} item(s) to review` : '' },
+      { id: 'stack', number: 2, title: 'Stack and dependencies', done: containerDone, available: !!draft, missing: containerDone ? '' : 'Complete the source first' },
+      { id: 'storage', number: 3, title: 'Storage and networking', done: containerDone, available: !!draft, missing: containerDone ? '' : 'Complete the source first' },
+      { id: 'proxy', number: 4, title: 'Routing', done: proxyDone, available: containerDone, missing: proxyDone ? '' : (st.access && st.access !== 'local' && !hostOk ? 'Enter a host name' : 'Choose where it is reachable') },
+      { id: 'auth', number: 5, title: 'Authentication', done: authDone, available: proxyDone, missing: authDone ? '' : 'Choose who has access' },
+      { id: 'publish', number: 6, title: 'Publication', done: authDone, available: authDone, missing: authDone ? '' : 'Choose who has access first' },
+      { id: 'review', number: 7, title: 'Review and deploy', done: deployed, available: authDone, missing: deployed ? '' : 'Review, then deploy' },
+      { id: 'verify', number: 8, title: 'Verify and manage', done: !!(verdict && verdict.state === 'verified'), available: !!st.result, missing: !st.result ? 'Deploy first' : verdict && verdict.state === 'verified' ? '' : 'Some checks are not passed yet' },
     ];
     const current = (steps.find((x) => !x.done && x.available) || steps[steps.length - 1]).id;
     return { steps, current, pendingAcks: pending };
+  }
+  // Pure: the component states after a deployment, in order: planned, installing, running, healthy, routed,
+  // authenticated, published, verified, failed (or skipped when it does not apply). A running container is never
+  // reported healthy without its health / backend checks.
+  function provisionProgress(result, choices) {
+    const c = choices || {};
+    const j = (result && result.journal) || {};
+    const stage = (id) => (j.stages || []).find((x) => x.stage === id);
+    const ver = (id) => (j.verification || []).find((x) => x.stage === id);
+    const st = (s) => (!s ? 'pending' : s.status === 'passed' ? 'done' : s.status === 'failed' ? 'failed' : s.status === 'not-applicable' ? 'skipped' : 'pending');
+    const failedAny = (j.stages || []).some((x) => x.status === 'failed');
+    const items = [
+      { id: 'planned', label: 'Planned', state: result ? 'done' : 'pending' },
+      { id: 'installing', label: 'Installed', state: st(stage('install')) },
+      { id: 'running', label: 'Running', state: st(ver('containers')) },
+      { id: 'healthy', label: 'Healthy', state: st(ver('dependencies')) === 'failed' || st(ver('backend')) === 'failed' ? 'failed' : (st(ver('backend')) === 'done' ? 'done' : 'pending') },
+      { id: 'routed', label: 'Routed', state: c.access === 'local' ? 'skipped' : st(stage('route')) },
+      { id: 'authenticated', label: 'Sign-in', state: c.auth === 'authentik' ? st(stage('authentication')) : 'skipped' },
+      { id: 'published', label: 'Published', state: c.access === 'public' ? st(stage('publish')) : 'skipped' },
+    ];
+    const v = provisionVerdict(j.verification);
+    items.push({ id: 'verified', label: 'Verified', state: failedAny || v.counts.failed ? 'failed' : v.state === 'verified' ? 'done' : 'pending' });
+    return { items, failed: failedAny || items.some((x) => x.state === 'failed') };
+  }
+  // Pure: the Compose file a service lands in (same rule as the server's ConvertTo-AppComposeSet).
+  function provisionComposeFile(role) {
+    const m = { database: 'database', cache: 'cache', messaging: 'messaging', worker: 'workers', support: 'support', init: 'setup', migration: 'setup', maintenance: 'setup' };
+    return m[role] ? `compose.${m[role]}.yaml` : 'compose.yaml';
   }
   // Pure: the overall verdict of a deployment's verification stages. Untested stages never count as passed.
   function provisionVerdict(stages) {
@@ -698,7 +733,7 @@
     ROUTING_STATES, routingState, routingEvidence, endpointAudience, endpointKind, ROUTING_HELP, routingHelp, journeyPath,
     DEPLOYMENT_STATES, deploymentState, statusTone, serviceGroups, terminationText, healthText, shortImage, roleSource, catalogInstallState, instanceTitle,
     catalogAccessText, authFitText, compatSummary, sortFindings, findingTone, backupTitle, catalogStatus, catalogStatusMatches, verificationText,
-    provisionAckIds, PROVISION_ACCESS, provisionWizard, provisionVerdict, suggestProvisionHostname,
+    provisionAckIds, PROVISION_ACCESS, provisionWizard, provisionVerdict, provisionProgress, provisionComposeFile, suggestProvisionHostname,
     samePath, launcherNotice, launcherDefaultAction, autostartText,
     IDENTITY_STATES, identityState, googleRedirectUri, isGoogleClientId, identityNextStep, identityWizard, wizardNeighbours, CREDENTIAL_STATUS, credentialStatus,
     appProtectionState, protectionSummary,

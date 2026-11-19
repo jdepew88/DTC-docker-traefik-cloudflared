@@ -256,6 +256,7 @@ function New-ObservedBaseline($Container, [int]$Port = 0, [string]$Protocol = ''
     project = [string](Get-AcProp (Get-AcProp $Container 'compose' $null) 'project' ''); service = [string](Get-AcProp (Get-AcProp $Container 'compose' $null) 'service' '')
     networks = @(@(Get-AcProp $Container 'networks' @()) | ForEach-Object { [string]$_.name })
     aliases = @(if ($net.Count) { @(Get-AcProp $net[0] 'aliases' @()) | ForEach-Object { [string]$_ } })
+    mounts = @(@(Get-AcProp $Container 'mounts' @()) | ForEach-Object { [string]$_ })
     port = $Port; protocol = $Protocol; authority = $(if ($Authority) { [string]$Authority.id } else { '' }); recordedAt = (Get-Date).ToUniversalTime().ToString('s') + 'Z' }
 }
 

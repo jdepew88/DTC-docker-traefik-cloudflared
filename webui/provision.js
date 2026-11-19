@@ -47,14 +47,15 @@
     const wiz = L.provisionWizard(st);
     const byId = Object.fromEntries(wiz.steps.map((s) => [s.id, s]));
     if (!byId[st.step] || !byId[st.step].available) st.step = wiz.current;
-    const go = (id) => { st.step = id; render(main, ctx); const p = document.getElementById('prov-panel'); if (p) p.scrollIntoView({ block: 'start' }); };
+    const go = (id) => { st.step = id; render(main, ctx); const p = document.getElementById('prov-panel'); if (p) p.scrollIntoView({ block: 'start' }); const t = document.getElementById('prov-title'); if (t) t.focus(); };
     const rerender = () => render(main, ctx);
     const nav = h('nav', { class: 'wizard-steps', 'aria-label': 'New app steps' }, h('ol', null, wiz.steps.map((s) => h('li', { class: `${s.id === st.step ? 'current' : ''} ${s.done ? 'done' : ''} ${!s.available ? 'locked' : ''}`, 'data-step': s.id },
       s.available ? h('button', { type: 'button', class: 'step-link', 'aria-current': s.id === st.step ? 'step' : null, onclick: () => go(s.id) },
         h('span', { class: 'step-num', 'aria-hidden': 'true' }, s.done ? '✓' : String(s.number)), h('span', null, s.title, !s.done && s.missing ? h('span', { class: 'step-badge small muted' }, s.missing) : null),
         h('span', { class: 'sr-only' }, `${s.done ? ', complete' : ''}${s.id === st.step ? ', current step' : ''}`))
         : h('span', { class: 'step-link' }, h('span', { class: 'step-num', 'aria-hidden': 'true' }, String(s.number)), h('span', null, s.title), h('span', { class: 'sr-only' }, ', not available yet'))))));
-    const body = { container: () => containerStep(rerender), proxy: () => proxyStep(rerender), auth: () => authStep(rerender), review: () => reviewStep(rerender) }[st.step]();
+    const body = { container: () => containerStep(rerender), stack: () => stackStep(), storage: () => storageStep(rerender), proxy: () => proxyStep(rerender), auth: () => authStep(rerender),
+      publish: () => publishStep(rerender), review: () => reviewStep(rerender, () => go('verify')), verify: () => verifyStep(rerender) }[st.step]();
     const ids = wiz.steps.map((s) => s.id);
     const i = ids.indexOf(st.step);
     const next = wiz.steps[i + 1];
@@ -62,10 +63,10 @@
       i > 0 ? h('button', { type: 'button', class: 'btn', onclick: () => go(ids[i - 1]) }, '← Back') : h('span'), h('span', { class: 'grow' }),
       next ? h('button', { type: 'button', class: 'btn primary', id: 'prov-next', disabled: !byId[st.step].done, title: byId[st.step].done ? '' : byId[st.step].missing, onclick: () => go(next.id) }, `Continue: ${next.title} →`) : null);
     fill(main,
-      head('New app', 'Paste a link from Docker Hub, GitHub, an Unraid template or awesome-selfhosted. The manager works out how to install it, where to reach it and who may open it; you review everything before anything is installed or published.',
+      head('Add application', 'From the catalog, a Docker Hub or GitHub link, pasted Compose or an Unraid template: the manager works out how to install it, where to reach it and who may open it; you review everything before anything is installed or published. Apps already running in Docker (Arcane, Portainer, Compose) are integrated from Applications.',
         h('a', { class: 'btn', href: '#catalog' }, icon('download'), 'Curated catalog')),
       nav,
-      h('section', { class: 'card wizard-panel', id: 'prov-panel', 'aria-labelledby': 'prov-title' }, h('h2', { id: 'prov-title' }, `${byId[st.step].number}. ${byId[st.step].title}`), body, foot),
+      h('section', { class: 'card wizard-panel', id: 'prov-panel', 'aria-labelledby': 'prov-title' }, h('h2', { id: 'prov-title', tabindex: '-1' }, `${byId[st.step].number}. ${byId[st.step].title}`), body, foot),
       recentSection(main, ctx), aiSettingsSection(rerender));
   }
 
@@ -176,7 +177,43 @@
     return box;
   }
 
-  // --- 2. Reverse proxy --------------------------------------------------------------------------------------------------
+  // --- 2. Stack and dependencies ---------------------------------------------------------------------------------------
+  const ROLE_TEXT = { app: 'Application', database: 'Database (private)', cache: 'Cache (private)', messaging: 'Message bus (private)', worker: 'Background worker', support: 'Supporting service', init: 'One-time setup job', migration: 'One-time migration', maintenance: 'Maintenance job' };
+  function stackStep() {
+    const d = st.draft;
+    if (!d) return h('p', { class: 'muted' }, 'Import an application first.');
+    const web = d.web && d.web.service;
+    const files = {};
+    arr(d.services).forEach((s) => { const f = L.provisionComposeFile(s.role || (s.name === web ? 'app' : '')); (files[f] = files[f] || []).push(s.name); });
+    return h('div', { id: 'prov-stack' },
+      h('p', null, 'The application is installed as its own Compose project, split into files by role. Only the web service is reachable through Traefik; databases, caches and workers stay on the project\'s private network.'),
+      h('ul', { class: 'checks', id: 'prov-stack-services' }, arr(d.services).map((s) => checkItem(s.name === web ? 'ok' : 'neutral', `${s.name}: ${ROLE_TEXT[s.role] || (s.name === web ? 'Web interface' : 'Service')}`,
+        `${short(s.image)}${arr(s.dependsOn).length ? ` · waits for ${arr(s.dependsOn).join(', ')}` : ''}${s.name !== web && ['database', 'cache', 'messaging'].includes(s.role) ? ' · never published' : ''}`))),
+      h('h3', null, 'Generated Compose files'),
+      h('ul', { class: 'checks', id: 'prov-stack-files' }, Object.entries(files).map(([f, names]) => checkItem('neutral', f, names.join(', ')))),
+      h('p', { class: 'small muted' }, 'COMPOSE_FILE in .env lists every file, so plain `docker compose` in the folder uses the whole set. The exact files are shown in the review (Expert level).'));
+  }
+
+  function storageStep(rerender) {
+    const d = st.draft;
+    if (!d) return h('p', { class: 'muted' }, 'Import an application first.');
+    const web = d.web && d.web.service;
+    const protectedRoute = st.access !== 'local' && ['authentik', 'cloudflare-access'].includes(st.auth);
+    return h('div', { id: 'prov-storage' },
+      h('h3', null, 'Storage'),
+      h('ul', { class: 'checks', id: 'prov-storage-volumes' }, arr(d.services).flatMap((s) => arr(s.volumes).map((v) => checkItem('neutral', `${s.name}: ${v.target}`, v.kind === 'tmpfs' ? 'temporary (memory), not backed up' : v.kind === 'folder' ? 'a folder of this PC you choose' : `Docker volume ${st.project || d.id}_${v.name} (backed up with the app)`)))
+        .concat(arr(d.services).every((s) => !arr(s.volumes).length) ? [checkItem('neutral', 'No persistent storage', 'Nothing is kept when the containers are recreated.')] : [])),
+      h('h3', null, 'Ports and networks'),
+      h('ul', { class: 'checks', id: 'prov-storage-ports' },
+        checkItem('ok', web ? `Web interface: ${web}, container port ${((arr(d.services).find((s) => s.name === web) || {}).ports || []).filter((p) => p.primary).map((p) => p.container).join(', ') || '?'}` : 'No web interface chosen yet', 'Reached by Traefik over the shared network by its DNS name; no fixed IP addresses.'),
+        checkItem(protectedRoute ? 'ok' : 'neutral', protectedRoute ? 'No port on this PC' : 'Port on this PC: 127.0.0.1 only', protectedRoute ? 'A direct port would bypass the sign-in, so none is published.' : 'Other devices cannot connect to it directly.'),
+        checkItem('neutral', 'Other ports', 'Reachable only from the project\'s own containers.')),
+      h('h3', null, 'This PC (Windows with Docker Desktop)'),
+      h('ul', { class: 'checks', id: 'prov-storage-host' }, arr(d.compatibility && d.compatibility.items).length ? arr(d.compatibility.items).map((x) => checkItem(x.level === 'incompatible' ? 'err' : x.level === 'limited' ? 'warn' : 'neutral', x.message, '')) : [checkItem('ok', 'No Docker Desktop restriction applies', '')]),
+      d.web && !st.webEdit ? h('p', null, h('button', { type: 'button', class: 'btn', id: 'prov-web-change', onclick: () => { st.webEdit = true; rerender(); } }, 'Use another web port')) : st.webEdit || !d.web ? webPortForm(d, rerender) : null);
+  }
+
+  // --- 4. Routing ----------------------------------------------------------------------------------------------------------
   function proxyStep(rerender) {
     const radios = Object.entries(L.PROVISION_ACCESS).map(([k, v]) => h('label', { class: 'choice' }, h('input', { type: 'radio', name: 'prov-access', value: k, checked: st.access === k || null, onchange: () => { st.access = k; if (k === 'local') st.auth = 'none'; else if (st.auth === 'none') st.auth = k === 'public' ? 'authentik' : 'none'; st.review = null; rerender(); } }),
       h('span', null, h('strong', null, v.label), h('span', { class: 'small muted' }, ` ${v.text}`))));
@@ -184,7 +221,15 @@
     const proj = h('input', { type: 'text', id: 'prov-project', value: st.project, autocomplete: 'off', oninput: (e) => { st.project = e.target.value.trim().toLowerCase(); st.review = null; } });
     return [h('fieldset', { id: 'prov-access' }, h('legend', null, 'Where should it be reachable?'), h('div', { class: 'choice-cards' }, radios)),
       st.access !== 'local' ? field({ id: 'prov-hostname', label: 'Host name', control: hostIn, hint: st.access === 'public' ? `Must be in a Cloudflare domain of this deployment${arr((st.data || {}).domains).length ? ` (${st.data.domains.join(', ')})` : ''}. Existing DNS records are never overwritten without your confirmation.` : 'The route is generated as an explicit Traefik file-provider definition.' }) : null,
-      field({ id: 'prov-project', label: 'Project name', control: proj, hint: 'The Compose project, folder and route name (lowercase letters, digits and dashes).', minLevel: 'intermediate' })];
+      field({ id: 'prov-project', label: 'Project name', control: proj, hint: 'The Compose project, folder and route name (lowercase letters, digits and dashes).', minLevel: 'intermediate' }),
+      st.access !== 'local' ? routePreview(rerender) : h('p', { class: 'muted', id: 'prov-route-none' }, 'No Traefik route: only this PC opens it, on 127.0.0.1.')];
+  }
+
+  function routePreview(rerender) {
+    const files = arr(st.review && st.review.routing && st.review.routing.traefik && st.review.routing.traefik.changes);
+    const btn = h('button', { type: 'button', class: 'btn', id: 'prov-route-preview', onclick: () => withBusy(btn, async () => { st.review = await api('POST', '/api/provision/plan', planBody()); rerender(); }) }, 'Preview the router, service and middleware');
+    return h('div', { id: 'prov-route' }, btn,
+      files.length ? h('div', { id: 'prov-route-yaml' }, files.map((f) => h('div', null, h('p', { class: 'mono small' }, `${f.action}: ${f.file}`), U.diffBlock(f.diff)))) : null);
   }
 
   // --- 3. Authentication -------------------------------------------------------------------------------------------------
@@ -194,20 +239,35 @@
     const radios = allowed.map((k) => h('label', { class: 'choice' }, h('input', { type: 'radio', name: 'prov-auth', value: k, disabled: k === 'authelia' || (k === 'authentik' && !ready.ready) || null, checked: st.auth === k || null, onchange: () => { st.auth = k; st.review = null; rerender(); } }),
       h('span', null, h('strong', null, AUTH[k][0]), h('span', { class: 'small muted' }, ` ${k === 'authentik' && !ready.ready ? `Not ready: ${arr(ready.missing).map((m) => m.message).join(' ')}` : AUTH[k][1]}`))));
     const prot = st.draft && st.draft.protection;
+    const ao = st.draft && st.draft.authOptions;
     return [h('fieldset', { id: 'prov-auth' }, h('legend', null, 'Who should have access?'), h('div', { class: 'choice-cards' }, radios)),
+      ao ? h('details', { class: 'more', id: 'prov-auth-methods', open: arr(ao.clients).length ? true : null }, h('summary', null, arr(ao.clients).length ? `This application has its own clients (${ao.clients.join(', ')})` : 'Sign-in methods for this application'),
+        h('ul', { class: 'checks' }, arr(ao.options).map((o) => checkItem(o.state === 'incompatible' ? 'err' : o.available ? 'neutral' : 'warn', `${o.name}: ${o.state.replace(/-/g, ' ')}${o.id === ao.recommended ? ' (recommended)' : ''}`, arr(o.notes).join(' '))))) : null,
       prot && st.auth === 'authentik' && prot.forwardAuth === 'caution' ? h('div', { class: 'callout warn', id: 'prov-forwardauth-caution' }, h('p', null, prot.recommendation), h('ul', null, arr(prot.reasons).map((r) => h('li', null, r)))) : null,
       st.access === 'public' && st.auth === 'native' ? h('label', { class: 'check', id: 'prov-public-native' }, h('input', { type: 'checkbox', id: 'prov-ack-auth', checked: st.authAck || null, onchange: (e) => { st.authAck = e.target.checked; st.review = null; } }), h('span', null, 'I understand that only the application\'s own login protects it on the Internet.')) : null,
       st.access === 'lan' && st.auth === 'none' ? h('label', { class: 'check' }, h('input', { type: 'checkbox', id: 'prov-ack-auth', checked: st.authAck || null, onchange: (e) => { st.authAck = e.target.checked; st.review = null; } }), h('span', null, 'I understand that anyone who can reach this host name can open it.')) : null];
   }
 
-  // --- 4. Review and deploy ----------------------------------------------------------------------------------------------
+  // --- 6. Publication ------------------------------------------------------------------------------------------------------
+  function publishStep(rerender) {
+    if (st.access !== 'public') return h('div', { id: 'prov-publish' }, h('p', null, st.access === 'lan' ? `Not published on the Internet: ${st.hostname} is a route on your network only.` : 'Not published: only this PC opens it.'),
+      h('p', { class: 'small muted' }, 'Choose "A public address" in Routing to publish it through the existing Cloudflare Tunnel.'));
+    const acts = arr(st.review && st.review.routing && st.review.routing.cloudflare && st.review.routing.cloudflare.actions).filter((a) => a.kind !== 'none');
+    const btn = h('button', { type: 'button', class: 'btn', id: 'prov-publish-preview', onclick: () => withBusy(btn, async () => { st.review = await api('POST', '/api/provision/plan', planBody()); rerender(); }) }, 'Preview the Cloudflare changes');
+    return h('div', { id: 'prov-publish' },
+      h('p', null, `${st.hostname} is published through this deployment's existing Cloudflare Tunnel (never a new tunnel), after the route works${st.auth === 'authentik' ? ' and the sign-in is verified' : ''}.`),
+      h('div', { class: 'callout warn' }, h('p', null, 'Changes in your Cloudflare account are made only when you deploy, after the review; an existing DNS record is never overwritten without its own confirmation.')),
+      btn, acts.length ? h('ul', { class: 'checks', id: 'prov-publish-actions' }, acts.map((a) => checkItem(a.overwrite ? 'warn' : 'neutral', a.summary, a.detail))) : null);
+  }
+
+  // --- 7. Review and deploy ----------------------------------------------------------------------------------------------
   function planBody() {
     const ack = [...st.acknowledged]; if (st.authAck) ack.push(`auth:${st.auth}`);
     return { draftId: st.draft.draftId, project: st.project, access: st.access, hostname: st.access === 'local' ? '' : st.hostname, auth: st.auth, acknowledge: ack };
   }
 
-  function reviewStep(rerender) {
-    if (st.result) return resultView(st.result, rerender);
+  function reviewStep(rerender, toVerify) {
+    if (st.result) return h('div', { id: 'prov-deployed' }, h('p', null, st.result.ok ? 'Deployed. Its checks and management are in the next stage.' : 'The deployment stopped; see the next stage.'), h('button', { type: 'button', class: 'btn primary', onclick: toVerify }, 'Verify and manage →'));
     const prep = h('button', { type: 'button', class: 'btn primary', id: 'prov-plan', onclick: () => withBusy(prep, async () => { st.review = await api('POST', '/api/provision/plan', planBody()); rerender(); }) }, icon('refresh'), st.review ? 'Prepare the review again' : 'Prepare the review');
     if (!st.review) return [h('p', null, 'The review checks everything against this PC, Docker, Traefik, Cloudflare and Identity & Access now. Nothing is changed.'), prep];
     const r = st.review;
@@ -222,7 +282,7 @@
     const deploy = h('button', { type: 'button', class: 'btn primary', id: 'prov-deploy', disabled: true, onclick: () => withBusy(deploy, async () => {
       const confirmOverwrites = owBoxes.filter((b) => b.querySelector('input').checked).map((b) => b.querySelector('input').dataset.id);
       st.result = await api('POST', '/api/provision/apply', { planId: r.planId, confirm: true, confirmPrivileges: !!(priv && priv.checked), confirmOverwrites });
-      st.data = await api('GET', '/api/provision'); rerender();
+      st.data = await api('GET', '/api/provision'); st.step = 'verify'; rerender();
     }) }, icon('rocket'), 'Deploy');
     const sync = () => { deploy.disabled = !(r.canApply && approve.checked && (!priv || priv.checked) && owBoxes.every((b) => b.querySelector('input').checked)); };
     [approve, priv, ...owBoxes.map((b) => b.querySelector('input'))].filter(Boolean).forEach((x) => x.addEventListener('change', sync));
@@ -245,6 +305,19 @@
       h('div', { class: 'actions' }, prep, deploy));
   }
 
+  // --- 8. Verify and manage -------------------------------------------------------------------------------------------------
+  const PROGRESS_TONE = { done: 'ok', failed: 'err', pending: 'neutral', skipped: 'neutral' };
+  const PROGRESS_TEXT = { done: 'yes', failed: 'failed', pending: 'not yet', skipped: 'does not apply' };
+  function verifyStep(rerender) {
+    if (!st.result) return h('p', { class: 'muted' }, 'Deploy first.');
+    const pr = L.provisionProgress(st.result, { access: st.access, auth: st.auth });
+    return h('div', { id: 'prov-verify-stage' },
+      h('ol', { class: 'checks progress-steps', id: 'prov-progress', 'aria-label': 'Deployment progress' }, pr.items.map((x) => h('li', { 'data-id': x.id, 'data-state': x.state },
+        h('span', { class: `ci ${PROGRESS_TONE[x.state]}` }, icon(x.state === 'done' ? 'check' : x.state === 'failed' ? 'alert' : 'minus')), h('span', null, h('strong', null, x.label), ` ${PROGRESS_TEXT[x.state]}`)))),
+      h('p', { class: 'small muted' }, 'A running container is not reported healthy until its health and backend checks pass. Manage it later on Installed apps and Applications (drift checks and repairs).'),
+      resultView(st.result, rerender));
+  }
+
   function verificationList(stages) {
     return h('ul', { class: 'checks', id: 'prov-verification' }, arr(stages).map((s) => h('li', { 'data-stage': s.stage, 'data-status': s.status }, h('span', { class: `ci ${STAGE[s.status] === 'ok' ? 'ok' : STAGE[s.status] === 'err' ? 'err' : 'neutral'}` }, icon(s.status === 'passed' ? 'check' : s.status === 'failed' ? 'alert' : 'minus')),
       h('span', null, h('strong', null, `${s.stage}: ${STAGE_TEXT[s.status] || s.status}`), s.detail ? h('span', { class: 'msg' }, s.detail) : null))));
@@ -261,7 +334,7 @@
       h('h3', null, 'Stages'), h('ul', { class: 'checks', id: 'prov-stages' }, arr(j.stages).map((s) => checkItem(s.status === 'passed' ? 'ok' : 'err', s.stage, s.message))),
       arr(j.verification).length ? [h('h3', null, 'Verification'), verificationList(j.verification)] : null,
       gate('advanced', h('details', { class: 'more' }, h('summary', null, 'Resources this operation owns'), h('ul', { class: 'small', id: 'prov-resources' }, arr(j.resources).map((x) => h('li', null, `${x.kind} ${x.name}: ${x.ownership}`))))),
-      h('div', { class: 'actions' }, res.ok ? verify : null, res.ok ? recipe : null, rollbackButton(res.operationId, () => { st.result = null; st.review = null; rerender(); })));
+      h('div', { class: 'actions' }, res.ok ? verify : null, res.ok ? recipe : null, h('a', { class: 'btn', href: '#applications' }, 'Applications'), rollbackButton(res.operationId, () => { st.result = null; st.review = null; st.step = 'review'; rerender(); })));
   }
 
   function rollbackButton(operationId, done) {

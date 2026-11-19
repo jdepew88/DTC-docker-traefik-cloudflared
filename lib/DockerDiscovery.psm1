@@ -76,6 +76,8 @@ function ConvertFrom-DockerInspect($C) {
     # Label names (never values) that identify a management tool (Portainer, Arcane): lib\AppContract.psm1.
     authorityHints = @(if ($labels) { @($labels.PSObject.Properties | Where-Object { $_.Name -match '^(io\.portainer\.|com\.getarcaneapp\.|arcane\.)' } | ForEach-Object { $_.Name }) })
     networks = $networks; exposed = @($exposed | Sort-Object { $_.port }); published = $published
+    # Container-side mount paths only (never host paths or volume names): drift detection notices a lost mount.
+    mounts = @(@(Get-Prop $C 'Mounts' @()) | ForEach-Object { [string](Get-Prop $_ 'Destination' '') } | Where-Object { $_ } | Sort-Object -Unique)
     traefik = $traefik
     managedBy = (& $label 'org.traefik-proxy.app')
     # Reverse proxies, tunnel connectors and socket proxies are infrastructure, not applications to publish.

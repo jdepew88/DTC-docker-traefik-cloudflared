@@ -154,6 +154,16 @@ try {
   Test-Condition 'step 1: acknowledging every high/review finding completes the step (green check) while it stays the open step' ($s1.cls -match '\bdone\b' -and $s1.cls -match '\bcurrent\b' -and $s1.mark -eq [string][char]0x2713 -and -not (Js "document.querySelector('#prov-next').disabled")) ($s1 | ConvertTo-Json -Compress)
 
   $null = Click '#prov-next'
+  $ok = Wait "!!document.querySelector('#prov-stack')"
+  $stackText = Js "document.querySelector('#prov-stack').textContent"
+  Test-Condition 'stage 2 (stack): each service with its role, the database never published, and the Compose file each one goes to (compose.yaml, compose.database.yaml)' ($ok -and $stackText -match 'Database \(private\)' -and $stackText -match 'never published' -and (Js "document.querySelector('#prov-stack-files').textContent") -match 'compose\.database\.yaml' -and (Js "document.querySelector('#prov-stack-files').textContent") -match 'compose\.yaml') $stackText
+  Test-Condition 'keyboard: moving to a stage puts the focus on its heading' ((Js "document.activeElement && document.activeElement.id") -eq 'prov-title') (Js "document.activeElement && (document.activeElement.id || document.activeElement.tagName)")
+  Shot 'provision-3b-stack'
+  $null = Click '#prov-next'
+  $ok = Wait "!!document.querySelector('#prov-storage')"
+  Test-Condition 'stage 3 (storage and networking): volumes named per project, the web port reached by DNS name, the Docker Desktop limitations of this draft' ($ok -and (Js "document.querySelector('#prov-storage-volumes').textContent") -match 'notes_pgdata' -and (Js "document.querySelector('#prov-storage-ports').textContent") -match 'DNS name' -and (Js "document.querySelector('#prov-storage-host').textContent") -match '9229') (Js "document.querySelector('#prov-storage').textContent")
+  Shot 'provision-3c-storage'
+  $null = Click '#prov-next'
   $null = Wait "!!document.querySelector('#prov-access')"
   $null = Js "{ const r = document.querySelector('input[name=prov-access][value=public]'); r.checked = true; r.dispatchEvent(new Event('change')); true }"
   $null = Wait "!!document.querySelector('#prov-hostname')"
@@ -175,6 +185,9 @@ try {
   Shot 'provision-5-auth'
   $null = Wait "!document.querySelector('#prov-next').disabled"
   $null = Click '#prov-next'
+  $ok = Wait "!!document.querySelector('#prov-publish')"
+  Test-Condition 'stage 6 (publication): the existing tunnel, changes only at deploy after review, overwrites need their own confirmation; preview on request' ($ok -and (Js "document.querySelector('#prov-publish').textContent") -match 'existing Cloudflare Tunnel' -and (Js "document.querySelector('#prov-publish').textContent") -match 'only when you deploy' -and (Js "!!document.querySelector('#prov-publish-preview')")) (Js "document.querySelector('#prov-publish').textContent")
+  $null = Click '#prov-next'
   $null = Wait "!!document.querySelector('#prov-plan')"
   $null = Click '#prov-plan'
   $ok = Wait "!!document.querySelector('#prov-review')"
@@ -193,6 +206,8 @@ try {
   Test-Condition 'deploy: the apply request confirms, allows the privilege and names the confirmed overwrite' ($ok -and $applyBody.confirm -and $applyBody.confirmPrivileges -and (@($applyBody.confirmOverwrites) -join ',') -eq 'dns:notes.provtest.example') ($applyBody | ConvertTo-Json -Compress)
   $notTested = Js "document.querySelector('#prov-verification li[data-stage=authorized-access]').textContent"
   Test-Condition 'deploy: the result lists each stage and each verification; a stage that was not tested says so (never shown as passed)' ([int](Js "document.querySelectorAll('#prov-stages li').length") -eq 5 -and $notTested -match 'Not tested' -and (Js "document.querySelector('#prov-result-status').textContent") -match '6 check\(s\) passed, 0 failed, 1 not tested' -and (Js "document.querySelector('#prov-url-out').href") -eq 'https://notes.provtest.example/' -and (Step 'review').cls -match '\bdone\b') $notTested
+  $states = Js "Array.from(document.querySelectorAll('#prov-progress li')).map((li) => li.dataset.id + '=' + li.dataset.state).join(',')"
+  Test-Condition 'stage 8 (verify and manage): the deployment opens here with each component''s state; with an untested check it is not marked verified' ((Step 'verify').cls -match '\bcurrent\b' -and [int](Js "document.querySelectorAll('#prov-progress li').length") -eq 8 -and $states -match 'routed=done' -and $states -match 'verified=pending' -and $states -match 'published=done') $states
   Shot 'provision-7-result'
   $null = Click '#prov-rollback'
   $ok = Wait "!!document.querySelector('#prov-rollback-panel')"

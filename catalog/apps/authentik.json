@@ -264,8 +264,8 @@
   },
   "testStatus": {
     "static": "passed",
-    "live": "partial",
+    "live": "passed",
     "date": "2026-11-19",
-    "notes": "Installed from the catalog on a disposable deployment by tests\\Test-IdentityLive.ps1: install, readiness, private database, bootstrap token, Google source setup, ForwardAuth protection and sign-ins, re-protection after a misroute, rollback, restart persistence, browser pages, teardown. Full run 2026-11-19: 127 passed; the only failure was the test harness starting a second Edge (fixed), which left 8 browser checks unreached; they passed in a -BrowserOnly run (82 passed, 0 failed). Catalog backup/restore not run for it."
+    "notes": "Installed from the catalog on disposable deployments by tests\\Test-IdentityLive.ps1: install, readiness, private database, bootstrap token, Google source setup, ForwardAuth protection and sign-ins, re-protection, rollback, restart persistence, browser pages, teardown (full run 127 passed; -BrowserOnly 82 passed). -UniversalOnly: ForwardAuth on an imported and an externally owned application (21 checks passed). -RecoveryOnly: backup (pg_dump, database volume, .env, data / certs / templates), loss of the volume, media and .env, restore with users, groups, providers, rules, policies, source secret and protected access intact, rollback of a corrupted backup (45 passed). See docs/authentik-recovery.md."
   }
 }

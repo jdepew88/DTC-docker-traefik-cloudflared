@@ -15,7 +15,7 @@
     h('div', null, h('div', { class: 'eyebrow' }, 'Apps'), h('h1', null, title), text ? h('p', null, text) : null),
     actions.length ? h('div', { class: 'actions' }, actions) : null);
   const modeChip = (m) => plainChip((MODE[m] || [m])[0], (MODE[m] || [0, 'neutral'])[1]);
-  const authorityText = (a) => (a ? `${a.label}${a.confidence === 'likely' ? ' (likely)' : ''}` : 'Unknown');
+  const authorityText = (a) => (a ? `${a.label}${a.confidence === 'likely' ? ' (likely)' : a.confidence === 'confirmed' ? ' (confirmed by its API)' : ''}` : 'Unknown');
   const reviewed = (label, onChange) => { const b = h('input', { type: 'checkbox' }); b.addEventListener('change', () => onChange(b.checked)); return h('label', { class: 'check' }, b, h('span', null, label)); };
 
   P.applications = async (main, ctx) => {
@@ -37,8 +37,45 @@
       h('section', { class: 'card', 'aria-labelledby': 'apps-found' }, h('h2', { id: 'apps-found' }, 'Found on this Docker engine'),
         h('p', { class: 'muted' }, 'Installed with Arcane, Portainer, docker compose or docker run. Integrate one to give it a route, sign-in or publication owned by DTC (its containers stay with their tool), or observe it.'),
         arr(data.unmanaged).length ? h('div', { class: 'disc-list', id: 'apps-unmanaged' }, arr(data.unmanaged).map((u) => unmanagedCard(u, data.proxyNetwork, reload))) : h('p', { class: 'empty' }, 'Nothing else runs on this engine.')),
+      managersSection(reload),
       gate('expert', technical([JSON.stringify(data, null, 2)], 'Applications registry view (contract version ' + data.contractVersion + ')')));
   };
+
+  // Optional, read-only Portainer / Arcane connectors: more precise ownership and drift; never required.
+  function managersSection(reload) {
+    const host = h('div', { id: 'apps-managers-body', 'aria-live': 'polite' }, h('p', { class: 'muted' }, 'Loading…'));
+    const sec = h('section', { class: 'card', 'aria-labelledby': 'apps-managers' }, h('h2', { id: 'apps-managers' }, 'Portainer and Arcane (optional)'),
+      h('p', { class: 'muted' }, 'Read-only connections that confirm which stack owns an application and add the owner\'s view to drift checks. Discovery works without them; DTC only reads (GET requests) and never changes a stack.'), host);
+    api('GET', '/api/managers').then((m) => drawManagers(host, m, reload)).catch((e) => fill(host, h('p', { class: 'muted' }, e.message)));
+    return gate('intermediate', sec);
+  }
+
+  function drawManagers(host, m, reload) {
+    const rows = arr(m.connectors).map((c) => {
+      const out = h('div', { 'aria-live': 'polite' });
+      const lc = c.lastCheck;
+      return h('article', { class: 'card inset', 'data-connector': c.id },
+        h('div', { class: 'card-head' }, h('h3', null, c.name), plainChip(m.kinds[c.kind] ? m.kinds[c.kind].label : c.kind), h('span', { class: 'grow' }),
+          lc ? plainChip(lc.ok ? `${arr(lc.stacks).length} stack(s)` : (lc.error || 'error'), lc.ok ? 'ok' : 'warn') : plainChip('not checked', 'neutral')),
+        kv([['Address', c.url], ['API key', c.keyStored ? `stored for this Windows account${c.keyReadable ? '' : ' (cannot be read: save it again)'}` : 'missing']]),
+        lc && !lc.ok ? h('p', { class: 'small' }, lc.message) : null, out,
+        h('div', { class: 'actions' },
+          h('button', { type: 'button', class: 'btn', 'data-action': 'manager-test', onclick: (e) => withBusy(e.currentTarget, async () => { const r = await api('POST', '/api/managers/test', { id: c.id }); fill(out, r.ok ? h('ul', { class: 'checks' }, arr(r.stacks).map((x) => checkItem(x.status === 'active' || x.status === 'running' ? 'ok' : 'neutral', `${x.name} (${x.status})`, arr(x.containers).join(', ')))) : h('p', { class: 'small' }, r.message)); }) }, 'Test'),
+          h('button', { type: 'button', class: 'btn', 'data-action': 'manager-delete', onclick: (e) => withBusy(e.currentTarget, async () => { await api('POST', '/api/managers/delete', { id: c.id, confirm: true }); toast('Connector and its stored key removed.'); reload(); }) }, 'Remove')));
+    });
+    const kind = h('select', { id: 'mgr-kind' }, Object.entries(m.kinds || {}).map(([k, v]) => h('option', { value: k }, v.label)));
+    const url = h('input', { type: 'url', id: 'mgr-url', placeholder: 'http://127.0.0.1:9000', autocomplete: 'off', spellcheck: 'false' });
+    const key = h('input', { type: 'password', id: 'mgr-key', autocomplete: 'off' });
+    const note = h('p', { class: 'small', id: 'mgr-scope' });
+    const showNote = () => { const k = (m.kinds || {})[kind.value] || {}; note.textContent = `${k.scopeNote || ''} ${k.tokenHelp || ''}`; };
+    kind.addEventListener('change', showNote); showNote();
+    const save = h('button', { type: 'submit', class: 'btn primary', id: 'mgr-save' }, 'Save connector');
+    const form = h('form', { id: 'mgr-form', onsubmit: (e) => { e.preventDefault(); withBusy(save, async () => {
+      await api('POST', '/api/managers/save', { kind: kind.value, url: url.value.trim(), key: key.value, confirm: true }); key.value = ''; toast('Saved. The key is stored encrypted for this Windows account.'); reload(); }); } },
+      h('h3', null, 'Add a connector'), field({ id: 'mgr-kind', label: 'Product', control: kind }), field({ id: 'mgr-url', label: 'Address', control: url, hint: 'https anywhere; plain http only for this PC or your private network.' }),
+      field({ id: 'mgr-key', label: 'API key', control: key }), note, h('div', { class: 'actions' }, save));
+    fill(host, rows.length ? rows : h('p', { class: 'muted' }, 'No connector. Ownership comes from Docker labels and Compose folders.'), form);
+  }
 
   function addSection(data) {
     return h('section', { class: 'card', 'aria-labelledby': 'apps-add' }, h('h2', { id: 'apps-add' }, 'Add application'),

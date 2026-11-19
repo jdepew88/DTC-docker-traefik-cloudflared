@@ -119,6 +119,7 @@ $ManagedFiles = @(
   'webui\provision.js',
   'lib\AppContract.psm1',
   'lib\Reconcile.psm1',
+  'lib\ExternalManagers.psm1',
   'webui\applications.js',
   'lib\Launcher.psm1',
   'launcher\DTC-Tray.ps1',

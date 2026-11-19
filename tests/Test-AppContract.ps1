@@ -181,6 +181,18 @@ $managedInst = [ordered]@{ instanceId = 'i-abc'; mode = 'managed'; target = [ord
 $d6 = Get-DriftFindings -Instance $managedInst -Container $cKuma -Routes @($routes[0]) -ProxyNetwork 'proxy' -Volumes @('kuma_other') -ExpectedVolumes @('kuma_data')
 Test-Condition 'drift: a managed stack whose data volume disappeared is reported (restore from a backup)' (@($d6 | Where-Object { $_.id -eq 'volume-missing' -and $_.repair.description -match 'backup' }).Count) (($d6 | ForEach-Object { $_.id }) -join ', ')
 
+$mInst = New-ContractInstance 'integrated' $cNotes $auth0 'Notes' (New-ObservedBaseline ([ordered]@{ id = $cNotes.id; name = $cNotes.name; image = $cNotes.image; compose = $cNotes.compose; networks = $cNotes.networks; mounts = @('/app/data', '/app/uploads') }) 8080 'http' 'proxy' $auth0)
+$mInst.integrations = $notesInst.integrations
+$noMount = New-FixtureContainer 'notes-web-1' 'notes' 'web' '/data/compose/3'; $noMount.mounts = @('/app/data')
+$d7 = Get-DriftFindings -Instance $mInst -Container $noMount -Authority $auth0 -Routes @($routes[1]) -Middlewares $mw -ProxyNetwork 'proxy'
+Test-Condition 'drift: a storage mount that disappeared (container paths only) is reported for the owner to restore' (@($d7 | Where-Object { $_.id -eq 'mount-lost' -and $_.explanation -match '/app/uploads' -and $_.repair.owner -eq 'external' }).Count -and $mInst.baseline.mounts.Count -eq 2) (($d7 | ForEach-Object { $_.id }) -join ', ')
+$protRoute = ConvertTo-ServiceDefinition @{ name = 'notes'; hostnames = @('notes.home.example'); target = @{ type = 'docker'; host = 'notes-web-1'; port = 8080 }; auth = @{ provider = 'authentik'; endpoint = 'http://old-ak-server:9000' }; owner = @{ kind = 'integration'; instanceId = $notesInst.instanceId; integrationId = 'int-000000000001' } }
+$d8 = Get-DriftFindings -Instance $notesInst -Container $cNotes -Authority $auth0 -Routes @($protRoute) -Middlewares $mw -ProxyNetwork 'proxy' -IdentityEndpoint 'http://new-ak-server:9000'
+$plan8 = Get-RepairPlan $d8 @($protRoute)
+$d9 = Get-DriftFindings -Instance $notesInst -Container $cNotes -Authority $auth0 -Routes @($protRoute) -Middlewares $mw -ProxyNetwork 'proxy' -IdentityEndpoint 'http://old-ak-server:9000/'
+Test-Condition 'drift: a protected route whose authentik address changed is repaired to the current address (sign-in kept); the same address is not reported' (
+  @($d8 | Where-Object { $_.id -eq 'auth-endpoint-stale' }).Count -and $plan8.routeChanges[0].after.authEndpoint -eq 'http://new-ak-server:9000' -and $plan8.routeChanges[0].before.authEndpoint -eq 'http://old-ak-server:9000' -and -not @($d9 | Where-Object { $_.id -eq 'auth-endpoint-stale' }).Count) (($d8 | ForEach-Object { $_.id }) -join ', ')
+
 # --- Part 1f: route ownership in service definitions --------------------------------------------------------------------
 $owned = $routes[1]
 $plainR = $routes[0]
@@ -311,6 +323,21 @@ else {
     $own = Invoke-WebUi $ui POST '/api/integrations/plan' @{ container = "tpm-ac-$id-traefik"; port = 8080; hostname = 'x.home.example' }
     $nope = Invoke-WebUi $ui POST '/api/integrations/plan' @{ container = 'no-such-container-here'; port = 80; hostname = 'x.home.example' }
     Test-Condition 'api: integration plans refuse unknown containers (404); this deployment''s own containers are never integrated (400 or 404 when not running)' ($nope.Status -eq 404 -and $own.Status -in 400, 404) "$($nope.Status) $($own.Status) $($own.Body)"
+    # An interrupted repair (the manager stopped part-way) is listed and rolled back to the routes from before it.
+    $st0 = Get-StackSettings -InstallPath $install
+    $addR = Invoke-WebUiChange $ui @{ op = 'add'; service = @{ name = 'repairme'; hostnames = @('repairme.home.example'); target = @{ type = 'docker'; host = 'nowhere-x'; port = 8080 }; cloudflare = @{ publish = $false; access = $false } }; cloudflare = @{ automate = $false } }
+    $regBefore = [IO.File]::ReadAllText($st0.RegistryPath)
+    $preId = Split-Path -Leaf (New-ServiceBackup $st0 -Suffix '-pre-repair')
+    $chgR = Invoke-WebUiChange $ui @{ op = 'update'; name = 'repairme'; service = @{ name = 'repairme'; hostnames = @('repairme.home.example'); target = @{ type = 'docker'; host = 'nowhere-x'; port = 9999 }; cloudflare = @{ publish = $false; access = $false } }; cloudflare = @{ automate = $false } }
+    $rid = 'abcdef012345'
+    New-Item -ItemType Directory -Force -Path (Join-Path $install 'config\provision\repairs') | Out-Null
+    [IO.File]::WriteAllText((Join-Path $install "config\provision\repairs\$rid.json"), (@{ repairId = $rid; instanceId = 'x-0123456789ab'; startedAt = '2026-11-19T10:00:00Z'; preBackup = $preId; state = 'running'; steps = @(@{ summary = "Update route 'repairme'"; ok = $true }) } | ConvertTo-Json -Depth 4))
+    $list = Invoke-WebUi $ui GET '/api/applications/repairs'
+    $rbNo = Invoke-WebUi $ui POST '/api/applications/repair/rollback' @{ repairId = $rid }
+    $rbR = Invoke-WebUi $ui POST '/api/applications/repair/rollback' @{ repairId = $rid; confirm = $true }
+    $rbTwice = Invoke-WebUi $ui POST '/api/applications/repair/rollback' @{ repairId = $rid; confirm = $true }
+    Test-Condition 'repairs: an interrupted repair is listed and rolled back (with confirmation) to the routes from before it, once' (
+      $addR.Apply.Data.ok -and $chgR.Apply.Data.ok -and @($list.Data.interrupted | Where-Object { $_.repairId -eq $rid }).Count -eq 1 -and $rbNo.Status -ge 400 -and $rbR.Status -eq 200 -and [IO.File]::ReadAllText($st0.RegistryPath) -eq $regBefore -and $rbTwice.Status -eq 409) "$($list.Body) $($rbR.Status) $($rbR.Body)"
     $obsBad = Invoke-WebUi $ui POST '/api/applications/observe' @{ container = 'no-such-container-here' }
     $drift = Invoke-WebUi $ui POST '/api/applications/drift' @{ instanceId = 'x-000000000000' }
     $rep = Invoke-WebUi $ui POST '/api/applications/repair/plan' @{ instanceId = 'x-000000000000' }

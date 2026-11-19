@@ -101,7 +101,7 @@ host compatibility check, plan, apply, journal and rollback.
 | Unraid template (pasted) | the template XML | **New**, working (template links already worked) |
 | Existing Docker apps | the engine's containers and Compose projects | **New**: integrate or observe without recreating anything |
 | awesome-selfhosted | entry link | Working |
-| Portainer / Arcane APIs | — | Not implemented: their stacks are recognized from Docker, which is enough to integrate them |
+| Portainer / Arcane APIs | optional read-only connectors (section 8) | Add evidence (stack identity, status, containers); Docker discovery works without them |
 
 Repeated imports of the same link or text return the existing draft (`importKey`); duplicates of running apps are
 caught by the plan ("already runs on this PC").
@@ -133,6 +133,16 @@ management tool, containers no longer on the proxy network, stale backend names,
 does not exist, protection removed outside DTC, hostnames claimed by another configuration, routes an integration
 created that disappeared, missing data volumes of managed stacks, unhealthy containers.
 
+Added after the live proofs: lost storage mounts (container paths recorded in the baseline; host paths never), a
+protected route whose authentik address is out of date (`auth-endpoint-stale`, repaired to the current address with
+the sign-in kept), and, with a Portainer or Arcane connector, stacks the owner reports as stopped while their
+container runs, recreated containers the owner does not list, and two tools claiming one application.
+
+Repairs are journalled (`config\provision\repairs\<id>.json`): a backup of every route file and the service
+registry is taken first; if a later step of a multi-step repair fails, everything goes back to that backup; a repair
+interrupted by a stopped manager stays `running` and is offered for rollback (`GET /api/applications/repairs`,
+`POST /api/applications/repair/rollback`). Drift is checked on request only (no background polling).
+
 Each finding has an explanation, evidence and a repair. Repairs DTC may apply (`owner: dtc`) are route updates
 (backend name, port, middleware list), route re-syncs and re-creation from the integration record; they are
 previewed as an ordinary change plan and applied through the same validation, backup and rollback. Everything owned
@@ -162,10 +172,61 @@ Results on 2026-11-19 (this PC, Windows 11 + Docker Desktop, production running 
 - Proof 2, a Compose project with Portainer's access-control label: 17 passed, 0 failed, 2 not tested (proof 1 was
   skipped in that run; authentik needs a real identity environment).
 
-authentik protection of both is verified against a real authentik only in `tests\Test-IdentityLive.ps1`; the
-universal test reports it as not tested unless an identity environment is ready.
+authentik protection of an imported and of an externally owned application is verified against a real, disposable
+authentik in `tests\Test-IdentityLive.ps1 -UniversalOnly` (section 7); this test reports it as not tested.
 
-## 7. Supported and unsupported
+## 7. authentik ForwardAuth on imported and integrated applications
+
+Verified live with a real, disposable authentik (`tests\Test-IdentityLive.ps1 -UniversalOnly`, which installs authentik
+from the catalog, connects it, publishes its sign-in page and sets the owner, then):
+
+- **Imported** (pasted Compose: a web service and a PostgreSQL database): provisioned with `auth = authentik`; modular
+  Compose, router, service and ForwardAuth middleware; one authentik application and proxy provider; anonymous
+  visitors sent to the sign-in; the owner group admitted; another signed-in user refused; a wrong password never
+  admitted; no direct web port and no other route to the container; protecting again keeps `http(s)://host[:port]` on
+  the provider (the 404 fix) without duplicate objects; unprotect / protect; rollback removes the route, the authentik
+  objects the operation created and the containers.
+- **Externally owned** (a Compose project with Portainer's label): discovered, observed, integrated after an explicit
+  switch, protected through the identity contract, owner admitted / outsider refused, protected again, drift after the
+  owner recreated it on another port, repair of the DTC-owned route only (ForwardAuth kept), removal of the route and
+  the authentik objects the integration created; the container kept running with the same ID, networks and Compose
+  file.
+
+Defects found and fixed by this run: the objects a provisioning created in authentik were recorded as "reused", so a
+rollback kept them; a provisioned application behind authentik or Cloudflare Access still published a direct web
+port on 127.0.0.1, which bypassed the sign-in (now no host port is published when the route is protected).
+
+## 8. Portainer and Arcane connectors (optional, read-only)
+
+`lib\ExternalManagers.psm1`, Applications page > "Portainer and Arcane", `GET/POST /api/managers*`.
+
+| | Portainer CE 2.x | Arcane 2.x |
+| --- | --- | --- |
+| Authentication | access token, header `X-API-Key` | API key, header `X-Api-Key` |
+| Read-only key | not possible: a token carries all rights of the user who created it (CE has no read-only role); use a dedicated non-administrator user | yes: `environments:list/read`, `projects:list/read`, `containers:list/read`, `networks:list/read` |
+| Read | `/api/stacks` (id, name, environment, status, project path, Git source), `/api/endpoints/{id}/docker/containers/json` | `/api/environments`, `/api/agents/{id}/projects` (documented; `/api/environments/{id}/projects` as fallback), `.../containers` |
+
+DTC sends GET requests only. Keys are DPAPI secrets for this Windows account, never written to `config\managers.json`,
+returned or logged. Plain http is accepted only for this PC or a private address. Snapshots are cached for 60
+seconds; without a connector, or when it does not answer, ownership comes from Docker labels and Compose folders as
+before. API evidence confirms Docker's guess (`confirmed`), names the owner of a plain Compose project, or reports a
+`conflict`; DTC still never edits a stack or takes over its lifecycle.
+
+Tested with mocked API responses and a local mock server only (`tests\Test-ExternalManagers.ps1`); no live Portainer or
+Arcane was connected, so compatibility with real instances is documented, not verified.
+
+## 9. Add application wizard
+
+One wizard for every source (New app page; Applications page for running containers): 1 Application source
+(publisher, source, trust, open questions, security review), 2 Stack and dependencies (roles, private services, the
+Compose file each service goes to), 3 Storage and networking (volumes, the web port, the absence of a host port behind
+a sign-in, Docker Desktop restrictions), 4 Routing (with an exact router/service/middleware preview), 5 Authentication
+(per-method states and client incompatibilities), 6 Publication (Cloudflare preview; changes only at deploy), 7 Review
+and deploy, 8 Verify and manage (planned, installed, running, healthy, routed, sign-in, published, verified; a running
+container is never shown healthy without its checks). Stages 2, 3 and 6 add no mandatory clicks. Detail levels are kept;
+the heading of each stage receives the focus when moving between stages.
+
+## 10. Supported and unsupported
 
 Supported: single and multi-service Compose applications with published images; dependencies with health
 conditions; generated secrets; named volumes; one web front end per application behind Traefik; ForwardAuth for
@@ -175,6 +236,6 @@ applications integrated without taking ownership.
 Not supported (refused or reported, never guessed): building images from source; `include:`/`extends:`; capabilities,
 sysctls, PID/IPC namespaces, `network_mode: service:`; devices on Docker Desktop; private registries; applications
 that need extra host ports for non-HTTP protocols (DNS, game servers, UDP discovery); native OIDC wiring (recognized
-and recommended, configured by you in authentik and the application); Portainer and Arcane API calls; Linux, Unraid
+and recommended, configured by you in authentik and the application); changing Portainer or Arcane stacks (the connectors only read; verified with mocks, not live instances); Linux, Unraid
 and macOS hosts. No claim is made that every Docker image works: an imported application is `unverified` until its
 deployment's stages pass, and a Compose file that validates is not a verified deployment.

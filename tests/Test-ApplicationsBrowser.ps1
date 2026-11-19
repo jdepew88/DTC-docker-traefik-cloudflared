@@ -152,6 +152,24 @@ try {
   $rm = Js "document.querySelector('[data-instance=x-0123456789ab] .app-detail').textContent"
   Test-Condition 'remove: the preview lists the route to remove and what is kept (containers, Compose files, volumes); disabled until confirmed' ($ok -and $rm -match 'Route wiki' -and $rm -match 'not touched' -and (Js "document.querySelector('[data-action=remove-apply]').disabled")) $rm
 
+  # Optional Portainer / Arcane connectors (real server: the key is stored with DPAPI; nothing answers on the address).
+  Open-Page $cdp "$base/?r=$id#applications?level=intermediate"
+  $ok = Wait "!!document.querySelector('#mgr-form')" 30
+  $null = Js "{ const k = document.querySelector('#mgr-kind'); k.value = 'arcane'; k.dispatchEvent(new Event('change')); true }"
+  Test-Condition 'connectors: optional; Arcane shows its read-only permissions, the key field is a password field' ($ok -and (Js "document.querySelector('#mgr-scope').textContent") -match 'projects:read' -and (Js "document.querySelector('#mgr-key').type") -eq 'password') (Js "document.querySelector('#mgr-scope').textContent")
+  $null = Js "{ const k = document.querySelector('#mgr-kind'); k.value = 'portainer'; k.dispatchEvent(new Event('change')); true }"
+  Test-Condition 'connectors: Portainer says its token cannot be restricted to read-only' ((Js "document.querySelector('#mgr-scope').textContent") -match 'no read-only role') ''
+  $deadPort = Get-FreeTcpPort
+  $null = Js "document.querySelector('#mgr-url').value = 'http://127.0.0.1:$deadPort'; document.querySelector('#mgr-key').value = 'browser-test-key-123'; true"
+  $null = Click '#mgr-save'
+  $ok = Wait "!!document.querySelector('[data-connector=portainer]')" 20
+  $null = Click '[data-connector=portainer] [data-action=manager-test]'
+  $null = Wait "/did not answer/.test(document.querySelector('[data-connector=portainer]').textContent)" 30
+  Test-Condition 'connectors: saved, tested (the address does not answer: reported, nothing breaks), the key never shown' ($ok -and (Js "document.querySelector('[data-connector=portainer]').textContent") -match 'did not answer' -and (Js "document.body.textContent") -notmatch 'browser-test-key-123') ''
+  $null = Click '[data-connector=portainer] [data-action=manager-delete]'
+  $ok = Wait "!document.querySelector('[data-connector=portainer]') && !!document.querySelector('#mgr-form')" 20
+  Test-Condition 'connectors: removing it removes the stored key too' ($ok -and -not (Test-Path -LiteralPath (Join-Path $install 'secrets\manager-portainer-api.dpapi'))) ''
+
   # Expert level shows the raw registry view.
   Open-Page $cdp "$base/?r=$id#applications?level=expert"
   $ok = Wait "!!document.querySelector('#apps-list')" 20

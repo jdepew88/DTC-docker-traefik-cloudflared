@@ -39,7 +39,7 @@ Summary: 36 manifests; 30 installable applications (plus the HTTP echo test app 
 | Application | Pinned version | Dependencies (own stack) | On this PC (read-only check) | Catalog status | Windows (Docker Desktop) | Sign-in | Static checks | Live install | Backup/restore | Known limitations |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | Authelia | `authelia/authelia:4.39.28` | - | Installed, managed (authelia) | Installable | supported | n/a (no web sign-in) | Passed | Passed (2026-11-16) | Tested (backup, restore, app works after) | Session cookies need a real domain with HTTPS: it protects apps only after a public or LAN hostname is configured. |
-| authentik | `ghcr.io/goauthentik/server:2026.8.5` | server:2026.8.5, postgres:16-alpine | Installed, managed (authentik; Identity & Access, Google sign-in) | Installable | supported | n/a (no web sign-in) | Passed | Partial (2026-11-19) | Not reached | - |
+| authentik | `ghcr.io/goauthentik/server:2026.8.5` | server:2026.8.5, postgres:16-alpine | Installed, managed (authentik; Identity & Access, Google sign-in) | Installable | supported | n/a (no web sign-in) | Passed | Passed (2026-11-19) | Not reached | - |
 | LLDAP (directory) | `lldap/lldap:v0.6.3` | - | Installed, managed (lldap) | Installable | supported | n/a (no web sign-in) | Passed | Passed (2026-11-16) | Tested (backup, restore, app works after) | The LDAP port is not published: only containers on its private network, or clients you connect explicitly, can use it. |
 | OpenLDAP | `ghcr.io/intechcore/openldap:2.6.16-6` | - | Not installed | Installable | supported | n/a (no web sign-in) | Passed | Passed (2026-11-17) | Tested (backup, restore, app works after) | The container comes from a small vendor (intechcore) that packages the official Symas OpenLDAP 2.6 LTS builds; osixia/openldap is unmaintained and the free Bitnami images were withdrawn.; No web interface: manage entries with LDAP tools (ldapadd, Apache Directory Studio) or use LLDAP for a simpler directory with a web interface. |
 | Vaultwarden | `vaultwarden/server:1.37.5` | - | Not installed | Installable | supported | Not with ForwardAuth | Passed | Passed (2026-11-17) | Tested (backup, restore, app works after) | Over plain http on a LAN address or hostname, the web vault refuses to sign in; use http://127.0.0.1 locally or publish it with HTTPS.; Bitwarden clients need version 2026.7.0 or later for Vaultwarden 1.37. |
@@ -127,8 +127,8 @@ Each card lists its manual steps (*Requires manual setup* filter). The most impo
   wait and rollback. Its one failure was the test harness: a second headless Edge received
   `--host-resolver-rules=MAP *.idtest.example 127.0.0.1` split at the spaces (Windows PowerShell's Start-Process does
   not quote arguments) and never opened DevTools, so 8 browser checks were not reached. With the arguments quoted
-  they passed in `Test-IdentityLive.ps1 -BrowserOnly` (82 passed, 0 failed). Catalog backup/restore of authentik is
-  still not run, hence "Partial".
+  they passed in `Test-IdentityLive.ps1 -BrowserOnly` (82 passed, 0 failed). Catalog backup/restore of authentik was verified on
+  2026-11-19 (`Test-IdentityLive.ps1 -RecoveryOnly`, 45 passed; see docs/authentik-recovery.md).
 - **Browser test harness (fixed 2026-11-19):** a DevTools reply that took longer than its timeout (an occasional
   full-page screenshot) cancelled the WebSocket receive, which closes the socket for good: every later browser command
   of that run failed. A timeout now leaves the receive pending and the session usable. `Test-UiBrowser.ps1` failed

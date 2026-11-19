@@ -83,6 +83,7 @@ Import-Module (Join-Path $here 'lib\AiAssist.psm1') -Force
 Import-Module (Join-Path $here 'lib\Recipes.psm1') -Force
 Import-Module (Join-Path $here 'lib\AppContract.psm1') -Force
 Import-Module (Join-Path $here 'lib\Reconcile.psm1') -Force
+Import-Module (Join-Path $here 'lib\ExternalManagers.psm1') -Force
 Import-Module (Join-Path $here 'lib\Launcher.psm1') -Force
 if (-not $CatalogDir) { $CatalogDir = Join-Path $here 'catalog' }
 Import-Module (Join-Path $here 'lib\LocalHttp.psm1') -Force
@@ -128,6 +129,7 @@ $State = @{
   IdpChecks = @{}
   ProvisionPlans = @{}
   IntegrationPlans = @{}
+  ManagerSnapshots = @{}
   AiEstimates = @{}
   Remembered = @{}
   Cookie    = "tpx_session_$Port"
@@ -2428,6 +2430,23 @@ function Invoke-AppBackupCore($App, $Manifest, $Settings, [string]$Reason = 'man
     $src = Join-Path $App.folder ($f -replace '/', '\')
     if (Test-Path -LiteralPath $src) { Copy-Item -LiteralPath $src -Destination (Join-Path $dir ($f -replace '/', '_')) -Recurse }
   }
+  # Logical dumps of PostgreSQL databases with the database's own pg_dump (custom format), taken while it runs (a
+  # consistent snapshot) and checked with pg_restore --list. The volume copy below restores into the same PostgreSQL
+  # major version; the dump also restores into a newer one (docs/authentik-recovery.md). Values never leave the container.
+  $dumps = @()
+  foreach ($sp in $active) {
+    if ([string](Get-Prop2 $sp.Value 'role' '') -ne 'database' -or [string](Get-Prop2 $sp.Value 'image' '') -notmatch '(^|/)postgres(ql)?:') { continue }
+    $cn = Get-AppContainerName $Manifest $App.project $sp.Name
+    if (-not (Test-ContainerRunning $cn)) { $dumps += [ordered]@{ service = $sp.Name; file = ''; ok = $false; message = 'not running: no dump (the volume copy still holds the data)' }; continue }
+    $fname = "$($App.project)_$($sp.Name).pgdump"
+    $d1 = Invoke-Docker exec $cn sh -c 'pg_dump -U "$POSTGRES_USER" -d "${POSTGRES_DB:-$POSTGRES_USER}" -Fc -f /tmp/dtc-backup.pgdump && pg_restore --list /tmp/dtc-backup.pgdump > /dev/null'
+    $d2 = $(if ($d1.ExitCode -eq 0) { Invoke-Docker cp "${cn}:/tmp/dtc-backup.pgdump" (Join-Path $dir $fname) } else { $d1 })
+    $null = Invoke-Docker exec $cn rm -f /tmp/dtc-backup.pgdump
+    $dfile = Join-Path $dir $fname
+    if (Test-Path -LiteralPath $dfile) { Set-SecretFileAcl $dfile }
+    $dumps += [ordered]@{ service = $sp.Name; file = $fname; ok = ($d1.ExitCode -eq 0 -and $d2.ExitCode -eq 0 -and (Test-Path -LiteralPath $dfile)); format = 'pg_dump custom (-Fc)'
+      sizeMB = $(if (Test-Path -LiteralPath $dfile) { [Math]::Round((Get-Item -LiteralPath $dfile).Length / 1MB, 2) } else { 0 }); message = $(if ($d1.ExitCode -ne 0) { ((ConvertTo-RedactedText @($d1.Output | Select-Object -Last 2)) -join ' ') } else { '' }) }
+  }
   $stateful = @($active | Where-Object { Get-Prop2 $_.Value 'stateful' $false }).Count -gt 0
   $stopped = $false
   if ($stateful -and $volumes.Count) {
@@ -2447,10 +2466,10 @@ function Invoke-AppBackupCore($App, $Manifest, $Settings, [string]$Reason = 'man
     if ($stopped) { $null = Invoke-Docker @((Get-AppComposeArgs $App) + @('start')) }
   }
   $info = [ordered]@{ app = $App.appId; project = $App.project; createdAt = (Get-Date -Format 's'); reason = $Reason; composeFiles = $fileNames; composeSha256 = (Get-AppComposeFingerprint $App)
-    volumes = $results; skipped = $skipped; folders = @($folders | Select-Object -Unique); stoppedForBackup = $stopped }
+    volumes = $results; skipped = $skipped; folders = @($folders | Select-Object -Unique); stoppedForBackup = $stopped; databases = @($dumps) }
   [IO.File]::WriteAllText((Join-Path $dir 'backup.json'), ($info | ConvertTo-Json -Depth 5))
-  Write-Audit 'app-backup' "$($App.project) $dir volumes=$(@($results).Count)"
-  return [ordered]@{ ok = -not @($results | Where-Object { -not $_.ok }).Count; folder = $dir; volumes = $results; skipped = $skipped; folders = $info.folders; stopped = $stopped }
+  Write-Audit 'app-backup' "$($App.project) $dir volumes=$(@($results).Count) dumps=$(@($dumps | Where-Object { $_.ok }).Count)/$(@($dumps).Count)"
+  return [ordered]@{ ok = -not @($results | Where-Object { -not $_.ok }).Count; folder = $dir; volumes = $results; skipped = $skipped; folders = $info.folders; stopped = $stopped; databases = @($dumps) }
 }
 
 function Invoke-AppBackup($Body) {
@@ -2789,6 +2808,20 @@ function Invoke-AppRestore($Body) {
     $r = Invoke-Docker run --rm --pull never --network none -v "$($v.volume):/v" -v "${dir}:/b:ro" --entrypoint sh $settings.TraefikImage -c "cd /v && rm -rf ./* ./.[!.]* ./..?* && tar xzf '/b/$($v.volume).tar.gz' -C /v"
     if ($r.ExitCode -ne 0) { $ok = $false }
     & $step "Restore volume $($v.volume)" $(if ($r.ExitCode -eq 0) { 'Done' } else { 'Failed' }) "$($v.sizeMB) MB"
+    if (-not $ok) { break }
+  }
+  if (-not $ok) {
+    # Roll back: every volume of the safety backup is put back, files and folders are left as they were, then the app
+    # starts in its state from before this restore.
+    $sdir = [string]$safety.folder
+    foreach ($sv in @($safety.volumes | Where-Object { $_.ok })) {
+      $rr = Invoke-Docker run --rm --pull never --network none -v "$($sv.volume):/v" -v "${sdir}:/b:ro" --entrypoint sh $settings.TraefikImage -c "cd /v && rm -rf ./* ./.[!.]* ./..?* && tar xzf '/b/$($sv.volume).tar.gz' -C /v"
+      & $step "Roll back volume $($sv.volume) from the safety backup" $(if ($rr.ExitCode -eq 0) { 'Done' } else { 'Failed' }) ''
+    }
+    $up0 = Invoke-Docker @((Get-AppComposeArgs $a) + @('up', '-d'))
+    & $step 'Start the app in its previous state' $(if ($up0.ExitCode -eq 0) { 'Done' } else { 'Failed' }) ''
+    Write-Audit 'app-restore-failed' "$($a.project) backup=$($plan.backup) rolled back from $(Split-Path -Leaf $sdir)"
+    return [ordered]@{ ok = $false; rolledBack = $true; project = $a.project; backup = $plan.backup; safetyBackup = (Split-Path -Leaf $sdir); steps = $steps.ToArray(); health = $null }
   }
   if ($plan.files.Count) {
     foreach ($f in $plan.files) {
@@ -4489,7 +4522,9 @@ function Request-IdentityProtection([string]$ServiceName) {
   $res = Invoke-IdentityProtectApply ([pscustomobject]@{ planId = $plan.planId; confirm = $true; confirmOverwrites = @() })
   $first = @($res.results)[0]
   return [ordered]@{ ok = [bool]$res.ok; message = [string]$res.message; challenge = $first.challenge
-    created = @(@($first.authentik) | Where-Object { [string]$_.kind -eq 'create' -or [string](Get-Prop2 $_ 'Kind' '') -eq 'create' } | ForEach-Object { "$(Get-Prop2 $_ 'object' (Get-Prop2 $_ 'Object' '')) $(Get-Prop2 $_ 'name' (Get-Prop2 $_ 'Name' ''))" })
+    # The action views are ordered dictionaries (ConvertTo-AkActionView): read their keys directly (Get-Prop2 reads
+    # object properties only, which left every name blank and recorded created objects as reused, so a rollback kept them).
+    created = @(@($first.authentik) | ForEach-Object { $v = $_; $g = { param($k) [string]$(if ($v -is [System.Collections.IDictionary]) { $v[$k] } else { Get-Prop2 $v $k '' }) }; if ((& $g 'kind') -eq 'create') { "$(& $g 'object') $(& $g 'name')" } })
     authentik = @($first.authentik) }
 }
 
@@ -4584,6 +4619,12 @@ function Invoke-ProvisionPlan($Body) {
   }
   $appBody = [pscustomobject]@{ appId = [string]$m.id; startNow = $true; anotherInstance = [bool](Get-Field $Body 'anotherInstance' $false); instanceLabel = [string](Get-Field $Body 'instanceLabel' '') }
   foreach ($k in @('project', 'folder', 'localPort', 'timezone', 'inputs', 'reuseData')) { $v = Get-Field $Body $k $null; if ($null -ne $v) { $appBody | Add-Member -NotePropertyName $k -NotePropertyValue $v } }
+  # A sign-in in front of the route is only a protection if nothing else reaches the application: no direct web port
+  # on this PC (127.0.0.1:<port> would bypass ForwardAuth or Access). It is opened through its host name only.
+  if ($access -ne 'local' -and $auth -in 'authentik', 'cloudflare-access') {
+    $appBody | Add-Member -NotePropertyName localPort -NotePropertyValue 0 -Force
+    $null = $warnings.Add("No direct web port is published on this PC: it would bypass the $(if ($auth -eq 'authentik') { 'authentik' } else { 'Cloudflare Access' }) sign-in. Open the application through $hostname.")
+  }
   $app = Invoke-AppPlan $appBody $(if ($imported) { $m } else { $null })
   foreach ($c in @($app.checks | Where-Object { $_.state -eq 'failed' })) { $null = $blockers.Add("$($c.label): $($c.message)") }
   # Imported images already running elsewhere on this PC (same repository as the web service): never a silent duplicate.
@@ -4891,6 +4932,12 @@ function Get-ApplicationsData {
   $c = Get-ContractContext
   $inv = Get-ApplicationInventory -Managed $c.Managed -Registry $c.Registry -Services $c.Services -Containers $c.Containers -StackName $c.Settings.StackName -OwnContainers $c.Own -ProxyNetwork $c.Settings.ProxyNetwork
   $inv.proxyNetwork = $c.Settings.ProxyNetwork
+  # Optional Portainer / Arcane connectors add API evidence to the Docker-based authority (never required).
+  $snaps = @(if (@(Read-ManagerConnectors).Count) { Get-ManagerSnapshots })
+  if ($snaps.Count) {
+    foreach ($a in @(@($inv.applications) + @($inv.unmanaged))) { if ($a -and [string]$a['mode'] -ne 'managed' -and [string]$a['project']) { $a['authority'] = Resolve-ManagerAuthority $a['authority'] ([string]$a['project']) $snaps } }
+  }
+  $inv.managers = @($snaps | ForEach-Object { [ordered]@{ id = $_.id; kind = $_.kind; ok = [bool]$_.ok; error = [string]$_.error; message = [string]$_.message; stacks = @($_.stacks).Count } })
   $inv.entryPoints = @(
     [ordered]@{ id = 'catalog'; label = 'Browse curated applications'; href = '#catalog' }
     [ordered]@{ id = 'link'; label = 'Paste a Docker Hub or GitHub link'; href = '#provision' }
@@ -5137,7 +5184,12 @@ function Get-ApplicationDrift($Ctx, [string]$InstanceId) {
   foreach ($r in $routes) { foreach ($h in @($r.hostnames)) { $claims[[string]$h] = @(Find-HostnameClaims -Hostname $h -Services $Ctx.Services -Routers @() -Containers $labelled -OwnService $r.name) } }
   $protection = @{}
   foreach ($g in @($inst.integrations)) { if ($g.protection -and [string]$g.protection.provider) { $protection[[string]$g.route] = $g.protection } }
-  $findings = @(Get-DriftFindings -Instance $inst -Container $container -Authority $authority -Routes $routes -LoadedRouters $loaded -RouteFiles $files -Probes $probes -Middlewares @(Get-AvailableMiddlewares $settings) -Claims $claims -ProxyNetwork $settings.ProxyNetwork -Volumes $volumes -ExpectedVolumes $expectedVolumes -Protection $protection -PortProbes $portProbes)
+  $snaps = @(if (@(Read-ManagerConnectors).Count -and $inst.mode -ne 'managed') { Get-ManagerSnapshots })
+  $proj = [string]$(if ($container) { $container.compose.project } else { $inst.target.project })
+  if ($snaps.Count -and $authority) { $authority = Resolve-ManagerAuthority $authority $proj $snaps }
+  $idEndpoint = ''; if (@($routes | Where-Object { $_.PSObject.Properties['auth'] }).Count) { try { $idEndpoint = [string](Get-IdentityContractStatus).endpoint } catch { } }
+  $findings = @(Get-DriftFindings -Instance $inst -Container $container -Authority $authority -Routes $routes -LoadedRouters $loaded -RouteFiles $files -Probes $probes -Middlewares @(Get-AvailableMiddlewares $settings) -Claims $claims -ProxyNetwork $settings.ProxyNetwork -Volumes $volumes -ExpectedVolumes $expectedVolumes -Protection $protection -PortProbes $portProbes -IdentityEndpoint $idEndpoint)
+  if ($snaps.Count) { $findings = @($findings) + @(Get-ManagerDriftFindings $proj $authority $snaps $container) }
   return [pscustomobject]@{ Instance = $inst; Container = $container; Routes = $routes; Findings = $findings; Summary = (Get-DriftSummary $findings); Repair = (Get-RepairPlan $findings $routes) }
 }
 
@@ -5145,7 +5197,8 @@ function Invoke-ApplicationDriftRequest($Body) {
   $ctx = Get-ContractContext
   $id = Assert-ContractInstanceId ([string](Get-Field $Body 'instanceId' ''))
   $d = Get-ApplicationDrift $ctx $id
-  return [ordered]@{ instanceId = $id; mode = [string]$d.Instance.mode; summary = $d.Summary; findings = @($d.Findings); repair = $d.Repair; checkedAt = (Get-Date -Format 's') }
+  return [ordered]@{ instanceId = $id; mode = [string]$d.Instance.mode; summary = $d.Summary; findings = @($d.Findings); repair = $d.Repair; checkedAt = (Get-Date -Format 's')
+    interruptedRepairs = @(Get-InterruptedRepairs | Where-Object { $_.instanceId -eq $id }) }
 }
 
 # The change bodies of a repair: route updates, re-syncs and re-creations of DTC-owned routes only.
@@ -5155,6 +5208,7 @@ function Get-RepairChangeBodies($Ctx, $Drift) {
     $cur = @($Ctx.Services | Where-Object { $_.name -eq $c.route })[0]
     $def = ConvertTo-ServiceDefinition ($cur | ConvertTo-Json -Depth 8 | ConvertFrom-Json)
     $def.target.host = [string]$c.after.host; $def.target.port = [int]$c.after.port; $def.middlewares = @($c.after.middlewares)
+    if ($def.PSObject.Properties['auth'] -and [string]$c.after.authEndpoint) { $def.auth.endpoint = [string]$c.after.authEndpoint }
     $bodies += [pscustomobject]@{ Summary = "Update route '$($c.route)'"; Body = [pscustomobject]@{ op = 'update'; name = $c.route; service = $def; cloudflare = [pscustomobject]@{ automate = $false } }; Owner = $null }
   }
   foreach ($rn in @($Drift.Repair.resync)) {
@@ -5190,14 +5244,28 @@ function Invoke-ApplicationRepair($Body) {
   if ($plan.key -ne [string](Get-Field $Body 'key' '')) { Stop-Request 409 'The application changed since the preview. Review the repair again.' }
   $ctx = Get-ContractContext
   $d = Get-ApplicationDrift $ctx $plan.instanceId
+  # Journal: the routes as they were before the repair, so a failed or interrupted repair never leaves routing half
+  # updated (Invoke-ApplicationRepairRollback, or automatically below).
+  $pre = Split-Path -Leaf (New-ServiceBackup $ctx.Settings -Suffix '-pre-repair')
+  $journal = [ordered]@{ repairId = (New-SecretValue 6); instanceId = $plan.instanceId; startedAt = (Get-Date).ToUniversalTime().ToString('s') + 'Z'; preBackup = $pre; state = 'running'; steps = @() }
+  Save-RepairJournal $journal
   $results = @()
   foreach ($b in @(Get-RepairChangeBodies $ctx $d)) {
     $p = Build-ChangePlan $b.Body $b.Owner
     $r = Invoke-ChangePlanSteps $p @()
     $results += [ordered]@{ summary = $b.Summary; ok = [bool]$r.ok; steps = @($r.steps) }
+    $journal.steps = @($journal.steps) + [ordered]@{ summary = $b.Summary; ok = [bool]$r.ok }
+    Save-RepairJournal $journal
     if (-not $r.ok) { break }
   }
   $ok = -not @($results | Where-Object { -not $_.ok }).Count
+  if (-not $ok -and @($results).Count -gt 1) {
+    $null = Restore-ServiceBackup -Settings $ctx.Settings -Id $pre
+    $journal.state = 'rolled-back'; Save-RepairJournal $journal
+    Write-Audit 'app-repair-rollback' "$($plan.instanceId) restored $pre"
+    return [ordered]@{ ok = $false; rolledBack = $true; results = $results; repairId = $journal.repairId }
+  }
+  $journal.state = $(if ($ok) { 'done' } else { 'failed' }); Save-RepairJournal $journal
   # A repaired integration records what it now relies on, so the next check compares against the repaired state.
   if ($ok -and $d.Instance.mode -eq 'integrated' -and $d.Container) {
     $reg = Read-ContractRegistry $ctx.Settings
@@ -5211,7 +5279,124 @@ function Invoke-ApplicationRepair($Body) {
     }
   }
   Write-Audit 'app-repair' "$($plan.instanceId) ok=$ok $((@($results | ForEach-Object { "$($_.summary)=$($_.ok)" })) -join '; ')"
-  return [ordered]@{ ok = $ok; results = $results }
+  return [ordered]@{ ok = $ok; results = $results; repairId = $journal.repairId }
+}
+
+function Save-RepairJournal($Journal) { Write-TextFileAtomic (Join-Path (Get-ProvisionDir 'repairs') "$($Journal.repairId).json") (($Journal | ConvertTo-Json -Depth 6) + "`n") }
+
+# Repairs that never finished (the manager was stopped part-way): listed with the routes as they were before.
+function Get-InterruptedRepairs {
+  return @(Get-ChildItem -LiteralPath (Get-ProvisionDir 'repairs') -Filter '*.json' -File -ErrorAction SilentlyContinue | ForEach-Object {
+      try { $j = [IO.File]::ReadAllText($_.FullName) | ConvertFrom-Json; if ([string]$j.state -eq 'running') { [ordered]@{ repairId = [string]$j.repairId; instanceId = [string]$j.instanceId; startedAt = [string]$j.startedAt; preBackup = [string]$j.preBackup; steps = @($j.steps) } } } catch { }
+    })
+}
+
+function Invoke-ApplicationRepairRollback($Body) {
+  Assert-Installed
+  Assert-Confirmed $Body
+  $id = [string](Get-Field $Body 'repairId' '')
+  if ($id -notmatch '^[a-f0-9]{8,32}$') { Stop-Request 400 'Invalid repair id.' }
+  $p = Join-Path (Get-ProvisionDir 'repairs') "$id.json"
+  if (-not (Test-Path -LiteralPath $p)) { Stop-Request 404 'No such repair.' }
+  $j = ConvertTo-OrderedTree ([IO.File]::ReadAllText($p) | ConvertFrom-Json)
+  if ([string]$j.state -ne 'running') { Stop-Request 409 "This repair is $($j.state); there is nothing to roll back." }
+  $r = Restore-ServiceBackup -Settings (Get-Settings) -Id ([string]$j.preBackup)
+  $j.state = 'rolled-back'; Save-RepairJournal $j
+  Write-Audit 'app-repair-rollback' "$($j.instanceId) interrupted repair $id restored $($j.preBackup)"
+  return [ordered]@{ ok = $true; restored = $r.Restored }
+}
+
+# --- External managers: optional read-only Portainer / Arcane connectors (lib\ExternalManagers.psm1) ---------------
+# Configured in config\managers.json (no secrets) with the API key as a DPAPI secret. Only GET requests are sent.
+# Discovery, integration and drift keep working from Docker alone when a connector is missing or does not answer.
+
+function Get-ManagersPath { return (Join-Path $InstallPath 'config\managers.json') }
+function Read-ManagerConnectors {
+  $p = Get-ManagersPath
+  if (-not (Test-Path -LiteralPath $p)) { return @() }
+  try { return @(([IO.File]::ReadAllText($p) | ConvertFrom-Json).connectors) } catch { return @() }
+}
+function Save-ManagerConnectors($List) {
+  New-Item -ItemType Directory -Force -Path (Split-Path -Parent (Get-ManagersPath)) | Out-Null
+  Write-TextFileAtomic (Get-ManagersPath) ((([ordered]@{ version = 1; connectors = @($List) }) | ConvertTo-Json -Depth 6) + "`n")
+}
+
+function ConvertTo-ManagerSnapshotView($Snap) {
+  if (-not $Snap) { return $null }
+  return [ordered]@{ ok = [bool]$Snap.ok; error = [string]$Snap.error; message = [string]$Snap.message; checkedAt = [string]$Snap.checkedAt
+    stacks = @(@($Snap.stacks) | ForEach-Object { [ordered]@{ name = $_.name; stackId = $_.stackId; status = $_.status; environment = $_.environment; containers = @(@($_.containers) | ForEach-Object { $_.name }) } }) }
+}
+
+function Get-ManagersData {
+  Assert-Installed
+  $settings = Get-Settings
+  return [ordered]@{ kinds = (Get-ExternalManagerKinds)
+    connectors = @(Read-ManagerConnectors | ForEach-Object {
+        $info = Get-ProtectedSecretInfo -Settings $settings -Name (Get-ManagerSecretName ([string]$_.id))
+        [ordered]@{ id = [string]$_.id; kind = [string]$_.kind; name = [string]$_.name; url = [string]$_.url; tlsSkipVerify = [bool](Get-Prop2 $_ 'tlsSkipVerify' $false); environment = [string](Get-Prop2 $_ 'environment' '')
+          keyStored = [bool]$info.Stored; keyReadable = [bool]$info.Readable; keySavedAt = [string]$info.SavedAt
+          lastCheck = (ConvertTo-ManagerSnapshotView $(if ($State.ManagerSnapshots.ContainsKey([string]$_.id)) { $State.ManagerSnapshots[[string]$_.id].Snap } else { $null })) }
+      }) }
+}
+
+function Invoke-ManagerSave($Body) {
+  Assert-Installed
+  Assert-Confirmed $Body
+  $settings = Get-Settings
+  $kind = [string](Get-Field $Body 'kind' '')
+  if (-not (Get-ExternalManagerKinds).Contains($kind)) { Stop-Request 400 'Choose Portainer or Arcane.' }
+  $id = ([string](Get-Field $Body 'id' $kind)).ToLowerInvariant()
+  if ($id -notmatch '^[a-z][a-z0-9-]{1,30}$') { Stop-Request 400 'The connector id may contain lowercase letters, digits and dashes.' }
+  $ep = Test-ManagerConnectorUrl ([string](Get-Field $Body 'url' ''))
+  if (-not $ep.Ok) { Stop-Request 400 $ep.Reason }
+  $name = ([string](Get-Field $Body 'name' (Get-ExternalManagerKinds)[$kind].label)).Trim(); if ($name.Length -gt 40 -or $name -match '[<>"\r\n]') { Stop-Request 400 'The name may have at most 40 characters, without quotes or angle brackets.' }
+  $key = [string](Get-Field $Body 'key' '')
+  $list = @(Read-ManagerConnectors | Where-Object { [string]$_.id -ne $id })
+  $existingKey = (Get-ProtectedSecretInfo -Settings $settings -Name (Get-ManagerSecretName $id)).Stored
+  if (-not $key -and -not $existingKey) { Stop-Request 400 'Paste the API key (it is stored encrypted for this Windows account and never shown again).' }
+  if ($key -and ($key.Length -lt 8 -or $key.Length -gt 512 -or $key -match '\s')) { Stop-Request 400 'That does not look like an API key.' }
+  if ($key) { Save-ProtectedSecret -Settings $settings -Name (Get-ManagerSecretName $id) -Value $key -Label "$((Get-ExternalManagerKinds)[$kind].label) API key (read-only connector)" }
+  $list += [ordered]@{ id = $id; kind = $kind; name = $name; url = $ep.BaseUrl; tlsSkipVerify = [bool](Get-Field $Body 'tlsSkipVerify' $false); environment = [string](Get-Field $Body 'environment' '') }
+  Save-ManagerConnectors $list
+  $State.ManagerSnapshots.Remove($id)
+  Write-Audit 'manager-save' "$id $kind $($ep.BaseUrl) key=$(if ($key) { 'replaced' } else { 'kept' })"
+  return [ordered]@{ ok = $true; id = $id; scopeNote = (Get-ExternalManagerKinds)[$kind].scopeNote }
+}
+
+function Invoke-ManagerDelete($Body) {
+  Assert-Installed
+  Assert-Confirmed $Body
+  $id = [string](Get-Field $Body 'id' '')
+  $list = @(Read-ManagerConnectors)
+  if (-not @($list | Where-Object { [string]$_.id -eq $id }).Count) { Stop-Request 404 'No such connector.' }
+  Save-ManagerConnectors @($list | Where-Object { [string]$_.id -ne $id })
+  $null = Remove-ProtectedSecret -Settings (Get-Settings) -Name (Get-ManagerSecretName $id)
+  $State.ManagerSnapshots.Remove($id)
+  Write-Audit 'manager-delete' $id
+  return [ordered]@{ ok = $true }
+}
+
+# Snapshots of every configured connector, cached for 60 s (no background polling).
+function Get-ManagerSnapshots([switch]$Fresh) {
+  $settings = Get-Settings
+  return @(foreach ($c in @(Read-ManagerConnectors)) {
+      $id = [string]$c.id
+      if (-not $Fresh -and $State.ManagerSnapshots.ContainsKey($id) -and ((Get-Date) - $State.ManagerSnapshots[$id].At).TotalSeconds -lt 60) { $State.ManagerSnapshots[$id].Snap; continue }
+      $key = $null; try { $key = Read-ProtectedSecret -Settings $settings -Name (Get-ManagerSecretName $id) } catch { }
+      $snap = $(if (-not $key) { [pscustomobject]@{ id = $id; kind = [string]$c.kind; ok = $false; error = 'no-key'; message = 'No API key is stored for this connector.'; checkedAt = (Get-Date).ToUniversalTime().ToString('s') + 'Z'; stacks = @() } }
+        else { Get-ManagerSnapshot -Connector $c -Key $key })
+      $State.ManagerSnapshots[$id] = [pscustomobject]@{ At = (Get-Date); Snap = $snap }
+      $snap
+    })
+}
+
+function Invoke-ManagerTest($Body) {
+  Assert-Installed
+  $id = [string](Get-Field $Body 'id' '')
+  if (-not @(Read-ManagerConnectors | Where-Object { [string]$_.id -eq $id }).Count) { Stop-Request 404 'No such connector.' }
+  $snap = @(Get-ManagerSnapshots -Fresh | Where-Object { $_.id -eq $id })[0]
+  Write-Audit 'manager-test' "$id ok=$($snap.ok) error=$($snap.error) stacks=$(@($snap.stacks).Count)"
+  return (ConvertTo-ManagerSnapshotView $snap)
 }
 
 # --- Router ----------------------------------------------------------------------------------------------------
@@ -5342,11 +5527,17 @@ function Invoke-ApiRoute($Request, $Body) {
     'POST /api/identity/unprotect/plan' { return Invoke-IdentityProtectPlan $Body -Remove }
     'POST /api/identity/unprotect/apply' { return Invoke-IdentityProtectApply $Body -Remove }
     'GET /api/applications' { return Get-ApplicationsData }
+    'GET /api/managers' { return Get-ManagersData }
+    'POST /api/managers/save' { return Invoke-ManagerSave $Body }
+    'POST /api/managers/test' { return Invoke-ManagerTest $Body }
+    'POST /api/managers/delete' { return Invoke-ManagerDelete $Body }
     'POST /api/applications/observe' { return Invoke-ApplicationObserve $Body }
     'POST /api/applications/forget' { return Invoke-ApplicationForget $Body }
     'POST /api/applications/drift' { return Invoke-ApplicationDriftRequest $Body }
     'POST /api/applications/repair/plan' { return Get-ApplicationRepairPlan $Body }
     'POST /api/applications/repair/apply' { return Invoke-ApplicationRepair $Body }
+    'GET /api/applications/repairs' { Assert-Installed; return [ordered]@{ interrupted = @(Get-InterruptedRepairs) } }
+    'POST /api/applications/repair/rollback' { return Invoke-ApplicationRepairRollback $Body }
     'POST /api/integrations/plan' { return Get-IntegrationPlan $Body }
     'POST /api/integrations/apply' { return Invoke-IntegrationApply $Body }
     'POST /api/integrations/protect' { return Invoke-IntegrationProtect $Body }
