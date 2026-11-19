@@ -92,8 +92,8 @@ $exeBuilt = $false
 $autoPath = Join-Path $startup ((Get-LauncherAppName (Get-LauncherEdition $repo)) + '.lnk')
 
 try {
-  $null = New-TestInstance -Repo $repo -Path $pathA -StackName $stackA -Subnet '172.30.197.0/28'
-  $null = New-TestInstance -Repo $repo -Path $pathB -StackName $stackB -Subnet '172.30.197.16/28'
+  $null = New-TestInstance -Repo $repo -Path $pathA -StackName $stackA -Subnet '172.31.238.0/28'
+  $null = New-TestInstance -Repo $repo -Path $pathB -StackName $stackB -Subnet '172.31.238.16/28'
   $mock = Start-CloudflareMock -Repo $repo -WorkDir $work -Token ('mockTok_' + [Guid]::NewGuid().ToString('N'))
   $script:DockerOk = ((Test-DockerReady 15000) -eq 'ready')
   $dockerBefore = Get-DockerSnapshot

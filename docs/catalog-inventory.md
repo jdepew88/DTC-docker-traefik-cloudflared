@@ -134,6 +134,9 @@ Each card lists its manual steps (*Requires manual setup* filter). The most impo
   of that run failed. A timeout now leaves the receive pending and the session usable. `Test-UiBrowser.ps1` failed
   in the service wizard because it switched the detail level and used a field in the same step, before the page had
   re-rendered; it now waits for the field (71 passed, 0 failed).
+- **Test-Projects upgrade checks (fixed 2026-11-19):** its fixture deployments used tunnel subnets in 172.30.x, which
+  overlap a network Docker created on this PC (`immich_internal`, 172.30.0.0/16), so `install.ps1` correctly refused
+  the upgrade preview. The fixtures (and Test-Launcher's) now use 172.31.238-241 (48 passed, 0 failed).
 - **Immich** was live-tested with machine learning off; the machine-learning service (about 2.5 GB) was not started.
 - **Paperless-ngx** Gotenberg and Tika (optional office-document services) were not started.
 - **Plex** was tested without a claim token and without GPU; claiming and hardware transcoding are not verified.
