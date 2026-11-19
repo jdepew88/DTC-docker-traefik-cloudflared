@@ -19,11 +19,19 @@
 
 .EXAMPLE
   powershell -ExecutionPolicy Bypass -File .\tests\Test-IdentityLive.ps1 -ScreenshotDir $env:TEMP\tpm-identity-shots
+
+.EXAMPLE
+  powershell -ExecutionPolicy Bypass -File .\tests\Test-IdentityLive.ps1 -BrowserOnly
+  Only what the browser checks need (installation, API token, sign-in hostname and route, outpost, Google source,
+  verified owner, sign-in page), then every browser check that does not need protected applications: the wizard,
+  authentik's sign-in page, API token replacement, the expert view, the 390 px layout and page script errors. Token
+  rotation, protection, rollback, persistence and the bulk application selection are skipped (reported as SKIP).
 #>
 [CmdletBinding()]
-param([string]$ScreenshotDir, [switch]$SkipBrowser, [string]$TunnelSubnet = '172.31.244.0/28', [switch]$KeepOnFailure)
+param([string]$ScreenshotDir, [switch]$SkipBrowser, [switch]$BrowserOnly, [string]$TunnelSubnet = '172.31.244.0/28', [switch]$KeepOnFailure)
 
 $ErrorActionPreference = 'Stop'
+if ($SkipBrowser -and $BrowserOnly) { throw '-SkipBrowser and -BrowserOnly cannot be combined.' }
 Set-StrictMode -Version 2.0
 $repo = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
 Import-Module (Join-Path $repo 'lib\TraefikProxy.psm1') -Force
@@ -176,62 +184,65 @@ try {
   $akadminPk = [int]@(Get-AuthentikList $adm '/core/users/?username=akadmin')[0].pk
   $outTok = @(Get-AuthentikList $adm '/core/tokens/?intent=api' | Where-Object { [string]$_.identifier -like 'ak-outpost-*' })[0]
   $outpostKey = [string](Invoke-AuthentikApi $adm GET "/core/tokens/$($outTok.identifier)/view_key/").key
-  $newTok = { param([string]$Ident, [int]$Seconds = 0)
-    $b = @{ identifier = $Ident; intent = 'api'; user = $akadminPk; description = 'tpx identity test'; expiring = [bool]$Seconds }
-    if ($Seconds) { $b.expires = (Get-Date).ToUniversalTime().AddSeconds($Seconds).ToString('o') }
-    $null = Invoke-AuthentikApi $adm POST '/core/tokens/' $b
-    [string](Invoke-AuthentikApi $adm GET "/core/tokens/$Ident/view_key/").key }
-  $settingsI = Get-StackSettings -InstallPath $installPath
-  $secretBytes = { [Convert]::ToBase64String([IO.File]::ReadAllBytes((Join-Path $installPath 'secrets\authentik_api.dpapi'))) }
-  # The situation from the field: an earlier version saved the outpost's token. (Written the way the old version did.)
-  Save-ProtectedSecret -Settings $settingsI -Name 'authentik_api' -Value $outpostKey -Label 'old version'
-  $c0 = Invoke-WebUi $ui GET '/api/identity?deep=1'
-  Test-Condition 'token mgmt: a saved outpost token is reported as not usable, with the reason (outpost) and the API step failed' ($c0.Data.credential.status -eq 'insufficient' -and $c0.Data.credential.message -match 'outpost' -and $c0.Data.credential.account -like 'ak-outpost-*' -and (Get-Step $c0.Data 'api').state -eq 'failed') ($c0.Data.credential | ConvertTo-Json -Compress)
-  $bad1 = Invoke-WebUi $ui POST '/api/identity/token' @{ token = 'wrongwrongwrongwrongwrongwrong0123456789' }
-  Test-Condition 'token mgmt: a wrong replacement is refused; the saved token is preserved and another attempt is possible' ($bad1.Status -eq 400 -and $bad1.Data.preserved -and $bad1.Data.candidate.status -eq 'rejected' -and (Invoke-WebUi $ui GET '/api/identity').Data.credential.account -like 'ak-outpost-*') ($bad1.Body)
-  $before1 = & $secretBytes
-  $rep1 = Invoke-WebUi $ui POST '/api/identity/token' @{ token = $bootToken }
-  Test-Condition 'token mgmt: outpost token -> admin token: validated, replaced, errors cleared' ($rep1.Status -eq 200 -and $rep1.Data.replaced -and $rep1.Data.credential.status -eq 'valid' -and $rep1.Data.credential.account -eq 'akadmin' -and (& $secretBytes) -ne $before1) ($rep1.Body)
-  Test-Condition 'token mgmt: after the replacement onboarding resumes at the next step (initial owner)' ($rep1.Data.next -eq 'owner' -and (Get-Step (Invoke-WebUi $ui GET '/api/identity').Data 'api').state -eq 'verified') "next=$($rep1.Data.next)"
-  Test-Condition 'token mgmt: the outpost''s own token is untouched in authentik' (@(Get-AuthentikList $adm "/core/tokens/?identifier=$($outTok.identifier)").Count -eq 1 -and (Test-AuthentikCredential -BaseUrl "http://127.0.0.1:$akPort" -Token $outpostKey).Account -like 'ak-outpost-*') ''
-  $bad2 = Invoke-WebUi $ui POST '/api/identity/token' @{ token = $outpostKey }
-  $before2 = & $secretBytes
-  Test-Condition 'token mgmt: replacing a working token with the outpost token is refused; the working token keeps working' ($bad2.Status -eq 400 -and $bad2.Data.candidate.status -eq 'insufficient' -and (Invoke-WebUi $ui POST '/api/identity/token/test' @{}).Data.ok -and (& $secretBytes) -eq $before2) ($bad2.Body)
-  # Voluntary rotation of a healthy connection.
-  $rotKey = & $newTok 'tpx-rotation' 0
-  $rot = Invoke-WebUi $ui POST '/api/identity/token' @{ token = $rotKey }
-  Test-Condition 'token mgmt: voluntary rotation of a healthy token' ($rot.Status -eq 200 -and $rot.Data.replaced -and $rot.Data.credential.rotatedAt -and $rot.Data.credential.status -eq 'valid' -and -not $rot.Data.credential.expiresAt) ($rot.Body)
-  # Expiring token: the expiry date is read from authentik, a warning is shown, then it expires.
-  # authentik gives every expiring API token the system's default token duration (it ignores a requested date), so
-  # the disposable instance's default is shortened to 25 seconds for this token and restored right after.
-  $prevDuration = [string](Invoke-AuthentikApi $adm GET '/admin/settings/').default_token_duration
-  $null = Invoke-AuthentikApi $adm PATCH '/admin/settings/' @{ default_token_duration = 'seconds=25' }
-  $expKey = & $newTok 'tpx-expiring' 25
-  $null = Invoke-AuthentikApi $adm PATCH '/admin/settings/' @{ default_token_duration = $prevDuration }
-  $exp = Invoke-WebUi $ui POST '/api/identity/token' @{ token = $expKey }
-  Test-Condition 'token mgmt: an expiring token shows its expiry date and a warning' ($exp.Status -eq 200 -and $exp.Data.credential.expiresAt -and $exp.Data.credential.expiryWarning -match 'expires') ($exp.Data.credential | ConvertTo-Json -Compress)
-  Start-Sleep -Seconds 35
-  $t1 = Invoke-WebUi $ui POST '/api/identity/token/test' @{}
-  Test-Condition 'token mgmt: Test connection reports the expired token (without asking for it)' ($t1.Status -eq 200 -and -not $t1.Data.ok -and $t1.Data.credential.status -eq 'expired') ($t1.Data.credential | ConvertTo-Json -Compress)
-  $g1x = Invoke-WebUi $ui GET '/api/identity'
-  Test-Condition 'token mgmt: with an expired token the API step fails and nothing is attempted with it' ((Get-Step $g1x.Data 'api').state -eq 'failed' -and (Invoke-WebUi $ui POST '/api/identity/outpost/plan' @{}).Status -eq 409) ''
-  $rep2 = Invoke-WebUi $ui POST '/api/identity/token' @{ token = $rotKey }
-  Test-Condition 'token mgmt: expired token -> replacement' ($rep2.Status -eq 200 -and $rep2.Data.credential.status -eq 'valid' -and -not $rep2.Data.credential.expiryWarning) ($rep2.Body)
-  # Revoked (deleted in authentik).
-  $null = Invoke-AuthentikApi $adm DELETE '/core/tokens/tpx-rotation/'
-  $t2 = Invoke-WebUi $ui POST '/api/identity/token/test' @{}
-  Test-Condition 'token mgmt: a revoked token is reported as rejected (wrong, expired or revoked)' (-not $t2.Data.ok -and $t2.Data.credential.status -eq 'rejected' -and $t2.Data.credential.message -match 'revoked') ($t2.Data.credential | ConvertTo-Json -Compress)
-  # The manager restarts (or the browser reloads): the failed state and the way out are still there.
-  Stop-TestServer $ui
-  $ui = Start-WebUiServer -Script (Join-Path $installPath 'webui.ps1') -InstallPath $installPath -WorkDir $uiDir
-  $null = Connect-WebUi $ui
-  $g2x = Invoke-WebUi $ui GET '/api/identity'
-  Test-Condition 'token mgmt: after a manager restart the revoked token is still reported and replaceable' ($g2x.Data.credential.status -eq 'rejected' -and $g2x.Data.credential.stored -and $g2x.Data.config.provider -eq 'authentik') ($g2x.Data.credential | ConvertTo-Json -Compress)
-  $rep3 = Invoke-WebUi $ui POST '/api/identity/token' @{ fromBootstrap = $true }
-  Test-Condition 'token mgmt: revoked token -> replacement (installation token); setup progress kept' ($rep3.Status -eq 200 -and $rep3.Data.credential.status -eq 'valid' -and (Invoke-WebUi $ui GET '/api/identity').Data.config.authentik.project -eq $akProject) ($rep3.Body)
-  $logText = ''
-  foreach ($f in @(Get-ChildItem -LiteralPath (Join-Path $installPath 'logs') -File -Recurse -ErrorAction SilentlyContinue) + @(Get-Item (Join-Path $installPath 'config\credentials.json'))) { $fs = [IO.File]::Open($f.FullName, 'Open', 'Read', 'ReadWrite'); try { $logText += (New-Object IO.StreamReader($fs)).ReadToEnd() } finally { $fs.Close() } }
-  Test-Condition 'token mgmt: no token value in any response, status file or log' (-not @(@($ui.Bodies) + $logText | Where-Object { $_ -match [regex]::Escape($outpostKey) -or $_ -match [regex]::Escape($rotKey) -or $_ -match [regex]::Escape($expKey) -or $_ -match [regex]::Escape($bootToken) }).Count) ''
+  # -BrowserOnly keeps the installation token (the browser checks below replace an outpost token themselves).
+  if (-not $BrowserOnly) {
+    $newTok = { param([string]$Ident, [int]$Seconds = 0)
+      $b = @{ identifier = $Ident; intent = 'api'; user = $akadminPk; description = 'tpx identity test'; expiring = [bool]$Seconds }
+      if ($Seconds) { $b.expires = (Get-Date).ToUniversalTime().AddSeconds($Seconds).ToString('o') }
+      $null = Invoke-AuthentikApi $adm POST '/core/tokens/' $b
+      [string](Invoke-AuthentikApi $adm GET "/core/tokens/$Ident/view_key/").key }
+    $settingsI = Get-StackSettings -InstallPath $installPath
+    $secretBytes = { [Convert]::ToBase64String([IO.File]::ReadAllBytes((Join-Path $installPath 'secrets\authentik_api.dpapi'))) }
+    # The situation from the field: an earlier version saved the outpost's token. (Written the way the old version did.)
+    Save-ProtectedSecret -Settings $settingsI -Name 'authentik_api' -Value $outpostKey -Label 'old version'
+    $c0 = Invoke-WebUi $ui GET '/api/identity?deep=1'
+    Test-Condition 'token mgmt: a saved outpost token is reported as not usable, with the reason (outpost) and the API step failed' ($c0.Data.credential.status -eq 'insufficient' -and $c0.Data.credential.message -match 'outpost' -and $c0.Data.credential.account -like 'ak-outpost-*' -and (Get-Step $c0.Data 'api').state -eq 'failed') ($c0.Data.credential | ConvertTo-Json -Compress)
+    $bad1 = Invoke-WebUi $ui POST '/api/identity/token' @{ token = 'wrongwrongwrongwrongwrongwrong0123456789' }
+    Test-Condition 'token mgmt: a wrong replacement is refused; the saved token is preserved and another attempt is possible' ($bad1.Status -eq 400 -and $bad1.Data.preserved -and $bad1.Data.candidate.status -eq 'rejected' -and (Invoke-WebUi $ui GET '/api/identity').Data.credential.account -like 'ak-outpost-*') ($bad1.Body)
+    $before1 = & $secretBytes
+    $rep1 = Invoke-WebUi $ui POST '/api/identity/token' @{ token = $bootToken }
+    Test-Condition 'token mgmt: outpost token -> admin token: validated, replaced, errors cleared' ($rep1.Status -eq 200 -and $rep1.Data.replaced -and $rep1.Data.credential.status -eq 'valid' -and $rep1.Data.credential.account -eq 'akadmin' -and (& $secretBytes) -ne $before1) ($rep1.Body)
+    Test-Condition 'token mgmt: after the replacement onboarding resumes at the next step (initial owner)' ($rep1.Data.next -eq 'owner' -and (Get-Step (Invoke-WebUi $ui GET '/api/identity').Data 'api').state -eq 'verified') "next=$($rep1.Data.next)"
+    Test-Condition 'token mgmt: the outpost''s own token is untouched in authentik' (@(Get-AuthentikList $adm "/core/tokens/?identifier=$($outTok.identifier)").Count -eq 1 -and (Test-AuthentikCredential -BaseUrl "http://127.0.0.1:$akPort" -Token $outpostKey).Account -like 'ak-outpost-*') ''
+    $bad2 = Invoke-WebUi $ui POST '/api/identity/token' @{ token = $outpostKey }
+    $before2 = & $secretBytes
+    Test-Condition 'token mgmt: replacing a working token with the outpost token is refused; the working token keeps working' ($bad2.Status -eq 400 -and $bad2.Data.candidate.status -eq 'insufficient' -and (Invoke-WebUi $ui POST '/api/identity/token/test' @{}).Data.ok -and (& $secretBytes) -eq $before2) ($bad2.Body)
+    # Voluntary rotation of a healthy connection.
+    $rotKey = & $newTok 'tpx-rotation' 0
+    $rot = Invoke-WebUi $ui POST '/api/identity/token' @{ token = $rotKey }
+    Test-Condition 'token mgmt: voluntary rotation of a healthy token' ($rot.Status -eq 200 -and $rot.Data.replaced -and $rot.Data.credential.rotatedAt -and $rot.Data.credential.status -eq 'valid' -and -not $rot.Data.credential.expiresAt) ($rot.Body)
+    # Expiring token: the expiry date is read from authentik, a warning is shown, then it expires.
+    # authentik gives every expiring API token the system's default token duration (it ignores a requested date), so
+    # the disposable instance's default is shortened to 25 seconds for this token and restored right after.
+    $prevDuration = [string](Invoke-AuthentikApi $adm GET '/admin/settings/').default_token_duration
+    $null = Invoke-AuthentikApi $adm PATCH '/admin/settings/' @{ default_token_duration = 'seconds=25' }
+    $expKey = & $newTok 'tpx-expiring' 25
+    $null = Invoke-AuthentikApi $adm PATCH '/admin/settings/' @{ default_token_duration = $prevDuration }
+    $exp = Invoke-WebUi $ui POST '/api/identity/token' @{ token = $expKey }
+    Test-Condition 'token mgmt: an expiring token shows its expiry date and a warning' ($exp.Status -eq 200 -and $exp.Data.credential.expiresAt -and $exp.Data.credential.expiryWarning -match 'expires') ($exp.Data.credential | ConvertTo-Json -Compress)
+    Start-Sleep -Seconds 35
+    $t1 = Invoke-WebUi $ui POST '/api/identity/token/test' @{}
+    Test-Condition 'token mgmt: Test connection reports the expired token (without asking for it)' ($t1.Status -eq 200 -and -not $t1.Data.ok -and $t1.Data.credential.status -eq 'expired') ($t1.Data.credential | ConvertTo-Json -Compress)
+    $g1x = Invoke-WebUi $ui GET '/api/identity'
+    Test-Condition 'token mgmt: with an expired token the API step fails and nothing is attempted with it' ((Get-Step $g1x.Data 'api').state -eq 'failed' -and (Invoke-WebUi $ui POST '/api/identity/outpost/plan' @{}).Status -eq 409) ''
+    $rep2 = Invoke-WebUi $ui POST '/api/identity/token' @{ token = $rotKey }
+    Test-Condition 'token mgmt: expired token -> replacement' ($rep2.Status -eq 200 -and $rep2.Data.credential.status -eq 'valid' -and -not $rep2.Data.credential.expiryWarning) ($rep2.Body)
+    # Revoked (deleted in authentik).
+    $null = Invoke-AuthentikApi $adm DELETE '/core/tokens/tpx-rotation/'
+    $t2 = Invoke-WebUi $ui POST '/api/identity/token/test' @{}
+    Test-Condition 'token mgmt: a revoked token is reported as rejected (wrong, expired or revoked)' (-not $t2.Data.ok -and $t2.Data.credential.status -eq 'rejected' -and $t2.Data.credential.message -match 'revoked') ($t2.Data.credential | ConvertTo-Json -Compress)
+    # The manager restarts (or the browser reloads): the failed state and the way out are still there.
+    Stop-TestServer $ui
+    $ui = Start-WebUiServer -Script (Join-Path $installPath 'webui.ps1') -InstallPath $installPath -WorkDir $uiDir
+    $null = Connect-WebUi $ui
+    $g2x = Invoke-WebUi $ui GET '/api/identity'
+    Test-Condition 'token mgmt: after a manager restart the revoked token is still reported and replaceable' ($g2x.Data.credential.status -eq 'rejected' -and $g2x.Data.credential.stored -and $g2x.Data.config.provider -eq 'authentik') ($g2x.Data.credential | ConvertTo-Json -Compress)
+    $rep3 = Invoke-WebUi $ui POST '/api/identity/token' @{ fromBootstrap = $true }
+    Test-Condition 'token mgmt: revoked token -> replacement (installation token); setup progress kept' ($rep3.Status -eq 200 -and $rep3.Data.credential.status -eq 'valid' -and (Invoke-WebUi $ui GET '/api/identity').Data.config.authentik.project -eq $akProject) ($rep3.Body)
+    $logText = ''
+    foreach ($f in @(Get-ChildItem -LiteralPath (Join-Path $installPath 'logs') -File -Recurse -ErrorAction SilentlyContinue) + @(Get-Item (Join-Path $installPath 'config\credentials.json'))) { $fs = [IO.File]::Open($f.FullName, 'Open', 'Read', 'ReadWrite'); try { $logText += (New-Object IO.StreamReader($fs)).ReadToEnd() } finally { $fs.Close() } }
+    Test-Condition 'token mgmt: no token value in any response, status file or log' (-not @(@($ui.Bodies) + $logText | Where-Object { $_ -match [regex]::Escape($outpostKey) -or $_ -match [regex]::Escape($rotKey) -or $_ -match [regex]::Escape($expKey) -or $_ -match [regex]::Escape($bootToken) }).Count) ''
+  }
 
   # --- Sign-in hostname ---------------------------------------------------------------------------------------------------
   $hn = Invoke-WebUi $ui POST '/api/identity/hostname' @{ hostname = $authHost; service = 'authentik' }
@@ -384,171 +395,175 @@ try {
   Test-Condition 'model: owner and Google verified from the owner''s sign-in; next step: protect applications' ((Get-Step $g4b.Data 'owner').state -eq 'verified' -and (Get-Step $g4b.Data 'google').state -eq 'verified' -and @($g4b.Data.model.next)[0] -eq 'apps') (($g4b.Data.model.steps | ForEach-Object { "$($_.id)=$($_.state)" }) -join ', ')
   Test-Condition 'manager keeps no user lists: identity.json has the owner address only' (([IO.File]::ReadAllText((Join-Path $installPath 'config\identity.json'))) -notmatch 'alice|emails|domains|groups') ''
 
-  # --- Protect selected applications ---------------------------------------------------------------------------------------
-  $app2 = "$stack-echo2"; $appHost2 = 'echo2.idtest.example'
-  $r0 = Invoke-Docker run -d --name $app --network $network --pull missing $whoami
-  $r0b = Invoke-Docker run -d --name $app2 --network $network --pull missing $whoami
-  $add = Invoke-WebUiChange $ui @{ op = 'add'; service = @{ name = 'echo'; displayName = 'Echo test'; hostnames = @($appHost); target = @{ type = 'docker'; host = $app; port = 80 }; cloudflare = @{ publish = $false; access = $false } }; cloudflare = @{ automate = $false } }
-  $add2 = Invoke-WebUiChange $ui @{ op = 'add'; service = @{ name = 'echo2'; displayName = 'Echo two'; hostnames = @($appHost2); target = @{ type = 'docker'; host = $app2; port = 80 }; cloudflare = @{ publish = $false; access = $false } }; cloudflare = @{ automate = $false } }
-  Test-Condition 'apps: two disposable whoami applications published through Traefik (no sign-in yet)' ($r0.ExitCode -eq 0 -and $r0b.ExitCode -eq 0 -and $add.Apply.Data.ok -and $add2.Apply.Data.ok -and (Test-ForwardAuthChallenge -TraefikPort $httpPort -Hostname $appHost).State -eq 'open') ($add.Apply.Body)
-  $self = Invoke-WebUi $ui POST '/api/identity/protect/plan' @{ services = @('authentik') }
-  Test-Condition 'protect: the authentik sign-in page itself cannot be protected (loop guard)' ($self.Status -eq 400) ($self.Body)
-  $withEmails = Invoke-WebUi $ui POST '/api/identity/protect/plan' @{ services = @('echo'); emails = @('alice@idtest.example') }
-  Test-Condition 'protect: emails, groups or domains are not accepted (access is managed in authentik)' ($withEmails.Status -eq 400 -and $withEmails.Data.error -match 'managed in authentik') ($withEmails.Body)
-  # echo2 already exists in authentik with its own rule (alice): that rule must be kept, not replaced by owner-only.
-  $alice = & $mk 'alice' 'alice@idtest.example' 'Alice-Live-Test-91x'
-  $mallory = & $mk 'mallory' 'mallory@other.example' 'Mallory-Live-Test-77y'
-  $pre = Invoke-AuthentikApi $conn POST '/core/applications/' @{ name = 'Echo two (made in authentik)'; slug = 'dm-echo2' }
-  $null = Invoke-AuthentikApi $conn POST '/policies/bindings/' @{ user = [int]$alice.pk; target = [string]$pre.pbm_uuid; order = 0; enabled = $true; negate = $false; timeout = 30 }
-  $pp = Invoke-WebUi $ui POST '/api/identity/protect/plan' @{ services = @('echo', 'echo2') }
-  $i1 = @($pp.Data.items | Where-Object { $_.service -eq 'echo' })[0]; $i2 = @($pp.Data.items | Where-Object { $_.service -eq 'echo2' })[0]
-  $diff = (@($i1.traefik.traefik.changes | ForEach-Object { $_.diff }) | ForEach-Object { $_ }) -join "`n"
-  Test-Condition 'protect: one preview for the selected applications, with the ForwardAuth route diff' ($pp.Status -eq 200 -and $pp.Data.canApply -and @($pp.Data.items).Count -eq 2 -and $diff -match 'forwardAuth' -and $diff -match 'svc-echo-outpost' -and $diff -match "address: http://$akProject-server:9000/outpost.goauthentik.io/auth/traefik") ($pp.Body.Substring(0, [Math]::Min(600, $pp.Body.Length)))
-  Test-Condition 'protect: a new application gets the owner-only rule; one with its own authentik rule keeps it' (@($i1.authentik | Where-Object { $_.object -eq 'access' -and $_.kind -eq 'create' }).Count -eq 1 -and @($i2.authentik | Where-Object { $_.object -eq 'access' -and $_.kind -eq 'none' }).Count -eq 1 -and @($i2.authentik | Where-Object { $_.object -eq 'application' -and $_.kind -eq 'create' }).Count -eq 0) (($i2.authentik | ForEach-Object { "$($_.kind):$($_.object)" }) -join ', ')
-  $pa = Invoke-WebUi $ui POST '/api/identity/protect/apply' @{ planId = $pp.Data.planId; confirm = $true }
-  Test-Condition 'protect: both applied and declared protected only after ForwardAuth was verified' ($pa.Status -eq 200 -and $pa.Data.ok -and @($pa.Data.results | Where-Object { $_.ok -and $_.challenge.State -eq 'auth' }).Count -eq 2) ($pa.Body)
-  Test-Condition 'protect: after protecting several at once every selected route still has its ForwardAuth (no later plan undoes an earlier one)' ([IO.File]::ReadAllText((Join-Path $installPath 'traefik\dynamic\svc-echo.yml')) -match 'svc-echo-authentik' -and [IO.File]::ReadAllText((Join-Path $installPath 'traefik\dynamic\svc-echo2.yml')) -match 'svc-echo2-authentik' -and (Test-ForwardAuthChallenge -TraefikPort $httpPort -Hostname $appHost).State -eq 'auth') ''
-  $protectBackup = [string](@($pa.Data.results | Where-Object { $_.service -eq 'echo' })[0].traefik.backup)
-  $edit = Invoke-WebUiChange $ui @{ op = 'update'; name = 'echo'; service = @{ name = 'echo'; displayName = 'Echo (renamed)'; hostnames = @($appHost); target = @{ type = 'docker'; host = $app; port = 80 }; cloudflare = @{ publish = $false; access = $false } }; cloudflare = @{ automate = $false } }
-  Test-Condition 'services: editing a protected service without the sign-in field keeps its protection' ($edit.Apply.Data.ok -and [IO.File]::ReadAllText((Join-Path $installPath 'traefik\dynamic\svc-echo.yml')) -match 'svc-echo-authentik') ($edit.Apply.Body)
+  # -BrowserOnly skips protection, sign-ins through the outpost, misroute, fail-closed, rollback, unprotect and
+  # persistence: the browser checks at the end do not depend on them.
+  if (-not $BrowserOnly) {
+    # --- Protect selected applications ---------------------------------------------------------------------------------------
+    $app2 = "$stack-echo2"; $appHost2 = 'echo2.idtest.example'
+    $r0 = Invoke-Docker run -d --name $app --network $network --pull missing $whoami
+    $r0b = Invoke-Docker run -d --name $app2 --network $network --pull missing $whoami
+    $add = Invoke-WebUiChange $ui @{ op = 'add'; service = @{ name = 'echo'; displayName = 'Echo test'; hostnames = @($appHost); target = @{ type = 'docker'; host = $app; port = 80 }; cloudflare = @{ publish = $false; access = $false } }; cloudflare = @{ automate = $false } }
+    $add2 = Invoke-WebUiChange $ui @{ op = 'add'; service = @{ name = 'echo2'; displayName = 'Echo two'; hostnames = @($appHost2); target = @{ type = 'docker'; host = $app2; port = 80 }; cloudflare = @{ publish = $false; access = $false } }; cloudflare = @{ automate = $false } }
+    Test-Condition 'apps: two disposable whoami applications published through Traefik (no sign-in yet)' ($r0.ExitCode -eq 0 -and $r0b.ExitCode -eq 0 -and $add.Apply.Data.ok -and $add2.Apply.Data.ok -and (Test-ForwardAuthChallenge -TraefikPort $httpPort -Hostname $appHost).State -eq 'open') ($add.Apply.Body)
+    $self = Invoke-WebUi $ui POST '/api/identity/protect/plan' @{ services = @('authentik') }
+    Test-Condition 'protect: the authentik sign-in page itself cannot be protected (loop guard)' ($self.Status -eq 400) ($self.Body)
+    $withEmails = Invoke-WebUi $ui POST '/api/identity/protect/plan' @{ services = @('echo'); emails = @('alice@idtest.example') }
+    Test-Condition 'protect: emails, groups or domains are not accepted (access is managed in authentik)' ($withEmails.Status -eq 400 -and $withEmails.Data.error -match 'managed in authentik') ($withEmails.Body)
+    # echo2 already exists in authentik with its own rule (alice): that rule must be kept, not replaced by owner-only.
+    $alice = & $mk 'alice' 'alice@idtest.example' 'Alice-Live-Test-91x'
+    $mallory = & $mk 'mallory' 'mallory@other.example' 'Mallory-Live-Test-77y'
+    $pre = Invoke-AuthentikApi $conn POST '/core/applications/' @{ name = 'Echo two (made in authentik)'; slug = 'dm-echo2' }
+    $null = Invoke-AuthentikApi $conn POST '/policies/bindings/' @{ user = [int]$alice.pk; target = [string]$pre.pbm_uuid; order = 0; enabled = $true; negate = $false; timeout = 30 }
+    $pp = Invoke-WebUi $ui POST '/api/identity/protect/plan' @{ services = @('echo', 'echo2') }
+    $i1 = @($pp.Data.items | Where-Object { $_.service -eq 'echo' })[0]; $i2 = @($pp.Data.items | Where-Object { $_.service -eq 'echo2' })[0]
+    $diff = (@($i1.traefik.traefik.changes | ForEach-Object { $_.diff }) | ForEach-Object { $_ }) -join "`n"
+    Test-Condition 'protect: one preview for the selected applications, with the ForwardAuth route diff' ($pp.Status -eq 200 -and $pp.Data.canApply -and @($pp.Data.items).Count -eq 2 -and $diff -match 'forwardAuth' -and $diff -match 'svc-echo-outpost' -and $diff -match "address: http://$akProject-server:9000/outpost.goauthentik.io/auth/traefik") ($pp.Body.Substring(0, [Math]::Min(600, $pp.Body.Length)))
+    Test-Condition 'protect: a new application gets the owner-only rule; one with its own authentik rule keeps it' (@($i1.authentik | Where-Object { $_.object -eq 'access' -and $_.kind -eq 'create' }).Count -eq 1 -and @($i2.authentik | Where-Object { $_.object -eq 'access' -and $_.kind -eq 'none' }).Count -eq 1 -and @($i2.authentik | Where-Object { $_.object -eq 'application' -and $_.kind -eq 'create' }).Count -eq 0) (($i2.authentik | ForEach-Object { "$($_.kind):$($_.object)" }) -join ', ')
+    $pa = Invoke-WebUi $ui POST '/api/identity/protect/apply' @{ planId = $pp.Data.planId; confirm = $true }
+    Test-Condition 'protect: both applied and declared protected only after ForwardAuth was verified' ($pa.Status -eq 200 -and $pa.Data.ok -and @($pa.Data.results | Where-Object { $_.ok -and $_.challenge.State -eq 'auth' }).Count -eq 2) ($pa.Body)
+    Test-Condition 'protect: after protecting several at once every selected route still has its ForwardAuth (no later plan undoes an earlier one)' ([IO.File]::ReadAllText((Join-Path $installPath 'traefik\dynamic\svc-echo.yml')) -match 'svc-echo-authentik' -and [IO.File]::ReadAllText((Join-Path $installPath 'traefik\dynamic\svc-echo2.yml')) -match 'svc-echo2-authentik' -and (Test-ForwardAuthChallenge -TraefikPort $httpPort -Hostname $appHost).State -eq 'auth') ''
+    $protectBackup = [string](@($pa.Data.results | Where-Object { $_.service -eq 'echo' })[0].traefik.backup)
+    $edit = Invoke-WebUiChange $ui @{ op = 'update'; name = 'echo'; service = @{ name = 'echo'; displayName = 'Echo (renamed)'; hostnames = @($appHost); target = @{ type = 'docker'; host = $app; port = 80 }; cloudflare = @{ publish = $false; access = $false } }; cloudflare = @{ automate = $false } }
+    Test-Condition 'services: editing a protected service without the sign-in field keeps its protection' ($edit.Apply.Data.ok -and [IO.File]::ReadAllText((Join-Path $installPath 'traefik\dynamic\svc-echo.yml')) -match 'svc-echo-authentik') ($edit.Apply.Body)
 
-  # Sign-ins through the real outpost. The test reaches Traefik on a local port over http, so the provider and outpost
-  # addresses are switched to that address for this part (production uses https://<host> without a port).
-  $prov = @(Get-AuthentikList $conn '/providers/proxy/?name=dm-echo' | Where-Object { $_.name -eq 'dm-echo' })[0]; $prov2 = @(Get-AuthentikList $conn '/providers/proxy/?name=dm-echo2' | Where-Object { $_.name -eq 'dm-echo2' })[0]
-  $null = Invoke-AuthentikApi $conn PATCH "/providers/proxy/$($prov.pk)/" @{ mode = 'forward_single'; external_host = "http://${appHost}:$httpPort" }
-  $null = Invoke-AuthentikApi $conn PATCH "/providers/proxy/$($prov2.pk)/" @{ mode = 'forward_single'; external_host = "http://${appHost2}:$httpPort" }
-  $null = Sync-AuthentikOutpost -Conn $conn -PublicUrl "http://${authHost}:$httpPort"
-  # This test publishes the sign-in page as http://<auth host>:<port>; record that as the public address, so protecting
-  # an application keeps (and, if needed, restores) the outpost and the application addresses on it.
-  $idPath = Join-Path $installPath 'config\identity.json'
-  $idj = [IO.File]::ReadAllText($idPath) | ConvertFrom-Json; $publicUrlBefore = [string]$idj.authentik.publicUrl; $idj.authentik.publicUrl = "http://${authHost}:$httpPort"
-  [IO.File]::WriteAllText($idPath, (ConvertTo-Json -InputObject $idj -Depth 10))
-  # Wait until the outpost has reloaded the test addresses (it refreshes a few seconds after a change).
-  $null = Wait-Until { @($appHost, $appHost2 | Where-Object { $x = Test-ForwardAuthChallenge -TraefikPort $httpPort -Hostname $_ -HostPort $httpPort -AuthHostname $authHost; $x.State -eq 'auth' -and $x.Location -match "^http://${authHost}:$httpPort/" }).Count -eq 2 } 90 2000
-  $anon = Test-ForwardAuthChallenge -TraefikPort $httpPort -Hostname $appHost -HostPort $httpPort -AuthHostname $authHost
-  Test-Condition 'forwardauth: anonymous visitors are sent to the authentik sign-in (no loop)' ($anon.State -eq 'auth' -and $anon.Location -match "^http://${authHost}:$httpPort/") ($anon | ConvertTo-Json -Compress)
+    # Sign-ins through the real outpost. The test reaches Traefik on a local port over http, so the provider and outpost
+    # addresses are switched to that address for this part (production uses https://<host> without a port).
+    $prov = @(Get-AuthentikList $conn '/providers/proxy/?name=dm-echo' | Where-Object { $_.name -eq 'dm-echo' })[0]; $prov2 = @(Get-AuthentikList $conn '/providers/proxy/?name=dm-echo2' | Where-Object { $_.name -eq 'dm-echo2' })[0]
+    $null = Invoke-AuthentikApi $conn PATCH "/providers/proxy/$($prov.pk)/" @{ mode = 'forward_single'; external_host = "http://${appHost}:$httpPort" }
+    $null = Invoke-AuthentikApi $conn PATCH "/providers/proxy/$($prov2.pk)/" @{ mode = 'forward_single'; external_host = "http://${appHost2}:$httpPort" }
+    $null = Sync-AuthentikOutpost -Conn $conn -PublicUrl "http://${authHost}:$httpPort"
+    # This test publishes the sign-in page as http://<auth host>:<port>; record that as the public address, so protecting
+    # an application keeps (and, if needed, restores) the outpost and the application addresses on it.
+    $idPath = Join-Path $installPath 'config\identity.json'
+    $idj = [IO.File]::ReadAllText($idPath) | ConvertFrom-Json; $publicUrlBefore = [string]$idj.authentik.publicUrl; $idj.authentik.publicUrl = "http://${authHost}:$httpPort"
+    [IO.File]::WriteAllText($idPath, (ConvertTo-Json -InputObject $idj -Depth 10))
+    # Wait until the outpost has reloaded the test addresses (it refreshes a few seconds after a change).
+    $null = Wait-Until { @($appHost, $appHost2 | Where-Object { $x = Test-ForwardAuthChallenge -TraefikPort $httpPort -Hostname $_ -HostPort $httpPort -AuthHostname $authHost; $x.State -eq 'auth' -and $x.Location -match "^http://${authHost}:$httpPort/" }).Count -eq 2 } 90 2000
+    $anon = Test-ForwardAuthChallenge -TraefikPort $httpPort -Hostname $appHost -HostPort $httpPort -AuthHostname $authHost
+    Test-Condition 'forwardauth: anonymous visitors are sent to the authentik sign-in (no loop)' ($anon.State -eq 'auth' -and $anon.Location -match "^http://${authHost}:$httpPort/") ($anon | ConvertTo-Json -Compress)
 
-  # --- Regression (Notflix): the outpost sends browsers to a local address ---------------------------------------------------
-  # ForwardAuth keeps working (Traefik reaches authentik internally), but the sign-in redirect only works on this PC. The
-  # probe, the routing view and the next protection must catch it; protecting again restores the public address.
-  $bindsBefore = @(Get-AuthentikList $conn '/policies/bindings/').Count
-  $ovm = Get-AuthentikOverview $conn; $cfgm = $ovm.Outpost.Config; $cfgm.authentik_host = "http://127.0.0.1:$akPort/"
-  $null = Invoke-AuthentikApi $conn PATCH "/outposts/instances/$($ovm.Outpost.Pk)/" @{ config = $cfgm }
-  $null = Wait-Until { (Test-ForwardAuthChallenge -TraefikPort $httpPort -Hostname $appHost -HostPort $httpPort -AuthHostname $authHost).State -eq 'misrouted' } 90 2000
-  $mis = Test-ForwardAuthChallenge -TraefikPort $httpPort -Hostname $appHost -HostPort $httpPort -AuthHostname $authHost
-  Test-Condition 'misroute: a sign-in redirect to 127.0.0.1 is reported as misrouted, never as protected' ($mis.State -eq 'misrouted' -and $mis.Location -match '^http://127\.0\.0\.1:' -and $mis.Location -notmatch 'state=ey') ($mis | ConvertTo-Json -Compress)
-  $rv = Invoke-WebUi $ui GET '/api/routing?service=echo&probe=1'
-  $rvStage = { param($id) @($rv.Data.model.stages | Where-Object { $_.id -eq $id })[0] }
-  Test-Condition 'routing view: the browser redirect is the first problem, ForwardAuth itself verified, internal address kept internal' ($rv.Status -eq 200 -and $rv.Data.model.firstProblem.id -eq 'redirect' -and (& $rvStage 'forwardauth').state -eq 'verified' -and (& $rvStage 'redirect').detail.fix -match [regex]::Escape("http://${authHost}:$httpPort/") -and @((& $rvStage 'forwardauth').endpoints | Where-Object { $_.audience -eq 'internal' -and $_.value -match "$akProject-server:9000" }).Count -eq 1) ($rv.Body.Substring(0, [Math]::Min(600, $rv.Body.Length)))
-  Test-Condition 'routing view: no state token, cookie or API token in the response' ($rv.Body -notmatch 'state=ey' -and $rv.Body -notmatch '(?i)set-cookie|authentik_proxy' -and $rv.Body -notmatch [regex]::Escape($bootToken)) ''
-  $fx = Invoke-WebUi $ui POST '/api/identity/protect/plan' @{ services = @('echo') }
-  Test-Condition 'protect: the preview includes sending browsers to the public sign-in address again' ($fx.Status -eq 200 -and @($fx.Data.items[0].authentik | Where-Object { $_.object -eq 'outpost' -and $_.kind -eq 'update' -and $_.summary -match 'send browsers to' }).Count -eq 1) (($fx.Data.items[0].authentik | ForEach-Object { "$($_.kind):$($_.summary)" }) -join '; ')
-  $fa = Invoke-WebUi $ui POST '/api/identity/protect/apply' @{ planId = $fx.Data.planId; confirm = $true }
-  $null = Wait-Until { (Test-ForwardAuthChallenge -TraefikPort $httpPort -Hostname $appHost -HostPort $httpPort -AuthHostname $authHost).State -eq 'auth' } 90 2000
-  $fixed = Test-ForwardAuthChallenge -TraefikPort $httpPort -Hostname $appHost -HostPort $httpPort -AuthHostname $authHost
-  Test-Condition 'protect: applying restores the public sign-in redirect, the return address and every access rule' ($fa.Data.ok -and $fixed.State -eq 'auth' -and $fixed.Location -match "^http://${authHost}:$httpPort/" -and $fixed.Location -match [regex]::Escape("redirect_uri=http://${appHost}:$httpPort/outpost.goauthentik.io/callback") -and @(Get-AuthentikList $conn '/policies/bindings/').Count -eq $bindsBefore) "$($fixed | ConvertTo-Json -Compress) apply: $(@($fa.Data.results | ForEach-Object { "$($_.service) ok=$($_.ok) $($_.message)" }) -join '; ')"
-  $so = Invoke-SignIn $httpPort $authHost $appHost 'owner' 'Owner-Live-Test-55q' $work
-  Test-Condition 'owner-only: the owner reaches the newly protected application (identity headers passed)' ($so.Login -eq 'xak-flow-redirect' -and $so.ReachedApp -and $so.Body -match 'X-Authentik-Username: owner') "$($so.Status) $($so.Url)"
-  $sa = Invoke-SignIn $httpPort $authHost $appHost 'alice' 'Alice-Live-Test-91x' $work
-  Test-Condition 'owner-only: any other signed-in user is refused and never reaches it' ($sa.Login -eq 'xak-flow-redirect' -and -not $sa.ReachedApp -and $sa.Body -match 'Permission denied') "$($sa.Status) $($sa.Url)"
-  $sa2 = Invoke-SignIn $httpPort $authHost $appHost2 'alice' 'Alice-Live-Test-91x' $work
-  $sm2 = Invoke-SignIn $httpPort $authHost $appHost2 'mallory' 'Mallory-Live-Test-77y' $work
-  $why = ([regex]::Match([string]$sa2.Body, '(?s)<title>[^<]*</title>|"error_message": *"[^"]*"|Permission denied[^<]{0,200}')).Value
-  $b2 = @(Get-AuthentikList $conn "/policies/bindings/?target=$((Invoke-AuthentikApi $conn GET '/core/applications/dm-echo2/').pbm_uuid)" | ForEach-Object { "user=$($_.user) group=$($_.group) policy=$($_.policy) enabled=$($_.enabled)" }) -join '; '
-  Test-Condition 'existing authentik rule respected: alice reaches echo2 (her rule), mallory does not' ($sa2.ReachedApp -and -not $sm2.ReachedApp) "alice $($sa2.Status) $why / bindings: $b2 / alice pk $($alice.pk) / mallory $($sm2.Status)"
-  $sw = Invoke-SignIn $httpPort $authHost $appHost 'owner' 'wrong-password-123' $work
-  Test-Condition 'authorization: a wrong password never reaches the application' (-not $sw.ReachedApp) "$($sw.Status) $($sw.Url)"
-  # Access changes made in authentik work immediately, without the manager and without touching Traefik files.
-  $filesBefore = @(Get-ChildItem -LiteralPath (Join-Path $installPath 'traefik\dynamic') -File | ForEach-Object { "$($_.Name)=$(Get-FileSha256 $_.FullName)" }) -join ';'
-  $regBefore = Get-FileSha256 (Join-Path $installPath 'config\services.json')
-  $null = Invoke-AuthentikApi $conn POST "/core/groups/$($owners.pk)/add_user/" @{ pk = [int]$mallory.pk }
-  $sg = Invoke-SignIn $httpPort $authHost $appHost 'mallory' 'Mallory-Live-Test-77y' $work
-  $filesAfter = @(Get-ChildItem -LiteralPath (Join-Path $installPath 'traefik\dynamic') -File | ForEach-Object { "$($_.Name)=$(Get-FileSha256 $_.FullName)" }) -join ';'
-  Test-Condition 'authentik is the authority: adding a user to "DTC owners" in authentik grants access, no manager or Traefik change' ($sg.ReachedApp -and $filesAfter -eq $filesBefore -and (Get-FileSha256 (Join-Path $installPath 'config\services.json')) -eq $regBefore) "$($sg.Status) $($sg.Url)"
-  # The manager never overwrites authentik-side access during refreshes, re-runs or unrelated routing changes.
-  $echoApp = Invoke-AuthentikApi $conn GET '/core/applications/dm-echo/'
-  $null = Invoke-AuthentikApi $conn POST '/policies/bindings/' @{ user = [int]$alice.pk; target = [string]$echoApp.pbm_uuid; order = 5; enabled = $true; negate = $false; timeout = 30 }
-  $bindsBefore = @(Get-AuthentikList $conn "/policies/bindings/?target=$($echoApp.pbm_uuid)" | ForEach-Object { [string]$_.pk } | Sort-Object) -join ','
-  $null = Invoke-WebUi $ui GET '/api/identity?deep=1'
-  $null = Invoke-WebUiChange $ui @{ op = 'update'; name = 'echo2'; service = @{ name = 'echo2'; displayName = 'Echo two (renamed)'; hostnames = @($appHost2); target = @{ type = 'docker'; host = $app2; port = 80 }; cloudflare = @{ publish = $false; access = $false } }; cloudflare = @{ automate = $false } }
-  $again = Invoke-WebUi $ui POST '/api/identity/protect/plan' @{ services = @('echo') }
-  $bindsAfter = @(Get-AuthentikList $conn "/policies/bindings/?target=$($echoApp.pbm_uuid)" | ForEach-Object { [string]$_.pk } | Sort-Object) -join ','
-  Test-Condition 'no overwrite: refresh, an unrelated route change and protecting again leave authentik''s access rules alone' ($bindsAfter -eq $bindsBefore -and -not @($again.Data.items[0].authentik | Where-Object { $_.object -eq 'access' -and $_.kind -ne 'none' }).Count -and (Invoke-SignIn $httpPort $authHost $appHost 'alice' 'Alice-Live-Test-91x' $work).ReachedApp) "$bindsBefore -> $bindsAfter"
-  $g5 = Invoke-WebUi $ui GET '/api/identity?deep=1'
-  $ea = @($g5.Data.apps | Where-Object { $_.service -eq 'echo' })[0]
-  Test-Condition 'verification: the application is marked verified only from authentik''s own access event' ($ea.verifiedAt -and (Get-Comp $g5.Data 'app:echo').state -eq 'verified') ($ea | ConvertTo-Json -Compress -Depth 4)
-  Test-Condition 'status: the page shows how many access rules authentik has (read only), and an Open in authentik address' ($ea.rules -eq 2 -and -not $ea.ownerOnly -and $g5.Data.adminLinks.applications -match '/if/admin/') ($ea | ConvertTo-Json -Compress -Depth 4)
-  $null = Invoke-AuthentikApi $conn PATCH "/providers/proxy/$($prov.pk)/" @{ mode = 'forward_single'; external_host = "https://$appHost" }
-  $null = Invoke-AuthentikApi $conn PATCH "/providers/proxy/$($prov2.pk)/" @{ mode = 'forward_single'; external_host = "https://$appHost2" }
-  $null = Sync-AuthentikOutpost -Conn $conn -PublicUrl "https://$authHost"
-  # ... and the recorded public sign-in address with them (the manager derives application addresses from it).
-  $idj = [IO.File]::ReadAllText($idPath) | ConvertFrom-Json; $idj.authentik.publicUrl = $publicUrlBefore
-  [IO.File]::WriteAllText($idPath, (ConvertTo-Json -InputObject $idj -Depth 10))
+    # --- Regression (Notflix): the outpost sends browsers to a local address ---------------------------------------------------
+    # ForwardAuth keeps working (Traefik reaches authentik internally), but the sign-in redirect only works on this PC. The
+    # probe, the routing view and the next protection must catch it; protecting again restores the public address.
+    $bindsBefore = @(Get-AuthentikList $conn '/policies/bindings/').Count
+    $ovm = Get-AuthentikOverview $conn; $cfgm = $ovm.Outpost.Config; $cfgm.authentik_host = "http://127.0.0.1:$akPort/"
+    $null = Invoke-AuthentikApi $conn PATCH "/outposts/instances/$($ovm.Outpost.Pk)/" @{ config = $cfgm }
+    $null = Wait-Until { (Test-ForwardAuthChallenge -TraefikPort $httpPort -Hostname $appHost -HostPort $httpPort -AuthHostname $authHost).State -eq 'misrouted' } 90 2000
+    $mis = Test-ForwardAuthChallenge -TraefikPort $httpPort -Hostname $appHost -HostPort $httpPort -AuthHostname $authHost
+    Test-Condition 'misroute: a sign-in redirect to 127.0.0.1 is reported as misrouted, never as protected' ($mis.State -eq 'misrouted' -and $mis.Location -match '^http://127\.0\.0\.1:' -and $mis.Location -notmatch 'state=ey') ($mis | ConvertTo-Json -Compress)
+    $rv = Invoke-WebUi $ui GET '/api/routing?service=echo&probe=1'
+    $rvStage = { param($id) @($rv.Data.model.stages | Where-Object { $_.id -eq $id })[0] }
+    Test-Condition 'routing view: the browser redirect is the first problem, ForwardAuth itself verified, internal address kept internal' ($rv.Status -eq 200 -and $rv.Data.model.firstProblem.id -eq 'redirect' -and (& $rvStage 'forwardauth').state -eq 'verified' -and (& $rvStage 'redirect').detail.fix -match [regex]::Escape("http://${authHost}:$httpPort/") -and @((& $rvStage 'forwardauth').endpoints | Where-Object { $_.audience -eq 'internal' -and $_.value -match "$akProject-server:9000" }).Count -eq 1) ($rv.Body.Substring(0, [Math]::Min(600, $rv.Body.Length)))
+    Test-Condition 'routing view: no state token, cookie or API token in the response' ($rv.Body -notmatch 'state=ey' -and $rv.Body -notmatch '(?i)set-cookie|authentik_proxy' -and $rv.Body -notmatch [regex]::Escape($bootToken)) ''
+    $fx = Invoke-WebUi $ui POST '/api/identity/protect/plan' @{ services = @('echo') }
+    Test-Condition 'protect: the preview includes sending browsers to the public sign-in address again' ($fx.Status -eq 200 -and @($fx.Data.items[0].authentik | Where-Object { $_.object -eq 'outpost' -and $_.kind -eq 'update' -and $_.summary -match 'send browsers to' }).Count -eq 1) (($fx.Data.items[0].authentik | ForEach-Object { "$($_.kind):$($_.summary)" }) -join '; ')
+    $fa = Invoke-WebUi $ui POST '/api/identity/protect/apply' @{ planId = $fx.Data.planId; confirm = $true }
+    $null = Wait-Until { (Test-ForwardAuthChallenge -TraefikPort $httpPort -Hostname $appHost -HostPort $httpPort -AuthHostname $authHost).State -eq 'auth' } 90 2000
+    $fixed = Test-ForwardAuthChallenge -TraefikPort $httpPort -Hostname $appHost -HostPort $httpPort -AuthHostname $authHost
+    Test-Condition 'protect: applying restores the public sign-in redirect, the return address and every access rule' ($fa.Data.ok -and $fixed.State -eq 'auth' -and $fixed.Location -match "^http://${authHost}:$httpPort/" -and $fixed.Location -match [regex]::Escape("redirect_uri=http://${appHost}:$httpPort/outpost.goauthentik.io/callback") -and @(Get-AuthentikList $conn '/policies/bindings/').Count -eq $bindsBefore) "$($fixed | ConvertTo-Json -Compress) apply: $(@($fa.Data.results | ForEach-Object { "$($_.service) ok=$($_.ok) $($_.message)" }) -join '; ')"
+    $so = Invoke-SignIn $httpPort $authHost $appHost 'owner' 'Owner-Live-Test-55q' $work
+    Test-Condition 'owner-only: the owner reaches the newly protected application (identity headers passed)' ($so.Login -eq 'xak-flow-redirect' -and $so.ReachedApp -and $so.Body -match 'X-Authentik-Username: owner') "$($so.Status) $($so.Url)"
+    $sa = Invoke-SignIn $httpPort $authHost $appHost 'alice' 'Alice-Live-Test-91x' $work
+    Test-Condition 'owner-only: any other signed-in user is refused and never reaches it' ($sa.Login -eq 'xak-flow-redirect' -and -not $sa.ReachedApp -and $sa.Body -match 'Permission denied') "$($sa.Status) $($sa.Url)"
+    $sa2 = Invoke-SignIn $httpPort $authHost $appHost2 'alice' 'Alice-Live-Test-91x' $work
+    $sm2 = Invoke-SignIn $httpPort $authHost $appHost2 'mallory' 'Mallory-Live-Test-77y' $work
+    $why = ([regex]::Match([string]$sa2.Body, '(?s)<title>[^<]*</title>|"error_message": *"[^"]*"|Permission denied[^<]{0,200}')).Value
+    $b2 = @(Get-AuthentikList $conn "/policies/bindings/?target=$((Invoke-AuthentikApi $conn GET '/core/applications/dm-echo2/').pbm_uuid)" | ForEach-Object { "user=$($_.user) group=$($_.group) policy=$($_.policy) enabled=$($_.enabled)" }) -join '; '
+    Test-Condition 'existing authentik rule respected: alice reaches echo2 (her rule), mallory does not' ($sa2.ReachedApp -and -not $sm2.ReachedApp) "alice $($sa2.Status) $why / bindings: $b2 / alice pk $($alice.pk) / mallory $($sm2.Status)"
+    $sw = Invoke-SignIn $httpPort $authHost $appHost 'owner' 'wrong-password-123' $work
+    Test-Condition 'authorization: a wrong password never reaches the application' (-not $sw.ReachedApp) "$($sw.Status) $($sw.Url)"
+    # Access changes made in authentik work immediately, without the manager and without touching Traefik files.
+    $filesBefore = @(Get-ChildItem -LiteralPath (Join-Path $installPath 'traefik\dynamic') -File | ForEach-Object { "$($_.Name)=$(Get-FileSha256 $_.FullName)" }) -join ';'
+    $regBefore = Get-FileSha256 (Join-Path $installPath 'config\services.json')
+    $null = Invoke-AuthentikApi $conn POST "/core/groups/$($owners.pk)/add_user/" @{ pk = [int]$mallory.pk }
+    $sg = Invoke-SignIn $httpPort $authHost $appHost 'mallory' 'Mallory-Live-Test-77y' $work
+    $filesAfter = @(Get-ChildItem -LiteralPath (Join-Path $installPath 'traefik\dynamic') -File | ForEach-Object { "$($_.Name)=$(Get-FileSha256 $_.FullName)" }) -join ';'
+    Test-Condition 'authentik is the authority: adding a user to "DTC owners" in authentik grants access, no manager or Traefik change' ($sg.ReachedApp -and $filesAfter -eq $filesBefore -and (Get-FileSha256 (Join-Path $installPath 'config\services.json')) -eq $regBefore) "$($sg.Status) $($sg.Url)"
+    # The manager never overwrites authentik-side access during refreshes, re-runs or unrelated routing changes.
+    $echoApp = Invoke-AuthentikApi $conn GET '/core/applications/dm-echo/'
+    $null = Invoke-AuthentikApi $conn POST '/policies/bindings/' @{ user = [int]$alice.pk; target = [string]$echoApp.pbm_uuid; order = 5; enabled = $true; negate = $false; timeout = 30 }
+    $bindsBefore = @(Get-AuthentikList $conn "/policies/bindings/?target=$($echoApp.pbm_uuid)" | ForEach-Object { [string]$_.pk } | Sort-Object) -join ','
+    $null = Invoke-WebUi $ui GET '/api/identity?deep=1'
+    $null = Invoke-WebUiChange $ui @{ op = 'update'; name = 'echo2'; service = @{ name = 'echo2'; displayName = 'Echo two (renamed)'; hostnames = @($appHost2); target = @{ type = 'docker'; host = $app2; port = 80 }; cloudflare = @{ publish = $false; access = $false } }; cloudflare = @{ automate = $false } }
+    $again = Invoke-WebUi $ui POST '/api/identity/protect/plan' @{ services = @('echo') }
+    $bindsAfter = @(Get-AuthentikList $conn "/policies/bindings/?target=$($echoApp.pbm_uuid)" | ForEach-Object { [string]$_.pk } | Sort-Object) -join ','
+    Test-Condition 'no overwrite: refresh, an unrelated route change and protecting again leave authentik''s access rules alone' ($bindsAfter -eq $bindsBefore -and -not @($again.Data.items[0].authentik | Where-Object { $_.object -eq 'access' -and $_.kind -ne 'none' }).Count -and (Invoke-SignIn $httpPort $authHost $appHost 'alice' 'Alice-Live-Test-91x' $work).ReachedApp) "$bindsBefore -> $bindsAfter"
+    $g5 = Invoke-WebUi $ui GET '/api/identity?deep=1'
+    $ea = @($g5.Data.apps | Where-Object { $_.service -eq 'echo' })[0]
+    Test-Condition 'verification: the application is marked verified only from authentik''s own access event' ($ea.verifiedAt -and (Get-Comp $g5.Data 'app:echo').state -eq 'verified') ($ea | ConvertTo-Json -Compress -Depth 4)
+    Test-Condition 'status: the page shows how many access rules authentik has (read only), and an Open in authentik address' ($ea.rules -eq 2 -and -not $ea.ownerOnly -and $g5.Data.adminLinks.applications -match '/if/admin/') ($ea | ConvertTo-Json -Compress -Depth 4)
+    $null = Invoke-AuthentikApi $conn PATCH "/providers/proxy/$($prov.pk)/" @{ mode = 'forward_single'; external_host = "https://$appHost" }
+    $null = Invoke-AuthentikApi $conn PATCH "/providers/proxy/$($prov2.pk)/" @{ mode = 'forward_single'; external_host = "https://$appHost2" }
+    $null = Sync-AuthentikOutpost -Conn $conn -PublicUrl "https://$authHost"
+    # ... and the recorded public sign-in address with them (the manager derives application addresses from it).
+    $idj = [IO.File]::ReadAllText($idPath) | ConvertFrom-Json; $idj.authentik.publicUrl = $publicUrlBefore
+    [IO.File]::WriteAllText($idPath, (ConvertTo-Json -InputObject $idj -Depth 10))
 
-  # Loop detection: a hand-written route that redirects to itself.
-  $loopFile = Join-Path $installPath 'traefik\dynamic\zz-loop-test.yml'
-  # Two routes that redirect to each other (/ -> /b -> /a -> /b ...): Traefik itself never redirects a URL to itself.
-  $loopYaml = @(
-    'http:', '  routers:',
-    '    loop-a:', "      rule: 'Host(``loop.idtest.example``) && (Path(``/``) || Path(``/a``))'", '      entryPoints: [web]', '      middlewares: [loop-to-b]', '      service: noop@internal',
-    '    loop-b:', "      rule: 'Host(``loop.idtest.example``) && Path(``/b``)'", '      entryPoints: [web]', '      middlewares: [loop-to-a]', '      service: noop@internal',
-    '  middlewares:',
-    '    loop-to-b:', '      redirectRegex:', "        regex: '.*'", "        replacement: 'http://loop.idtest.example/b'",
-    '    loop-to-a:', '      redirectRegex:', "        regex: '.*'", "        replacement: 'http://loop.idtest.example/a'") -join "`n"
-  [IO.File]::WriteAllText($loopFile, $loopYaml + "`n")
-  $null = Sync-TraefikDynamic (Get-StackSettings -InstallPath $installPath)
-  $null = Wait-Until { (Invoke-AkHttp -Url "http://127.0.0.1:$httpPort/" -Headers @{ Host = 'loop.idtest.example' }).Status -eq 302 } 30 1000
-  $lp = Test-ForwardAuthChallenge -TraefikPort $httpPort -Hostname 'loop.idtest.example' -AuthHostname $authHost
-  Test-Condition 'loop detection: a redirect loop is reported as a loop' ($lp.State -eq 'loop') ($lp | ConvertTo-Json -Compress)
-  Remove-Item -LiteralPath $loopFile -Force
+    # Loop detection: a hand-written route that redirects to itself.
+    $loopFile = Join-Path $installPath 'traefik\dynamic\zz-loop-test.yml'
+    # Two routes that redirect to each other (/ -> /b -> /a -> /b ...): Traefik itself never redirects a URL to itself.
+    $loopYaml = @(
+      'http:', '  routers:',
+      '    loop-a:', "      rule: 'Host(``loop.idtest.example``) && (Path(``/``) || Path(``/a``))'", '      entryPoints: [web]', '      middlewares: [loop-to-b]', '      service: noop@internal',
+      '    loop-b:', "      rule: 'Host(``loop.idtest.example``) && Path(``/b``)'", '      entryPoints: [web]', '      middlewares: [loop-to-a]', '      service: noop@internal',
+      '  middlewares:',
+      '    loop-to-b:', '      redirectRegex:', "        regex: '.*'", "        replacement: 'http://loop.idtest.example/b'",
+      '    loop-to-a:', '      redirectRegex:', "        regex: '.*'", "        replacement: 'http://loop.idtest.example/a'") -join "`n"
+    [IO.File]::WriteAllText($loopFile, $loopYaml + "`n")
+    $null = Sync-TraefikDynamic (Get-StackSettings -InstallPath $installPath)
+    $null = Wait-Until { (Invoke-AkHttp -Url "http://127.0.0.1:$httpPort/" -Headers @{ Host = 'loop.idtest.example' }).Status -eq 302 } 30 1000
+    $lp = Test-ForwardAuthChallenge -TraefikPort $httpPort -Hostname 'loop.idtest.example' -AuthHostname $authHost
+    Test-Condition 'loop detection: a redirect loop is reported as a loop' ($lp.State -eq 'loop') ($lp | ConvertTo-Json -Compress)
+    Remove-Item -LiteralPath $loopFile -Force
 
-  # --- Fail closed ----------------------------------------------------------------------------------------------------------
-  $null = Invoke-Docker stop "$akProject-server"
-  $down = Invoke-AkHttp -Url "http://127.0.0.1:$httpPort/" -Headers @{ Host = $appHost }
-  Test-Condition 'fail closed: with authentik stopped the application is not served' ($down.Status -ge 500 -and $down.Body -notmatch 'Hostname:') "HTTP $($down.Status)"
-  $gp3 = Invoke-WebUi $ui POST '/api/identity/protect/plan' @{ services = @('echo') }
-  Test-Condition 'interrupted: with authentik unreachable no change is previewed or applied' ($gp3.Status -eq 409) ($gp3.Body)
-  $null = Invoke-Docker start "$akProject-server"
-  $back = Wait-Until { (Get-AuthentikHealth -BaseUrl "http://127.0.0.1:$akPort").Ready } 180 3000
-  $null = Wait-Until { (Test-ForwardAuthChallenge -TraefikPort $httpPort -Hostname $appHost -AuthHostname $authHost).State -eq 'auth' } 90 3000
-  Test-Condition 'recovery: authentik restarted, the application asks for sign-in again' ($back -and (Test-ForwardAuthChallenge -TraefikPort $httpPort -Hostname $appHost -AuthHostname $authHost).State -eq 'auth') ''
+    # --- Fail closed ----------------------------------------------------------------------------------------------------------
+    $null = Invoke-Docker stop "$akProject-server"
+    $down = Invoke-AkHttp -Url "http://127.0.0.1:$httpPort/" -Headers @{ Host = $appHost }
+    Test-Condition 'fail closed: with authentik stopped the application is not served' ($down.Status -ge 500 -and $down.Body -notmatch 'Hostname:') "HTTP $($down.Status)"
+    $gp3 = Invoke-WebUi $ui POST '/api/identity/protect/plan' @{ services = @('echo') }
+    Test-Condition 'interrupted: with authentik unreachable no change is previewed or applied' ($gp3.Status -eq 409) ($gp3.Body)
+    $null = Invoke-Docker start "$akProject-server"
+    $back = Wait-Until { (Get-AuthentikHealth -BaseUrl "http://127.0.0.1:$akPort").Ready } 180 3000
+    $null = Wait-Until { (Test-ForwardAuthChallenge -TraefikPort $httpPort -Hostname $appHost -AuthHostname $authHost).State -eq 'auth' } 90 3000
+    Test-Condition 'recovery: authentik restarted, the application asks for sign-in again' ($back -and (Test-ForwardAuthChallenge -TraefikPort $httpPort -Hostname $appHost -AuthHostname $authHost).State -eq 'auth') ''
 
-  # --- Rollback through the service backups ---------------------------------------------------------------------------------
-  $rs = Invoke-WebUi $ui POST '/api/backups/restore' @{ id = $protectBackup; confirm = $true }
-  $echoYaml = [IO.File]::ReadAllText((Join-Path $installPath 'traefik\dynamic\svc-echo.yml'))
-  Test-Condition 'rollback: restoring the backup made before protection restores the previous route (no ForwardAuth)' ($rs.Status -eq 200 -and $echoYaml -notmatch 'forwardAuth') ($rs.Body)
-  # The backup holds the whole registry from before the batch: echo2 lost its protection too, so both are protected again.
-  $pp2 = Invoke-WebUi $ui POST '/api/identity/protect/plan' @{ services = @('echo', 'echo2') }
-  Test-Condition 'rollback: protecting again reuses the authentik objects and their rules (only the routes change)' ($pp2.Status -eq 200 -and @($pp2.Data.items | ForEach-Object { $_.authentik } | Where-Object { $_.kind -ne 'none' }).Count -eq 0 -and @($pp2.Data.items | Where-Object { @($_.traefik.traefik.changes).Count -eq 1 }).Count -eq 2) (($pp2.Data.items | ForEach-Object { $_.authentik } | ForEach-Object { "$($_.kind):$($_.object)" }) -join ', ')
-  $pa2 = Invoke-WebUi $ui POST '/api/identity/protect/apply' @{ planId = $pp2.Data.planId; confirm = $true }
-  Test-Condition 'rollback: protection re-applied and verified for both' ($pa2.Data.ok -and @($pa2.Data.results | Where-Object { $_.ok -and $_.challenge.State -eq 'auth' }).Count -eq 2) ($pa2.Body)
+    # --- Rollback through the service backups ---------------------------------------------------------------------------------
+    $rs = Invoke-WebUi $ui POST '/api/backups/restore' @{ id = $protectBackup; confirm = $true }
+    $echoYaml = [IO.File]::ReadAllText((Join-Path $installPath 'traefik\dynamic\svc-echo.yml'))
+    Test-Condition 'rollback: restoring the backup made before protection restores the previous route (no ForwardAuth)' ($rs.Status -eq 200 -and $echoYaml -notmatch 'forwardAuth') ($rs.Body)
+    # The backup holds the whole registry from before the batch: echo2 lost its protection too, so both are protected again.
+    $pp2 = Invoke-WebUi $ui POST '/api/identity/protect/plan' @{ services = @('echo', 'echo2') }
+    Test-Condition 'rollback: protecting again reuses the authentik objects and their rules (only the routes change)' ($pp2.Status -eq 200 -and @($pp2.Data.items | ForEach-Object { $_.authentik } | Where-Object { $_.kind -ne 'none' }).Count -eq 0 -and @($pp2.Data.items | Where-Object { @($_.traefik.traefik.changes).Count -eq 1 }).Count -eq 2) (($pp2.Data.items | ForEach-Object { $_.authentik } | ForEach-Object { "$($_.kind):$($_.object)" }) -join ', ')
+    $pa2 = Invoke-WebUi $ui POST '/api/identity/protect/apply' @{ planId = $pp2.Data.planId; confirm = $true }
+    Test-Condition 'rollback: protection re-applied and verified for both' ($pa2.Data.ok -and @($pa2.Data.results | Where-Object { $_.ok -and $_.challenge.State -eq 'auth' }).Count -eq 2) ($pa2.Body)
 
-  # --- Remove protection ----------------------------------------------------------------------------------------------------
-  $up = Invoke-WebUi $ui POST '/api/identity/unprotect/plan' @{ service = 'echo' }
-  Test-Condition 'unprotect: preview warns what stays in front of the application and that authentik keeps its rules' ($up.Status -eq 200 -and (@($up.Data.notes) -join ' ') -match 'without sign-in' -and (@($up.Data.notes) -join ' ') -match 'stay in authentik') ($up.Body)
-  $ua = Invoke-WebUi $ui POST '/api/identity/unprotect/apply' @{ planId = $up.Data.planId; confirm = $true }
-  $provNow = @(Get-AuthentikList $conn '/providers/proxy/?name=dm-echo' | Where-Object { $_.name -eq 'dm-echo' })[0]
-  $bindsKept = @(Get-AuthentikList $conn "/policies/bindings/?target=$($echoApp.pbm_uuid)" | ForEach-Object { [string]$_.pk } | Sort-Object) -join ','
-  Test-Condition 'unprotect: route without ForwardAuth; outpost no longer serves it; authentik application and its rules kept' ($ua.Data.ok -and [IO.File]::ReadAllText((Join-Path $installPath 'traefik\dynamic\svc-echo.yml')) -notmatch 'forwardAuth' -and (Get-AuthentikOverview $conn).Outpost.Providers -notcontains [int]$provNow.pk -and @(Get-AuthentikList $conn '/core/applications/?slug=dm-echo').Count -eq 1 -and $bindsKept -eq $bindsBefore) ($ua.Body)
-  $pp3 = Invoke-WebUi $ui POST '/api/identity/protect/plan' @{ services = @('echo') }
-  Test-Condition 'unprotect: protecting again restores the same rules (only outpost assignment and route)' (@($pp3.Data.items[0].authentik | Where-Object { $_.kind -ne 'none' } | ForEach-Object { $_.object }) -join ',' -eq 'outpost') (($pp3.Data.items[0].authentik | ForEach-Object { "$($_.kind):$($_.object)" }) -join ', ')
+    # --- Remove protection ----------------------------------------------------------------------------------------------------
+    $up = Invoke-WebUi $ui POST '/api/identity/unprotect/plan' @{ service = 'echo' }
+    Test-Condition 'unprotect: preview warns what stays in front of the application and that authentik keeps its rules' ($up.Status -eq 200 -and (@($up.Data.notes) -join ' ') -match 'without sign-in' -and (@($up.Data.notes) -join ' ') -match 'stay in authentik') ($up.Body)
+    $ua = Invoke-WebUi $ui POST '/api/identity/unprotect/apply' @{ planId = $up.Data.planId; confirm = $true }
+    $provNow = @(Get-AuthentikList $conn '/providers/proxy/?name=dm-echo' | Where-Object { $_.name -eq 'dm-echo' })[0]
+    $bindsKept = @(Get-AuthentikList $conn "/policies/bindings/?target=$($echoApp.pbm_uuid)" | ForEach-Object { [string]$_.pk } | Sort-Object) -join ','
+    Test-Condition 'unprotect: route without ForwardAuth; outpost no longer serves it; authentik application and its rules kept' ($ua.Data.ok -and [IO.File]::ReadAllText((Join-Path $installPath 'traefik\dynamic\svc-echo.yml')) -notmatch 'forwardAuth' -and (Get-AuthentikOverview $conn).Outpost.Providers -notcontains [int]$provNow.pk -and @(Get-AuthentikList $conn '/core/applications/?slug=dm-echo').Count -eq 1 -and $bindsKept -eq $bindsBefore) ($ua.Body)
+    $pp3 = Invoke-WebUi $ui POST '/api/identity/protect/plan' @{ services = @('echo') }
+    Test-Condition 'unprotect: protecting again restores the same rules (only outpost assignment and route)' (@($pp3.Data.items[0].authentik | Where-Object { $_.kind -ne 'none' } | ForEach-Object { $_.object }) -join ',' -eq 'outpost') (($pp3.Data.items[0].authentik | ForEach-Object { "$($_.kind):$($_.object)" }) -join ', ')
 
-  # --- Persistence and bootstrap semantics ----------------------------------------------------------------------------------
-  $akadmin = @(Get-AuthentikList $conn '/core/users/?username=akadmin')[0]
-  $null = Invoke-AuthentikApi $conn POST "/core/users/$($akadmin.pk)/set_password/" @{ password = 'Changed-Admin-Pass-55z' }
-  # All Compose files of the modular stack (server in compose.yaml, worker and database in their own files).
-  $rargs = @('compose', '--project-directory', $akFolder); foreach ($f in @(Get-ChildItem -LiteralPath $akFolder -Filter 'compose*.yaml' -File | Sort-Object { $_.Name -ne 'compose.yaml' }, Name)) { $rargs += @('-f', $f.FullName) }
-  $rr = Invoke-Docker @($rargs + 'restart')
-  $null = Wait-Until { (Get-AuthentikHealth -BaseUrl "http://127.0.0.1:$akPort").Ready } 240 5000
-  $null = Wait-Until { @(Get-AuthentikList $conn '/sources/oauth/?slug=google').Count -eq 1 } 120 5000
-  Test-Condition 'persistence: after restarting server, worker and database the configuration is still there' ($rr.ExitCode -eq 0 -and @(Get-AuthentikList $conn '/sources/oauth/?slug=google').Count -eq 1 -and @(Get-AuthentikList $conn '/core/users/?username=alice').Count -eq 1) ''
-  $pwCheck = { param($pw) $b = Join-Path $work 'pw.json'; $j = Join-Path $work 'pw.jar'
-    $ex = "http://127.0.0.1:$akPort/api/v3/flows/executor/default-authentication-flow/?query=next%3D%252F"
-    $null = & curl.exe -s -c $j -b $j -o NUL $ex
-    [IO.File]::WriteAllText($b, '{"component":"ak-stage-identification","uid_field":"akadmin"}'); $null = & curl.exe -s -L -c $j -b $j $ex -H 'Content-Type: application/json' --data-binary "@$b"
-    [IO.File]::WriteAllText($b, (ConvertTo-Json -Compress @{ component = 'ak-stage-password'; password = $pw })); $r = (& curl.exe -s -L -c $j -b $j $ex -H 'Content-Type: application/json' --data-binary "@$b") -join ''
-    Remove-Item $b, $j -Force -ErrorAction SilentlyContinue; return [string]($r | ConvertFrom-Json).component }
-  Test-Condition 'bootstrap: the changed administrator password survives a restart (bootstrap values are first-start only)' ((& $pwCheck 'Changed-Admin-Pass-55z') -eq 'xak-flow-redirect' -and (& $pwCheck $adminPass) -ne 'xak-flow-redirect') ''
+    # --- Persistence and bootstrap semantics ----------------------------------------------------------------------------------
+    $akadmin = @(Get-AuthentikList $conn '/core/users/?username=akadmin')[0]
+    $null = Invoke-AuthentikApi $conn POST "/core/users/$($akadmin.pk)/set_password/" @{ password = 'Changed-Admin-Pass-55z' }
+    # All Compose files of the modular stack (server in compose.yaml, worker and database in their own files).
+    $rargs = @('compose', '--project-directory', $akFolder); foreach ($f in @(Get-ChildItem -LiteralPath $akFolder -Filter 'compose*.yaml' -File | Sort-Object { $_.Name -ne 'compose.yaml' }, Name)) { $rargs += @('-f', $f.FullName) }
+    $rr = Invoke-Docker @($rargs + 'restart')
+    $null = Wait-Until { (Get-AuthentikHealth -BaseUrl "http://127.0.0.1:$akPort").Ready } 240 5000
+    $null = Wait-Until { @(Get-AuthentikList $conn '/sources/oauth/?slug=google').Count -eq 1 } 120 5000
+    Test-Condition 'persistence: after restarting server, worker and database the configuration is still there' ($rr.ExitCode -eq 0 -and @(Get-AuthentikList $conn '/sources/oauth/?slug=google').Count -eq 1 -and @(Get-AuthentikList $conn '/core/users/?username=alice').Count -eq 1) ''
+    $pwCheck = { param($pw) $b = Join-Path $work 'pw.json'; $j = Join-Path $work 'pw.jar'
+      $ex = "http://127.0.0.1:$akPort/api/v3/flows/executor/default-authentication-flow/?query=next%3D%252F"
+      $null = & curl.exe -s -c $j -b $j -o NUL $ex
+      [IO.File]::WriteAllText($b, '{"component":"ak-stage-identification","uid_field":"akadmin"}'); $null = & curl.exe -s -L -c $j -b $j $ex -H 'Content-Type: application/json' --data-binary "@$b"
+      [IO.File]::WriteAllText($b, (ConvertTo-Json -Compress @{ component = 'ak-stage-password'; password = $pw })); $r = (& curl.exe -s -L -c $j -b $j $ex -H 'Content-Type: application/json' --data-binary "@$b") -join ''
+      Remove-Item $b, $j -Force -ErrorAction SilentlyContinue; return [string]($r | ConvertFrom-Json).component }
+    Test-Condition 'bootstrap: the changed administrator password survives a restart (bootstrap values are first-start only)' ((& $pwCheck 'Changed-Admin-Pass-55z') -eq 'xak-flow-redirect' -and (& $pwCheck $adminPass) -ne 'xak-flow-redirect') ''
+  }
 
   # --- Secrets never leak ---------------------------------------------------------------------------------------------------
   $haystack = (@($ui.Bodies) -join "`n") + [IO.File]::ReadAllText((Join-Path $installPath 'config\identity.json'))
@@ -560,6 +575,7 @@ try {
   Test-Condition 'secrets: the Google client secret, the API token and the admin password appear in no response, state file or log' ($haystack -notmatch [regex]::Escape($googleSecret) -and $haystack -notmatch [regex]::Escape($bootToken) -and $haystack -notmatch [regex]::Escape($adminPass)) ''
 
   # --- Browser --------------------------------------------------------------------------------------------------------------
+  if ($BrowserOnly) { Add-Result 'SKIP' 'token rotation/expiry, protection, sign-ins, rollback, persistence, bulk app selection' '-BrowserOnly' }
   if ($SkipBrowser) { Add-Result 'SKIP' 'browser' '-SkipBrowser' }
   elseif (-not (Get-EdgePath)) { Add-Result 'SKIP' 'browser' 'Microsoft Edge not found' }
   else {
@@ -568,11 +584,13 @@ try {
     Set-Viewport $cdp 1366 900
     Open-Page $cdp $ui.LaunchUrl
     $null = Wait-PageCondition $cdp "document.readyState === 'complete' && window.TPMApp && document.querySelector('main h1')" 30
-    # Seven more applications; with echo (unprotected again above) that makes eight selectable ones.
-    $batch = @(1..7 | ForEach-Object { "b$_" })
-    foreach ($n in $batch) {
-      $null = Invoke-Docker run -d --name "$stack-$n" --network $network --pull missing $whoami
-      $null = Invoke-WebUiChange $ui @{ op = 'add'; service = @{ name = $n; displayName = "Batch $n"; hostnames = @("$n.idtest.example"); target = @{ type = 'docker'; host = "$stack-$n"; port = 80 }; cloudflare = @{ publish = $false; access = $false } }; cloudflare = @{ automate = $false } }
+    if (-not $BrowserOnly) {
+      # Seven more applications; with echo (unprotected again above) that makes eight selectable ones.
+      $batch = @(1..7 | ForEach-Object { "b$_" })
+      foreach ($n in $batch) {
+        $null = Invoke-Docker run -d --name "$stack-$n" --network $network --pull missing $whoami
+        $null = Invoke-WebUiChange $ui @{ op = 'add'; service = @{ name = $n; displayName = "Batch $n"; hostnames = @("$n.idtest.example"); target = @{ type = 'docker'; host = "$stack-$n"; port = 80 }; cloudflare = @{ publish = $false; access = $false } }; cloudflare = @{ automate = $false } }
+      }
     }
     foreach ($lv in @('beginner', 'expert')) {
       Open-Page $cdp "$base/#identity?level=$lv"
@@ -582,10 +600,10 @@ try {
       Test-Condition "browser ($lv): no secret is shown" ($text -notmatch [regex]::Escape($googleSecret) -and $text -notmatch [regex]::Escape($bootToken) -and $text -notmatch [regex]::Escape($adminPass)) ''
     }
     # Screenshots are deliverables, not checks: a capture that times out is retried once as a viewport image and noted.
-    $shot = { param($name) if (-not $ScreenshotDir) { return }
-      try { Save-PageScreenshot $cdp (Join-Path $ScreenshotDir $name) }
+    $shot = { param($name, $session = $cdp) if (-not $ScreenshotDir) { return }
+      try { Save-PageScreenshot $session (Join-Path $ScreenshotDir $name) }
       catch {
-        try { $img = Invoke-Cdp $cdp 'Page.captureScreenshot' @{ format = 'png' } 60000; [IO.File]::WriteAllBytes((Join-Path $ScreenshotDir $name), [Convert]::FromBase64String($img.data)); Write-Host "screenshot ${name}: viewport only ($($_.Exception.Message))" -ForegroundColor DarkYellow }
+        try { $img = Invoke-Cdp $session 'Page.captureScreenshot' @{ format = 'png' } 60000; [IO.File]::WriteAllBytes((Join-Path $ScreenshotDir $name), [Convert]::FromBase64String($img.data)); Write-Host "screenshot ${name}: viewport only ($($_.Exception.Message))" -ForegroundColor DarkYellow }
         catch { Write-Host "screenshot ${name} not saved: $($_.Exception.Message)" -ForegroundColor DarkYellow }
       } }
     Open-Page $cdp "$base/#identity/mode?level=beginner"; $null = Wait-PageCondition $cdp "!!document.querySelector('#identity-mode')" 60; & $shot 'wizard-1-mode.png'
@@ -599,31 +617,34 @@ try {
     Open-Page $cdp "$base/#identity/owner?level=beginner"; $okO = Wait-PageCondition $cdp "!!document.querySelector('.verified-banner')" 60
     Test-Condition 'browser owner: the owner step shows an obvious verified state' ($okO -and [string](Invoke-PageScript $cdp "document.querySelector('.verified-banner').innerText") -match 'Owner verified') ''
     & $shot 'wizard-7-owner-verified.png'
-    # Application selection: select all, deselect one, the page never jumps.
-    Open-Page $cdp "$base/#identity/apps?level=beginner"
-    $okA = Wait-PageCondition $cdp "!!document.querySelector('#id-sel-all') && document.querySelectorAll('.protect-table tbody input[type=checkbox]').length >= 8" 60
-    $null = Invoke-PageScript $cdp "document.querySelector('.protect-table').scrollIntoView({ block: 'center' }); true"
-    $y0 = [int](Invoke-PageScript $cdp 'Math.round(window.scrollY)')
-    $null = Invoke-PageScript $cdp "document.querySelector('#id-sel-all').click(); true"
-    $cnt = [string](Invoke-PageScript $cdp "document.querySelector('.sel-count').textContent")
-    $null = Invoke-PageScript $cdp "document.querySelector('#sel-b3').click(); true"
-    $null = Invoke-PageScript $cdp "document.querySelector('#sel-b5').click(); document.querySelector('#sel-b5').click(); true"
-    $y1 = [int](Invoke-PageScript $cdp 'Math.round(window.scrollY)')
-    $states = [string](Invoke-PageScript $cdp "[...document.querySelectorAll('.protect-table tbody input[type=checkbox]')].map((b) => b.dataset.name + '=' + b.checked).join(',')")
-    $cnt2 = [string](Invoke-PageScript $cdp "document.querySelector('.sel-count').textContent")
-    Test-Condition 'browser apps: Select all selects the 8 new applications; already protected ones are labelled, not selectable' ($okA -and $cnt -match '^8 of 8' -and [string](Invoke-PageScript $cdp "document.querySelector('.protect-table').innerText") -match 'Already protected') "$cnt"
-    Test-Condition 'browser apps: ticking and unticking never moves the page; selections stay as set' ($y1 -eq $y0 -and $cnt2 -match '^7 of 8' -and $states -match 'b3=false' -and $states -match 'b5=true' -and $states -match 'b1=true') "y $y0 -> $y1; $cnt2; $states"
-    & $shot 'wizard-8-apps-selection.png'
-    $null = Invoke-PageScript $cdp "document.querySelector('#id-protect-btn').click(); true"
-    $okP = Wait-PageCondition $cdp "!!document.querySelector('#id-protect-review') && [...document.querySelectorAll('#id-protect-review button')].some((b) => b.textContent.includes('Protect 7'))" 240
-    $null = Invoke-PageScript $cdp "(() => { document.querySelector('#id-protect-review input[type=checkbox]').click(); [...document.querySelectorAll('#id-protect-review button')].find((b) => b.textContent.includes('Protect 7')).click(); return true; })()"
-    $okR = Wait-PageCondition $cdp "!!document.querySelector('#id-protect-result')" 900
-    $resText = [string](Invoke-PageScript $cdp "(document.querySelector('#id-protect-result') || {}).innerText || ''")
-    $prot = @(@('echo') + $batch | Where-Object { [IO.File]::ReadAllText((Join-Path $installPath "traefik\dynamic\svc-$_.yml")) -match "svc-$_-authentik" })
-    Test-Condition 'browser apps: the batch of 7 is protected, each route verified; the unticked one is untouched' ($okP -and $okR -and $prot.Count -eq 7 -and $prot -notcontains 'b3' -and ([regex]::Matches($resText, 'ForwardAuth enforced')).Count -eq 7) "$($prot -join ',') / $($resText.Substring(0, [Math]::Min(300, $resText.Length)))"
-    $stillEcho2 = [IO.File]::ReadAllText((Join-Path $installPath 'traefik\dynamic\svc-echo2.yml')) -match 'svc-echo2-authentik'
-    Test-Condition 'bulk protection keeps every earlier protection (echo2 still protected; nothing removed by deselecting)' ($stillEcho2 -and @($batch | Where-Object { (Test-ForwardAuthChallenge -TraefikPort $httpPort -Hostname "$_.idtest.example").State -eq 'auth' }).Count -eq 6) ''
-    & $shot 'wizard-8-apps-result.png'
+    # -BrowserOnly: the bulk selection needs the protected applications of the skipped sections.
+    if (-not $BrowserOnly) {
+      # Application selection: select all, deselect one, the page never jumps.
+      Open-Page $cdp "$base/#identity/apps?level=beginner"
+      $okA = Wait-PageCondition $cdp "!!document.querySelector('#id-sel-all') && document.querySelectorAll('.protect-table tbody input[type=checkbox]').length >= 8" 60
+      $null = Invoke-PageScript $cdp "document.querySelector('.protect-table').scrollIntoView({ block: 'center' }); true"
+      $y0 = [int](Invoke-PageScript $cdp 'Math.round(window.scrollY)')
+      $null = Invoke-PageScript $cdp "document.querySelector('#id-sel-all').click(); true"
+      $cnt = [string](Invoke-PageScript $cdp "document.querySelector('.sel-count').textContent")
+      $null = Invoke-PageScript $cdp "document.querySelector('#sel-b3').click(); true"
+      $null = Invoke-PageScript $cdp "document.querySelector('#sel-b5').click(); document.querySelector('#sel-b5').click(); true"
+      $y1 = [int](Invoke-PageScript $cdp 'Math.round(window.scrollY)')
+      $states = [string](Invoke-PageScript $cdp "[...document.querySelectorAll('.protect-table tbody input[type=checkbox]')].map((b) => b.dataset.name + '=' + b.checked).join(',')")
+      $cnt2 = [string](Invoke-PageScript $cdp "document.querySelector('.sel-count').textContent")
+      Test-Condition 'browser apps: Select all selects the 8 new applications; already protected ones are labelled, not selectable' ($okA -and $cnt -match '^8 of 8' -and [string](Invoke-PageScript $cdp "document.querySelector('.protect-table').innerText") -match 'Already protected') "$cnt"
+      Test-Condition 'browser apps: ticking and unticking never moves the page; selections stay as set' ($y1 -eq $y0 -and $cnt2 -match '^7 of 8' -and $states -match 'b3=false' -and $states -match 'b5=true' -and $states -match 'b1=true') "y $y0 -> $y1; $cnt2; $states"
+      & $shot 'wizard-8-apps-selection.png'
+      $null = Invoke-PageScript $cdp "document.querySelector('#id-protect-btn').click(); true"
+      $okP = Wait-PageCondition $cdp "!!document.querySelector('#id-protect-review') && [...document.querySelectorAll('#id-protect-review button')].some((b) => b.textContent.includes('Protect 7'))" 240
+      $null = Invoke-PageScript $cdp "(() => { document.querySelector('#id-protect-review input[type=checkbox]').click(); [...document.querySelectorAll('#id-protect-review button')].find((b) => b.textContent.includes('Protect 7')).click(); return true; })()"
+      $okR = Wait-PageCondition $cdp "!!document.querySelector('#id-protect-result')" 900
+      $resText = [string](Invoke-PageScript $cdp "(document.querySelector('#id-protect-result') || {}).innerText || ''")
+      $prot = @(@('echo') + $batch | Where-Object { [IO.File]::ReadAllText((Join-Path $installPath "traefik\dynamic\svc-$_.yml")) -match "svc-$_-authentik" })
+      Test-Condition 'browser apps: the batch of 7 is protected, each route verified; the unticked one is untouched' ($okP -and $okR -and $prot.Count -eq 7 -and $prot -notcontains 'b3' -and ([regex]::Matches($resText, 'ForwardAuth enforced')).Count -eq 7) "$($prot -join ',') / $($resText.Substring(0, [Math]::Min(300, $resText.Length)))"
+      $stillEcho2 = [IO.File]::ReadAllText((Join-Path $installPath 'traefik\dynamic\svc-echo2.yml')) -match 'svc-echo2-authentik'
+      Test-Condition 'bulk protection keeps every earlier protection (echo2 still protected; nothing removed by deselecting)' ($stillEcho2 -and @($batch | Where-Object { (Test-ForwardAuthChallenge -TraefikPort $httpPort -Hostname "$_.idtest.example").State -eq 'auth' }).Count -eq 6) ''
+      & $shot 'wizard-8-apps-result.png'
+    }
     # Authentik's real sign-in page, through Traefik (Edge maps the test hostnames to this PC).
     $cdp2 = Start-EdgeSession -WorkDir $work -ExtraArgs @("--host-resolver-rules=MAP *.idtest.example 127.0.0.1")
     try {
@@ -631,7 +652,7 @@ try {
       Open-Page $cdp2 "http://${authHost}:$httpPort/"
       $okL = Wait-PageCondition $cdp2 "(() => { const deep = (n) => { let t = ''; if (n.shadowRoot) t += deep(n.shadowRoot); for (const c of n.childNodes) t += c.nodeType === 3 ? c.textContent : deep(c); return t; }; return /Google/.test(deep(document.body)); })()" 90
       Start-Sleep -Seconds 2
-      if ($ScreenshotDir) { Save-PageScreenshot $cdp2 (Join-Path $ScreenshotDir 'authentik-signin-page.png') }
+      & $shot 'authentik-signin-page.png' $cdp2
       Test-Condition 'login page: authentik''s sign-in page renders with the Google button (screenshot)' $okL ''
     } finally { Stop-EdgeSession $cdp2 }
     # Token management in the browser: an unusable token opens the replacement form; replacing works from the page.
@@ -641,7 +662,7 @@ try {
     $ok1 = Wait-PageCondition $cdp "!!document.querySelector('#cred-card-authentik-api') && !!document.querySelector('#cred-authentik-api')" 60
     $cardText = [string](Invoke-PageScript $cdp "document.querySelector('#cred-card-authentik-api').innerText")
     Test-Condition 'browser token: a failed token shows the reason, Replace API token and the replacement field right away' ($ok1 -and $cardText -match 'Replace API token' -and $cardText -match 'outpost' -and $cardText -match 'Try a different token' -and $cardText -match 'Test connection') $cardText
-    if ($ScreenshotDir) { Save-PageScreenshot $cdp (Join-Path $ScreenshotDir 'identity-token-failed-1366.png') }
+    & $shot 'identity-token-failed-1366.png'
     Open-Page $cdp "$base/#identity/connect?level=beginner"
     $ok2 = Wait-PageCondition $cdp "!!document.querySelector('#cred-authentik-api')" 60
     Test-Condition 'browser token: after a page refresh the replacement form is still offered' $ok2 ''
@@ -649,10 +670,16 @@ try {
     $ok3 = Wait-PageCondition $cdp "(document.querySelector('#cred-card-authentik-api .form-error') || {}).textContent.includes('not saved')" 60
     Test-Condition 'browser token: a refused token shows why and keeps the form for another attempt' ($ok3 -and [bool](Invoke-PageScript $cdp "!!document.querySelector('#cred-authentik-api') && document.querySelector('#cred-authentik-api').value === ''")) ''
     $null = Invoke-PageScript $cdp "(() => { const i = document.querySelector('#cred-authentik-api'); i.value = '$bootToken'; [...document.querySelectorAll('#cred-card-authentik-api button')].find((b) => b.textContent.includes('Validate and save')).click(); return true; })()"
-    $ok4 = Wait-PageCondition $cdp "(() => { const c = document.querySelector('#cred-card-authentik-api'); return c && c.innerText.includes('Connected') && !document.querySelector('#cred-authentik-api'); })()" 60
-    $card2 = [string](Invoke-PageScript $cdp "document.querySelector('#cred-card-authentik-api').innerText")
-    Test-Condition 'browser token: replacing from the page connects; Replace API token stays available on a healthy connection' ($ok4 -and $card2 -match 'akadmin' -and $card2 -match 'Replace API token' -and $card2 -notmatch [regex]::Escape($bootToken)) $card2
-    if ($ScreenshotDir) { Save-PageScreenshot $cdp (Join-Path $ScreenshotDir 'identity-token-connected-1366.png') }
+    # A successful replacement resumes the setup at the next step that needs attention (the same 'next' the API returns);
+    # the connection step, opened again, then shows the healthy connection.
+    $nextStep = [string]@((Invoke-WebUi $ui GET '/api/identity').Data.model.next)[0]
+    # With nothing left to set up there is no next step and the page stays on the connection step.
+    $okNext = $(if ($nextStep) { Wait-PageCondition $cdp "location.hash.startsWith('#identity/$nextStep') && !document.querySelector('#cred-authentik-api')" 60 } else { $true })
+    Open-Page $cdp "$base/#identity/connect?level=beginner"
+    $ok4 = $okNext -and (Wait-PageCondition $cdp "(() => { const c = document.querySelector('#cred-card-authentik-api'); return c && c.innerText.includes('Connected') && !document.querySelector('#cred-authentik-api'); })()" 60)
+    $card2 = [string](Invoke-PageScript $cdp "(document.querySelector('#cred-card-authentik-api') || {}).innerText || ''")
+    Test-Condition 'browser token: replacing from the page connects and resumes the setup; Replace API token stays available on a healthy connection' ($ok4 -and $card2 -match 'akadmin' -and $card2 -match 'Replace API token' -and $card2 -notmatch [regex]::Escape($bootToken)) "next step: '$nextStep', resumed there: $okNext; $card2"
+    & $shot 'identity-token-connected-1366.png'
     Open-Page $cdp "$base/#identity?level=expert"
     $null = Wait-PageCondition $cdp "!!document.querySelector('.wizard-steps')" 60
     $raw = [string](Invoke-PageScript $cdp "(document.querySelector('details.tech pre') || {}).textContent || ''")
@@ -662,7 +689,7 @@ try {
     $null = Wait-PageCondition $cdp "!!document.querySelector('.wizard-steps')" 60
     $overflow = [bool](Invoke-PageScript $cdp 'document.documentElement.scrollWidth > window.innerWidth + 1')
     Test-Condition 'browser (390 px): no horizontal scrolling' (-not $overflow) ''
-    if ($ScreenshotDir) { Save-PageScreenshot $cdp (Join-Path $ScreenshotDir 'wizard-390.png') }
+    & $shot 'wizard-390.png'
     $errs = @($cdp.Errors | Where-Object { $_ -notmatch 'favicon' })
     Test-Condition 'browser: no script errors' ($errs.Count -eq 0) ($errs -join ' | ')
   }

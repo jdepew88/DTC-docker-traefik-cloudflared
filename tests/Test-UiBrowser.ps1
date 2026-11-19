@@ -355,7 +355,10 @@ try {
     Test-Condition 'expert: exact URL, network identities and subnets, generated Traefik service, redacted test output' ($exp -match 'Exact backend URL' -and $exp -match 'Docker subnets' -and $exp -match 'Network identities' -and $exp -match 'Generated Traefik service' -and $exp -match 'Connection test output') $exp.Substring(0, [Math]::Min(500, $exp.Length))
     Shot 'services-add-expert-1366'
     # A deliberate override (Advanced) survives other changes; protocol choices are not replaced by recommendations.
-    $null = Js "TPMUI.setLevel('advanced'); document.querySelector('#svc-custom').closest('.field').querySelector('input[type=checkbox]').click(); true"; Start-Sleep -Milliseconds 200
+    # A level switch re-renders the page asynchronously (app.js route()): wait for the new form before using it.
+    $null = Js "TPMUI.setLevel('advanced'); true"
+    if (-not (Wait-PageCondition $cdp "__t.visible('#svc-custom')" 30)) { throw 'The custom backend field did not appear after switching to Advanced.' }
+    $null = Js "document.querySelector('#svc-custom').closest('.field').querySelector('input[type=checkbox]').click(); true"; Start-Sleep -Milliseconds 200
     $null = Js "__t.set('#svc-custom', 'http://192.0.2.77:8080'); true"
     $ok = Wait-PageCondition $cdp "document.querySelector('#svc-backend').innerText.includes('192.0.2.77:8080')" 60
     $null = Js "__t.set('#svc-display', 'Win App 2'); true"; Start-Sleep -Milliseconds 1200

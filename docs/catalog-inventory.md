@@ -39,7 +39,7 @@ Summary: 36 manifests; 30 installable applications (plus the HTTP echo test app 
 | Application | Pinned version | Dependencies (own stack) | On this PC (read-only check) | Catalog status | Windows (Docker Desktop) | Sign-in | Static checks | Live install | Backup/restore | Known limitations |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | Authelia | `authelia/authelia:4.39.28` | - | Installed, managed (authelia) | Installable | supported | n/a (no web sign-in) | Passed | Passed (2026-11-16) | Tested (backup, restore, app works after) | Session cookies need a real domain with HTTPS: it protects apps only after a public or LAN hostname is configured. |
-| authentik | `ghcr.io/goauthentik/server:2026.8.5` | server:2026.8.5, postgres:16-alpine | Installed, managed (authentik; Identity & Access, Google sign-in) | Installable | supported | n/a (no web sign-in) | Passed | Partial (2026-11-17) | Not reached | - |
+| authentik | `ghcr.io/goauthentik/server:2026.8.5` | server:2026.8.5, postgres:16-alpine | Installed, managed (authentik; Identity & Access, Google sign-in) | Installable | supported | n/a (no web sign-in) | Passed | Partial (2026-11-19) | Not reached | - |
 | LLDAP (directory) | `lldap/lldap:v0.6.3` | - | Installed, managed (lldap) | Installable | supported | n/a (no web sign-in) | Passed | Passed (2026-11-16) | Tested (backup, restore, app works after) | The LDAP port is not published: only containers on its private network, or clients you connect explicitly, can use it. |
 | OpenLDAP | `ghcr.io/intechcore/openldap:2.6.16-6` | - | Not installed | Installable | supported | n/a (no web sign-in) | Passed | Passed (2026-11-17) | Tested (backup, restore, app works after) | The container comes from a small vendor (intechcore) that packages the official Symas OpenLDAP 2.6 LTS builds; osixia/openldap is unmaintained and the free Bitnami images were withdrawn.; No web interface: manage entries with LDAP tools (ldapadd, Apache Directory Studio) or use LLDAP for a simpler directory with a web interface. |
 | Vaultwarden | `vaultwarden/server:1.37.5` | - | Not installed | Installable | supported | Not with ForwardAuth | Passed | Passed (2026-11-17) | Tested (backup, restore, app works after) | Over plain http on a LAN address or hostname, the web vault refuses to sign in; use http://127.0.0.1 locally or publish it with HTTPS.; Bitwarden clients need version 2026.7.0 or later for Vaultwarden 1.37. |
@@ -122,9 +122,18 @@ Each card lists its manual steps (*Requires manual setup* filter). The most impo
   test entry point) to `https://<host>`; authentik's outpost matches the forwarded Host, port included, against that
   address, so it answered 404 (passed through by Traefik ForwardAuth). The application address now follows the scheme
   and port of the public sign-in address (unchanged in production: `https://<host>`), in the provider, the routing view
-  and every probe; apply also waits for the outpost to reload a corrected sign-in address. A re-run was stopped by
-  Claude Code for low PC memory after 103 passed checks with 2 failures (both fixed afterwards, covered by unit tests);
-  the complete live re-run is still pending.
+  and every probe; apply also waits for the outpost to reload a corrected sign-in address. Verified live on 2026-11-19:
+  the complete run passed every identity check (127 passed), including re-protection, the routing view, the outpost
+  wait and rollback. Its one failure was the test harness: a second headless Edge received
+  `--host-resolver-rules=MAP *.idtest.example 127.0.0.1` split at the spaces (Windows PowerShell's Start-Process does
+  not quote arguments) and never opened DevTools, so 8 browser checks were not reached. With the arguments quoted
+  they passed in `Test-IdentityLive.ps1 -BrowserOnly` (82 passed, 0 failed). Catalog backup/restore of authentik is
+  still not run, hence "Partial".
+- **Browser test harness (fixed 2026-11-19):** a DevTools reply that took longer than its timeout (an occasional
+  full-page screenshot) cancelled the WebSocket receive, which closes the socket for good: every later browser command
+  of that run failed. A timeout now leaves the receive pending and the session usable. `Test-UiBrowser.ps1` failed
+  in the service wizard because it switched the detail level and used a field in the same step, before the page had
+  re-rendered; it now waits for the field (71 passed, 0 failed).
 - **Immich** was live-tested with machine learning off; the machine-learning service (about 2.5 GB) was not started.
 - **Paperless-ngx** Gotenberg and Tika (optional office-document services) were not started.
 - **Plex** was tested without a claim token and without GPU; claiming and hardware transcoding are not verified.

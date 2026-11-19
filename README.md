@@ -594,6 +594,7 @@ container on this PC already uses.
 .\tests\Test-IdentityLive.ps1 -ScreenshotDir .\screens   # disposable instance + authentik from the catalog: adopt, token,
                                         # sign-in route, outpost, Google source (synthetic credentials), protect/unprotect,
                                         # allowed/denied sign-ins through the real outpost, fail closed, rollback, browser
+.\tests\Test-IdentityLive.ps1 -BrowserOnly    # only the setup the browser checks need, then the identity pages in Edge
 node .\tests\ui-logic.test.js           # developer-only unit tests of webui\logic.js (Node is not needed to run the tool)
 .\tests\Invoke-UiPreview.ps1            # developer tool: quick screenshots of pages at chosen levels and widths
 .\tests\Invoke-IsolatedTest.ps1         # (repository only) disposable second instance: install, live tests,

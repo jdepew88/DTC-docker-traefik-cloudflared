@@ -265,7 +265,7 @@
   "testStatus": {
     "static": "passed",
     "live": "partial",
-    "date": "2026-11-17",
-    "notes": "Installed from the catalog on a disposable deployment by tests\\Test-IdentityLive.ps1: install, readiness, private database, bootstrap token, Google source setup, ForwardAuth protection and sign-ins, restart persistence, teardown. Catalog backup/restore not run for it. The 8 re-protection failures (404) were fixed on 2026-11-17; the complete live re-run is pending (the last run was stopped for low PC memory)."
+    "date": "2026-11-19",
+    "notes": "Installed from the catalog on a disposable deployment by tests\\Test-IdentityLive.ps1: install, readiness, private database, bootstrap token, Google source setup, ForwardAuth protection and sign-ins, re-protection after a misroute, rollback, restart persistence, browser pages, teardown. Full run 2026-11-19: 127 passed; the only failure was the test harness starting a second Edge (fixed), which left 8 browser checks unreached; they passed in a -BrowserOnly run (82 passed, 0 failed). Catalog backup/restore not run for it."
   }
 }
