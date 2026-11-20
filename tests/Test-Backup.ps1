@@ -129,7 +129,7 @@ try {
     $h.Count -eq 1 -and $h[0].dnsRecordId -and $h[0].accessAppId -and @($h[0].accessEmails) -contains 'owner@example.com' -and
     @($m.services).Count -eq 2 -and @($m.routes | Where-Object { $_.rule -eq 'Host(`web1.example.test`)' }).Count -eq 1 -and
     @($m.middlewares.available) -contains 'my-mw@file' -and @($m.middlewares.customFiles) -contains 'custom-mw.yml') $jsonText
-  Test-Condition 'export .json: credentials listed as not included' (@($m.credentials).Count -eq 3 -and @($m.credentials | Where-Object { $_.id -eq 'authentik-api-token' -and -not $_.present }).Count -eq 1 -and @($m.credentials | Where-Object { $_.included }).Count -eq 0 -and
+  Test-Condition 'export .json: credentials listed as not included' (@($m.credentials).Count -eq 4 -and @($m.credentials | Where-Object { $_.id -eq 'ai-api-key' -and -not $_.included }).Count -eq 1 -and @($m.credentials | Where-Object { $_.id -eq 'authentik-api-token' -and -not $_.present }).Count -eq 1 -and @($m.credentials | Where-Object { $_.included }).Count -eq 0 -and
     @($m.credentials | Where-Object { $_.id -eq 'tunnel-connector-token' -and $_.present }).Count -eq 1) ($m.credentials | ConvertTo-Json -Compress)
   $leaks = @($apiToken, $fakeTunnelToken, 'eyJ', 'sk_live_', 'EXTRA_API_KEY=', '"data"') | Where-Object { $jsonText.Contains($_) }
   Test-Condition 'export .json: no API token, tunnel token, unknown .env values or DPAPI data (left-out keys named only)' (@($leaks).Count -eq 0 -and @($m.omittedEnvKeys) -contains 'EXTRA_API_KEY') ($leaks -join ', ')
@@ -165,6 +165,35 @@ try {
   $archEntries = Read-Zip $arch.Bytes
   Test-Condition 'export .zip: a credential-like file is left out and listed' (-not $archEntries.Contains('files/traefik/dynamic/auth.yml') -and @($arch.Excluded | Where-Object { $_.path -eq 'traefik\dynamic\auth.yml' }).Count -eq 1) (@($archEntries.Keys) -join ', ')
 
+  # Application registry and connectors travel with the backup; connector API keys never do.
+  Remove-Item -LiteralPath (Join-Path $tmpS 'traefik\dynamic\auth.yml') -Force
+  $appsJson = '{"kind":"dtc-applications","contractVersion":1,"instances":[{"instanceId":"i-1a2b3c4d5e6f","mode":"observed","name":"Notes","integrations":[]}]}' + "`n"
+  $mgrJson = '{"version":1,"connectors":[{"id":"home-portainer","kind":"portainer","url":"http://127.0.0.1:9000"}]}' + "`n"
+  [IO.File]::WriteAllText((Join-Path $tmpS 'config\applications.json'), $appsJson)
+  [IO.File]::WriteAllText((Join-Path $tmpS 'config\managers.json'), $mgrJson)
+  New-Item -ItemType Directory -Force -Path (Join-Path $tmpS 'secrets') | Out-Null
+  [IO.File]::WriteAllText((Join-Path $tmpS 'secrets\manager-home-portainer-api.dpapi'), '{"data":"not-a-real-key"}')
+  $archC = New-ConfigBackupArchive -Settings $sS -SourceRoot $repo
+  $eC = Read-Zip $archC.Bytes
+  $credC = @($archC.Manifest.credentials | Where-Object { $_.id -eq 'manager-home-portainer' })
+  Test-Condition 'export .zip: the application registry and connector addresses are included; the connector API key is not (listed to reconnect)' (
+    $eC.Contains('files/config/applications.json') -and $eC.Contains('files/config/managers.json') -and -not @($eC.Keys | Where-Object { $_ -match 'dpapi|secrets/' }).Count -and
+    $credC.Count -eq 1 -and $credC[0].present -and -not $credC[0].included -and $eC['INVENTORY.txt'] -match 'Portainer API key') (@($eC.Keys) -join ', ')
+  $tmpR = Join-Path $work 'restore-reg'
+  $null = New-TestInstance -Repo $repo -Path $tmpR -StackName "$stack-r"
+  $sR = Get-StackSettings -InstallPath $tmpR
+  $bk = Read-ConfigBackup -Bytes $archC.Bytes -FileName 'c.zip'
+  $planR = Get-RestorePlan -Settings $sR -Backup $bk -SourceRoot $repo
+  $created = @($planR.Local.Items | Where-Object { $_.area -in 'applications', 'connectors' -and $_.action -eq 'create' })
+  [IO.File]::WriteAllText((Join-Path $tmpR 'config\applications.json'), ($appsJson -replace 'Notes', 'Newer notes'))
+  $planR2 = Get-RestorePlan -Settings $sR -Backup $bk -SourceRoot $repo
+  $kept = @($planR2.Local.Items | Where-Object { $_.area -eq 'applications' -and $_.action -eq 'keep' })
+  $bkF = Read-ConfigBackup -Bytes (New-Zip @{ 'manifest.json' = $eC['manifest.json']; 'files/config/applications.json' = ($appsJson -replace '"contractVersion":1', '"contractVersion":7') }) -FileName 'f.zip'
+  $planF = Get-RestorePlan -Settings $sR -Backup $bkF -SourceRoot $repo
+  Test-Condition 'restore: the registry and connectors are created when missing, an existing registry is kept (never overwritten), a newer contract version is refused' (
+    $created.Count -eq 2 -and $planR.Local.Writes.Contains('config\applications.json') -and $kept.Count -eq 1 -and -not $planR2.Local.Writes.Contains('config\applications.json') -and
+    @($planF.Local.Errors | Where-Object { $_ -match 'newer Deployment Manager' }).Count -eq 1) ((@($planR.Local.Items | ForEach-Object { "$($_.area)/$($_.action)" }) -join ', ') + ' | ' + (@($planF.Local.Errors) -join ' '))
+
   # --- Version compatibility and validation ------------------------------------------------------------------------
   $enc = [Text.Encoding]::UTF8
   $r = Import-Preview $uiA $enc.GetBytes('{"format":"traefik-proxy-config","schemaVersion":2,"managerVersion":"9.0.0","services":[]}') 'future.json'
@@ -195,7 +224,7 @@ try {
   $writesBefore = @(Get-Writes).Count
   $p = Import-Preview $uiB $z.Bytes 'backup.zip'
   Test-Condition 'restore preview without a token: local part ready, Cloudflare not verified, credentials to reconnect' ($p.Status -eq 200 -and $p.Data.local.canApply -and -not $p.Data.cloudflare.connected -and
-    $p.Data.cloudflare.message -match 'Connect Cloudflare' -and @($p.Data.credentials | Where-Object { -not $_.present }).Count -eq 3 -and
+    $p.Data.cloudflare.message -match 'Connect Cloudflare' -and @($p.Data.credentials | Where-Object { -not $_.present }).Count -eq 4 -and
     @($p.Data.actions | Where-Object { $_ -match 'not adopted' }).Count -eq 1 -and -not (Test-Path -LiteralPath $pathB)) (Short $p)
   $tok = Invoke-WebUi $uiB POST '/api/cloudflare/token' @{ token = $apiToken }
   $p = Import-Preview $uiB $z.Bytes 'backup.zip'

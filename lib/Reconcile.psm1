@@ -163,6 +163,22 @@ function Get-DriftFindings {
       if ($cl.Count) { $null = $f.Add((New-DriftFinding 'hostname-conflict' 'error' "$h is claimed by another configuration" "$((@($cl | ForEach-Object { [string](Get-RcnProp $_ 'detail' '') })) -join ' ') One configuration must own a hostname." "hostname: $h" (New-Repair 'advice' 'external' 'Remove the other definition (Docker labels or a hand-written file) or choose another hostname.'))) }
     }
   }
+  # 3b. A sign-in in front of a route protects only requests that pass through Traefik: a port the container publishes on
+  #     the host reaches the application directly. Reported, never changed automatically (the owner's Compose file
+  #     decides); loopback-only bindings are a warning (this PC only), any other binding an error.
+  $protectedRoutes = @($routed | Where-Object { [string](Get-RcnProp (Get-RcnProp $_ 'auth' $null) 'provider' '') })
+  $pubs = @(@(Get-RcnProp $Container 'published' @()) | Where-Object { [int](Get-RcnProp $_ 'hostPort' 0) -gt 0 })
+  if ($protectedRoutes.Count -and $pubs.Count) {
+    $isLoop = { param($ip) [string]$ip -in '127.0.0.1', '::1', 'localhost' }
+    $open = @($pubs | Where-Object { -not (& $isLoop (Get-RcnProp $_ 'hostIp' '')) })
+    $desc = @($pubs | ForEach-Object { $ip = [string](Get-RcnProp $_ 'hostIp' ''); "$(if ($ip) { $ip } else { '0.0.0.0' }):$([int]$_.hostPort)->$([int]$_.port)" }) -join ', '
+    $providers = @($protectedRoutes | ForEach-Object { [string]$_.auth.provider } | Select-Object -Unique) -join ', '
+    $svc = [string](Get-RcnProp (Get-RcnProp $Container 'compose' $null) 'service' '')
+    $null = $f.Add((New-DriftFinding 'auth-bypass-port' $(if ($open.Count) { 'error' } else { 'warning' }) 'A published port bypasses the sign-in' `
+        "The route$(if ($protectedRoutes.Count -gt 1) { 's' }) $(@($protectedRoutes | ForEach-Object { "'$($_.name)'" }) -join ', ') require$(if ($protectedRoutes.Count -eq 1) { 's' }) $providers, but $cname also publishes $desc on the host. $(if ($open.Count) { 'Anyone who can reach this computer on that port opens the application without signing in.' } else { 'Programs and users on this computer open the application without signing in.' })" `
+        "published: $desc" `
+        $(if ($external) { New-Repair 'advice' 'external' "Remove the ports: entry from the service in $owner's Compose file and redeploy it there (Traefik reaches it over the shared network). DTC does not edit Compose files it does not own." $null @('services:', "  $(if ($svc) { $svc } else { '<service>' }):", '    # delete the ports: block (or bind it to 127.0.0.1 if something on this PC needs it)') } else { New-Repair 'advice' 'dtc' 'Stop publishing the port: remove it from the app''s stack settings on the Installed apps page and update the app. The route through Traefik keeps working.' })))
+  }
   # 4. Integrations whose route disappeared from the registry (removed by hand or by an older backup restore).
   foreach ($g in @(Get-RcnProp $Instance 'integrations' @())) {
     $rn = [string](Get-RcnProp $g 'route' '')

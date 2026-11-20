@@ -69,3 +69,7 @@ SYSTEM and Administrators, holds:
 - The dump-only path (a different PostgreSQL major version) is documented and its dump verified, but a full start of
   authentik from a dump-only restore was not automated.
 - Production authentik backups are your decision: nothing backs up or restores it automatically.
+- The backup holds authentik's secrets in plain text (`.env`, the database) behind an owner-only ACL. Copies taken
+  off the PC must be encrypted; see [credential-portability.md](credential-portability.md). Taking the stopped-volume
+  copy stops authentik for a few seconds (sign-in unavailable); the upgrade procedure uses an online `pg_dump` instead
+  ([production-upgrade.md](production-upgrade.md)).

@@ -192,6 +192,17 @@ $plan8 = Get-RepairPlan $d8 @($protRoute)
 $d9 = Get-DriftFindings -Instance $notesInst -Container $cNotes -Authority $auth0 -Routes @($protRoute) -Middlewares $mw -ProxyNetwork 'proxy' -IdentityEndpoint 'http://old-ak-server:9000/'
 Test-Condition 'drift: a protected route whose authentik address changed is repaired to the current address (sign-in kept); the same address is not reported' (
   @($d8 | Where-Object { $_.id -eq 'auth-endpoint-stale' }).Count -and $plan8.routeChanges[0].after.authEndpoint -eq 'http://new-ak-server:9000' -and $plan8.routeChanges[0].before.authEndpoint -eq 'http://old-ak-server:9000' -and -not @($d9 | Where-Object { $_.id -eq 'auth-endpoint-stale' }).Count) (($d8 | ForEach-Object { $_.id }) -join ', ')
+$pubLan = New-FixtureContainer 'notes-web-1' 'notes' 'web' '/data/compose/3'; $pubLan.published = @([ordered]@{ port = 8080; proto = 'tcp'; hostIp = '0.0.0.0'; hostPort = 18080 })
+$pubLoop = New-FixtureContainer 'notes-web-1' 'notes' 'web' '/data/compose/3'; $pubLoop.published = @([ordered]@{ port = 8080; proto = 'tcp'; hostIp = '127.0.0.1'; hostPort = 18080 })
+$dB1 = Get-DriftFindings -Instance $notesInst -Container $pubLan -Authority $auth0 -Routes @($protRoute) -Middlewares $mw -ProxyNetwork 'proxy'
+$dB2 = Get-DriftFindings -Instance $notesInst -Container $pubLoop -Authority $auth0 -Routes @($protRoute) -Middlewares $mw -ProxyNetwork 'proxy'
+$dB3 = Get-DriftFindings -Instance $notesInst -Container $pubLan -Authority $auth0 -Routes @($routes[1]) -Middlewares $mw -ProxyNetwork 'proxy'
+$planB = Get-RepairPlan $dB1 @($protRoute)
+$bp1 = @($dB1 | Where-Object { $_.id -eq 'auth-bypass-port' }); $bp2 = @($dB2 | Where-Object { $_.id -eq 'auth-bypass-port' })
+Test-Condition 'drift: a protected route whose container publishes a host port is a sign-in bypass (LAN binding error, loopback warning), left to the owner (no automatic change); unprotected routes are not flagged' (
+  $bp1.Count -eq 1 -and $bp1[0].severity -eq 'error' -and $bp1[0].evidence -match '0\.0\.0\.0:18080->8080' -and $bp1[0].repair.owner -eq 'external' -and $bp1[0].repair.kind -eq 'advice' -and
+  $bp2.Count -eq 1 -and $bp2[0].severity -eq 'warning' -and -not @($dB3 | Where-Object { $_.id -eq 'auth-bypass-port' }).Count -and
+  -not @($planB.routeChanges).Count -and @($planB.external | Where-Object { $_.finding -eq 'auth-bypass-port' }).Count) (($dB1 | ForEach-Object { "$($_.id)/$($_.severity)" }) -join ', ')
 
 # --- Part 1f: route ownership in service definitions --------------------------------------------------------------------
 $owned = $routes[1]

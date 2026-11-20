@@ -49,7 +49,7 @@
     if (!byId[st.step] || !byId[st.step].available) st.step = wiz.current;
     const go = (id) => { st.step = id; render(main, ctx); const p = document.getElementById('prov-panel'); if (p) p.scrollIntoView({ block: 'start' }); const t = document.getElementById('prov-title'); if (t) t.focus(); };
     const rerender = () => render(main, ctx);
-    const nav = h('nav', { class: 'wizard-steps', 'aria-label': 'New app steps' }, h('ol', null, wiz.steps.map((s) => h('li', { class: `${s.id === st.step ? 'current' : ''} ${s.done ? 'done' : ''} ${!s.available ? 'locked' : ''}`, 'data-step': s.id },
+    const nav = h('nav', { class: 'wizard-steps', 'aria-label': 'Add application stages' }, h('ol', null, wiz.steps.map((s) => h('li', { class: `${s.id === st.step ? 'current' : ''} ${s.done ? 'done' : ''} ${!s.available ? 'locked' : ''}`, 'data-step': s.id },
       s.available ? h('button', { type: 'button', class: 'step-link', 'aria-current': s.id === st.step ? 'step' : null, onclick: () => go(s.id) },
         h('span', { class: 'step-num', 'aria-hidden': 'true' }, s.done ? '✓' : String(s.number)), h('span', null, s.title, !s.done && s.missing ? h('span', { class: 'step-badge small muted' }, s.missing) : null),
         h('span', { class: 'sr-only' }, `${s.done ? ', complete' : ''}${s.id === st.step ? ', current step' : ''}`))

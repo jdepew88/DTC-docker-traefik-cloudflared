@@ -163,4 +163,4 @@ function Invoke-TestOrphanSweep {
   return @($lines)
 }
 
-Export-ModuleMember -Function Get-TestRunPrefix, Register-TestRun, Unregister-TestRun, Complete-TestRun, Get-TestRunOwner, Get-TestOrphans, Remove-TestOrphan, Invoke-TestOrphanSweep
+Export-ModuleMember -Function Invoke-TrDocker, Get-TestRunPrefix, Register-TestRun, Unregister-TestRun, Complete-TestRun, Get-TestRunOwner, Get-TestOrphans, Remove-TestOrphan, Invoke-TestOrphanSweep

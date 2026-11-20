@@ -5,23 +5,26 @@ Set-StrictMode -Version 2.0
 # deployment status, networks and source references. Discovery from the Docker API keeps working without them, and
 # nothing here can change a stack: only GET requests are ever sent.
 #
-#   Portainer CE 2.x (catalog: 2.45): header X-API-Key; GET /api/endpoints, GET /api/stacks,
+#   Portainer CE 2.x (catalog: 2.45; live-checked against a disposable 2.45.2): header X-API-Key; GET /api/stacks,
 #     GET /api/endpoints/{id}/docker/containers/json?all=1 (Docker proxy, read). An access token carries ALL the rights
 #     of the user who created it; Portainer CE has no read-only role, so the token cannot be restricted. Use a
-#     dedicated non-admin user that only sees the environments DTC should read. DTC still sends GET requests only.
-#   Arcane 2.x (catalog: 2.16): header X-Api-Key; GET /api/environments, GET /api/agents/{id}/projects (documented
-#     example; /api/environments/{id}/projects as fallback) and .../containers. API keys take permissions; read-only scopes exist: environments:list,
-#     environments:read, projects:list, projects:read, containers:list, containers:read, networks:list, networks:read.
+#     dedicated non-admin user; it sees only stacks shared with it
+#     (and can operate their containers). DTC still sends GET requests only.
+#   Arcane 2.x (catalog: 2.16; live-checked against a disposable 2.16.1): header X-API-Key; GET /api/environments,
+#     /api/environments/{id}/projects and /api/environments/{id}/containers, all paginated (start/limit,
+#     pagination.totalItems; every page is read). /api/agents/{id}/... is tried only when the first path is missing.
+#     API keys take permissions ("cannot exceed the creator's own"); the read-only set environments:list/read,
+#     projects:list/read, containers:list/read is enough (a write with such a key is refused with 403).
 #
 # Endpoint rules: https anywhere; plain http only to this PC or a private network address. Credentials are DPAPI
 # secrets (lib\SecretStore.psm1), never returned or logged. $Transport (tests) replaces the HTTP call.
 
 $script:Kinds = [ordered]@{
   portainer = [ordered]@{ label = 'Portainer'; header = 'X-API-Key'; readOnlyScopes = $false
-    scopeNote = 'Portainer CE access tokens carry every right of the user who created them (no read-only role in CE). Create the token as a dedicated non-administrator user with access to the environments DTC should read. DTC only sends GET requests.'
+    scopeNote = 'Portainer CE access tokens carry every right of the user who created them (no read-only role in CE). Create the token as a dedicated non-administrator user with access to the environments DTC should read, and share with it only the stacks DTC should recognize: that user can also start or stop those stacks'' containers, so keep its token safe. DTC only sends GET requests.'
     tokenHelp = 'Portainer: My account > Access tokens > Add access token.' }
   arcane = [ordered]@{ label = 'Arcane'; header = 'X-Api-Key'; readOnlyScopes = $true
-    scopeNote = 'Give the key only read permissions: environments:list, environments:read, projects:list, projects:read, containers:list, containers:read, networks:list, networks:read.'
+    scopeNote = 'Give the key only these read permissions: environments:list, environments:read, projects:list, projects:read, containers:list, containers:read (nothing else is used).'
     tokenHelp = 'Arcane: System > API Keys > Create API Key (choose the read permissions only, and an expiry date).' }
 }
 $script:IdPattern = '^[a-z][a-z0-9-]{1,30}$'
@@ -124,25 +127,44 @@ function Get-ManagerSnapshot {
       foreach ($s in $stacks) { if ($s.environment -eq [string]$eid) { $s.containers = @($cs | Where-Object { $_.project -eq $s.project }) } }
     }
     $out.stacks = $stacks
+    # Live-checked (Portainer CE 2.45.2): a non-administrator only sees stacks shared with it (stack access control).
+    if (-not $stacks.Count) { $out.message = 'Portainer returned no stacks. A non-administrator user only sees stacks shared with it (stack > Access control): share the stacks DTC should recognize with this user or its team.' }
   } else {
-    $er = & $get '/api/environments'
+    # Arcane 2.x lists are paginated (default 20 per page; pagination.totalItems): every page is read.
+    $getAll = {
+      param($path)
+      $items = @(); $start = 0; $last = $null
+      for ($page = 0; $page -lt 25; $page++) {
+        $sep = $(if ($path.Contains('?')) { '&' } else { '?' })
+        $r = & $get "$path${sep}start=$start&limit=200"
+        if ($r.Error) { if ($page -eq 0) { return $r }; break }
+        $batch = @(Get-EmItems $r.Data); $items += $batch; $last = $r
+        $total = [int](Get-EmProp (Get-EmProp $r.Data 'pagination' $null) 'totalItems' 0)
+        if (-not $batch.Count -or -not $total -or $items.Count -ge $total) { break }
+        $start += $batch.Count
+      }
+      return [pscustomobject]@{ Error = ''; Status = $(if ($last) { $last.Status } else { 200 }); Data = [pscustomobject]@{ data = $items } }
+    }
+    $er = & $getAll '/api/environments'
     if ($er.Error) { return (& $fail $er) }
     $envs = @(Get-EmItems $er.Data | ForEach-Object { [string](Get-EmProp $_ 'id' '') } | Where-Object { $_ })
     if (-not $envs.Count) { $envs = @('0') }
     $stacks = @()
     foreach ($e in $envs) {
-      # Documented example: GET /api/agents/{id}/projects; some versions serve /api/environments/{id}/projects.
-      $prefix = "/api/agents/$e"
-      $pr = & $get "$prefix/projects"
-      if ($pr.Error -eq 'not-found') { $prefix = "/api/environments/$e"; $pr = & $get "$prefix/projects" }
+      # Arcane 2.16 (live-checked): GET /api/environments/{id}/projects and .../containers. Older documentation shows
+      # /api/agents/{id}/... ; it is tried only when the first path does not exist.
+      $prefix = "/api/environments/$e"
+      $pr = & $getAll "$prefix/projects"
+      if ($pr.Error -eq 'not-found') { $prefix = "/api/agents/$e"; $pr = & $getAll "$prefix/projects" }
       if ($pr.Error) { if ($pr.Error -eq 'unauthorized') { return (& $fail $pr) }; continue }
-      $cr = & $get "$prefix/containers"
+      $cr = & $getAll "$prefix/containers"
       $cs = @(if (-not $cr.Error) { ConvertFrom-ManagerContainers (Get-EmItems $cr.Data) })
       foreach ($p in (Get-EmItems $pr.Data)) {
         $name = [string](Get-EmProp $p 'name' '')
         $stacks += [ordered]@{ manager = 'arcane'; stackId = [string](Get-EmProp $p 'id' $name); name = $name; project = $name.ToLowerInvariant()
           status = ([string](Get-EmProp $p 'status' 'unknown')).ToLowerInvariant(); environment = $e; path = [string](Get-EmProp $p 'path' (Get-EmProp $p 'dirName' ''))
-          source = [string](Get-EmProp $p 'gitUrl' ''); containers = @($cs | Where-Object { $_.project -eq $name.ToLowerInvariant() }) }
+          source = [string](Get-EmProp $p 'gitRepositoryURL' (Get-EmProp $p 'gitUrl' '')); discovered = [bool](Get-EmProp $p 'isDiscovered' $false)
+          containers = @($cs | Where-Object { $_.project -eq $name.ToLowerInvariant() }) }
       }
     }
     $out.stacks = $stacks

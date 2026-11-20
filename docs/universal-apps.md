@@ -138,6 +138,13 @@ protected route whose authentik address is out of date (`auth-endpoint-stale`, r
 the sign-in kept), and, with a Portainer or Arcane connector, stacks the owner reports as stopped while their
 container runs, recreated containers the owner does not list, and two tools claiming one application.
 
+Added in the release-readiness audit: a sign-in bypass through a published port (`auth-bypass-port`): a route
+protected by authentik, Authelia or Cloudflare Access whose container also publishes a host port. Bound to the network
+(0.0.0.0, a LAN address) it is an error, bound to 127.0.0.1 a warning (programs and users on this PC). It is reported
+with the lines to remove from the owner's Compose file and never changed automatically. The authentik protection
+preview shows the same warning before an application is protected, also for routes to a port on this PC
+(`host.docker.internal`) that listens on all interfaces.
+
 Repairs are journalled (`config\provision\repairs\<id>.json`): a backup of every route file and the service
 registry is taken first; if a later step of a multi-step repair fails, everything goes back to that backup; a repair
 interrupted by a stopped manager stays `running` and is offered for rollback (`GET /api/applications/repairs`,
@@ -200,11 +207,12 @@ port on 127.0.0.1, which bypassed the sign-in (now no host port is published whe
 
 `lib\ExternalManagers.psm1`, Applications page > "Portainer and Arcane", `GET/POST /api/managers*`.
 
-| | Portainer CE 2.x | Arcane 2.x |
+| | Portainer CE 2.45 | Arcane 2.16 |
 | --- | --- | --- |
-| Authentication | access token, header `X-API-Key` | API key, header `X-Api-Key` |
-| Read-only key | not possible: a token carries all rights of the user who created it (CE has no read-only role); use a dedicated non-administrator user | yes: `environments:list/read`, `projects:list/read`, `containers:list/read`, `networks:list/read` |
-| Read | `/api/stacks` (id, name, environment, status, project path, Git source), `/api/endpoints/{id}/docker/containers/json` | `/api/environments`, `/api/agents/{id}/projects` (documented; `/api/environments/{id}/projects` as fallback), `.../containers` |
+| Authentication | access token, header `X-API-Key` | API key, header `X-API-Key` |
+| Least privilege | a token carries every right of the user who created it (CE has no read-only role). Use a dedicated non-administrator user; it sees only the stacks shared with it (stack > Access control) and **can operate those stacks' containers** | a key with `environments:list/read`, `projects:list/read`, `containers:list/read` only; writes are refused (403) |
+| Read | `/api/stacks` (id, name, environment, status 1 active / 2 inactive, `/data/compose/<id>`, Git source), `/api/endpoints/{id}/docker/containers/json?all=1` | `/api/environments`, `/api/environments/{id}/projects`, `/api/environments/{id}/containers` (paginated, every page read; `/api/agents/{id}/...` only as a fallback) |
+| Compose association | stack name = Compose project label of its containers | project name = Compose project label; working folder `/app/data/projects/<name>` |
 
 DTC sends GET requests only. Keys are DPAPI secrets for this Windows account, never written to `config\managers.json`,
 returned or logged. Plain http is accepted only for this PC or a private address. Snapshots are cached for 60
@@ -212,8 +220,16 @@ seconds; without a connector, or when it does not answer, ownership comes from D
 before. API evidence confirms Docker's guess (`confirmed`), names the owner of a plain Compose project, or reports a
 `conflict`; DTC still never edits a stack or takes over its lifecycle.
 
-Tested with mocked API responses and a local mock server only (`tests\Test-ExternalManagers.ps1`); no live Portainer or
-Arcane was connected, so compatibility with real instances is documented, not verified.
+**Verification levels (2026-11-19).**
+
+| | Documented | Mock-tested (`Test-ExternalManagers.ps1`, 19) | Live-verified on disposable instances (`Test-ManagerConnectorsLive.ps1`, 14) | Verified against your installed instance |
+| --- | --- | --- | --- | --- |
+| Arcane 2.16.1 | OpenAPI served by the instance itself | yes (pagination, fallback path, refused key, unreachable) | yes: project + container listed with a read-only key, authority confirmed, write refused (403), wrong key refused, API down falls back to Docker evidence | **no** (needs your authorization and a key) |
+| Portainer CE 2.45.2 | Portainer API | yes (stacks, containers, refused key, empty list explained) | yes: non-admin token sees only shared stacks (explained), shared stack + container listed, authority confirmed, the token can stop a shared container (documented limit), wrong token refused | **no** (needs your authorization and a token) |
+
+Corrected by the live check: Arcane 2.16 serves projects under `/api/environments/{id}/projects` (the
+`/api/agents/...` path from older documentation does not exist), its lists are paginated (only the first 20 items were
+read before), and the Git field is `gitRepositoryURL`.
 
 ## 9. Add application wizard
 
@@ -226,6 +242,11 @@ and deploy, 8 Verify and manage (planned, installed, running, healthy, routed, s
 container is never shown healthy without its checks). Stages 2, 3 and 6 add no mandatory clicks. Detail levels are kept;
 the heading of each stage receives the focus when moving between stages.
 
+Accessibility (audited 2026-11-19 in `tests\Test-ProvisionBrowser.ps1`, every stage and the 390 px layout): every
+form control and button has an accessible name, ids are unique, no positive tabindex, each stage has a heading that
+receives the focus, and the stage list marks the current stage with `aria-current="step"` plus screen-reader text for
+complete and unavailable stages. Not covered: a screen-reader session (NVDA/JAWS) and colour-contrast measurement.
+
 ## 10. Supported and unsupported
 
 Supported: single and multi-service Compose applications with published images; dependencies with health
@@ -236,6 +257,6 @@ applications integrated without taking ownership.
 Not supported (refused or reported, never guessed): building images from source; `include:`/`extends:`; capabilities,
 sysctls, PID/IPC namespaces, `network_mode: service:`; devices on Docker Desktop; private registries; applications
 that need extra host ports for non-HTTP protocols (DNS, game servers, UDP discovery); native OIDC wiring (recognized
-and recommended, configured by you in authentik and the application); changing Portainer or Arcane stacks (the connectors only read; verified with mocks, not live instances); Linux, Unraid
+and recommended, configured by you in authentik and the application); changing Portainer or Arcane stacks (the connectors only read; verified on disposable Portainer 2.45.2 and Arcane 2.16.1, not against your own instances); Linux, Unraid
 and macOS hosts. No claim is made that every Docker image works: an imported application is `unverified` until its
 deployment's stages pass, and a Compose file that validates is not a verified deployment.

@@ -1064,6 +1064,7 @@ function Save-TunnelTokenFile {
     $saved = Join-Path $Settings.BackupRoot ((Get-Date -Format 'yyyyMMdd-HHmmss') + '\secrets\cloudflare_tunnel_token')
     New-Item -ItemType Directory -Force -Path (Split-Path -Parent $saved) | Out-Null
     Copy-Item -LiteralPath $path -Destination $saved -Force
+    Set-SecretFileAcl $saved
   }
   [IO.File]::WriteAllText($path, $Token)
   Set-SecretFileAcl $path

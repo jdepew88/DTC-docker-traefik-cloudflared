@@ -2239,7 +2239,9 @@ function Get-AppHealth([string]$Project, $Manifest, $Settings, [int]$WaitSeconds
     $c = @(Get-DockerContainerInventory -ProxyNetwork $Settings.ProxyNetwork | Where-Object { $_.name -eq $web })
     if ($c.Count) {
       $probe = $null
-      for ($i = 0; $i -lt 10; $i++) { $probe = Test-ContainerPort -Container $c[0] -Port ([int]$primary.container) -ProxyNetwork $Settings.ProxyNetwork -Image $Settings.TraefikImage -NamePrefix $Settings.StackName -Schemes $(if ($primary.protocol -eq 'https') { @('https') } else { @('http', 'https') }); if ($probe.result -in 'http', 'https') { break }; Start-Sleep -Seconds 4 }
+      # Retries only while an install or update waits for the app to come up; a page view probes once.
+      $tries = $(if ($WaitSeconds -gt 0) { 10 } else { 1 })
+      for ($i = 0; $i -lt $tries; $i++) { $probe = Test-ContainerPort -Container $c[0] -Port ([int]$primary.container) -ProxyNetwork $Settings.ProxyNetwork -Image $Settings.TraefikImage -NamePrefix $Settings.StackName -Schemes $(if ($primary.protocol -eq 'https') { @('https') } else { @('http', 'https') }); if ($probe.result -in 'http', 'https') { break }; if ($i -lt $tries - 1) { Start-Sleep -Seconds 4 } }
       $out.http = $probe
     }
   }
@@ -4143,6 +4145,44 @@ function Get-ProtectDesired($Svc) {
 }
 
 # Preview for "Protect selected with authentik" (services: [...]) or for removing protection from one (service).
+# A sign-in in Traefik protects only requests through Traefik: host ports the backend container publishes reach it
+# directly. Returns a note for the protection preview ('' when nothing is published or the container is unknown).
+# Nothing is changed: the owner of the Compose file removes the ports.
+function Get-SignInBypassNote($Service) {
+  if (-not $Service) { return '' }
+  if ([string]$Service.target.type -eq 'host') {
+    # Traefik reaches it through a port on this computer: that port is open to the network unless bound to loopback.
+    $port = [int]$Service.target.port
+    $listen = @(Get-NetTCPConnection -State Listen -LocalPort $port -ErrorAction SilentlyContinue | ForEach-Object { [string]$_.LocalAddress } | Select-Object -Unique)
+    $wide = @($listen | Where-Object { $_ -notin '127.0.0.1', '::1' })
+    if ($wide.Count) { return "Warning: the application listens on $(@($wide | ForEach-Object { "${_}:$port" }) -join ', '), so other devices on the network can open it directly, WITHOUT signing in, unless Windows Firewall blocks port $port. Block port $port for other devices in Windows Firewall, or make the application listen on 127.0.0.1 only (then check that the route still works: Traefik reaches it as host.docker.internal); the sign-in protects only the address $(@($Service.hostnames)[0])." }
+    return ''
+  }
+  if ([string]$Service.target.type -ne 'docker') { return '' }
+  $name = [string]$Service.target.host
+  if ($name -notmatch '^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$') { return '' }
+  $r = Invoke-Docker inspect --format '{{json .NetworkSettings.Ports}}|{{json .Config.Labels}}' $name
+  if ($r.ExitCode -ne 0) { return '' }
+  $parts = ([string]($r.Output -join '')) -split '\|', 2
+  $ports = $null; $labels = $null
+  try { $ports = $parts[0] | ConvertFrom-Json; if ($parts.Count -gt 1) { $labels = $parts[1] | ConvertFrom-Json } } catch { return '' }
+  if (-not $ports) { return '' }
+  $open = @(); $local = @()
+  foreach ($p in $ports.PSObject.Properties) {
+    foreach ($b in @($p.Value)) {
+      if (-not $b -or -not [string]$b.HostPort) { continue }
+      $ip = [string]$b.HostIp
+      $d = "$(if ($ip) { $ip } else { '0.0.0.0' }):$($b.HostPort)"
+      if ($ip -in '127.0.0.1', '::1') { $local += $d } else { $open += $d }
+    }
+  }
+  $open = @($open | Select-Object -Unique); $local = @($local | Select-Object -Unique)
+  if (-not ($open.Count + $local.Count)) { return '' }
+  $cf = $(if ($labels -and $labels.PSObject.Properties['com.docker.compose.project.config_files']) { [string]$labels.'com.docker.compose.project.config_files' } else { '' })
+  $owner = $(if ($cf) { "its Compose file ($cf)" } else { '' })
+  return "Warning: $name also publishes $(@($open + $local) -join ', ') on this computer. $(if ($open.Count) { 'Anyone who can reach this computer on that port opens the application WITHOUT signing in.' } else { 'Programs and users on this PC open it without signing in.' }) Remove the ports: entry from $(if ($owner) { $owner } else { 'its Compose file' }) and redeploy it (Traefik reaches it over the shared network); the sign-in protects only the address $(@($Service.hostnames)[0])."
+}
+
 function Invoke-IdentityProtectPlan($Body, [switch]$Remove) {
   Assert-Installed
   $ctx = Get-IdentityContext
@@ -4167,6 +4207,8 @@ function Invoke-IdentityProtectPlan($Body, [switch]$Remove) {
     else {
       if ($svc.cloudflare.publish -and $req.ChangeBody.service.cloudflare.access) { $notes += 'Cloudflare Access stays in front: visitors sign in with Cloudflare first, then with authentik.' }
       if (@($ak | Where-Object { $_.Object -eq 'access' -and $_.Kind -eq 'none' }).Count) { $notes += 'This application already has access rules in authentik; they are kept exactly as they are.' }
+      $bypass = Get-SignInBypassNote $svc
+      if ($bypass) { $notes += $bypass }
     }
     $errors = @($view.traefik.issues | Where-Object { $_.Level -eq 'Error' }).Count + @($view.cloudflare.errors).Count
     # Removal: what stays exactly as it is, and whether the application ends up open to the Internet without any

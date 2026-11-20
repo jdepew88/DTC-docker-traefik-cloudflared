@@ -108,6 +108,41 @@ function Click([string]$Sel) { return (Js "(() => { const e = document.querySele
 function Wait([string]$Cond, [int]$Seconds = 15) { return (Wait-PageCondition $cdp $Cond $Seconds) }
 function Step([string]$Id) { return (Js "(() => { const li = document.querySelector('.wizard-steps li[data-step=$Id]'); return li ? JSON.stringify({ cls: li.className.trim().split(/\s+/).sort().join(' '), mark: li.querySelector('.step-num').textContent }) : 'missing'; })()" | ConvertFrom-Json) }
 
+# Accessibility audit of the visible wizard (in-page; no external tool): every form control and button has an
+# accessible name, ids are unique, no positive tabindex, images have alt text, the stage has a heading and the
+# step list exposes the current stage (aria-current). Problems are collected per stage and checked at the end.
+$script:A11y = New-Object System.Collections.ArrayList
+$script:A11yStages = New-Object System.Collections.ArrayList
+$A11yJs = @'
+(() => {
+  const root = document.querySelector('#main') || document.body;
+  const vis = (e) => !!(e.offsetWidth || e.offsetHeight || e.getClientRects().length);
+  const name = (e) => {
+    if ((e.getAttribute('aria-label') || '').trim()) return true;
+    const lb = e.getAttribute('aria-labelledby'); if (lb && lb.split(/\s+/).some((i) => { const t = document.getElementById(i); return t && t.textContent.trim(); })) return true;
+    if (e.id && document.querySelector(`label[for="${CSS.escape(e.id)}"]`)) return true;
+    if (e.closest('label')) return true;
+    if ((e.getAttribute('title') || '').trim()) return true;
+    if (['BUTTON', 'A', 'SUMMARY'].includes(e.tagName) && (e.textContent || '').trim()) return true;
+    return false;
+  };
+  const out = [];
+  root.querySelectorAll('input:not([type=hidden]), select, textarea, button, a[href], summary').forEach((e) => { if (vis(e) && !name(e)) out.push(`no accessible name: <${e.tagName.toLowerCase()}${e.id ? ' id=' + e.id : ''}${e.name ? ' name=' + e.name : ''}${e.type ? ' type=' + e.type : ''}>`); });
+  const ids = {}; document.querySelectorAll('[id]').forEach((e) => { ids[e.id] = (ids[e.id] || 0) + 1; });
+  Object.keys(ids).filter((k) => ids[k] > 1).forEach((k) => out.push(`duplicate id: ${k}`));
+  root.querySelectorAll('[tabindex]').forEach((e) => { if (parseInt(e.getAttribute('tabindex'), 10) > 0) out.push(`positive tabindex on ${e.tagName.toLowerCase()}#${e.id}`); });
+  root.querySelectorAll('img').forEach((e) => { if (!e.hasAttribute('alt')) out.push(`img without alt: ${e.src}`); });
+  if (!document.querySelector('#prov-title')) out.push('no stage heading (#prov-title)');
+  const cur = document.querySelector('.wizard-steps li.current'); if (cur && !cur.querySelector('[aria-current]') && cur.getAttribute('aria-current') === null) out.push('current stage not exposed with aria-current');
+  return JSON.stringify(out);
+})()
+'@
+function Audit([string]$Stage) {
+  $null = $script:A11yStages.Add($Stage)
+  $r = @((Js $A11yJs) | ConvertFrom-Json)
+  foreach ($x in $r) { if ($x) { $null = $script:A11y.Add("${Stage}: $x") } }
+}
+
 try {
   $install = New-TestInstance -Repo $repo -Path (Join-Path $work 'instance') -StackName "tpm-provb-$id"
   $mock = Start-CloudflareMock -Repo $repo -WorkDir $work -Token ('mockTok_' + [Guid]::NewGuid().ToString('N'))
@@ -131,6 +166,7 @@ try {
   $rows = [int](Js "document.querySelectorAll('#prov-services tbody tr').length")
   $acks = [int](Js "document.querySelectorAll('#prov-findings .prov-ack').length")
   Test-Condition 'draft: services (app and database), open questions, findings with acknowledgement boxes (high and review only) and compatibility are shown' ($ok -and $rows -eq 2 -and $acks -eq 2 -and (Js "!!document.querySelector('#prov-unresolved')") -and (Js "!!document.querySelector('#prov-web')") -and (Js "document.querySelector('#prov-compat').textContent") -match 'limitations') "rows=$rows acks=$acks"
+  Audit 'source'
   Test-Condition 'step 1: not complete while the web port is open; Continue is disabled and says why' (-not ((Step 'container').cls -match '\bdone\b') -and (Js "document.querySelector('#prov-next').disabled") -and (Js "document.querySelector('.wizard-steps li[data-step=container] .step-badge').textContent") -match 'cannot be deployed') ''
   Shot 'provision-2-draft'
 
@@ -157,17 +193,20 @@ try {
   $ok = Wait "!!document.querySelector('#prov-stack')"
   $stackText = Js "document.querySelector('#prov-stack').textContent"
   Test-Condition 'stage 2 (stack): each service with its role, the database never published, and the Compose file each one goes to (compose.yaml, compose.database.yaml)' ($ok -and $stackText -match 'Database \(private\)' -and $stackText -match 'never published' -and (Js "document.querySelector('#prov-stack-files').textContent") -match 'compose\.database\.yaml' -and (Js "document.querySelector('#prov-stack-files').textContent") -match 'compose\.yaml') $stackText
+  Audit 'stack'
   Test-Condition 'keyboard: moving to a stage puts the focus on its heading' ((Js "document.activeElement && document.activeElement.id") -eq 'prov-title') (Js "document.activeElement && (document.activeElement.id || document.activeElement.tagName)")
   Shot 'provision-3b-stack'
   $null = Click '#prov-next'
   $ok = Wait "!!document.querySelector('#prov-storage')"
   Test-Condition 'stage 3 (storage and networking): volumes named per project, the web port reached by DNS name, the Docker Desktop limitations of this draft' ($ok -and (Js "document.querySelector('#prov-storage-volumes').textContent") -match 'notes_pgdata' -and (Js "document.querySelector('#prov-storage-ports').textContent") -match 'DNS name' -and (Js "document.querySelector('#prov-storage-host').textContent") -match '9229') (Js "document.querySelector('#prov-storage').textContent")
+  Audit 'storage'
   Shot 'provision-3c-storage'
   $null = Click '#prov-next'
   $null = Wait "!!document.querySelector('#prov-access')"
   $null = Js "{ const r = document.querySelector('input[name=prov-access][value=public]'); r.checked = true; r.dispatchEvent(new Event('change')); true }"
   $null = Wait "!!document.querySelector('#prov-hostname')"
   Test-Condition 'step 2: public access suggests <app>.<your Cloudflare domain> and the step completes with a valid host name' ((Js "document.querySelector('#prov-hostname').value") -eq 'notes.provtest.example' -and (Step 'proxy').cls -match '\bdone\b') (Js "document.querySelector('#prov-hostname').value")
+  Audit 'routing'
   $null = Js "{ const h = document.querySelector('#prov-hostname'); h.value = 'not a host'; h.dispatchEvent(new Event('input')); h.dispatchEvent(new Event('change')); true }"
   $null = Wait "!document.querySelector('.wizard-steps li[data-step=proxy]').classList.contains('done')"
   Test-Condition 'step 2: an invalid host name makes the step incomplete again (Continue disabled)' ((Js "document.querySelector('#prov-next').disabled") -and -not ((Step 'proxy').cls -match '\bdone\b')) ''
@@ -178,6 +217,7 @@ try {
   $null = Wait "!!document.querySelector('#prov-auth')"
   $authOpts = (Js "Array.from(document.querySelectorAll('input[name=prov-auth]')).map((r) => r.value + (r.disabled ? '(off)' : '')).join(',')")
   Test-Condition "step 3: public offers authentik, Cloudflare Access and the app's own login (never 'no sign-in'); Authelia is shown as not available" ($authOpts -eq 'authentik,cloudflare-access,native,authelia(off)' -and (Js "document.querySelector('input[name=prov-auth]:checked').value") -eq 'authentik') $authOpts
+  Audit 'authentication'
   $null = Js "{ const r = document.querySelector('input[name=prov-auth][value=native]'); r.checked = true; r.dispatchEvent(new Event('change')); true }"
   $null = Wait "!!document.querySelector('#prov-public-native')"
   Test-Condition "step 3: the app's own login on a public address needs an explicit acknowledgement" ((Js "!!document.querySelector('#prov-ack-auth')")) ''
@@ -187,6 +227,7 @@ try {
   $null = Click '#prov-next'
   $ok = Wait "!!document.querySelector('#prov-publish')"
   Test-Condition 'stage 6 (publication): the existing tunnel, changes only at deploy after review, overwrites need their own confirmation; preview on request' ($ok -and (Js "document.querySelector('#prov-publish').textContent") -match 'existing Cloudflare Tunnel' -and (Js "document.querySelector('#prov-publish').textContent") -match 'only when you deploy' -and (Js "!!document.querySelector('#prov-publish-preview')")) (Js "document.querySelector('#prov-publish').textContent")
+  Audit 'publication'
   $null = Click '#prov-next'
   $null = Wait "!!document.querySelector('#prov-plan')"
   $null = Click '#prov-plan'
@@ -194,6 +235,7 @@ try {
   $planCall = Js "JSON.stringify(window.__provmock.calls.filter((c) => c.path === '/api/provision/plan').pop().body)" | ConvertFrom-Json
   Test-Condition 'review: the plan request carries the draft, access, host name, authentication and every acknowledgement' ($ok -and $planCall.access -eq 'public' -and $planCall.auth -eq 'authentik' -and $planCall.hostname -eq 'notes.provtest.example' -and @($planCall.acknowledge).Count -eq 2) ($planCall | ConvertTo-Json -Compress)
   Test-Condition 'review: one summary lists the steps in order, containers, images, volumes, networks, host ports, Traefik, Cloudflare and authentik changes, and AI usage' ([int](Js "document.querySelectorAll('#prov-steps li').length") -eq 6 -and (Js "document.querySelector('#prov-review').textContent") -match 'pgdata' -and (Js "!!document.querySelector('#prov-traefik')") -and [int](Js "document.querySelectorAll('#prov-cloudflare li').length") -eq 2 -and [int](Js "document.querySelectorAll('#prov-authentik li').length") -eq 3 -and (Js "document.querySelector('#prov-review').textContent") -match 'none during deployment') ''
+  Audit 'review'
   Test-Condition 'review: Deploy stays disabled until the review is confirmed, the privilege allowed and the Cloudflare overwrite confirmed' ((Js "document.querySelector('#prov-deploy').disabled") -and (Js "!!document.querySelector('#prov-priv')") -and [int](Js "document.querySelectorAll('.prov-overwrite').length") -eq 1) ''
   $null = Js "['#prov-approve', '#prov-priv'].forEach((s) => { const b = document.querySelector(s); b.checked = true; b.dispatchEvent(new Event('change')); }); true"
   Test-Condition 'review: with the overwrite still unconfirmed, Deploy is still disabled' ((Js "document.querySelector('#prov-deploy').disabled")) ''
@@ -208,6 +250,7 @@ try {
   Test-Condition 'deploy: the result lists each stage and each verification; a stage that was not tested says so (never shown as passed)' ([int](Js "document.querySelectorAll('#prov-stages li').length") -eq 5 -and $notTested -match 'Not tested' -and (Js "document.querySelector('#prov-result-status').textContent") -match '6 check\(s\) passed, 0 failed, 1 not tested' -and (Js "document.querySelector('#prov-url-out').href") -eq 'https://notes.provtest.example/' -and (Step 'review').cls -match '\bdone\b') $notTested
   $states = Js "Array.from(document.querySelectorAll('#prov-progress li')).map((li) => li.dataset.id + '=' + li.dataset.state).join(',')"
   Test-Condition 'stage 8 (verify and manage): the deployment opens here with each component''s state; with an untested check it is not marked verified' ((Step 'verify').cls -match '\bcurrent\b' -and [int](Js "document.querySelectorAll('#prov-progress li').length") -eq 8 -and $states -match 'routed=done' -and $states -match 'verified=pending' -and $states -match 'published=done') $states
+  Audit 'verify'
   Shot 'provision-7-result'
   $null = Click '#prov-rollback'
   $ok = Wait "!!document.querySelector('#prov-rollback-panel')"
@@ -219,6 +262,8 @@ try {
   Start-Sleep -Milliseconds 400
   $overflow = Js "document.documentElement.scrollWidth - document.documentElement.clientWidth"
   Test-Condition 'mobile: the New app page fits a 390 px wide screen (no horizontal page scroll)' ([int]$overflow -le 1) "overflow=$overflow"
+  Audit 'mobile'
+  Test-Condition "accessibility: every stage ($($script:A11yStages -join ', ')) has named controls and buttons, unique ids, no positive tabindex, a stage heading and the current stage exposed" ($script:A11y.Count -eq 0) (($script:A11y | Select-Object -Unique) -join ' | ')
   Shot 'provision-9-mobile'
 } finally {
   if ($cdp) { Stop-EdgeSession $cdp }

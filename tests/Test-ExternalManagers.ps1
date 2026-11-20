@@ -6,7 +6,7 @@
 
 .DESCRIPTION
   Part 1 (pure, mocked transport): endpoint rules, GET-only requests with the right header, Portainer stacks with
-  their containers, Arcane projects (documented agents path and the environments fallback), refused or expired keys,
+  their containers, Arcane projects (/api/environments/{id}/... with pagination; /api/agents fallback), refused or expired keys,
   unreachable servers, ownership confirmed / conflicting / unknown, restarted containers and stacks stopped in the
   manager, and that Docker-only discovery is unchanged without connectors.
   Part 2 (throwaway instance + a loopback mock server speaking the Portainer API): save a connector (the key is
@@ -46,8 +46,15 @@ $mkTransport = { param([hashtable]$Routes, [string]$Key, [string]$Header)
   { param($method, $url, $headers)
     $null = $calls.Add([pscustomobject]@{ Method = $method; Url = $url; Header = [string]$headers[$Header] })
     if ([string]$headers[$Header] -ne $Key) { return [pscustomobject]@{ Status = 401; Body = '{"message":"Unauthorized"}' } }
-    $path = ([Uri]$url).PathAndQuery
+    $u = [Uri]$url; $path = $u.PathAndQuery
     if ($Routes.ContainsKey($path)) { return [pscustomobject]@{ Status = 200; Body = ($Routes[$path] | ConvertTo-Json -Depth 8) } }
+    # Arcane-style paginated lists: ?start=&limit= over @{ paged = items }, at most 10 per page (a server-side cap).
+    $q = @{}; foreach ($kv in $u.Query.TrimStart('?').Split('&')) { if ($kv) { $a = $kv.Split('=', 2); $q[$a[0]] = $(if ($a.Count -gt 1) { $a[1] } else { '' }) } }
+    if ($Routes.ContainsKey($u.AbsolutePath) -and $q.ContainsKey('start')) {
+      $all = @($Routes[$u.AbsolutePath].paged); $st = [int]$q['start']; $lim = [Math]::Min([int]$q['limit'], 10)
+      $slice = @(if ($st -lt $all.Count) { $all[$st..([Math]::Min($all.Count, $st + $lim) - 1)] })
+      return [pscustomobject]@{ Status = 200; Body = ([ordered]@{ success = $true; data = $slice; pagination = [ordered]@{ totalItems = $all.Count; itemsPerPage = $lim; currentPage = [int]($st / [Math]::Max($lim, 1)) + 1 } } | ConvertTo-Json -Depth 8) }
+    }
     return [pscustomobject]@{ Status = 404; Body = '' } }.GetNewClosure() }
 $pc = { param($name, $project, $service, $state, [string[]]$nets) [ordered]@{ Names = @("/$name"); State = $state; Labels = [ordered]@{ 'com.docker.compose.project' = $project; 'com.docker.compose.service' = $service }; NetworkSettings = [ordered]@{ Networks = [ordered]@{ ($nets[0]) = @{}; } } } }
 $portRoutes = @{
@@ -69,21 +76,28 @@ $odd = Get-ManagerSnapshot -Connector $conn -Key 'x' -Transport { param($m, $u, 
 Test-Condition 'portainer: a refused or expired key, an unreachable server and a non-JSON answer are reported (never thrown); the key never appears in messages' (
   -not $bad.ok -and $bad.error -eq 'unauthorized' -and $bad.message -match 'expired' -and -not $down.ok -and $down.error -eq 'unreachable' -and -not $odd.ok -and $odd.error -eq 'error' -and (($bad | ConvertTo-Json -Depth 5) -notmatch 'expired-or-revoked')) "$($bad.error) $($down.error) $($odd.error)"
 
+$emptyPt = Get-ManagerSnapshot -Connector $conn -Key 'ptr_good_key_123' -Transport (& $mkTransport @{ '/api/stacks' = @() } 'ptr_good_key_123' 'X-API-Key')
+Test-Condition 'portainer: no visible stacks is reported with the reason (a non-admin user sees only stacks shared with it; live-checked on 2.45.2)' ($emptyPt.ok -and @($emptyPt.stacks).Count -eq 0 -and $emptyPt.message -match 'shared with it') ($emptyPt | ConvertTo-Json -Depth 4 -Compress)
+
+# Shapes as served by Arcane 2.16.1 (checked against a disposable instance's /api/openapi.json and live answers):
+# paginated { success, data, pagination { totalItems } } lists under /api/environments/{id}/...
+$extra = @(1..14 | ForEach-Object { & $pc "other-$_" "other$_" 'app' 'running' @('bridge') })
 $arcRoutes = @{
-  '/api/environments' = @{ data = @(@{ id = '0'; name = 'Local' }) }
-  '/api/environments/0/projects' = @{ data = @(@{ id = 'p1'; name = 'notes'; status = 'RUNNING'; path = '/app/data/projects/notes' }) }
-  '/api/environments/0/containers' = @{ data = @((& $pc 'notes-web-1' 'notes' 'web' 'running' @('proxy'))) }
+  '/api/environments' = @{ paged = @(@{ id = '0'; name = 'Local Docker' }) }
+  '/api/environments/0/projects' = @{ paged = @(@{ id = 'p1'; name = 'notes'; status = 'running'; path = '/app/data/projects/notes'; gitRepositoryURL = 'https://github.com/example/notes'; isDiscovered = $false }) }
+  '/api/environments/0/containers' = @{ paged = @($extra + @((& $pc 'notes-web-1' 'notes' 'web' 'running' @('proxy')))) }
 }
 $at = & $mkTransport $arcRoutes 'arc_key_456' 'X-Api-Key'
 $aconn = [pscustomobject]@{ id = 'arcane'; kind = 'arcane'; url = 'http://192.168.1.20:3552' }
 $calls.Clear()
 $asnap = Get-ManagerSnapshot -Connector $aconn -Key 'arc_key_456' -Transport $at
-Test-Condition 'arcane: environments, projects (documented agents path first, environments path as fallback) and their containers; only GET with X-Api-Key' (
-  $asnap.ok -and @($asnap.stacks).Count -eq 1 -and $asnap.stacks[0].project -eq 'notes' -and $asnap.stacks[0].status -eq 'running' -and @($asnap.stacks[0].containers).Count -eq 1 -and
-  @($calls | Where-Object { $_.Url -match '/api/agents/0/projects' }).Count -eq 1 -and -not @($calls | Where-Object { $_.Method -ne 'GET' -or $_.Header -ne 'arc_key_456' }).Count) (($calls | ForEach-Object { $_.Url }) -join ', ')
-$arcAgents = @{ '/api/environments' = @{ data = @(@{ id = '0' }) }; '/api/agents/0/projects' = @(@{ name = 'Blog'; status = 'stopped' }); '/api/agents/0/containers' = @() }
+Test-Condition 'arcane: environments, projects and containers on /api/environments/{id}/... (Arcane 2.16), every page of a paginated list read (container on page 2 found), only GET with X-Api-Key' (
+  $asnap.ok -and @($asnap.stacks).Count -eq 1 -and $asnap.stacks[0].project -eq 'notes' -and $asnap.stacks[0].status -eq 'running' -and @($asnap.stacks[0].containers).Count -eq 1 -and $asnap.stacks[0].source -eq 'https://github.com/example/notes' -and
+  @($calls | Where-Object { $_.Url -match '/api/environments/0/containers\?start=10' }).Count -eq 1 -and -not @($calls | Where-Object { $_.Url -match '/api/agents/' }).Count -and
+  -not @($calls | Where-Object { $_.Method -ne 'GET' -or $_.Header -ne 'arc_key_456' }).Count) (($calls | ForEach-Object { $_.Url }) -join ', ')
+$arcAgents = @{ '/api/environments?start=0&limit=200' = @{ data = @(@{ id = '0' }) }; '/api/agents/0/projects?start=0&limit=200' = @(@{ name = 'Blog'; status = 'stopped' }); '/api/agents/0/containers?start=0&limit=200' = @() }
 $asnap2 = Get-ManagerSnapshot -Connector $aconn -Key 'k2-arcane-key' -Transport (& $mkTransport $arcAgents 'k2-arcane-key' 'X-Api-Key')
-Test-Condition 'arcane: plain arrays on the documented /api/agents/{id}/projects path are read too' ($asnap2.ok -and $asnap2.stacks[0].project -eq 'blog' -and $asnap2.stacks[0].status -eq 'stopped') ($asnap2 | ConvertTo-Json -Depth 5 -Compress)
+Test-Condition 'arcane: servers without /api/environments/{id}/projects fall back to /api/agents/{id}/... (plain arrays read too)' ($asnap2.ok -and $asnap2.stacks[0].project -eq 'blog' -and $asnap2.stacks[0].status -eq 'stopped') ($asnap2 | ConvertTo-Json -Depth 5 -Compress)
 
 # --- Part 1c: ownership and drift with API evidence -------------------------------------------------------------------------
 $dockerPortainer = [ordered]@{ id = 'portainer'; label = 'Portainer'; confidence = 'likely'; evidence = @("Compose working folder '/data/compose/3'") }
