@@ -11,8 +11,10 @@
   const head = (eyebrow, title, text, ...actions) => h('div', { class: 'page-head' },
     h('div', null, h('div', { class: 'eyebrow' }, eyebrow), h('h1', null, title), text ? h('p', null, text) : null),
     actions.length ? h('div', { class: 'actions' }, actions) : null);
-  const CATEGORY = { monitoring: 'Monitoring', media: 'Media', management: 'Container management', authentication: 'Sign-in and identity', networking: 'Networking', tools: 'Tools', productivity: 'Productivity', communication: 'Communication', photos: 'Photos', dashboard: 'Dashboard', updates: 'Updates' };
-  const GROUPS = { A: 'Group A: basic management', B: 'Group B: identity', C: 'Group C: media', D: 'Group D: heavy services', E: 'Group E: updates', '': 'Other' };
+  const CATEGORY = { monitoring: 'Monitoring', media: 'Media', management: 'Container management', authentication: 'Sign-in and identity', networking: 'Networking', tools: 'Tools', productivity: 'Productivity', communication: 'Communication', photos: 'Photos', dashboard: 'Dashboard', updates: 'Updates',
+    security: 'Security', passwords: 'Passwords', files: 'Files', development: 'Development', automation: 'Automation', games: 'Games', surveillance: 'Cameras' };
+  const GROUPS = { A: 'A · Docker management, infrastructure and monitoring', B: 'B · Sign-in, passwords and directories', C: 'C · Media and personal libraries', D: 'D · Productivity, files and communication', E: 'E · Cameras and surveillance', '': 'Other' };
+  const STATES = { '': 'Any state', available: 'Available', installed: 'Already installed', managed: 'Managed here', detected: 'Detected on this PC', manual: 'Requires manual setup', unsupported: 'Not supported on this PC' };
   const PRIV = { 'docker-socket': 'Controls Docker', 'host-network': 'Host network', device: 'Hardware devices', gpu: 'GPU', privileged: 'Privileged' };
   const mb = (n) => (n >= 1024 ? `${(n / 1024).toFixed(1)} GB` : `${n} MB`);
   const supportChip = (p) => ({ supported: plainChip('Windows: supported', 'ok'), limited: plainChip('Windows: limited', 'warn'), untested: plainChip('Windows: untested', 'warn') })[p.support] || plainChip('Not on this platform', 'err');
@@ -20,17 +22,21 @@
   async function loadCatalog(ctx) { ctx.state.catalog = await api('GET', '/api/catalog'); return ctx.state.catalog; }
 
   // --- Catalog ---------------------------------------------------------------------------------------------------------
-  const filt = { q: '', cat: '' };
+  const filt = { q: '', cat: '', state: '' };
   P.catalog = async (main, ctx) => {
     fill(main, head('Apps', 'App Catalog', 'Loading…'));
     const cat = await loadCatalog(ctx);
     const gridHost = h('div', { class: 'cat-groups' });
     const q = h('input', { type: 'search', id: 'cat-q', value: filt.q, placeholder: 'Search apps', autocomplete: 'off' });
-    const sel = h('select', { id: 'cat-cat' }, h('option', { value: '' }, 'All categories'), Object.entries(CATEGORY).map(([k, v]) => h('option', { value: k, selected: filt.cat === k }, v)));
+    const used = new Set(arr(cat.apps).map((a) => a.category));
+    const sel = h('select', { id: 'cat-cat' }, h('option', { value: '' }, 'All categories'), Object.entries(CATEGORY).filter(([k]) => used.has(k)).map(([k, v]) => h('option', { value: k, selected: filt.cat === k }, v)));
+    const stSel = h('select', { id: 'cat-state' }, Object.entries(STATES).map(([k, v]) => h('option', { value: k, selected: filt.state === k }, v)));
     q.addEventListener('input', () => { filt.q = q.value.trim().toLowerCase(); draw(); });
     sel.addEventListener('change', () => { filt.cat = sel.value; draw(); });
+    stSel.addEventListener('change', () => { filt.state = stSel.value; draw(); });
     function draw() {
-      const list = arr(cat.apps).filter((a) => (!filt.cat || a.category === filt.cat) && (!filt.q || `${a.name} ${a.description} ${a.category}`.toLowerCase().includes(filt.q)));
+      const list = arr(cat.apps).filter((a) => (!filt.cat || a.category === filt.cat) && L.catalogStatusMatches(a, filt.state)
+        && (!filt.q || `${a.name} ${a.description} ${a.category} ${a.maintainer}`.toLowerCase().includes(filt.q)));
       if (!list.length) { fill(gridHost, h('p', { class: 'empty' }, 'No app matches.')); return; }
       fill(gridHost, Object.keys(GROUPS).map((g) => { const items = list.filter((a) => (a.group || '') === g); return items.length ? h('section', { class: 'cat-group', 'aria-label': GROUPS[g] }, h('h2', null, GROUPS[g]), h('div', { class: 'cat-grid' }, items.map((a) => appCard(a)))) : null; }));
     }
@@ -40,7 +46,7 @@
       head('Apps', 'App Catalog', 'Curated applications, installed as ordinary Docker Compose projects in their own folders. They keep running, and stay yours, without this manager.',
         h('a', { class: 'btn', href: '#apps' }, icon('box'), 'Installed apps')),
       resHost,
-      h('div', { class: 'disc-toolbar' }, field({ id: 'cat-q', label: 'Search', control: q }), field({ id: 'cat-cat', label: 'Category', control: sel })),
+      h('div', { class: 'disc-toolbar' }, field({ id: 'cat-q', label: 'Search', control: q }), field({ id: 'cat-cat', label: 'Category', control: sel }), field({ id: 'cat-state', label: 'Installation state', control: stSel })),
       gridHost,
       referenceSections(cat),
       gate('advanced', h('section', { class: 'card' }, h('h2', null, 'Catalog sources'),
@@ -63,34 +69,83 @@
   function appCard(a) {
     const socket = arr(a.privileges).some((p) => p.kind === 'docker-socket');
     const inst = L.catalogInstallState(a);
+    const st = L.catalogStatus(a);
+    const ver = L.verificationText(a.verification);
+    const detected = arr(a.detected);
     const cg = a.choiceGroup;
-    const canInstall = a.installable && a.platform.installable;
-    return h('article', { class: 'card cat-card', 'aria-label': a.name, 'data-app': a.id, 'data-installed': inst.installed ? 'true' : 'false' },
-      h('div', { class: 'card-head' }, h('span', { class: 'xp-icon' }, brand(a.id, 'box')), h('div', null, h('h2', null, a.name), h('span', { class: 'small muted' }, CATEGORY[a.category] || a.category)),
+    const compat = L.compatSummary(a.compatibility);
+    const canInstall = a.installable && a.platform.installable && compat.tone !== 'err';
+    const auth = L.authFitText(a.authentication);
+    const source = a.source && a.source.url;
+    return h('article', { class: 'card cat-card', 'aria-label': a.name, 'data-app': a.id, 'data-installed': st.installed ? 'true' : 'false', 'data-state': st.key },
+      h('div', { class: 'card-head' }, h('span', { class: 'xp-icon' }, brand(a.id, 'box')), h('div', null, h('h2', null, a.name), h('span', { class: 'small muted' }, `${CATEGORY[a.category] || a.category} · by ${a.maintainer}`)),
         h('span', { class: 'grow' }), cg && cg.recommended ? plainChip('Recommended', 'ok') : null),
       h('p', null, a.description),
       cg && cg.note ? h('p', { class: 'small hint' }, cg.note) : null,
-      h('div', { class: 'chips' }, inst.installed ? plainChip(inst.text, 'ok') : null, a.deprecated ? plainChip('Deprecated', 'err') : null, supportChip(a.platform), plainChip(a.license), arr(a.privileges).filter((p) => p.kind !== 'docker-socket').map((p) => plainChip(PRIV[p.kind] || p.kind, 'warn')), socket ? plainChip('Controls Docker', 'warn') : null,
-        a.resources && a.resources.memoryMB ? plainChip(`~${mb(a.resources.memoryMB)} RAM`) : null),
+      h('div', { class: 'chips' }, h('span', { class: `chip plain ${st.tone}`, 'data-status': st.key }, inst.installed ? inst.text : st.text), a.deprecated ? plainChip('Deprecated', 'err') : null, supportChip(a.platform),
+        a.installable ? h('span', { class: `chip plain ${ver.tone}`, 'data-verified': a.verification ? a.verification.live : 'unknown' }, ver.text) : null,
+        st.manualSteps && a.installable ? plainChip('Setup steps after installing', 'neutral') : null,
+        a.installable ? h('span', { class: `chip plain ${compat.tone}`, title: compat.detail || '', 'data-compat': compat.tone }, compat.text) : null,
+        a.headless ? plainChip('No web interface', 'neutral') : null, plainChip(a.license), arr(a.privileges).filter((p) => p.kind !== 'docker-socket').map((p) => plainChip(PRIV[p.kind] || p.kind, 'warn')), socket ? plainChip('Controls Docker', 'warn') : null,
+        a.resources && a.resources.memoryMB ? plainChip(`~${mb(a.resources.memoryMB)} RAM`) : null, a.installable && a.authentication ? plainChip(auth.text, auth.tone) : null),
+      arr(a.instances).length ? h('ul', { class: 'checks cat-instances' }, a.instances.map((x) => { const acc = L.catalogAccessText(x); return checkItem(acc.tone, `${x.project}${x.label ? ` (${x.label})` : ''}`, acc.text); })) : null,
+      detected.length ? h('ul', { class: 'checks cat-detected', 'aria-label': `${a.name} found on this PC` }, detected.map((x) => checkItem('info', x.standalone ? `${x.container} (container)` : `${x.project} (Compose project)`,
+        `${x.standalone ? 'Started without Docker Compose: inspect and route it; it cannot be adopted.' : 'Not managed here; nothing is changed unless you adopt it.'} ${arr(x.containers).map((c) => `${c.name}: ${c.state}`).join(', ')}`))) : null,
       a.deprecated && a.deprecationNote ? h('p', { class: 'small hint warn' }, a.deprecationNote) : null,
+      detailsBlock(a, compat, source),
       U.gateSpan('advanced', h('p', { class: 'mono small' }, arr(a.services).map((s) => s.image.replace(/@sha256:[0-9a-f]{64}/, '@sha256:…')).join(', ') || (a.imageReference || '').replace(/@sha256:[0-9a-f]{64}/, '@sha256:…'))),
       arr(a.variants).length ? h('details', { class: 'more cat-variants' }, h('summary', null, `Advanced: other ways to install (${a.variants.length})`),
         h('ul', null, a.variants.map((v) => h('li', null, h('strong', null, v.variant ? v.variant.label : v.name), ' ', h('span', { class: 'small muted' }, v.variant ? v.variant.reason : v.description), ' ',
           v.installable && v.platform.installable ? h('a', { href: `#install/${v.id}`, 'aria-label': `Install ${a.name} (${v.variant ? v.variant.label : v.name})` }, 'Install this variant…') : null)))) : null,
       h('div', { class: 'actions' },
         inst.installed ? h('a', { class: 'btn primary', href: `#apps/${encodeURIComponent(a.instances[0].project)}`, 'aria-label': `Manage ${a.name}` }, icon('box'), arr(a.instances).length > 1 ? 'Manage installations' : 'Manage') : null,
-        canInstall ? h('a', { class: `btn${inst.installed ? '' : ' primary'}`, href: `#install/${a.id}`, 'aria-label': `Install ${a.name}` }, icon('download'), inst.installed ? 'Install another…' : 'Install…')
-          : h('p', { class: 'small muted' }, a.installNote || 'Not installable on this platform.'),
+        !inst.installed && detected.some((x) => !x.standalone) ? h('a', { class: 'btn primary', href: '#apps', 'aria-label': `Review and adopt ${a.name}` }, icon('box'), 'Review and adopt…') : null,
+        !inst.installed && detected.length && detected.every((x) => x.standalone) ? h('a', { class: 'btn primary', href: `#publish/${encodeURIComponent(detected[0].container)}`, 'aria-label': `Inspect and route ${a.name}` }, icon('eye'), 'Inspect and route…') : null,
+        canInstall ? h('a', { class: `btn${st.installed ? '' : ' primary'}`, href: `#install/${a.id}`, 'aria-label': `Install ${a.name}` }, icon('download'), st.installed ? 'Install another…' : 'Install…')
+          : null,
+        canInstall && !st.installed && !a.headless && !(a.web && a.web.proxy === false) ? h('button', { type: 'button', class: 'btn ghost', 'aria-label': `Install and publish ${a.name} in one pass`, 'data-provision': a.id, onclick: (e) => withBusy(e.currentTarget, async () => {
+          try { const d = await api('POST', '/api/provision/catalog', { appId: a.id }); location.hash = `#provision/${d.draftId}`; } catch (x) { toast(x.message, true); }
+        }) }, icon('rocket'), 'Install and publish…') : null,
+        canInstall ? null
+          : h('p', { class: 'small muted' }, a.installable && compat.tone === 'err' ? compat.detail : (a.installNote || 'Not installable on this platform.')),
         arr(a.docs)[0] ? h('a', { class: 'btn ghost', href: a.docs[0].url, target: '_blank', rel: 'noopener noreferrer', 'aria-label': `${a.name} documentation` }, 'Docs ', icon('external')) : null));
+  }
+
+  // "View details": everything the catalog knows before installation (publisher, source, images and architectures,
+  // requirements, Compose files, sign-in, host limitations, updates and backups).
+  const COMPONENT = { app: 'compose.yaml (application)', database: 'compose.database.yaml', cache: 'compose.cache.yaml', messaging: 'compose.messaging.yaml', workers: 'compose.workers.yaml', support: 'compose.support.yaml', setup: 'compose.setup.yaml' };
+  function detailsBlock(a, compat, source) {
+    const auth = a.authentication || {};
+    const res = a.resources || {};
+    const vols = arr(a.services).flatMap((s) => arr(s.volumes)).filter((v) => v.kind === 'volume' || v.kind === 'folder');
+    return h('details', { class: 'more cat-details', 'data-details': a.id }, h('summary', null, `Details: ${a.name}`),
+      kv([['Publisher', a.maintainer], ['Licence', a.license],
+        ['Source', source ? h('a', { href: source, target: '_blank', rel: 'noopener noreferrer' }, source.replace(/^https:\/\//, ''), ' ', icon('external')) : '-'],
+        ['Images', h('span', { class: 'mono small' }, arr(a.services).map((s) => `${s.name}: ${L.shortImage(s.image)}`).join('; '))],
+        ['CPU architectures', arr(a.architectures).join(', ') || 'not declared'],
+        ['Compatibility', a.installable ? `${compat.text}${compat.detail ? ` (${compat.detail})` : ''}` : 'Not assessed: not installable from the catalog'],
+        ['Requirements', `about ${mb(res.memoryMB || 0)} memory, ${mb(res.diskMB || 0)} disk${arr(a.dependencies).length ? `; also runs ${a.dependencies.join(', ')}` : ''}`],
+        ['Compose files', arr(a.components).map((c) => COMPONENT[c] || `compose.${c}.yaml`).join(', ') || 'compose.yaml'],
+        ['Data', vols.length ? vols.map((v) => `${v.name} → ${v.target}`).join('; ') : 'none'],
+        ['Sign-in', `${L.authFitText(auth).text}${arr(auth.native).length ? `; built in: ${auth.native.join(', ')}` : ''}`],
+        ['Updates', a.update ? `${a.update.strategy === 'pinned-digest' ? 'Pinned images; nothing updates automatically.' : a.update.strategy}${a.update.notes ? ` ${a.update.notes}` : ''}` : '-'],
+        ['Optional ports', arr(a.optionalPorts).length ? a.optionalPorts.map((p) => `${p.label || `port ${p.container}`}: ${p.protocol.toUpperCase()} ${p.hostPort} (${p.address === 'lan' ? 'this PC and your network' : 'this PC only'}, off unless you choose it)`).join('; ') : 'none'],
+        ['Verification', a.verification ? `${L.verificationText(a.verification).text}${a.verification.notes ? `. ${a.verification.notes}` : ''}` : 'not recorded'],
+        ['After installing', arr(a.postInstall).join('; ') || (a.headless ? 'Configure it in its folder; there is no web interface.' : 'Open it and finish its own setup.')]]),
+      arr(a.manualSetup).length ? [h('p', { class: 'small' }, h('strong', null, 'Manual setup')), h('ol', { class: 'small cat-manual' }, a.manualSetup.map((n) => h('li', null, n)))] : null,
+      arr(auth.notes).length ? h('ul', { class: 'small' }, auth.notes.map((n) => h('li', null, n))) : null,
+      arr(a.limitations).length ? [h('p', { class: 'small' }, h('strong', null, 'Known limitations on this host')), h('ul', { class: 'small cat-limits' }, a.limitations.map((n) => h('li', null, n)))] : null,
+      arr(a.docs).length ? h('ul', { class: 'xp-docs' }, a.docs.map((d) => h('li', null, h('a', { href: d.url, target: '_blank', rel: 'noopener noreferrer' }, d.title, ' ', icon('external'))))) : null);
   }
 
   // Building blocks bundled inside other apps, and entries no longer offered (explained, never installable).
   function referenceSections(cat) {
     return [arr(cat.reference).length ? h('details', { class: 'more card', id: 'cat-reference' }, h('summary', null, `Building blocks, not installed on their own (${cat.reference.length})`),
       h('ul', null, cat.reference.map((r) => h('li', { class: 'small' }, h('strong', null, r.name), `: ${r.note || r.description}`)))) : null,
-    arr(cat.retired).length ? gate('advanced', h('details', { class: 'more card', id: 'cat-retired' }, h('summary', null, `No longer offered (${cat.retired.length})`),
+    // Retired entries (e.g. Watchtower) are not part of the catalog; they are named only while an installation exists.
+    arr(cat.retired).some((r) => r.installed) ? gate('advanced', h('details', { class: 'more card', id: 'cat-retired' }, h('summary', null, `No longer offered (${cat.retired.length})`),
       h('p', { class: 'small muted' }, 'Removed from new installations. Existing installations keep running, are still recognized, and are never removed by this change.'),
-      h('ul', null, cat.retired.map((r) => h('li', { class: 'small' }, h('strong', null, r.name), `: ${r.note}`, arr(r.replacement).length ? ` Instead: ${r.replacement.map((x) => (arr(cat.apps).find((ap) => ap.id === x) || { name: x }).name).join(', ')}.` : ''))))) : null];
+      h('ul', null, cat.retired.filter((r) => r.installed).map((r) => h('li', { class: 'small' }, h('strong', null, r.name), `: ${r.note}`, arr(r.replacement).length ? ` Instead: ${r.replacement.map((x) => (arr(cat.apps).find((ap) => ap.id === x) || { name: x }).name).join(', ')}.` : ''))))) : null];
   }
 
   // --- Installation wizard -------------------------------------------------------------------------------------------------
@@ -150,7 +205,7 @@
     }) }, icon('eye'), f.plan ? 'Preview again' : 'Preview the Compose project');
     deploy.addEventListener('click', () => withBusy(deploy, async () => {
       const ok = await U.confirmDialog({ title: `${f.prepareOnly ? 'Prepare' : 'Deploy'} ${a.name}`, okText: f.prepareOnly ? 'Prepare' : 'Deploy',
-        body: [f.prepareOnly ? `Creates ${f.plan.folder} (compose.yaml, .env, README.md). Nothing is downloaded or started until you press Start on the Installed apps page.` : `Creates ${f.plan.folder} (compose.yaml, .env, README.md) and runs docker compose up -d. Images are downloaded first; this can take several minutes.`,
+        body: [f.prepareOnly ? `Creates ${f.plan.folder} (${arr(f.plan.composeFiles).map((x) => x.file).join(', ') || 'compose.yaml'}, .env, README.md, dtc-stack.json). Nothing is downloaded or started until you press Start on the Installed apps page.` : `Creates ${f.plan.folder} (${arr(f.plan.composeFiles).map((x) => x.file).join(', ') || 'compose.yaml'}, .env, README.md, dtc-stack.json) and runs docker compose up -d. Images are downloaded first; this can take several minutes.`,
           'Nothing is published until you choose to in the last step.'] });
       if (!ok) return;
       f.progress = true; rerender();
@@ -177,9 +232,12 @@
         step(3, 'Storage', h('ul', { class: 'checks' }, arr(a.services).flatMap((sv) => sv.volumes).filter((v) => v.kind !== 'folder').sort((x, y) => (y.description ? 1 : 0) - (x.description ? 1 : 0)).filter((v, i, all) => all.findIndex((o) => o.name === v.name) === i).map((v) => checkItem('neutral', `${f.project}_${v.name} → ${v.target}`, `${v.description} Docker volume: kept across updates, restarts and removal unless you delete it.`))),
           folderInputs.map(inputField),
           arr(a.services).every((sv) => !sv.volumes.length) ? h('p', { class: 'muted small' }, 'This app stores no data.') : null),
-        step(4, 'Networking', h('p', null, `Joins the shared network '${net}', so Traefik can reach it as `, h('code', null, `http://${container}:${webPort}`), '. It is not reachable from the Internet or your LAN until you publish it (step 11).'),
+        step(4, 'Networking', a.headless ? h('p', { id: 'inst-headless' }, 'No web interface: it runs on its own private network only. Nothing is published, and there is nothing to route.')
+          : [a.web && a.web.proxy === false ? h('p', null, 'Stays off the shared proxy network: its own private network only, opened on this PC (127.0.0.1).')
+            : h('p', null, `Joins the shared network '${net}', so Traefik can reach it as `, h('code', null, `http://${container}:${webPort}`), '. It is not reachable from the Internet or your LAN until you publish it (step 11).'),
+          arr(a.components).length > 1 ? h('p', { class: 'small muted' }, `Databases, caches and other dependencies stay on the app's private network (${arr(a.components).filter((c) => c !== 'app').join(', ')}).`) : null,
           h('label', { class: 'check' }, localBox, h('span', null, 'Also open it on this PC (127.0.0.1 only)')),
-          f.local ? field({ id: 'inst-port', label: 'Local port', control: localPort, hint: `http://127.0.0.1:${f.localPort || '?'}/` }) : null),
+          f.local ? field({ id: 'inst-port', label: 'Local port', control: localPort, hint: `http://127.0.0.1:${f.localPort || '?'}/` }) : null]),
         step(5, 'Settings and secrets', field({ id: 'inst-tz', label: 'Time zone', control: tz, hint: 'IANA name, e.g. Europe/Berlin.' }), boolInputs.map(boolField), otherInputs.map(inputField),
           generated.length ? h('ul', { class: 'checks' }, generated.map((g) => checkItem('ok', g.label, 'Generated on this PC and stored only in the app\'s .env (readable by your Windows account only). Never shown here.'))) : null),
         step(6, 'Dependencies and privileges',
@@ -187,7 +245,9 @@
           arr(a.dependencies).length ? h('p', null, `Also runs: ${a.dependencies.join(', ')}`) : null,
           arr(a.security).length ? h('ul', null, a.security.map((x) => h('li', { class: 'small' }, x))) : null),
         step(7, 'Preview the Compose project', h('div', { class: 'actions' }, preview), err,
-          plan && plan.compose ? [technical(plan.compose.split('\n'), 'compose.yaml'), technical(plan.envPreview.split('\n'), '.env (secrets masked)'),
+          plan && plan.compose ? [arr(plan.composeFiles).length > 1 ? h('p', { class: 'small', id: 'inst-modular' }, `One Compose project in ${plan.composeFiles.length} files: ${plan.composeFiles.map((x) => `${x.file} (${x.services.join(', ')})`).join('; ')}.`) : null,
+            (arr(plan.composeFiles).length ? plan.composeFiles : [{ file: 'compose.yaml', content: plan.compose }]).map((x) => technical(String(x.content).split('\n'), x.file)),
+            technical(plan.envPreview.split('\n'), '.env (secrets masked)'), plan.stack ? technical(JSON.stringify(plan.stack, null, 2).split('\n'), 'dtc-stack.json (no secrets)') : null,
             arr(plan.files).map((x) => technical(String(x.content).split('\n'), `${x.path} (written once; your later edits are kept)`))] : null),
         step(8, 'Validation', plan ? [h('ul', { class: 'checks' }, arr(plan.checks).map((c) => checkItem(stateTone(c.state), c.label, c.message))),
           arr(plan.existingVolumes).length ? h('label', { class: 'check' }, (() => { const b = h('input', { type: 'checkbox', checked: !!f.reuseData }); b.addEventListener('change', () => { f.reuseData = b.checked; f.plan = null; rerender(); }); return b; })(), h('span', null, `Reuse the data in ${plan.existingVolumes.join(', ')} (then preview again)`)) : null] : h('p', { class: 'muted' }, 'Runs with the preview: folder, project name, volumes, ports, network, settings and docker compose config.')),
@@ -197,11 +257,13 @@
           res.credentialsFile ? h('p', { class: 'hint' }, 'Sign-in details: ', h('code', null, res.credentialsFile), ' (readable by your Windows account only).') : null,
           res.localUrl && !res.prepared ? h('p', null, h('a', { href: res.localUrl, target: '_blank', rel: 'noopener noreferrer' }, `Open ${a.name} on this PC `, icon('external'))) : null,
           health ? h('ul', { class: 'checks' }, checkItem(health.running ? 'ok' : 'err', 'Container running', arr(health.containers).map((c) => `${c.name}: ${c.status}`).join(', ')),
-            health.http ? checkItem(health.http.result === 'http' || health.http.result === 'https' ? 'ok' : 'warn', 'Web interface answers', health.http.detail) : checkItem('neutral', 'Web interface answers', 'Not checked.')) : null,
+            health.http && health.http.result === 'not-applicable' ? checkItem('neutral', 'No web interface', health.http.detail)
+              : health.http ? checkItem(health.http.result === 'http' || health.http.result === 'https' ? 'ok' : 'warn', 'Web interface answers', health.http.detail) : checkItem('neutral', 'Web interface answers', 'Not checked.')) : null,
           gate('expert', res.output ? technical(res.output.split('\n'), 'docker compose output') : null)] : h('p', { class: 'muted' }, 'Checked right after deploying.')),
         step(11, 'Publish (optional)', res && res.ok ? [
           exposureWarn ? h('div', { class: 'callout warn' }, h('p', null, exposureWarn)) : null,
-          a.id === 'authentik' ? h('div', { class: 'actions' }, h('a', { class: 'btn primary', href: '#identity' }, icon('lock'), 'Continue in Identity & Access…'), h('a', { class: 'btn', href: '#apps' }, 'Installed apps'))
+          a.headless ? h('div', { class: 'actions' }, h('p', { class: 'small muted' }, 'Nothing to publish: this app has no web interface.'), h('a', { class: 'btn', href: '#apps' }, 'Installed apps'))
+          : a.id === 'authentik' ? h('div', { class: 'actions' }, h('a', { class: 'btn primary', href: '#identity' }, icon('lock'), 'Continue in Identity & Access…'), h('a', { class: 'btn', href: '#apps' }, 'Installed apps'))
             : h('div', { class: 'actions' }, h('a', { class: 'btn primary', href: `#publish/${encodeURIComponent(res.container)}` }, icon('globe'), 'Publish through Traefik…'), h('a', { class: 'btn', href: '#apps' }, 'Installed apps'))] : h('p', { class: 'muted' }, 'After deploying: publish it with a hostname, behind Cloudflare Access by default, or keep it private.'))));
   }
 })();

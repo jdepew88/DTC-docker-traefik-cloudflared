@@ -4,7 +4,7 @@
   "id": "immich",
   "name": "Immich",
   "category": "photos",
-  "group": "D",
+  "group": "C",
   "description": "Self-hosted photo and video library with mobile backup, faces and smart search. Server, machine learning (optional), Valkey and its own PostgreSQL with vector extensions (immich-db).",
   "maintainer": "Immich contributors",
   "license": "AGPL-3.0",
@@ -32,6 +32,10 @@
     "unraid": "untested",
     "podman": "untested"
   },
+  "architectures": [
+    "amd64",
+    "arm64"
+  ],
   "installable": true,
   "services": {
     "immich-server": {
@@ -170,6 +174,21 @@
     "The database stays in a Docker volume: Immich's database does not work on NTFS.",
     "Create the administrator right after the first start."
   ],
+  "authentication": {
+    "forwardAuth": "caution",
+    "native": [
+      "local",
+      "oidc"
+    ],
+    "notes": [
+      "The mobile apps use the API with their own login; ForwardAuth blocks them. Prefer Immich's own OAuth/OIDC sign-in with authentik."
+    ]
+  },
+  "limitations": [
+    "The PostgreSQL database must be on a Docker volume (not a Windows folder) on Docker Desktop.",
+    "Machine learning runs on the CPU (no CUDA/OpenVINO variant is offered here) and needs about 2 GB of extra memory.",
+    "6-8 GB of free memory recommended with machine learning enabled."
+  ],
   "update": {
     "strategy": "pinned-digest",
     "notes": "Always read the release notes: Immich releases can require database migrations. The database image is changed only together with a catalog update."
@@ -185,5 +204,11 @@
   "resources": {
     "memoryMB": 5050,
     "diskMB": 5860
+  },
+  "testStatus": {
+    "static": "passed",
+    "live": "passed",
+    "date": "2026-11-17",
+    "notes": "Installed in isolation with machine learning off (server, database, Valkey): /api/server/ping, network isolation, modular stack, stop/start, Traefik file route, backup and restore, removal with data. The machine-learning service (about 2.5 GB more) was not started."
   }
 }

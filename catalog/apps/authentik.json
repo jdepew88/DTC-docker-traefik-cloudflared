@@ -40,6 +40,10 @@
     "unraid": "untested",
     "podman": "untested"
   },
+  "architectures": [
+    "amd64",
+    "arm64"
+  ],
   "installable": true,
   "services": {
     "server": {
@@ -227,6 +231,20 @@
     "The Docker socket mount from the official file is left out: the embedded outpost (part of the server) handles Traefik ForwardAuth, so no outpost container has to be deployed. The worker still runs as root like upstream for its file permissions.",
     "PostgreSQL stays on the app's private network; only the server joins the shared proxy network. Google sign-in is configured from Identity & Access; the Google OAuth client itself must be created in Google Cloud by hand (Google offers no API for it)."
   ],
+  "authentication": {
+    "forwardAuth": "not-applicable",
+    "native": [
+      "local",
+      "oauth-sources",
+      "oidc-provider",
+      "saml-provider",
+      "ldap-outpost"
+    ],
+    "notes": [
+      "Installed and managed through Identity & Access; its own sign-in pages are never protected by itself."
+    ]
+  },
+  "limitations": [],
   "update": {
     "strategy": "pinned-digest",
     "notes": "Upgrade one minor version at a time and read the release notes; PostgreSQL major upgrades need authentik's documented dump/restore procedure."
@@ -243,5 +261,11 @@
   "resources": {
     "memoryMB": 1550,
     "diskMB": 1200
+  },
+  "testStatus": {
+    "static": "passed",
+    "live": "passed",
+    "date": "2026-11-19",
+    "notes": "Installed from the catalog on disposable deployments by tests\\Test-IdentityLive.ps1: install, readiness, private database, bootstrap token, Google source setup, ForwardAuth protection and sign-ins, re-protection, rollback, restart persistence, browser pages, teardown (full run 127 passed; -BrowserOnly 82 passed). -UniversalOnly: ForwardAuth on an imported and an externally owned application (21 checks passed). -RecoveryOnly: backup (pg_dump, database volume, .env, data / certs / templates), loss of the volume, media and .env, restore with users, groups, providers, rules, policies, source secret and protected access intact, rollback of a corrupted backup (45 passed). See docs/authentik-recovery.md."
   }
 }

@@ -4,7 +4,7 @@
   "id": "whats-up-docker",
   "name": "What's Up Docker",
   "category": "updates",
-  "group": "E",
+  "group": "A",
   "description": "Notifies you when newer images exist for your containers, with a web interface. Installed notification-only: it never updates anything, and it reads Docker through a read-only socket proxy.",
   "maintainer": "getwud",
   "license": "MIT",
@@ -28,7 +28,16 @@
     "unraid": "untested",
     "podman": "untested"
   },
+  "architectures": [
+    "amd64",
+    "arm64"
+  ],
   "installable": true,
+  "choiceGroup": {
+    "id": "update-notifications",
+    "recommended": true,
+    "note": "Recommended: update notifications with a web interface. Diun is the headless alternative; one of the two is enough. Neither updates anything."
+  },
   "services": {
     "app": {
       "image": "getwud/wud:9.5.0@sha256:2dcc930828ce983b1c3b0373e3ca8ee67759835e4a7eb2f78af9ada45eb1a1f9",
@@ -115,6 +124,19 @@
     "No update trigger is configured, so it only notifies; updates are still applied here with a backup and your confirmation.",
     "Notifications (ntfy, mail, Discord, ...) are configured with WUD_TRIGGER_* variables in .env; see its documentation."
   ],
+  "authentication": {
+    "forwardAuth": "compatible",
+    "native": [
+      "basic",
+      "oidc"
+    ],
+    "notes": [
+      "Browser-only; its API is used by its own UI. It also has basic and OIDC authentication."
+    ]
+  },
+  "limitations": [
+    "Reads Docker through a read-only socket proxy; it reports updates but never applies them here."
+  ],
   "update": {
     "strategy": "pinned-digest",
     "notes": ""
@@ -133,5 +155,11 @@
   "resources": {
     "memoryMB": 190,
     "diskMB": 270
+  },
+  "testStatus": {
+    "static": "passed",
+    "live": "passed",
+    "date": "2026-11-17",
+    "notes": "Installed in isolation: health, its web interface, network isolation, stack on disk, stop/start, Traefik file route, backup and restore, removal with data."
   }
 }

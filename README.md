@@ -44,6 +44,17 @@ traefik --socket-internal (internal)--> socket-proxy --> docker.sock (read-only,
 Double-clicking `START-HERE.cmd` again while the manager runs offers to open it again instead of starting a second
 copy. If port 8190 is taken, the next free port is used. No administrator rights are needed.
 
+### One click, no window: the DTC launcher (optional)
+
+Double-click **`Setup-Launcher.cmd`** once. It creates a **DTC Deployment Manager** shortcut on the desktop and in the
+Start menu, plus **DTC - Choose deployment** and **DTC - Recovery mode**. The shortcut starts the manager in the
+background with a **system-tray icon**: no PowerShell window, and it opens your **default deployment** without asking.
+The tray menu offers Open Dashboard, Choose Deployment, Restart Manager and Exit.
+
+Run `Setup-Launcher.cmd -Autostart` (or use the tray menu or the Deployments page) to turn on **Start with Windows**.
+DTC then starts silently when you sign in: it waits for Docker Desktop and opens no browser. Once you have opened the
+dashboard from the tray, a bookmark to `http://127.0.0.1:8190/` keeps working. See [docs/launcher.md](docs/launcher.md).
+
 ### Reopening an existing deployment (for example `traefik-ext1`)
 
 Start the manager with `START-HERE.cmd`; under *Continue where you left off* select the deployment (or *Open another
@@ -86,12 +97,15 @@ never changed.
 | Portable backups (.json / .zip export, import with preview, two-part restore, recovery points) | **Implemented and tested** against the mock (round trip, version compatibility, credential exclusion, idempotency) and live in an isolated instance (local restore). |
 | Traefik dashboard bootstrap (public `/dashboard/` behind Cloudflare Access, fail closed) | **Implemented**; routing **live-tested** in an isolated instance, Cloudflare steps mock-tested. Not yet run against a real Access application. |
 | Deployment review (prepared / validated / applied / verified / action required, technical output) | **Implemented** for the installation, restores and the dashboard. |
-| App Catalog: 21 entries in installation groups A-E (Traefik Manager, Uptime Kuma, Portainer, Homepage, Arcane, HTTP echo; authentik + PostgreSQL, Authelia, LLDAP; Jellyfin, Dispatcharr, Channels DVR; Immich, Rocket.Chat; What's Up Docker; listed: OpenLDAP; building blocks: PostgreSQL, Redis/Valkey; no longer offered: Diun, Watchtower), each an ordinary Compose project in its own folder with pinned images, private networks for databases, generated secrets and credentials, resource checks, prepare-only, first-start steps, backups, backup-first updates and data-keeping removal. See [docs/app-catalog.md](docs/app-catalog.md) | **Implemented and tested** (all templates validated with `docker compose config`; lifecycle with fixture apps on a disposable instance; Group A installed for real next to an existing deployment). |
+| App Catalog: 36 entries in groups A-E: **A** Traefik Manager, Uptime Kuma, Portainer, Homepage, Arcane, Dozzle, What's Up Docker, Diun (headless), CrowdSec (detection only), Pi-hole, HTTP echo; **B** authentik + PostgreSQL, Authelia, LLDAP, OpenLDAP, Vaultwarden; **C** Plex, Jellyfin, Immich, Dispatcharr, Channels DVR, MediaFusion, RomM; **D** Nextcloud, Paperless-ngx, File Browser (deprecated upstream), Rocket.Chat, Gitea, n8n, Mealie, HFS; **E** Shinobi (listed, manual setup); building blocks PostgreSQL, Redis/Valkey; not offered: Watchtower (Prowlarr, Sonarr and Radarr are not part of the catalog). Each installed app is its own Compose project in its own folder: **modular stacks** (one small Compose file per component; `dtc-stack.json` describes it without secrets), pinned images, private networks for databases, generated secrets and credentials, host compatibility, opt-in extra ports (Git over SSH, DNS, direct Plex access), resource checks, prepare-only, first-start steps, backups, **restore and update rollback**, interrupted-installation recovery, per-app **stack, routing and diagnostics** view, backup-first updates and data-keeping removal. Existing installations on the PC (managed, hand-made Compose projects, plain containers, other builds such as LinuxServer.io Plex) are shown on each card and offered for adoption or inspection instead of a second installation. See [docs/app-catalog.md](docs/app-catalog.md) and the inventory in [docs/catalog-inventory.md](docs/catalog-inventory.md) | **Implemented and tested** (all 32 installable templates validated with `docker compose config` as file sets and routes; lifecycle with fixture apps on a disposable instance; real isolated installations of the apps marked *live-tested* in the inventory; the others are statically validated only). |
 | Docker discovery and publishing: Services offers *Discover running containers*, *Install a new application* (App Catalog, next milestone) and *Enter an HTTP backend manually*; containers with networks, ports (likely HTTP / not HTTP / never publish), health and existing routes; port test in a short-lived probe container; wizard (name → port → hostname suggested and checked against every existing definition → reachability: shared network, confirmed attach, or published port → who can reach it → preview); one owner per hostname; per-service request-path health (DNS, Access, tunnel, router, service, backend, HTTP, optional public URL) that marks every check it did not perform | **Implemented and tested** (unit, a disposable instance with throwaway containers, browser); read-only compatibility checks against a real installation. |
 | Infrastructure Explorer: the request path (browser → DNS → Cloudflare → Access → tunnel → cloudflared → Traefik router → middleware → service → Docker network → app) with six separate states per component (detected, configured, running, reachable, authenticated, verified), tools shown apart from the path, small diagram and quick actions on the Overview | **Implemented and tested** (model unit tests, a disposable running instance, browser at three widths and four levels). Read-only. |
 | One-click launcher (`START-HERE.cmd`) and existing-deployment discovery / attach | **Implemented and tested** (launcher, discovery, attach without changes, recent projects, upgrade preview/apply on test folders, browser); discovery and read-only Cloudflare verification also run against a real installation. |
+| DTC tray launcher (`Setup-Launcher.cmd`, `launcher\DTC.exe`): no console window, tray menu, start modes default / choose / recovery, default deployment, Start with Windows (per-user Startup folder, waits for Docker Desktop), remembered browsers for a bookmarked address, logs | **Implemented and tested** in isolated folders (`tests\Test-Launcher.ps1`: real DTC.exe and tray, setup, all modes, port conflict, duplicate start, failures, the Deployments page in headless Edge). **Not done on this PC:** the setup was not run against your real desktop, Start menu and Startup folder, and the container-unchanged checks were skipped while Docker Desktop was stopped. |
 | Redesigned web UI: seven-step journey, four detail levels, review states, topology, operational pages, learning catalog | **Implemented and browser-tested** in headless Edge (desktop, tablet and phone widths, keyboard and accessible-name checks), including an installation of a disposable instance through the UI. The tunnel path through the UI has only run against the Cloudflare API mock. |
 | Identity & Access (optional): authentik installed from the catalog with a bootstrap administrator and API token, or an existing installation adopted; its sign-in hostname routed through the existing Traefik and tunnel; guided Google sign-in (Google offers no API for OAuth clients) with automatic authentik configuration (Google source, restricted sign-up, login button); an initial owner (owner-only enrollment and access group), then "protect selected applications" with per-application ForwardAuth (embedded outpost); afterwards users and access are managed in authentik only; resumable setup, health states that are only "verified" from real sign-in evidence; Explorer hop. See [docs/identity.md](docs/identity.md) | **Implemented and tested** against a disposable authentik 2026.8.5 (catalog install, API configuration, sign-ins with local test users through the real outpost and Traefik, fail closed, rollback, browser) with **synthetic** Google credentials. A real Google sign-in and the real Cloudflare publication of the sign-in hostname have **not** been run (they need your accounts). |
+| New app (universal provisioning): paste a Docker Hub, GitHub, Compose-file, Unraid template (XML) or awesome-selfhosted link; the manager builds a normalized manifest (images pinned by digest, dependencies, generated secrets, open questions instead of guesses), reviews it for security and host compatibility, and deploys it in one approved operation: Compose project (App Catalog installer) -> explicit Traefik route -> authentik protection through the identity contract -> Cloudflare publication through the existing tunnel -> stage-by-stage verification, with a journal and rollback of only what it created. Optional AI completion (your own Anthropic API key; per-request estimate and approval, limits, cache, redaction). Local installation recipes with sanitized export. See [docs/provisioning.md](docs/provisioning.md) | **Implemented and tested on Windows + Docker Desktop** (sources through fixtures and read-only checks against Docker Hub, GitHub, GHCR and an Unraid template; a real disposable two-service deployment with verification and rollback; authentik contract against an in-memory authentik; AI with a mocked provider). **Not run:** a real AI request, a real public Cloudflare publication and authentik protection of a provisioned app (they need your accounts or approval); other host platforms are designed, not tested. |
+| Applications (universal application engine): one model for every application: DTC Managed (installed or adopted), DTC Integrated (another tool such as Arcane, Portainer or plain Compose owns the containers; DTC owns only the route, sign-in and publication it creates) and DTC Observed (monitored only). Management tool detection with evidence, recipe trust separate from installation success, pasted Compose (main file + overrides) and Unraid templates, drift detection (containers, networks, ports, routes, middleware, protection, ownership, volumes) with previewable repairs of DTC-owned routes only. See [docs/universal-apps.md](docs/universal-apps.md) | **Implemented and tested on Windows + Docker Desktop** (unit and API tests; live proofs on a disposable deployment: an application not in the catalog imported from its upstream Compose example, and an externally owned Compose project integrated, drifted and repaired). authentik ForwardAuth on an imported and on an externally owned application verified live against a disposable authentik (`Test-IdentityLive.ps1 -UniversalOnly`). Optional read-only Portainer / Arcane connectors (mock-tested and live-verified on disposable Portainer CE 2.45.2 and Arcane 2.16.1; not against your own instances). |
 
 ## Requirements
 
@@ -120,6 +134,8 @@ Everything the website does is also available from PowerShell.
 ```powershell
 .\Start-DeploymentManager.ps1                  # what START-HERE.cmd runs; -Status, -Stop, -Restart, -Port, -InstallPath
 .\Start-DeploymentManager.ps1 -InstallPath D:\proxy   # open one deployment directly (skips the chooser)
+.\Start-DeploymentManager.ps1 -StartMode default    # open the saved default deployment (choose / recovery: see docs\launcher.md)
+.\launcher\Install-Launcher.ps1 -Autostart          # what Setup-Launcher.cmd runs: DTC.exe, shortcuts, default, Start with Windows
 ```
 
 ```powershell
@@ -549,6 +565,21 @@ container on this PC already uses.
                                         # responsive layout (390/820/1366 px), keyboard and accessible names
 .\tests\Test-Explorer.ps1               # Infrastructure Explorer: model (fixture facts), a disposable running instance, browser;
                                         # -LiveReadOnly also checks %USERPROFILE%\.docker\projects\traefik-proxy read-only
+.\tests\Test-Provisioning.ps1           # New app: sources (fixtures), manifests, security review, identity contract (in-memory authentik),
+                                        # AI (mocked), recipes, API, one disposable deployment + rollback (-SkipDocker: no containers)
+.\tests\Test-ProvisionBrowser.ps1       # New app page in headless Edge (in-page API stand-in)
+.\tests\Test-AppContract.ps1           # Universal application contract: ownership modes, authority, trust, registry migration,
+                                        # drift and repairs, pasted Compose/Unraid imports, route ownership, API (no containers)
+.\tests\Test-UniversalApps.ps1         # Live proofs: an imported app (upstream Compose, needs the internet) installed, routed,
+                                        # backed up, restored, removed; an app owned by another tool integrated, drift repaired
+.\tests\Test-ApplicationsBrowser.ps1    # Applications page and pasted Compose/Unraid inputs in headless Edge (in-page API stand-in)
+.\tests\Test-ExternalManagers.ps1      # optional Portainer / Arcane connectors: mocked APIs, a loopback mock server, key handling
+.\tests\Test-ManagerConnectorsLive.ps1 # the connectors against disposable Portainer CE / Arcane containers (stacks made through their APIs)
+.\tests\Test-UpgradePreflight.ps1     # upgrade rehearsal on a COPY of a deployment: install.ps1 + opening the manager, Docker read-only
+.\tests\Test-IdentityLive.ps1 -UniversalOnly   # authentik ForwardAuth on an imported and an externally owned application
+.\tests\Test-IdentityLive.ps1 -RecoveryOnly    # authentik backup, disaster (volume, media, .env lost), restore, failed restore
+.\tests\Test-CatalogInstall.ps1 -Apps echo,diun,uptime-kuma -Cloudflare   # real catalog apps, one at a time, on a disposable deployment
+.\tests\Find-TestOrphans.ps1 [-Remove]  # leftovers of interrupted test runs (only tpx-/tpm- test prefixes)
 .\tests\Test-Catalog.ps1                # App Catalog: manifests, templates, Compose generation, install, lifecycle, update,
                                         # removal and data retention, browser; fixture apps only (no image downloads)
 .\tests\Test-Discovery.ps1              # Docker discovery, port probes, hostname claims, publishing (network / published port),
@@ -564,6 +595,8 @@ container on this PC already uses.
                                         # browser test of "How should Traefik connect to this application?" against an
                                         # installed instance, read-only (never applies; fails if routes, registry,
                                         # tunnel config, containers or networks change); -ScreenshotDir saves screenshots
+.\tests\Test-Launcher.ps1               # DTC tray launcher: settings, start modes, remembered browsers, autostart, setup, real DTC.exe + tray,
+                                        # port conflict, duplicate start, failures, Deployments page (isolated folders; -SkipTray, -SkipBrowser)
 .\tests\Test-Projects.ps1               # launcher (single-use link, duplicate start, ports, stop, START-HERE.cmd), discovery,
                                         # attach without changes, recent projects, upgrade preview/apply, browser;
                                         # -LiveReadOnly also inspects %USERPROFILE%\.docker\projects\traefik-proxy read-only
@@ -572,6 +605,7 @@ container on this PC already uses.
 .\tests\Test-IdentityLive.ps1 -ScreenshotDir .\screens   # disposable instance + authentik from the catalog: adopt, token,
                                         # sign-in route, outpost, Google source (synthetic credentials), protect/unprotect,
                                         # allowed/denied sign-ins through the real outpost, fail closed, rollback, browser
+.\tests\Test-IdentityLive.ps1 -BrowserOnly    # only the setup the browser checks need, then the identity pages in Edge
 node .\tests\ui-logic.test.js           # developer-only unit tests of webui\logic.js (Node is not needed to run the tool)
 .\tests\Invoke-UiPreview.ps1            # developer tool: quick screenshots of pages at chosen levels and widths
 .\tests\Invoke-IsolatedTest.ps1         # (repository only) disposable second instance: install, live tests,
@@ -677,3 +711,14 @@ routes from the old `traefik\dynamic\` folder can be copied over as-is, or re-cr
   content restrictions for video streaming.
 - One backend server per service (no load balancing across several servers) and IPv4 targets only.
 - Tested on one Windows 11 machine with Docker Desktop 29.8.2 and Windows PowerShell 5.1.
+- Applications: imported or integrated applications are not guaranteed to work just because their Compose file
+  validates; each is "unverified" until its deployment's stages pass. Management tools are recognized from Docker
+  labels and folders (heuristics shown with their evidence), or through optional read-only Portainer / Arcane
+  connectors (live-verified on disposable Portainer CE 2.45.2 and Arcane 2.16.1; a Portainer CE token cannot be
+  restricted to read-only). See [docs/universal-apps.md](docs/universal-apps.md).
+- Credentials are encrypted for one Windows account (DPAPI) and never exported: after a move to another user or PC
+  they are entered again; Linux is not supported yet. See [docs/credential-portability.md](docs/credential-portability.md).
+- Release status and the production upgrade/rollback procedure: [docs/release-readiness.md](docs/release-readiness.md),
+  [docs/production-upgrade.md](docs/production-upgrade.md).
+- authentik backup and restore: verified on a disposable authentik only; see
+  [docs/authentik-recovery.md](docs/authentik-recovery.md) for what is backed up and the disaster-recovery steps.

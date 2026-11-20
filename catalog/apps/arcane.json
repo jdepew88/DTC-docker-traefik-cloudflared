@@ -27,6 +27,12 @@
     "unraid": "untested",
     "podman": "untested"
   },
+  "architectures": [
+    "amd64",
+    "arm64",
+    "arm/v7",
+    "riscv64"
+  ],
   "installable": true,
   "services": {
     "app": {
@@ -93,6 +99,20 @@
     "Change the default administrator password on first sign-in (see Arcane's documentation).",
     "Never publish it without Cloudflare Access in front of its own login."
   ],
+  "authentication": {
+    "forwardAuth": "compatible",
+    "native": [
+      "local",
+      "oidc"
+    ],
+    "notes": [
+      "Browser-only administration: ForwardAuth adds a second sign-in in front of its own.",
+      "Controls Docker: keep it local or behind authentication; never public without it."
+    ]
+  },
+  "limitations": [
+    "Needs the Docker socket (full control of Docker on this PC)."
+  ],
   "update": {
     "strategy": "pinned-digest",
     "notes": "Back up the data volume before updating; downgrades are blocked by Arcane."
@@ -116,5 +136,11 @@
   "resources": {
     "memoryMB": 200,
     "diskMB": 400
+  },
+  "testStatus": {
+    "static": "passed",
+    "live": "passed",
+    "date": "2026-11-17",
+    "notes": "Installed in isolation: health, its web interface, network isolation, stack on disk, stop/start, Traefik file route, backup and restore, removal with data."
   }
 }

@@ -23,6 +23,11 @@
     "unraid": "untested",
     "podman": "untested"
   },
+  "architectures": [
+    "amd64",
+    "arm64",
+    "arm/v7"
+  ],
   "installable": true,
   "services": {
     "app": {
@@ -44,6 +49,14 @@
   "security": [
     "It shows request headers (including the Cloudflare Access identity header) to whoever can open it: keep it behind Access or local only."
   ],
+  "authentication": {
+    "forwardAuth": "compatible",
+    "native": [],
+    "notes": [
+      "Test page without a sign-in of its own: suitable for testing ForwardAuth and Cloudflare Access."
+    ]
+  },
+  "limitations": [],
   "update": {
     "strategy": "pinned-digest",
     "notes": "Stateless; updates only replace the container."
@@ -64,5 +77,11 @@
   "resources": {
     "memoryMB": 32,
     "diskMB": 20
+  },
+  "testStatus": {
+    "static": "passed",
+    "live": "passed",
+    "date": "2026-11-16",
+    "notes": "Installed in isolation with the whole lifecycle (2026-11-16)."
   }
 }

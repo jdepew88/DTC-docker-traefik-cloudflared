@@ -12,7 +12,14 @@ $script:IdPattern = '^[a-z0-9]([a-z0-9-]{0,30}[a-z0-9])?$'
 $script:ImagePattern = '^[a-z0-9]+([._/-][a-z0-9]+)*(:[A-Za-z0-9_][A-Za-z0-9_.-]{0,127})?@sha256:[0-9a-f]{64}$'
 $script:EnvKeyPattern = '^[A-Z][A-Z0-9_]{0,63}$'
 $script:Platforms = @('windows-docker-desktop', 'linux-docker', 'unraid', 'podman')
-$script:Categories = @('monitoring', 'media', 'management', 'authentication', 'networking', 'tools', 'productivity', 'communication', 'photos', 'dashboard', 'updates')
+$script:Categories = @('monitoring', 'media', 'management', 'authentication', 'networking', 'tools', 'productivity', 'communication', 'photos', 'dashboard', 'updates',
+  'security', 'passwords', 'files', 'development', 'automation', 'games', 'surveillance')
+# What has been demonstrated for a manifest (shown in the catalog): static = manifest, Compose file set and route checks;
+# live = a real installation of exactly these images on a disposable deployment (tests\Test-CatalogInstall.ps1).
+$script:LiveStates = @('passed', 'partial', 'not-run', 'failed')
+# Extra ports a service may publish on the host when the user opts in: 'local' = 127.0.0.1 only, 'lan' = every
+# interface of this PC (other devices on the network can connect).
+$script:PublishAddresses = @{ local = '127.0.0.1'; lan = '0.0.0.0' }
 # Paths inside an app's project folder: relative, no '..', no drive letters.
 $script:RelPathPattern = '^(?!.*\.\.)[A-Za-z0-9][A-Za-z0-9_.-]*(/[A-Za-z0-9_.-]+)*$'
 # Values computed at installation time from another input (see Resolve-DerivedValue in webui.ps1).
@@ -21,13 +28,23 @@ $script:DerivedMethods = @('authelia-argon2')
 # building blocks bundled inside other apps) or 'retired' (no longer offered; kept so existing installations are still
 # recognized).
 $script:Availability = @('offered', 'reference', 'retired')
-# Where a manifest comes from. Only curated manifests are installable in this version; community and generated
-# manifests will pass through the same validation before they can be.
-$script:SourceTypes = @('curated', 'community', 'generated')
+# Where a manifest comes from. Catalog files (catalog\apps) must be curated to be installable. 'imported' manifests
+# (lib\AppSources.psm1: Docker Hub, GitHub, Unraid, directories) are installable only through the provisioning engine,
+# which validates them with -AllowImported after its security review (lib\ProvisionPolicy.psm1).
+$script:SourceTypes = @('curated', 'community', 'generated', 'imported')
 # Service roles in a multi-container app, and the lifecycle each implies unless the manifest says otherwise.
 $script:ServiceRoles = [ordered]@{ app = 'long-running'; database = 'long-running'; cache = 'long-running'; messaging = 'long-running'; worker = 'long-running'
   support = 'long-running'; proxy = 'long-running'; init = 'run-once'; migration = 'run-once'; maintenance = 'run-once' }
 $script:Lifecycles = @('long-running', 'run-once')
+# Modular stacks: the Compose file a service is generated into (compose.<component>.yaml; 'app' = compose.yaml),
+# unless the manifest names a component.
+$script:RoleComponents = @{ database = 'database'; cache = 'cache'; messaging = 'messaging'; worker = 'workers'; support = 'support'; init = 'setup'; migration = 'setup'; maintenance = 'setup' }
+$script:ComponentPattern = '^[a-z][a-z0-9-]{0,19}$'
+# CPU architectures as Docker names them; imported drafts use the platform form (linux/amd64), curated manifests the short one.
+$script:Architectures = '^(linux/)?(amd64|arm64|arm/v[5-8]|386|ppc64le|riscv64|s390x)$'
+$script:ForwardAuthFit = @('compatible', 'caution', 'unsuitable', 'not-applicable')
+# Imported drafts have not been assessed; only curated manifests must state a fit.
+$script:ForwardAuthFitImported = @($script:ForwardAuthFit) + 'unknown'
 
 function Get-Prop($Object, [string]$Name, $Default = $null) {
   if ($null -eq $Object) { return $Default }
@@ -39,8 +56,9 @@ function Get-Prop($Object, [string]$Name, $Default = $null) {
 
 # --- Manifests ------------------------------------------------------------------------------------------------------------
 
-# Every rule a curated manifest must satisfy. Returns error strings (empty = valid).
-function Test-AppManifest($M) {
+# Every rule a curated manifest must satisfy. Returns error strings (empty = valid). -AllowImported: the same rules,
+# but a non-curated manifest may be installable (the provisioning engine's drafts).
+function Test-AppManifest($M, [switch]$AllowImported) {
   $e = New-Object System.Collections.ArrayList
   $add = { param($t) $null = $e.Add($t) }
   if ((Get-Prop $M 'schema' 0) -ne $script:SchemaVersion) { & $add "schema must be $($script:SchemaVersion)" }
@@ -58,6 +76,7 @@ function Test-AppManifest($M) {
   else { foreach ($p in $platforms.PSObject.Properties) { if ($script:Platforms -notcontains $p.Name) { & $add "unknown platform '$($p.Name)'" } elseif ($p.Value -notin 'supported', 'untested', 'limited', 'unsupported') { & $add "platform '$($p.Name)' must be supported, limited, untested or unsupported" } } }
   # Identity: the canonical id, earlier ids and other spellings (aliases), and variants grouped under one application.
   if ((Get-Prop $M 'manifestVersion' '') -and [string]$M.manifestVersion -notmatch '^[0-9A-Za-z][0-9A-Za-z.+-]{0,31}$') { & $add 'manifestVersion is invalid' }
+  foreach ($r in @(Get-Prop $M 'identifiedBy' @())) { if ([string]$r -notmatch '^[a-z0-9]+([._/-][a-z0-9]+)*$') { & $add "identifiedBy '$r' must be an image repository without tag" } }
   foreach ($a in @(Get-Prop $M 'aliases' @())) { if ([string]$a -notmatch $script:IdPattern -or [string]$a -eq $id) { & $add "alias '$a' is invalid" } }
   $variantOf = [string](Get-Prop $M 'variantOf' '')
   if ($variantOf -and ($variantOf -notmatch $script:IdPattern -or $variantOf -eq $id)) { & $add 'variantOf must name another application' }
@@ -70,8 +89,26 @@ function Test-AppManifest($M) {
   if ($availability -eq 'retired' -and -not [string](Get-Prop (Get-Prop $M 'retired' $null) 'note' '')) { & $add 'a retired manifest needs retired.note' }
   $sourceType = [string](Get-Prop (Get-Prop $M 'source' $null) 'type' 'curated')
   if ($script:SourceTypes -notcontains $sourceType) { & $add "source.type must be one of $($script:SourceTypes -join ', ')" }
-  elseif ($sourceType -ne 'curated' -and [bool](Get-Prop $M 'installable' $false)) { & $add 'only curated manifests are installable in this version' }
+  elseif ($sourceType -ne 'curated' -and [bool](Get-Prop $M 'installable' $false) -and -not $AllowImported) { & $add 'only curated manifests are installable from the catalog' }
+  foreach ($a in @(Get-Prop $M 'architectures' @())) { if ([string]$a -notmatch $script:Architectures) { & $add "architecture '$a' is unknown (amd64, arm64, arm/v7, ...)" } }
+  $auth = Get-Prop $M 'authentication' $null
+  $fits = $(if ($sourceType -eq 'curated') { $script:ForwardAuthFit } else { $script:ForwardAuthFitImported })
+  if ($auth -and $fits -notcontains [string](Get-Prop $auth 'forwardAuth' '')) { & $add "authentication.forwardAuth must be one of $($fits -join ', ')" }
+  foreach ($l in @(Get-Prop $M 'limitations' @())) { if (-not ([string]$l).Trim()) { & $add 'limitations must be non-empty sentences' } }
+  foreach ($l in @(Get-Prop $M 'manualSetup' @())) { if (-not ([string]$l).Trim()) { & $add 'manualSetup must be non-empty sentences' } }
+  $ver = Get-Prop $M 'testStatus' $null
+  if ($ver) {
+    if ([string](Get-Prop $ver 'static' '') -notin 'passed', 'not-run') { & $add 'testStatus.static must be passed or not-run' }
+    if ($script:LiveStates -notcontains [string](Get-Prop $ver 'live' '')) { & $add "testStatus.live must be one of $($script:LiveStates -join ', ')" }
+    if ((Get-Prop $ver 'date' '') -and [string]$ver.date -notmatch '^\d{4}-\d{2}-\d{2}$') { & $add 'testStatus.date must be YYYY-MM-DD' }
+  }
   if (-not [bool](Get-Prop $M 'installable' $false)) { if (-not [string](Get-Prop $M 'installNote' '') -and $availability -ne 'retired') { & $add 'a manifest that is not installable needs installNote' }; return $e.ToArray() }
+  # Curated, installable manifests describe what the catalog shows before installation.
+  if ($sourceType -eq 'curated') {
+    if (-not @(Get-Prop $M 'architectures' @()).Count) { & $add 'architectures is required (CPU architectures every image of the stack is published for)' }
+    if (-not $auth) { & $add 'authentication is required (forwardAuth fit, native sign-in methods)' }
+    if (-not (Get-Prop $M 'update' $null)) { & $add 'update is required (how updates are applied)' }
+  }
   $services = Get-Prop $M 'services' $null
   if (-not $services -or -not @($services.PSObject.Properties).Count) { & $add 'services is required'; return $e.ToArray() }
   $serviceNames = @($services.PSObject.Properties | ForEach-Object { $_.Name })
@@ -101,6 +138,8 @@ function Test-AppManifest($M) {
     if ([string](Get-Prop $s 'image' '') -notmatch $script:ImagePattern) { & $add "${where}: image must be pinned by digest (name:tag@sha256:...)" }
     if ((Get-Prop $s 'role' '') -and -not $script:ServiceRoles.Contains([string]$s.role)) { & $add "${where}: role must be one of $(@($script:ServiceRoles.Keys) -join ', ')" }
     if ((Get-Prop $s 'lifecycle' '') -and $script:Lifecycles -notcontains [string]$s.lifecycle) { & $add "${where}: lifecycle must be long-running or run-once" }
+    if ((Get-Prop $s 'component' '') -and [string]$s.component -notmatch $script:ComponentPattern) { & $add "${where}: component must be a short lowercase name" }
+    if ($sp.Name -eq [string](Get-Prop (Get-Prop $M 'web' $null) 'service' '') -and (Get-Prop $s 'component' '') -and [string]$s.component -ne 'app') { & $add "${where}: the web service belongs to the app component (compose.yaml)" }
     if ($sp.Name -eq [string](Get-Prop (Get-Prop $M 'web' $null) 'service' '') -and (Get-ServiceDeclaredLifecycle $s).lifecycle -eq 'run-once') { & $add "${where}: the web service cannot be a run-once job" }
     $when = [string](Get-Prop $s 'when' '')
     if ($when -and -not @($inputs | Where-Object { $_.id -eq $when -and $_.type -eq 'boolean' }).Count) { & $add "${where}: when must name a boolean input" }
@@ -108,6 +147,17 @@ function Test-AppManifest($M) {
       if ([int](Get-Prop $p 'container' 0) -lt 1 -or [int](Get-Prop $p 'container' 0) -gt 65535) { & $add "${where}: invalid port" }
       if ([string](Get-Prop $p 'protocol' '') -notin 'http', 'https', 'tcp', 'udp') { & $add "${where}: port protocol must be http, https, tcp or udp" }
       if ([bool](Get-Prop $p 'primary' $false)) { $primary++ }
+      $pub = Get-Prop $p 'publish' $null
+      if ($pub) {
+        if (-not $script:PublishAddresses.ContainsKey([string](Get-Prop $pub 'address' ''))) { & $add "${where}: publish.address must be local or lan" }
+        if ([int](Get-Prop $pub 'hostPort' 0) -lt 1 -or [int](Get-Prop $pub 'hostPort' 0) -gt 65535) { & $add "${where}: publish.hostPort must be a port number" }
+        $pw = [string](Get-Prop $pub 'when' '')
+        if ($pw -and -not @($inputs | Where-Object { $_.id -eq $pw -and $_.type -eq 'boolean' }).Count) { & $add "${where}: publish.when must name a boolean input" }
+        $pin = [string](Get-Prop $pub 'input' '')
+        if ($pin -and -not @($inputs | Where-Object { $_.id -eq $pin -and $_.type -eq 'text' }).Count) { & $add "${where}: publish.input must name a text input (the host port)" }
+        if ([string](Get-Prop $pub 'address' '') -eq 'lan' -and -not $pw) { & $add "${where}: a port published on the network must be opt-in (publish.when)" }
+        if ([string](Get-Prop $s 'networkMode' '') -eq 'host') { & $add "${where}: a host-network service cannot publish ports" }
+      }
     }
     foreach ($v in @(Get-Prop $s 'volumes' @())) {
       $kind = [string](Get-Prop $v 'kind' 'volume')
@@ -128,7 +178,8 @@ function Test-AppManifest($M) {
         & $checkTemplates $where ([string]$ev.Value) @()
       } }
     foreach ($c in @(Get-Prop $s 'command' @())) { & $checkTemplates $where ([string]$c) @() }
-    if ((Get-Prop $s 'user' '') -and [string](Get-Prop $s 'user' '') -notmatch '^\d{1,6}(:\d{1,6})?$') { & $add "${where}: user must be uid[:gid]" }
+    if ((Get-Prop $s 'nofile' $null) -and ([int]$s.nofile -lt 256 -or [int]$s.nofile -gt 1048576)) { & $add "${where}: nofile must be between 256 and 1048576" }
+    if ((Get-Prop $s 'user' '') -and [string](Get-Prop $s 'user' '') -notmatch '^(\d{1,6}(:\d{1,6})?|[a-z_][a-z0-9_-]{0,31}(:[a-z_][a-z0-9_-]{0,31})?)$') { & $add "${where}: user must be uid[:gid] or a user name" }
     $needs = @()
     if (Get-Prop $s 'dockerSocket' $false) { $needs += 'docker-socket' }
     if ([string](Get-Prop $s 'networkMode' '') -eq 'host') { $needs += 'host-network' } elseif (Get-Prop $s 'networkMode' '') { & $add "${where}: networkMode may only be host" }
@@ -141,7 +192,7 @@ function Test-AppManifest($M) {
   }
   foreach ($f in @(Get-Prop $M 'files' @())) {
     if ([string](Get-Prop $f 'path' '') -notmatch $script:RelPathPattern) { & $add "file '$($f.path)': path must be relative inside the project folder" }
-    if ([string](Get-Prop $f 'path' '') -in 'compose.yaml', '.env', 'README.md') { & $add "file '$($f.path)' is reserved" }
+    if ([string](Get-Prop $f 'path' '') -in 'compose.yaml', '.env', 'README.md', 'dtc-stack.json', 'credentials.txt' -or [string](Get-Prop $f 'path' '') -match '^compose\.[a-z0-9-]+\.yaml$') { & $add "file '$($f.path)' is reserved" }
     & $checkTemplates "file '$($f.path)'" ([string](Get-Prop $f 'content' '')) @('installedApps')
   }
   foreach ($h in @(Get-Prop $M 'postInstall' @())) {
@@ -152,8 +203,14 @@ function Test-AppManifest($M) {
     elseif (-not @(Get-Prop $h 'command' @()).Count) { & $add 'postInstall needs a command or http' }
   }
   foreach ($p in $declared) { if ($p -notin 'docker-socket', 'host-network', 'device', 'gpu', 'privileged') { & $add "unknown privilege '$p'" } }
-  if ($primary -ne 1) { & $add 'exactly one port must be marked primary (the web interface)' }
   $web = Get-Prop $M 'web' $null
+  # A headless app (e.g. a notifier) has no web interface: no primary port, no local port, never published.
+  $headless = [bool](Get-Prop $web 'headless' $false)
+  if ($headless) {
+    if ($primary -ne 0) { & $add 'a headless app has no primary (web) port' }
+    if (Get-Prop $web 'localPort' $null) { & $add 'a headless app has no web.localPort' }
+    if ([string](Get-Prop (Get-Prop $M 'exposure' $null) 'default' '') -ne 'local') { & $add 'a headless app must have exposure.default local' }
+  } elseif ($primary -ne 1) { & $add 'exactly one port must be marked primary (the web interface)' }
   if (-not $web -or -not $services.PSObject.Properties[[string](Get-Prop $web 'service' '')]) { & $add 'web.service must name a service' }
   elseif ((Get-Prop $web 'localPort' $null) -and ([int]$web.localPort -lt 1024 -or [int]$web.localPort -gt 65535)) { & $add 'web.localPort must be between 1024 and 65535' }
   if ([string](Get-Prop (Get-Prop $M 'exposure' $null) 'default' '') -notin 'access', 'public', 'local') { & $add 'exposure.default must be access, public or local' }
@@ -343,8 +400,15 @@ function ConvertTo-YamlScalar([string]$Value) { return "'" + $Value.Replace("'",
 
 
 # The README written next to compose.yaml: how to live without the manager.
-function New-AppReadme($Manifest, [string]$Project, [string]$Folder) {
+function New-AppReadme($Manifest, [string]$Project, [string]$Folder, [string[]]$ComposeFiles = @('compose.yaml')) {
   $docs = (@($Manifest.docs) | ForEach-Object { "- $($_.title): $($_.url)" }) -join "`n"
+  $files = $(if (@($ComposeFiles).Count -gt 1) { @"
+
+This app is a modular stack: one Compose project made of $(@($ComposeFiles).Count) files ($(@($ComposeFiles) -join ', ')).
+COMPOSE_FILE in .env lists them, so the commands above use all of them. With another tool, pass every file:
+docker compose $((@($ComposeFiles) | ForEach-Object { "-f $_" }) -join ' ') up -d
+dtc-stack.json describes the services, networks, volumes and dependencies (no secrets).
+"@ } else { '' })
   return @"
 # $($Manifest.name) ($Project)
 
@@ -360,7 +424,7 @@ Compose project; you do not need the manager to run, update or remove it.
 
 Data lives in the named volumes listed at the end of compose.yaml (docker volume ls --filter name=${Project}_) or in
 the folders you chose. ``docker compose down -v`` deletes the named volumes: only do that when you want the data gone.
-Settings and secrets are in .env (private to your Windows account).
+Settings and secrets are in .env (private to your Windows account).$files
 
 Licence of the application: $($Manifest.license). Maintainer: $($Manifest.maintainer).
 $docs
@@ -438,6 +502,25 @@ function Get-ActiveServices($Manifest, [hashtable]$Values) {
     })
 }
 
+# Pure: the extra host ports an installation publishes (opt-in ports of active services whose 'when' input is on):
+# service, container port, protocol (tcp/udp), host address and port, label. The host port can come from a text input.
+function Get-AppPublishedPorts($Manifest, [hashtable]$Values) {
+  return @(foreach ($sp in (Get-ActiveServices $Manifest $Values)) {
+      foreach ($p in @(Get-Prop $sp.Value 'ports' @())) {
+        $pub = Get-Prop $p 'publish' $null
+        if (-not $pub) { continue }
+        $w = [string](Get-Prop $pub 'when' '')
+        if ($w -and [string]$Values["input:$w"] -ne 'true') { continue }
+        $hp = [int](Get-Prop $pub 'hostPort' 0)
+        $pin = [string](Get-Prop $pub 'input' '')
+        if ($pin -and [string]$Values["input:$pin"] -match '^\d{1,5}$' -and [int]$Values["input:$pin"] -ge 1 -and [int]$Values["input:$pin"] -le 65535) { $hp = [int]$Values["input:$pin"] }
+        $proto = $(if ([string]$p.protocol -eq 'udp') { 'udp' } else { 'tcp' })
+        [ordered]@{ service = $sp.Name; container = [int]$p.container; protocol = $proto; address = [string]$pub.address; hostIp = $script:PublishAddresses[[string]$pub.address]; hostPort = $hp
+          label = [string](Get-Prop $p 'label' ''); primary = [bool](Get-Prop $p 'primary' $false) }
+      }
+    })
+}
+
 # A readable random password (24 characters from an unambiguous alphabet), for accounts a person signs in with.
 function New-PasswordValue([int]$Length = 24) {
   $alphabet = 'abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789'
@@ -455,21 +538,34 @@ function Get-AppFiles($Manifest, [hashtable]$Values) {
     })
 }
 
-# Pure: the Compose project of one app. Only the web service (and services marked proxy) join the shared proxy network;
-# other services of multi-service apps share a private network. An app whose web.proxy is false (e.g. a directory
-# server) never joins the shared network: it gets a private network of its own and is reached on 127.0.0.1 only. $LocalPort publishes the web port on 127.0.0.1 only.
+# Pure: the Compose project of one app in a single file. Only the web service (and services marked proxy) join the
+# shared proxy network; other services of multi-service apps share a private network. An app whose web.proxy is false
+# (e.g. a directory server) never joins the shared network: it gets a private network of its own and is reached on
+# 127.0.0.1 only. $LocalPort publishes the web port on 127.0.0.1 only. Installations use ConvertTo-AppComposeSet, which
+# splits multi-service apps into one file per component.
 function ConvertTo-AppCompose {
   param([Parameter(Mandatory = $true)]$Manifest, [Parameter(Mandatory = $true)][string]$Project, [Parameter(Mandatory = $true)]$Resolved, [Parameter(Mandatory = $true)][string]$ProxyNetwork, [int]$LocalPort = 0)
-  $services = @(Get-ActiveServices $Manifest $Resolved.Values)
+  return New-AppComposeText -Manifest $Manifest -Project $Project -Resolved $Resolved -ProxyNetwork $ProxyNetwork -LocalPort $LocalPort -Main
+}
+
+# Pure: Compose text for some or all ($Only) of an app's active services. -Main adds the project name (compose.yaml);
+# $Header replaces the default explanation lines. depends_on may name services defined in another file of the set.
+function New-AppComposeText {
+  param([Parameter(Mandatory = $true)]$Manifest, [Parameter(Mandatory = $true)][string]$Project, [Parameter(Mandatory = $true)]$Resolved, [Parameter(Mandatory = $true)][string]$ProxyNetwork, [int]$LocalPort = 0,
+    [string[]]$Only = $null, [switch]$Main, [string[]]$Header = @())
+  $all = @(Get-ActiveServices $Manifest $Resolved.Values)
+  $services = $(if ($null -ne $Only) { @($all | Where-Object { $Only -contains $_.Name }) } else { $all })
   $multi = @((Get-Prop $Manifest 'services').PSObject.Properties).Count -gt 1
   $web = [string](Get-Prop (Get-Prop $Manifest 'web') 'service' '')
   $webProxy = [bool](Get-Prop (Get-Prop $Manifest 'web') 'proxy' $true)
-  $active = @($services | ForEach-Object { $_.Name })
+  $active = @($all | ForEach-Object { $_.Name })
+  $published = @(Get-AppPublishedPorts $Manifest $Resolved.Values)
   $L = New-Object System.Collections.Generic.List[string]
   $L.Add("# Generated by the Deployment Manager from catalog app '$($Manifest.id)' ($($Manifest.name)).")
-  $L.Add('# An ordinary Compose project: manage it with docker compose in this folder, with or without the manager.')
+  if (@($Header).Count) { foreach ($hl in $Header) { $L.Add($hl) } }
+  else { $L.Add('# An ordinary Compose project: manage it with docker compose in this folder, with or without the manager.') }
   $L.Add('# Settings and secrets are in .env next to this file.')
-  $L.Add("name: $Project")
+  if ($Main) { $L.Add("name: $Project") }
   $L.Add('services:')
   $namedVolumes = New-Object System.Collections.ArrayList
   $usesProxy = $false; $usesInternal = $false
@@ -519,16 +615,24 @@ function ConvertTo-AppCompose {
     }
     if ($tmpfs.Count) { $L.Add('    tmpfs:'); foreach ($t in $tmpfs) { $L.Add("      - $($t.target)") } }
     if (Get-Prop $s 'shmSize' '') { $L.Add("    shm_size: '$($s.shmSize)'") }
+    # Open-file limit: some servers (slapd) size their memory by it, and Docker's default is very high.
+    if (Get-Prop $s 'nofile' $null) { $L.Add('    ulimits:'); $L.Add('      nofile:'); $L.Add("        soft: $([int]$s.nofile)"); $L.Add("        hard: $([int]$s.nofile)") }
     if (@(Get-Prop $s 'devices' @()).Count) { $L.Add('    devices:'); foreach ($d in @($s.devices)) { $L.Add("      - $($d):$($d)") } }
     $g = Get-Prop $s 'gpus' $false
     if (($g -is [bool] -and $g) -or ($g -is [string] -and [string]$Resolved.Values["input:$g"] -eq 'true')) { $L.Add('    gpus: all') }
     if (Get-Prop $s 'privileged' $false) { $L.Add('    privileged: true') }
     if ([string](Get-Prop $s 'networkMode' '') -eq 'host') { $L.Add('    network_mode: host') }
     else {
-      if ($LocalPort -gt 0 -and $sp.Name -eq $web) {
-        $wp = [int](@(Get-Prop $s 'ports' @() | Where-Object { Get-Prop $_ 'primary' $false })[0].container)
-        $L.Add('    ports:'); $L.Add("      - '127.0.0.1:${LocalPort}:$wp'")
+      $primaryPorts = @(Get-Prop $s 'ports' @() | Where-Object { Get-Prop $_ 'primary' $false })
+      $pubs = @($published | Where-Object { $_.service -eq $sp.Name })
+      $portLines = @()
+      # The web port on 127.0.0.1, unless the user chose to open that same port on the network (which includes this PC).
+      if ($LocalPort -gt 0 -and $sp.Name -eq $web -and $primaryPorts.Count) {
+        $wp = [int]$primaryPorts[0].container
+        if (-not @($pubs | Where-Object { $_.container -eq $wp -and $_.address -eq 'lan' -and $_.protocol -eq 'tcp' }).Count) { $portLines += "      - '127.0.0.1:${LocalPort}:$wp'" }
       }
+      foreach ($pp in $pubs) { $portLines += "      - '$($pp.hostIp):$($pp.hostPort):$($pp.container)$(if ($pp.protocol -eq 'udp') { '/udp' })'" }
+      if ($portLines.Count) { $L.Add('    ports:'); foreach ($pl in $portLines) { $L.Add($pl) } }
       $nets = @()
       if (($sp.Name -eq $web -and $webProxy) -or [bool](Get-Prop $s 'proxy' $false)) { $nets += 'proxy'; $usesProxy = $true }
       if ($multi -or -not $webProxy) { $nets += 'internal'; $usesInternal = $true }
@@ -559,7 +663,168 @@ function ConvertTo-AppCompose {
   return ($L -join "`n") + "`n"
 }
 
+# --- Modular application stacks ------------------------------------------------------------------------------------------
+# Every installed app is its own folder and its own Compose project. A multi-service app is split into small Compose
+# files by component (the application with its web front end in compose.yaml; databases, caches, messaging, workers,
+# support services and one-time setup jobs in compose.<component>.yaml), combined with Compose's own multi-file
+# mechanism (-f ... -f ..., and COMPOSE_FILE in .env for plain `docker compose` in the folder). Single-service apps keep
+# one compose.yaml. dtc-stack.json describes the project for people and tools; it never holds a secret.
+
+# Pure: the component (file) a service belongs to: the manifest's 'component', else derived from its role. The web
+# service is always part of the application component (compose.yaml).
+function Get-ServiceComponent($Manifest, [string]$Name) {
+  $web = [string](Get-Prop (Get-Prop $Manifest 'web' $null) 'service' '')
+  if ($Name -eq $web) { return 'app' }
+  $s = (Get-Prop $Manifest 'services').PSObject.Properties[$Name].Value
+  $c = [string](Get-Prop $s 'component' '')
+  if ($c) { return $c }
+  $role = [string](Get-Prop $s 'role' '')
+  if ($script:RoleComponents.ContainsKey($role)) { return $script:RoleComponents[$role] }
+  return 'app'
+}
+
+# Pure: the file name of a component.
+function Get-ComponentFileName([string]$Component) { if ($Component -eq 'app') { return 'compose.yaml' }; return "compose.$Component.yaml" }
+
+# Pure: the Compose files of an installation (ordered: compose.yaml first), each with its component, services and text.
+# Callers wrap the result in @() (a single file is returned unrolled).
+function ConvertTo-AppComposeSet {
+  param([Parameter(Mandatory = $true)]$Manifest, [Parameter(Mandatory = $true)][string]$Project, [Parameter(Mandatory = $true)]$Resolved, [Parameter(Mandatory = $true)][string]$ProxyNetwork, [int]$LocalPort = 0)
+  $services = @(Get-ActiveServices $Manifest $Resolved.Values)
+  $groups = [ordered]@{ app = @() }
+  foreach ($sp in $services) { $c = Get-ServiceComponent $Manifest $sp.Name; if (-not $groups.Contains($c)) { $groups[$c] = @() }; $groups[$c] += $sp.Name }
+  $rank = @{ app = 0; database = 1; cache = 2; messaging = 3; support = 4; workers = 5; setup = 6 }
+  $parts = @($groups.Keys | Where-Object { @($groups[$_]).Count } | Sort-Object { $(if ($rank.ContainsKey($_)) { $rank[$_] } else { 5 }) }, { $_ })
+  if ($parts.Count -le 1) {
+    return @([ordered]@{ file = 'compose.yaml'; component = 'app'; services = @($services | ForEach-Object { $_.Name }); content = (ConvertTo-AppCompose -Manifest $Manifest -Project $Project -Resolved $Resolved -ProxyNetwork $ProxyNetwork -LocalPort $LocalPort) })
+  }
+  $files = @($parts | ForEach-Object { Get-ComponentFileName $_ })
+  $n = 0
+  return @(foreach ($c in $parts) {
+      $n++
+      $header = @("# Part $n of $($parts.Count) of one Compose project ($Project): $(Get-ComponentTitle $c).", "# The project is made of: $($files -join ', '). Use all of them together; COMPOSE_FILE in .env lists them, so plain", '# `docker compose` commands in this folder use the complete set.')
+      [ordered]@{ file = (Get-ComponentFileName $c); component = $c; services = @($groups[$c]); content = (New-AppComposeText -Manifest $Manifest -Project $Project -Resolved $Resolved -ProxyNetwork $ProxyNetwork -LocalPort $LocalPort -Only @($groups[$c]) -Main:($c -eq 'app') -Header $header) }
+    })
+}
+
+function Get-ComponentTitle([string]$Component) {
+  switch ($Component) { 'app' { 'the application and its web front end' } 'database' { 'the database' } 'cache' { 'the cache' } 'messaging' { 'the message bus' } 'workers' { 'background workers' } 'support' { 'supporting services' } 'setup' { 'one-time setup jobs' } default { "the $Component component" } }
+}
+
+# Pure: the variables that make plain `docker compose` in the folder use the complete file set ('' for one file).
+function Get-ComposeFileEnv([string[]]$Files) {
+  if (@($Files).Count -le 1) { return [ordered]@{} }
+  return [ordered]@{ COMPOSE_FILE = (@($Files) -join ':'); COMPOSE_PATH_SEPARATOR = ':' }
+}
+
+# Pure: one fingerprint of a file set (the text's SHA-256 for a single file, so earlier records stay comparable).
+function Get-ComposeSetFingerprint([object[]]$Files) {
+  $list = @($Files)
+  if ($list.Count -eq 1) { return Get-TextSha256 ([string]$list[0].content) }
+  return Get-TextSha256 ((@($list | ForEach-Object { "## $($_.file)`n$($_.content)" })) -join "`n")
+}
+
+# Pure: the order Compose starts the services in (dependencies first). Cycles cannot occur in validated manifests; a
+# remaining service is appended so the list is always complete.
+function Get-StackStartOrder([object[]]$Services) {
+  $done = New-Object System.Collections.ArrayList
+  $left = @($Services)
+  while ($left.Count) {
+    $ready = @(foreach ($s in $left) { $open = @(@($s.dependsOn) | Where-Object { $_ -and -not $done.Contains([string]$_.service) }); if (-not $open.Count) { $s } })
+    if (-not $ready.Count) { $ready = @($left[0]) }
+    foreach ($r in $ready) { $null = $done.Add([string]$r.name) }
+    $left = @($left | Where-Object { -not $done.Contains([string]$_.name) })
+  }
+  return @($done)
+}
+
+# Pure: the machine-readable description of an installed stack (dtc-stack.json): Compose project and files, services
+# with roles, components, networks, volumes and dependencies, the web front end, authentication and routing ownership,
+# and lifecycle requirements. Variable names only; never a value or a secret.
+function New-AppStackManifest {
+  param([Parameter(Mandatory = $true)]$Manifest, [Parameter(Mandatory = $true)][string]$Project, [Parameter(Mandatory = $true)][object[]]$ComposeSet, [Parameter(Mandatory = $true)]$Resolved,
+    [Parameter(Mandatory = $true)][string]$ProxyNetwork, [int]$LocalPort = 0, [string]$LocalUrl = '', [string]$Origin = 'installed')
+  $web = Get-Prop $Manifest 'web' $null
+  $webName = [string](Get-Prop $web 'service' '')
+  $webProxy = [bool](Get-Prop $web 'proxy' $true)
+  $headless = [bool](Get-Prop $web 'headless' $false)
+  $multi = @((Get-Prop $Manifest 'services').PSObject.Properties).Count -gt 1
+  $active = @(Get-ActiveServices $Manifest $Resolved.Values)
+  $activeNames = @($active | ForEach-Object { $_.Name })
+  $fileOf = @{}; foreach ($f in $ComposeSet) { foreach ($s in @($f.services)) { $fileOf[[string]$s] = [string]$f.file } }
+  $internal = "${Project}_internal"
+  $published = @(Get-AppPublishedPorts $Manifest $Resolved.Values)
+  $svcList = @(foreach ($sp in $active) {
+      $s = $sp.Value; $decl = Get-ServiceDeclaredLifecycle $s
+      $nets = @()
+      if ([string](Get-Prop $s 'networkMode' '') -eq 'host') { $nets = @('host') }
+      else {
+        if (($sp.Name -eq $webName -and $webProxy) -or [bool](Get-Prop $s 'proxy' $false)) { $nets += $ProxyNetwork }
+        if ($multi -or -not $webProxy) { $nets += $internal }
+      }
+      $vols = @(foreach ($v in @(Get-Prop $s 'volumes' @())) {
+          $kind = [string](Get-Prop $v 'kind' 'volume')
+          $chosen = $(if (Get-Prop $v 'input' '') { [string]$Resolved.Values["input:$($v.input)"] } else { '' })
+          if ($kind -eq 'tmpfs') { [ordered]@{ type = 'tmpfs'; target = [string]$v.target; backup = $false } }
+          elseif ($kind -eq 'project') { [ordered]@{ type = 'bind'; source = "./$($v.source)"; target = [string]$v.target; backup = [bool](Get-Prop $v 'backup' $true) } }
+          elseif ($kind -eq 'folder' -or $chosen) { if ($chosen) { [ordered]@{ type = 'bind'; source = $chosen; target = [string]$v.target; backup = $false; note = 'A folder you chose: your data, never deleted or copied by the manager.' } } }
+          else { [ordered]@{ type = 'volume'; name = "${Project}_$($v.name)"; target = [string]$v.target; backup = [bool](Get-Prop $v 'backup' $true) } }
+        })
+      $ports = @(foreach ($p in @(Get-Prop $s 'ports' @())) {
+          $prim = [bool](Get-Prop $p 'primary' $false)
+          $proto = $(if ([string]$p.protocol -eq 'udp') { 'udp' } else { 'tcp' })
+          $pub = @($published | Where-Object { $_.service -eq $sp.Name -and $_.container -eq [int]$p.container -and $_.protocol -eq $proto })
+          $at = @($pub | ForEach-Object { "$($_.hostIp):$($_.hostPort)" })
+          if ($prim -and $sp.Name -eq $webName -and $LocalPort -gt 0 -and -not @($pub | Where-Object { $_.address -eq 'lan' }).Count) { $at = @("127.0.0.1:$LocalPort") + $at }
+          [ordered]@{ container = [int]$p.container; protocol = [string]$p.protocol; primary = $prim; label = [string](Get-Prop $p 'label' ''); published = ($at -join ', ') }
+        })
+      [ordered]@{ name = $sp.Name; container = (Get-AppContainerName $Manifest $Project $sp.Name); component = (Get-ServiceComponent $Manifest $sp.Name); file = [string]$fileOf[$sp.Name]
+        role = $decl.role; lifecycle = $decl.lifecycle; label = $decl.label; image = [string]$s.image; stateful = [bool](Get-Prop $s 'stateful' $false)
+        networks = $nets; volumes = $vols; ports = $ports
+        dependsOn = @(@(Get-Prop $s 'dependsOn' @()) | Where-Object { $activeNames -contains [string]$_.service } | ForEach-Object { [ordered]@{ service = [string]$_.service; condition = [string](Get-Prop $_ 'condition' 'service_started') } })
+        healthcheck = [bool](Get-Prop $s 'healthcheck' $null); dockerSocket = [bool](Get-Prop $s 'dockerSocket' $false)
+        environment = @(if ($Resolved.Env.Contains($sp.Name)) { @($Resolved.Env[$sp.Name].Keys) }) }
+    })
+  $wsvc = @($svcList | Where-Object { $_.name -eq $webName })[0]
+  $primary = $(if ($wsvc) { @($wsvc.ports | Where-Object { $_.primary })[0] } else { $null })
+  $scheme = $(if ($primary -and $primary.protocol -eq 'https') { 'https' } else { 'http' })
+  $auth = Get-Prop $Manifest 'authentication' $null
+  $upd = Get-Prop $Manifest 'update' $null
+  $order = Get-StackStartOrder $svcList
+  return [ordered]@{
+    schema = 1; kind = 'dtc-stack'; generatedBy = 'Traefik + Cloudflare Deployment Manager'; generatedAt = (Get-Date -Format 's'); project = $Project; origin = $Origin
+    application = [ordered]@{ id = (Get-ApplicationId $Manifest); manifestId = [string]$Manifest.id; name = [string]$Manifest.name; manifestVersion = [string](Get-Prop $Manifest 'manifestVersion' '')
+      publisher = [string](Get-Prop $Manifest 'maintainer' ''); license = [string](Get-Prop $Manifest 'license' ''); sourceType = [string](Get-Prop (Get-Prop $Manifest 'source' $null) 'type' 'curated')
+      source = [string](Get-Prop (Get-Prop $Manifest 'source' $null) 'url' ''); docs = @(@(Get-Prop $Manifest 'docs' @()) | ForEach-Object { [string]$_.url }) }
+    composeFiles = @($ComposeSet | ForEach-Object { [ordered]@{ file = [string]$_.file; component = [string]$_.component; services = @($_.services) } })
+    envFile = [ordered]@{ file = '.env'; secrets = @($Resolved.Secrets); note = 'Values are kept only in .env, readable by your Windows account, SYSTEM and Administrators.' }
+    frontend = [ordered]@{ service = $webName; container = (Get-AppContainerName $Manifest $Project $webName); headless = $headless
+      port = $(if ($primary) { $primary.container } else { 0 }); scheme = $scheme; localUrl = $LocalUrl
+      proxyNetwork = $(if ($wsvc -and @($wsvc.networks) -contains $ProxyNetwork) { $ProxyNetwork } else { '' })
+      backendUrl = $(if ($primary -and $wsvc -and @($wsvc.networks) -contains $ProxyNetwork) { "${scheme}://$(Get-AppContainerName $Manifest $Project $webName):$($primary.container)" } else { '' }) }
+    services = $svcList
+    startOrder = $order
+    dependencies = @($svcList | Where-Object { $_.role -in 'database', 'cache', 'messaging', 'support' } | ForEach-Object { [ordered]@{ service = $_.name; role = $_.role; image = $_.image } })
+    networks = [ordered]@{ shared = @(@($svcList | ForEach-Object { $_.networks }) | Where-Object { $_ -eq $ProxyNetwork } | Select-Object -Unique)
+      private = @(@($svcList | ForEach-Object { $_.networks }) | Where-Object { $_ -eq $internal } | Select-Object -Unique)
+      note = 'Only the web front end joins the shared proxy network; databases, caches and other dependencies stay on the private network.' }
+    volumes = @($svcList | ForEach-Object { $n = $_.name; @($_.volumes) | ForEach-Object { $o = [ordered]@{ service = $n }; foreach ($k in $_.Keys) { $o[$k] = $_[$k] }; $o } })
+    publishedPorts = @($published | ForEach-Object { [ordered]@{ service = $_.service; container = $_.container; protocol = $_.protocol; host = "$($_.hostIp):$($_.hostPort)"; scope = $(if ($_.address -eq 'lan') { 'this PC and the local network' } else { 'this PC only' }); label = $_.label } })
+    authentication = [ordered]@{ forwardAuth = [string](Get-Prop $auth 'forwardAuth' 'unknown'); native = @(Get-Prop $auth 'native' @()); notes = @(Get-Prop $auth 'notes' @()) }
+    manualSetup = @(Get-Prop $Manifest 'manualSetup' @())
+    ownership = [ordered]@{ managedBy = 'deployment-manager'; origin = $Origin; note = $(if ($Origin -eq 'adopted') { 'Adopted: the manager records and operates this project; its Compose files and data were not rewritten.' } else { 'Created by the manager from the App Catalog.' }) }
+    routing = [ordered]@{ owner = 'deployment-manager'; provider = 'traefik-file'; dockerLabels = $false
+      note = 'Routes are explicit Traefik file-provider definitions (traefik/dynamic/svc-<route>.yml of the proxy deployment), created on the Services page or by New app. Installing does not publish anything.' }
+    lifecycle = [ordered]@{ composeFiles = @($ComposeSet | ForEach-Object { [string]$_.file })
+      commands = [ordered]@{ start = 'docker compose up -d'; stop = 'docker compose stop'; logs = 'docker compose logs -f'; remove = 'docker compose down' }
+      backup = [ordered]@{ volumes = @($svcList | ForEach-Object { @($_.volumes) | Where-Object { $_.type -eq 'volume' -and $_.backup } | ForEach-Object { $_.name } }); stopsForConsistency = [bool](@($svcList | Where-Object { $_.stateful }).Count) }
+      update = [ordered]@{ strategy = [string](Get-Prop $upd 'strategy' 'pinned-digest'); notes = [string](Get-Prop $upd 'notes' ''); automatic = $false }
+      postInstall = @(@(Get-Prop $Manifest 'postInstall' @()) | ForEach-Object { [string](Get-Prop $_ 'label' '') }) }
+  }
+}
+
 Export-ModuleMember -Function Test-AppManifest, Get-AppContainerName, Get-ActiveServices, New-PasswordValue, Get-AppFiles, Get-CatalogApps, Get-CatalogApp, Get-PlatformSupport, New-SecretValue, Resolve-TemplateValue, Resolve-AppValues,
   Get-AppIdentityKey, Resolve-CatalogEntry, Get-ApplicationId, Get-ManifestAvailability, Get-ServiceDeclaredLifecycle,
   ConvertTo-HostFolder, ConvertTo-EnvFileText, ConvertTo-AppCompose, New-AppReadme, Hide-SecretValues, Read-AppEnv, Get-AppsRegistryPath, Read-AppsRegistry,
-  Save-AppsRegistry, Get-ComposeServiceImages, Get-AppUpdateDiff
+  Save-AppsRegistry, Get-ComposeServiceImages, Get-AppUpdateDiff, New-AppComposeText, ConvertTo-AppComposeSet, Get-ServiceComponent, Get-ComponentFileName,
+  Get-ComposeFileEnv, Get-ComposeSetFingerprint, Get-StackStartOrder, New-AppStackManifest, Get-AppPublishedPorts

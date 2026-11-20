@@ -27,6 +27,12 @@
     "unraid": "untested",
     "podman": "untested"
   },
+  "architectures": [
+    "amd64",
+    "arm64",
+    "arm/v7",
+    "ppc64le"
+  ],
   "installable": true,
   "services": {
     "app": {
@@ -70,6 +76,20 @@
     "Portainer controls every container on this PC. The administrator is created immediately after the first start (password in credentials.txt), so the 5-minute setup window cannot be used by someone else.",
     "Never publish it without Cloudflare Access in front of its own login."
   ],
+  "authentication": {
+    "forwardAuth": "compatible",
+    "native": [
+      "local",
+      "ldap"
+    ],
+    "notes": [
+      "Controls Docker: keep it local; ForwardAuth may be added in front of its own sign-in."
+    ]
+  },
+  "limitations": [
+    "Needs the Docker socket (full control of Docker on this PC).",
+    "Uses a self-signed HTTPS certificate on its local port."
+  ],
   "update": {
     "strategy": "pinned-digest",
     "notes": "LTS channel (2.45.2 at the time of curation)."
@@ -112,5 +132,11 @@
         }
       }
     }
-  ]
+  ],
+  "testStatus": {
+    "static": "passed",
+    "live": "passed",
+    "date": "2026-11-17",
+    "notes": "Installed in isolation: health, its web interface, network isolation, stack on disk, stop/start, Traefik file route, backup and restore, removal with data."
+  }
 }

@@ -703,3 +703,11 @@ ol.gsteps li { margin: .45rem 0; }
 .wizard-steps li.skipped .step-num { color: var(--muted); border-style: dashed; }
 .wizard-steps .step-badge { display: block; font-weight: 400; }
 .step-status.skipped { color: var(--muted); }
+/* New app (provisioning). */
+.row { display: flex; flex-wrap: wrap; gap: .5rem .75rem; align-items: flex-end; }
+.row > .field { flex: 1 1 12rem; min-width: 0; }
+.prov-import .row input { flex: 1 1 18rem; min-width: 0; }
+.link-gap { margin-right: .75rem; }
+.prov-draft h3, #prov-review h3, #prov-result h3 { margin-top: 1.1rem; }
+#prov-ai-preview pre { max-height: 18rem; overflow: auto; white-space: pre-wrap; word-break: break-word; }
+#prov-findings label.check { display: inline-flex; margin-left: .5rem; }

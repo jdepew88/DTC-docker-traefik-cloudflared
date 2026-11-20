@@ -414,6 +414,18 @@ function ConvertTo-ServiceDefinition($InputObject) {
       endpoint = ([string](Get-ServiceProperty $auth 'endpoint' '')).Trim().TrimEnd('/')
     }
   }
+  # Optional owner of the route (docs/universal-apps.md): the integration or instance that created it, so removing an
+  # integration removes only its own routes. Only stored when set, so registries without it are unchanged.
+  $owner = Get-ServiceProperty $InputObject 'owner' $null
+  if ($owner -is [hashtable]) { $owner = [pscustomobject]$owner }
+  $ownerKind = ([string](Get-ServiceProperty $owner 'kind' '')).Trim().ToLowerInvariant()
+  if ($ownerKind) {
+    $definition['owner'] = [pscustomobject][ordered]@{
+      kind          = $ownerKind
+      instanceId    = ([string](Get-ServiceProperty $owner 'instanceId' '')).Trim()
+      integrationId = ([string](Get-ServiceProperty $owner 'integrationId' '')).Trim()
+    }
+  }
   return [pscustomobject]$definition
 }
 
@@ -535,6 +547,12 @@ function Test-ServiceDefinition {
     }
   }
   if (@($s.hostnames | Select-Object -Unique).Count -ne @($s.hostnames).Count) { & $err 'hostnames' 'Hostnames are listed more than once.' }
+  if ($s.PSObject.Properties['owner']) {
+    $o = $s.owner
+    if ($o.kind -notin 'integration', 'provision', 'app' -or $o.instanceId -notmatch '^(x|i)-[0-9a-f]{6,12}$' -or ($o.integrationId -and $o.integrationId -notmatch '^int-[0-9a-f]{12}$')) {
+      & $err 'owner' 'The route owner must be an integration, provisioning operation or app with a valid instance id.'
+    }
+  }
 
   if ($s.pathPrefix) {
     if ($s.pathPrefix -notmatch $script:PathPrefixPattern -or $s.pathPrefix -eq '/') { & $err 'pathPrefix' "Path prefix must start with / and contain only letters, digits and . _ ~ / - (e.g. /api)." }
@@ -658,6 +676,7 @@ function ConvertTo-TraefikRouteYaml($Service) {
   $lines.Add("# Generated from config/services.json (service '$($s.name)'). Do not edit by hand:")
   $lines.Add('# changes here are overwritten. Use services.ps1 or the web UI instead.')
   if ($s.description) { $lines.Add('# ' + ($s.description -replace '[\r\n]+', ' ')) }
+  if ($s.PSObject.Properties['owner']) { $lines.Add("# Owner: $($s.owner.kind) $($s.owner.instanceId)$(if ($s.owner.integrationId) { " ($($s.owner.integrationId))" }). Removing that integration removes this route; the application's containers are not touched.") }
   if ($auth) { $lines.Add("# Sign-in: authentik ForwardAuth (embedded outpost at $($auth.endpoint)). If authentik is unreachable, Traefik refuses the request.") }
   $lines.Add('http:')
   $lines.Add('  routers:')
@@ -1045,6 +1064,7 @@ function Save-TunnelTokenFile {
     $saved = Join-Path $Settings.BackupRoot ((Get-Date -Format 'yyyyMMdd-HHmmss') + '\secrets\cloudflare_tunnel_token')
     New-Item -ItemType Directory -Force -Path (Split-Path -Parent $saved) | Out-Null
     Copy-Item -LiteralPath $path -Destination $saved -Force
+    Set-SecretFileAcl $saved
   }
   [IO.File]::WriteAllText($path, $Token)
   Set-SecretFileAcl $path

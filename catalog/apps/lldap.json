@@ -28,6 +28,11 @@
     "unraid": "untested",
     "podman": "untested"
   },
+  "architectures": [
+    "amd64",
+    "arm64",
+    "arm/v7"
+  ],
   "installable": true,
   "services": {
     "app": {
@@ -99,6 +104,18 @@
     "LLDAP is not on the shared proxy network: it has a private network of its own, so neither its LDAP port (3890) nor its web interface is reachable by other containers, published on this PC (except the web interface on 127.0.0.1) or through Cloudflare.",
     "Apps that use the directory (authentik, Authelia) must be attached to its private network deliberately; that is not done automatically."
   ],
+  "authentication": {
+    "forwardAuth": "not-applicable",
+    "native": [
+      "local"
+    ],
+    "notes": [
+      "A directory server for other apps (LDAP); its admin page stays local and is never published."
+    ]
+  },
+  "limitations": [
+    "The LDAP port is not published: only containers on its private network, or clients you connect explicitly, can use it."
+  ],
   "update": {
     "strategy": "pinned-digest",
     "notes": "Back up the data volume first."
@@ -117,5 +134,11 @@
   "resources": {
     "memoryMB": 50,
     "diskMB": 60
+  },
+  "testStatus": {
+    "static": "passed",
+    "live": "passed",
+    "date": "2026-11-16",
+    "notes": "Installed in isolation: administrator login API, backup and restore (2026-11-16)."
   }
 }

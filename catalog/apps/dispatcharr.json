@@ -28,6 +28,10 @@
     "unraid": "untested",
     "podman": "untested"
   },
+  "architectures": [
+    "amd64",
+    "arm64"
+  ],
   "installable": true,
   "services": {
     "app": {
@@ -80,6 +84,18 @@
     "Plex/Jellyfin cannot discover its HDHomeRun emulation through Docker Desktop: add the tuner by URL (http://<container or this PC>:9191).",
     "IPTV sources must be ones you are entitled to use."
   ],
+  "authentication": {
+    "forwardAuth": "caution",
+    "native": [
+      "local"
+    ],
+    "notes": [
+      "M3U, EPG and HDHomeRun endpoints are fetched by media servers without a browser session; ForwardAuth blocks them. Protect the web interface only, or keep it local."
+    ]
+  },
+  "limitations": [
+    "SSDP/HDHomeRun discovery from LAN devices does not reach containers on Docker Desktop: add tuners and clients by URL."
+  ],
   "update": {
     "strategy": "pinned-digest",
     "notes": "Back up the data volume first: it holds the embedded database."
@@ -98,5 +114,11 @@
   "resources": {
     "memoryMB": 700,
     "diskMB": 1800
+  },
+  "testStatus": {
+    "static": "passed",
+    "live": "passed",
+    "date": "2026-11-17",
+    "notes": "Installed in isolation: health, own API, network isolation, modular stack, stop/start, Traefik file route, backup and restore, removal with data."
   }
 }

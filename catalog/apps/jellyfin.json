@@ -31,6 +31,10 @@
     "unraid": "untested",
     "podman": "untested"
   },
+  "architectures": [
+    "amd64",
+    "arm64"
+  ],
   "installable": true,
   "services": {
     "app": {
@@ -128,6 +132,21 @@
     "Streaming video through Cloudflare's proxy or Tunnel is restricted by Cloudflare's terms: keep Jellyfin local only (or use your own connection), and use Cloudflare only for occasional, low-volume access.",
     "Create the administrator in the setup wizard right after the first start."
   ],
+  "authentication": {
+    "forwardAuth": "caution",
+    "native": [
+      "local",
+      "ldap-plugin",
+      "sso-plugin"
+    ],
+    "notes": [
+      "TV, phone and desktop clients sign in with Jellyfin accounts; ForwardAuth blocks them. Use Jellyfin accounts, or its LDAP plugin with LLDAP."
+    ]
+  },
+  "limitations": [
+    "Hardware transcoding: only NVIDIA GPUs through WSL2 (experimental); Intel Quick Sync and VA-API (/dev/dri) are not available in Docker Desktop.",
+    "DLNA and client auto-discovery do not cross the Docker Desktop VM."
+  ],
   "update": {
     "strategy": "pinned-digest",
     "notes": "Read the release notes before major versions: the library database is migrated on start."
@@ -145,5 +164,11 @@
   "resources": {
     "memoryMB": 1024,
     "diskMB": 2500
+  },
+  "testStatus": {
+    "static": "passed",
+    "live": "passed",
+    "date": "2026-11-17",
+    "notes": "Installed in isolation: health, its web interface, network isolation, stack on disk, stop/start, Traefik file route, backup and restore, removal with data."
   }
 }

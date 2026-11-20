@@ -72,8 +72,12 @@ function ConvertFrom-DockerInspect($C) {
     image = $image; tag = $tag
     state = [string](Get-Prop $state 'Status' ''); health = $(if ($hc) { [string](Get-Prop $hc 'Status' '') } else { '' })
     restart = [string](Get-Prop (Get-Prop (Get-Prop $C 'HostConfig') 'RestartPolicy') 'Name' '')
-    compose = [ordered]@{ project = (& $label 'com.docker.compose.project'); service = (& $label 'com.docker.compose.service'); workingDir = (& $label 'com.docker.compose.project.working_dir') }
+    compose = [ordered]@{ project = (& $label 'com.docker.compose.project'); service = (& $label 'com.docker.compose.service'); workingDir = (& $label 'com.docker.compose.project.working_dir'); configFiles = (& $label 'com.docker.compose.project.config_files') }
+    # Label names (never values) that identify a management tool (Portainer, Arcane): lib\AppContract.psm1.
+    authorityHints = @(if ($labels) { @($labels.PSObject.Properties | Where-Object { $_.Name -match '^(io\.portainer\.|com\.getarcaneapp\.|arcane\.)' } | ForEach-Object { $_.Name }) })
     networks = $networks; exposed = @($exposed | Sort-Object { $_.port }); published = $published
+    # Container-side mount paths only (never host paths or volume names): drift detection notices a lost mount.
+    mounts = @(@(Get-Prop $C 'Mounts' @()) | ForEach-Object { [string](Get-Prop $_ 'Destination' '') } | Where-Object { $_ } | Sort-Object -Unique)
     traefik = $traefik
     managedBy = (& $label 'org.traefik-proxy.app')
     # Reverse proxies, tunnel connectors and socket proxies are infrastructure, not applications to publish.

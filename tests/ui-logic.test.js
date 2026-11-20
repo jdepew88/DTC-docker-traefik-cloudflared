@@ -470,5 +470,106 @@ test('installed apps: images, catalog install state and instance titles', () => 
   assert.strictEqual(L.instanceTitle({ name: 'Rocket.Chat', label: '' }), 'Rocket.Chat');
 });
 
+test('new app: step completion from the draft, acknowledgements, access and sign-in; untested stages never count as passed', () => {
+  const findings = [{ id: 'socket:web', severity: 'high' }, { id: 'registry:web', severity: 'review' }, { id: 'unverified', severity: 'info' }, { id: 'x', severity: 'block' }];
+  assert.deepStrictEqual(L.provisionAckIds(findings), ['socket:web', 'registry:web']);
+  const draft = { deployable: true, findings };
+  const S = (w, id) => w.steps.find((x) => x.id === id);
+  let w = L.provisionWizard({});
+  assert.strictEqual(w.current, 'container');
+  assert.deepStrictEqual(w.steps.map((x) => x.id), ['container', 'stack', 'storage', 'proxy', 'auth', 'publish', 'review', 'verify'], 'one wizard, eight stages');
+  assert.ok(!S(w, 'proxy').available && !S(w, 'stack').available, 'routing and the stack view are locked without a draft');
+  w = L.provisionWizard({ draft, acknowledged: ['socket:web'] });
+  assert.ok(!S(w, 'container').done); assert.deepStrictEqual(w.pendingAcks, ['registry:web']); assert.match(S(w, 'container').missing, /1 item/);
+  assert.ok(S(w, 'stack').available && !S(w, 'stack').done && !S(w, 'proxy').available, 'the stack and storage can be inspected before the source is complete; routing cannot');
+  w = L.provisionWizard({ draft: { deployable: false, findings: [] } });
+  assert.ok(!S(w, 'container').done, 'an undeployable draft never completes step 1');
+  const acked = { draft, acknowledged: ['socket:web', 'registry:web'] };
+  w = L.provisionWizard({ ...acked, access: 'local', auth: 'none' });
+  assert.deepStrictEqual(w.steps.map((x) => x.done), [true, true, true, true, true, true, false, false]); assert.strictEqual(w.current, 'review');
+  w = L.provisionWizard({ ...acked, access: 'public', hostname: 'not a host', auth: 'authentik' });
+  assert.ok(!S(w, 'proxy').done); assert.match(S(w, 'proxy').missing, /host name/);
+  w = L.provisionWizard({ ...acked, access: 'public', hostname: 'notes.example.com', auth: 'none' });
+  assert.ok(S(w, 'proxy').done && !S(w, 'auth').done && !S(w, 'publish').available, "a public address never completes with 'no sign-in'");
+  const verified = { ok: true, journal: { verification: [{ stage: 'backend', status: 'passed' }, { stage: 'router', status: 'passed' }] } };
+  w = L.provisionWizard({ ...acked, access: 'public', hostname: 'notes.example.com', auth: 'authentik', result: verified });
+  assert.ok(w.steps.every((x) => x.done));
+  w = L.provisionWizard({ ...acked, access: 'public', hostname: 'notes.example.com', auth: 'authentik', result: { ok: true, journal: { verification: [{ stage: 'backend', status: 'passed' }, { stage: 'authorized-access', status: 'not-tested' }] } } });
+  assert.ok(S(w, 'review').done && !S(w, 'verify').done && w.current === 'verify', 'a deployment with untested checks is not "verified"');
+  w = L.provisionWizard({ ...acked, access: 'local', auth: 'authentik' });
+  assert.ok(!S(w, 'auth').done, 'authentik needs a route');
+  const pr = L.provisionProgress({ ok: true, journal: { stages: [{ stage: 'install', status: 'passed' }, { stage: 'backend', status: 'passed' }, { stage: 'route', status: 'passed' }, { stage: 'authentication', status: 'failed' }],
+    verification: [{ stage: 'containers', status: 'passed' }, { stage: 'dependencies', status: 'passed' }, { stage: 'backend', status: 'passed' }] } }, { access: 'lan', auth: 'authentik' });
+  const ps = Object.fromEntries(pr.items.map((x) => [x.id, x.state]));
+  assert.deepStrictEqual(ps, { planned: 'done', installing: 'done', running: 'done', healthy: 'done', routed: 'done', authenticated: 'failed', published: 'skipped', verified: 'failed' });
+  assert.ok(pr.failed);
+  const run = L.provisionProgress({ ok: true, journal: { stages: [{ stage: 'install', status: 'passed' }], verification: [{ stage: 'containers', status: 'passed' }] } }, { access: 'local', auth: 'none' });
+  assert.strictEqual(run.items.find((x) => x.id === 'healthy').state, 'pending', 'a running container is not healthy until its checks pass');
+  assert.strictEqual(L.provisionComposeFile('database'), 'compose.database.yaml'); assert.strictEqual(L.provisionComposeFile('app'), 'compose.yaml'); assert.strictEqual(L.provisionComposeFile('init'), 'compose.setup.yaml');
+  const v = L.provisionVerdict([{ status: 'passed' }, { status: 'not-tested' }, { status: 'not-applicable' }]);
+  assert.deepStrictEqual(v.counts, { passed: 1, failed: 0, notTested: 1, notApplicable: 1 }); assert.strictEqual(v.state, 'partial');
+  assert.strictEqual(L.provisionVerdict([{ status: 'passed' }, { status: 'failed' }]).state, 'attention');
+  assert.strictEqual(L.provisionVerdict([{ status: 'passed' }, { status: 'not-applicable' }]).state, 'verified');
+  assert.strictEqual(L.suggestProvisionHostname('Uptime Kuma', ['example.com']), 'uptime-kuma.example.com');
+  assert.strictEqual(L.suggestProvisionHostname('x', []), '');
+});
+
+test('launcher: default deployment, start notices and autostart text', () => {
+  assert.ok(L.samePath('C:\\Users\\me\\proxy\\', 'c:\\users\\ME\\proxy'));
+  assert.ok(!L.samePath('C:\\a', 'C:\\ab') && !L.samePath('', ''));
+  const l = { available: true, startMode: 'default', notice: '', defaultDeployment: { path: 'C:\\p\\traefik-proxy', usable: true } };
+  const proj = (path, kind = 'manager', usable = true) => ({ summary: { path, kind, usable } });
+  assert.strictEqual(L.launcherDefaultAction(l, proj('c:\\p\\traefik-proxy\\')), 'is-default');
+  assert.strictEqual(L.launcherDefaultAction(l, proj('C:\\p\\other')), 'make-default');
+  assert.strictEqual(L.launcherDefaultAction(l, proj('C:\\p\\draft', 'draft', true)), 'none', 'only installed deployments can be the default');
+  assert.strictEqual(L.launcherDefaultAction({ available: false }, proj('C:\\p\\other')), 'none', 'not started by the launcher');
+  assert.strictEqual(L.launcherNotice(l), null);
+  const rec = L.launcherNotice({ ...l, startMode: 'recovery', notice: 'Recovery mode: no deployment was opened.' });
+  assert.strictEqual(rec.title, 'Recovery mode');
+  assert.strictEqual(rec.text, 'No deployment was opened.', 'the title is not repeated in the text');
+  assert.strictEqual(L.launcherNotice({ ...l, notice: 'gone', defaultDeployment: { path: 'C:\\gone', usable: false } }).tone, 'warn');
+  assert.strictEqual(L.launcherNotice({ ...l, notice: 'Port 8190 is in use' }).tone, 'info');
+  assert.strictEqual(L.autostartText(null).text, 'Off');
+  assert.strictEqual(L.autostartText({ enabled: true, allowedByWindows: false, pointsHere: true }).tone, 'warn');
+  assert.strictEqual(L.autostartText({ enabled: true, allowedByWindows: true, pointsHere: false }).tone, 'warn');
+  assert.strictEqual(L.autostartText({ enabled: true, allowedByWindows: true, pointsHere: true, windowless: true }).tone, 'ok');
+});
+
+test('app catalog: access, sign-in fit, host compatibility, findings and backups', () => {
+  assert.strictEqual(L.catalogAccessText({ access: { localUrl: 'http://127.0.0.1:3001/', hostnames: [] } }).text, 'This PC only');
+  assert.strictEqual(L.catalogAccessText({ prepared: true, access: {} }).text, 'Prepared, not started');
+  assert.strictEqual(L.catalogAccessText({ access: { hostnames: ['a.example.com'], public: true, protected: false } }).tone, 'warn', 'public without sign-in is flagged');
+  assert.match(L.catalogAccessText({ access: { hostnames: ['a.example.com'], public: true, protected: true } }).text, /sign-in required/);
+  assert.match(L.catalogAccessText({ access: { hostnames: ['a.lan'], public: false } }).text, /^Routed: a\.lan/);
+  assert.strictEqual(L.authFitText({ forwardAuth: 'caution' }).tone, 'warn');
+  assert.strictEqual(L.authFitText(null).text, 'Sign-in: not assessed');
+  assert.strictEqual(L.compatSummary([{ label: 'CPU architecture', state: 'ok', message: 'ok' }]).tone, 'ok');
+  assert.strictEqual(L.compatSummary([{ label: 'CPU architecture', state: 'ok' }, { label: 'GPU', state: 'warning', message: 'x' }]).text, 'Limited: GPU');
+  assert.strictEqual(L.compatSummary([{ label: 'CPU architecture', state: 'failed', message: 'arm only' }, { label: 'GPU', state: 'warning' }]).tone, 'err');
+  assert.deepStrictEqual(L.sortFindings([{ level: 'ok' }, { level: 'error' }, { level: 'warning' }]).map((f) => f.level), ['error', 'warning', 'ok']);
+  assert.strictEqual(L.findingTone('error'), 'err');
+  assert.strictEqual(L.backupTitle({ id: '20261116-201500', reason: 'before-update', volumes: [{ sizeMB: 1.5 }, { sizeMB: 2 }] }), '2026-11-16 20:15 · Before an update · 2 volumes (3.5 MB)');
+});
+
+test('catalog: one state per card (managed, detected, unsupported, manual setup, available) and the state filter', () => {
+  const ok = { installable: true, platform: { support: 'supported', installable: true }, compatibility: [{ label: 'CPU architecture', state: 'ok' }] };
+  assert.strictEqual(L.catalogStatus(ok).key, 'available');
+  assert.strictEqual(L.catalogStatus({ ...ok, instances: [{ project: 'a' }], detected: [{ project: 'b' }] }).key, 'managed', 'a managed instance wins');
+  const det = L.catalogStatus({ ...ok, detected: [{ project: 'docker-compose' }] });
+  assert.strictEqual(det.key, 'detected'); assert.ok(det.installed, 'detected counts as already installed');
+  assert.strictEqual(L.catalogStatus({ ...ok, compatibility: [{ label: 'CPU architecture', state: 'failed' }] }).key, 'unsupported');
+  assert.strictEqual(L.catalogStatus({ installable: false, installNote: 'x', platform: { support: 'supported', installable: false } }).key, 'manual');
+  assert.strictEqual(L.catalogStatus({ installable: true, platform: { support: 'unsupported', installable: false } }).key, 'unsupported');
+  assert.ok(L.catalogStatus({ ...ok, manualSetup: ['Claim the server'] }).manualSteps);
+  assert.ok(L.catalogStatusMatches({ ...ok, detected: [{ project: 'x' }] }, 'installed'));
+  assert.ok(!L.catalogStatusMatches(ok, 'installed'));
+  assert.ok(L.catalogStatusMatches({ ...ok, manualSetup: ['x'] }, 'manual'), 'installable apps with setup steps appear under manual setup');
+  assert.ok(L.catalogStatusMatches(ok, ''));
+  assert.strictEqual(L.verificationText({ static: 'passed', live: 'passed', date: '2026-11-17' }).text, 'Live-tested 2026-11-17');
+  assert.strictEqual(L.verificationText({ static: 'passed', live: 'not-run' }).tone, 'warn');
+  assert.match(L.verificationText({ static: 'passed', live: 'not-run' }).text, /not live-tested/);
+  assert.strictEqual(L.verificationText(null).text, 'Verification: not recorded');
+});
+
 console.log(`\n${passed} passed, ${failures.length} failed`);
 process.exit(failures.length ? 1 : 0);

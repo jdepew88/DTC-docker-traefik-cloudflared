@@ -529,12 +529,212 @@
     const n = ((app && app.instances) || []).length;
     return n === 0 ? { installed: false, text: '' } : { installed: true, text: n === 1 ? 'Installed' : `Installed: ${n} instances` };
   }
+  // Catalog card: the one state that decides its primary action and the state filter.
+  //   managed     installed or adopted here (Manage)
+  //   detected    running on this PC, not managed here (Review and adopt / Inspect; never a plain Install)
+  //   unsupported cannot run on this host (platform, architecture or a failed host check)
+  //   manual      not installable from the catalog: a recipe or listing that needs manual setup
+  //   available   can be installed
+  // installed = managed or detected ("Already installed"). manualSteps = an installable app that still needs setup in
+  // the app itself afterwards (shown as a chip, not a separate state).
+  const CATALOG_STATES = {
+    managed: { text: 'Managed here', tone: 'ok' },
+    detected: { text: 'Detected on this PC', tone: 'info' },
+    unsupported: { text: 'Not supported on this PC', tone: 'err' },
+    manual: { text: 'Requires manual setup', tone: 'warn' },
+    available: { text: 'Available', tone: 'neutral' },
+  };
+  function catalogStatus(app) {
+    const a = app || {};
+    const managed = (a.instances || []).length;
+    const detected = (a.detected || []).length;
+    const compatFailed = (a.compatibility || []).some((c) => c.state === 'failed');
+    const platformOk = !a.platform || a.platform.installable !== false || !a.installable;
+    let key = 'available';
+    if (managed) key = 'managed';
+    else if (detected) key = 'detected';
+    else if (a.platform && a.platform.support === 'unsupported') key = 'unsupported';
+    else if (!a.installable) key = 'manual';
+    else if (compatFailed || !platformOk) key = 'unsupported';
+    return { key, ...CATALOG_STATES[key], installed: key === 'managed' || key === 'detected', manualSteps: (a.manualSetup || []).length > 0 };
+  }
+  function catalogStatusMatches(app, filter) {
+    if (!filter) return true;
+    const s = catalogStatus(app);
+    if (filter === 'installed') return s.installed;
+    if (filter === 'manual') return s.key === 'manual' || (s.key === 'available' && s.manualSteps);
+    return s.key === filter;
+  }
+  // Catalog card: what has been demonstrated (live installation on a disposable deployment vs static checks only).
+  function verificationText(v) {
+    if (!v) return { tone: 'neutral', text: 'Verification: not recorded' };
+    if (v.live === 'passed') return { tone: 'ok', text: `Live-tested${v.date ? ` ${v.date}` : ''}` };
+    if (v.live === 'partial') return { tone: 'warn', text: 'Partly live-tested' };
+    if (v.live === 'failed') return { tone: 'err', text: 'Live test failed' };
+    return { tone: 'warn', text: v.static === 'passed' ? 'Static checks only (not live-tested)' : 'Not verified' };
+  }
+
   // Display name of an installed instance: the application, plus its label when it has one (e.g. "Testing").
   function instanceTitle(a) { return a && a.label ? `${a.name} (${a.label})` : (a ? a.name : ''); }
+
+  // Catalog card: where an installation is reachable (public through Cloudflare, routed on a hostname, or this PC only).
+  function catalogAccessText(instance) {
+    const a = (instance && instance.access) || {};
+    const hosts = a.hostnames || [];
+    if (!instance) return { tone: 'neutral', text: '' };
+    if (instance.prepared) return { tone: 'neutral', text: 'Prepared, not started' };
+    if (a.public) return { tone: a.protected ? 'ok' : 'warn', text: `Public: ${hosts.join(', ')}${a.protected ? ' (sign-in required)' : ''}` };
+    if (hosts.length) return { tone: 'info', text: `Routed: ${hosts.join(', ')}${a.protected ? ' (sign-in required)' : ''}` };
+    return { tone: 'neutral', text: a.localUrl ? 'This PC only' : 'Not published' };
+  }
+  // Catalog card: how well generic ForwardAuth (authentik) suits the application.
+  const AUTH_FIT = {
+    compatible: { tone: 'ok', text: 'Sign-in: authentik or Cloudflare Access' },
+    caution: { tone: 'warn', text: 'Sign-in: own clients (ForwardAuth blocks them)' },
+    unsuitable: { tone: 'err', text: 'Sign-in: not with ForwardAuth' },
+    'not-applicable': { tone: 'neutral', text: 'Sign-in provider or no web interface' },
+  };
+  function authFitText(auth) { return AUTH_FIT[auth && auth.forwardAuth] || { tone: 'neutral', text: 'Sign-in: not assessed' }; }
+  // Catalog card: the worst host-compatibility check (failed > warning > ok; info alone counts as ok).
+  function compatSummary(checks) {
+    const list = checks || [];
+    const failed = list.find((c) => c.state === 'failed');
+    if (failed) return { tone: 'err', text: `Not compatible: ${failed.label}`, detail: failed.message };
+    const warn = list.find((c) => c.state === 'warning');
+    if (warn) return { tone: 'warn', text: `Limited: ${warn.label}`, detail: warn.message };
+    const arch = list.find((c) => c.label === 'CPU architecture');
+    return { tone: 'ok', text: 'Compatible with this PC', detail: arch ? arch.message : '' };
+  }
+  // Installed app: findings of the stack view, worst first.
+  const FINDING_ORDER = { error: 0, warning: 1, info: 2, ok: 3 };
+  function sortFindings(list) { return (list || []).slice().sort((x, y) => (FINDING_ORDER[x.level] ?? 9) - (FINDING_ORDER[y.level] ?? 9)); }
+  function findingTone(level) { return { error: 'err', warning: 'warn', info: 'neutral', ok: 'ok' }[level] || 'neutral'; }
+  // Installed app: a backup's one-line description.
+  const BACKUP_REASONS = { manual: 'Manual backup', 'before-update': 'Before an update', 'before-restore': 'Before a restore' };
+  function backupTitle(b) {
+    if (!b) return '';
+    const m = /^(\d{4})(\d{2})(\d{2})-(\d{2})(\d{2})(\d{2})$/.exec(b.id || '');
+    const when = m ? `${m[1]}-${m[2]}-${m[3]} ${m[4]}:${m[5]}` : b.id;
+    const size = (b.volumes || []).reduce((s, v) => s + (Number(v.sizeMB) || 0), 0);
+    return `${when} · ${BACKUP_REASONS[b.reason] || b.reason || 'Backup'} · ${(b.volumes || []).length} volume${(b.volumes || []).length === 1 ? '' : 's'}${size ? ` (${size.toFixed(1)} MB)` : ''}`;
+  }
+
+  // --- New app (provisioning): Container -> Reverse proxy -> Authentication -> Review and deploy ---------------------
+  // Findings the user must acknowledge before a deployment can be reviewed (block findings cannot be acknowledged).
+  function provisionAckIds(findings) { return (findings || []).filter((f) => f.severity === 'high' || f.severity === 'review').map((f) => f.id); }
+  // Where the app is reachable, and which sign-in choices make sense there (the server decides availability).
+  const PROVISION_ACCESS = {
+    local: { label: 'Only this PC', text: 'Opens on 127.0.0.1; no route, nothing published.' },
+    lan: { label: 'A host name on your network', text: 'An explicit Traefik route. In this deployment Traefik listens on this PC only.' },
+    public: { label: 'A public address (Cloudflare Tunnel)', text: 'An explicit Traefik route, published through your existing Cloudflare Tunnel.' },
+  };
+  // Pure: step states of the wizard. s: { draft, acknowledged[], access, hostname, auth, review, result }.
+  // Pure: the Add application wizard (one wizard for every source). Eight stages; the informational ones (stack,
+  // storage, publication) are complete as soon as the stage before them is, so they never add mandatory clicks.
+  function provisionWizard(s) {
+    const st = s || {};
+    const draft = st.draft || null;
+    const acks = new Set(st.acknowledged || []);
+    const pending = draft ? provisionAckIds(draft.findings).filter((id) => !acks.has(id)) : [];
+    const containerDone = !!(draft && draft.deployable && !pending.length);
+    const hostOk = /^(?=.{4,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/.test(String(st.hostname || ''));
+    const proxyDone = containerDone && (st.access === 'local' || ((st.access === 'lan' || st.access === 'public') && hostOk));
+    const authDone = proxyDone && !!st.auth && !(st.access === 'public' && st.auth === 'none') && !(st.access === 'local' && st.auth !== 'none' && st.auth !== 'native');
+    const deployed = !!(st.result && st.result.ok);
+    const verdict = deployed ? provisionVerdict(((st.result || {}).journal || {}).verification) : null;
+    const steps = [
+      { id: 'container', number: 1, title: 'Application source', done: containerDone, available: true, missing: !draft ? 'Import an application' : !draft.deployable ? 'The draft cannot be deployed yet' : pending.length ? `${pending.length} item(s) to review` : '' },
+      { id: 'stack', number: 2, title: 'Stack and dependencies', done: containerDone, available: !!draft, missing: containerDone ? '' : 'Complete the source first' },
+      { id: 'storage', number: 3, title: 'Storage and networking', done: containerDone, available: !!draft, missing: containerDone ? '' : 'Complete the source first' },
+      { id: 'proxy', number: 4, title: 'Routing', done: proxyDone, available: containerDone, missing: proxyDone ? '' : (st.access && st.access !== 'local' && !hostOk ? 'Enter a host name' : 'Choose where it is reachable') },
+      { id: 'auth', number: 5, title: 'Authentication', done: authDone, available: proxyDone, missing: authDone ? '' : 'Choose who has access' },
+      { id: 'publish', number: 6, title: 'Publication', done: authDone, available: authDone, missing: authDone ? '' : 'Choose who has access first' },
+      { id: 'review', number: 7, title: 'Review and deploy', done: deployed, available: authDone, missing: deployed ? '' : 'Review, then deploy' },
+      { id: 'verify', number: 8, title: 'Verify and manage', done: !!(verdict && verdict.state === 'verified'), available: !!st.result, missing: !st.result ? 'Deploy first' : verdict && verdict.state === 'verified' ? '' : 'Some checks are not passed yet' },
+    ];
+    const current = (steps.find((x) => !x.done && x.available) || steps[steps.length - 1]).id;
+    return { steps, current, pendingAcks: pending };
+  }
+  // Pure: the component states after a deployment, in order: planned, installing, running, healthy, routed,
+  // authenticated, published, verified, failed (or skipped when it does not apply). A running container is never
+  // reported healthy without its health / backend checks.
+  function provisionProgress(result, choices) {
+    const c = choices || {};
+    const j = (result && result.journal) || {};
+    const stage = (id) => (j.stages || []).find((x) => x.stage === id);
+    const ver = (id) => (j.verification || []).find((x) => x.stage === id);
+    const st = (s) => (!s ? 'pending' : s.status === 'passed' ? 'done' : s.status === 'failed' ? 'failed' : s.status === 'not-applicable' ? 'skipped' : 'pending');
+    const failedAny = (j.stages || []).some((x) => x.status === 'failed');
+    const items = [
+      { id: 'planned', label: 'Planned', state: result ? 'done' : 'pending' },
+      { id: 'installing', label: 'Installed', state: st(stage('install')) },
+      { id: 'running', label: 'Running', state: st(ver('containers')) },
+      { id: 'healthy', label: 'Healthy', state: st(ver('dependencies')) === 'failed' || st(ver('backend')) === 'failed' ? 'failed' : (st(ver('backend')) === 'done' ? 'done' : 'pending') },
+      { id: 'routed', label: 'Routed', state: c.access === 'local' ? 'skipped' : st(stage('route')) },
+      { id: 'authenticated', label: 'Sign-in', state: c.auth === 'authentik' ? st(stage('authentication')) : 'skipped' },
+      { id: 'published', label: 'Published', state: c.access === 'public' ? st(stage('publish')) : 'skipped' },
+    ];
+    const v = provisionVerdict(j.verification);
+    items.push({ id: 'verified', label: 'Verified', state: failedAny || v.counts.failed ? 'failed' : v.state === 'verified' ? 'done' : 'pending' });
+    return { items, failed: failedAny || items.some((x) => x.state === 'failed') };
+  }
+  // Pure: the Compose file a service lands in (same rule as the server's ConvertTo-AppComposeSet).
+  function provisionComposeFile(role) {
+    const m = { database: 'database', cache: 'cache', messaging: 'messaging', worker: 'workers', support: 'support', init: 'setup', migration: 'setup', maintenance: 'setup' };
+    return m[role] ? `compose.${m[role]}.yaml` : 'compose.yaml';
+  }
+  // Pure: the overall verdict of a deployment's verification stages. Untested stages never count as passed.
+  function provisionVerdict(stages) {
+    const list = stages || [];
+    const n = (st) => list.filter((x) => x.status === st).length;
+    const counts = { passed: n('passed'), failed: n('failed'), notTested: n('not-tested'), notApplicable: n('not-applicable') };
+    const state = counts.failed ? 'attention' : counts.notTested ? 'partial' : counts.passed ? 'verified' : 'unknown';
+    return { counts, state };
+  }
+  // Pure: a host name suggestion: <app id>.<first domain>.
+  function suggestProvisionHostname(appId, domains) {
+    const label = suggestLabel(appId || '');
+    const d = (domains || []).find(Boolean);
+    return label && d ? `${label}.${d}` : '';
+  }
+
+  // --- Launcher (DTC tray, start modes, default deployment) ------------------------------------------------------------
+  // Pure: Windows paths compare without case and without a trailing backslash.
+  function samePath(a, b) {
+    const n = (p) => String(p || '').replace(/[\\/]+$/, '').toLowerCase();
+    return !!a && !!b && n(a) === n(b);
+  }
+  // Pure: the banner at the top of the chooser for this start (recovery mode, a missing default, a port fallback).
+  function launcherNotice(l) {
+    if (!l || !l.available) return null;
+    if (l.startMode === 'recovery') {
+      const text = String(l.notice || 'No deployment was opened automatically.').replace(/^Recovery mode:\s*/i, '');
+      return { tone: 'warn', title: 'Recovery mode', text: text.charAt(0).toUpperCase() + text.slice(1) };
+    }
+    if (l.notice) return { tone: l.defaultDeployment && l.defaultDeployment.path && !l.defaultDeployment.usable ? 'warn' : 'info', title: '', text: l.notice };
+    return null;
+  }
+  // Pure: what the chooser shows for one deployment: "Default at startup", a "Make default" action, or nothing.
+  function launcherDefaultAction(l, project) {
+    if (!l || !l.available || !project || !project.summary) return 'none';
+    const d = l.defaultDeployment || {};
+    if (samePath(d.path, project.summary.path)) return 'is-default';
+    return project.summary.kind === 'manager' && project.summary.usable ? 'make-default' : 'none';
+  }
+  // Pure: one line about Start with Windows.
+  function autostartText(a) {
+    if (!a || !a.enabled) return { tone: 'neutral', text: 'Off' };
+    if (!a.allowedByWindows) return { tone: 'warn', text: 'On, but disabled in Task Manager > Startup apps' };
+    if (!a.pointsHere) return { tone: 'warn', text: 'On, but it starts another copy of DTC. Turn it off and on again to use this one.' };
+    return { tone: 'ok', text: a.windowless ? 'On (silent, waits for Docker Desktop)' : 'On (waits for Docker Desktop; a console may flash briefly)' };
+  }
 
   return {
     ROUTING_STATES, routingState, routingEvidence, endpointAudience, endpointKind, ROUTING_HELP, routingHelp, journeyPath,
     DEPLOYMENT_STATES, deploymentState, statusTone, serviceGroups, terminationText, healthText, shortImage, roleSource, catalogInstallState, instanceTitle,
+    catalogAccessText, authFitText, compatSummary, sortFindings, findingTone, backupTitle, catalogStatus, catalogStatusMatches, verificationText,
+    provisionAckIds, PROVISION_ACCESS, provisionWizard, provisionVerdict, provisionProgress, provisionComposeFile, suggestProvisionHostname,
+    samePath, launcherNotice, launcherDefaultAction, autostartText,
     IDENTITY_STATES, identityState, googleRedirectUri, isGoogleClientId, identityNextStep, identityWizard, wizardNeighbours, CREDENTIAL_STATUS, credentialStatus,
     appProtectionState, protectionSummary,
     LEVELS, LEVEL_TITLES, DEFAULT_LEVEL, normalizeLevel, levelIndex, isVisibleAt,

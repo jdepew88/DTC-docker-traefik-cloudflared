@@ -8,7 +8,7 @@
   two Rocket.Chat installations, one written as 'rocket-chat'). The installed apps, their details and the install
   defaults are answered in the page from models built by the real lib\ComposeLifecycle.psm1 from facts shaped like the
   live Rocket.Chat project (three long-running services, two completed setup jobs) and a prepared second installation.
-  Covers: Arcane, Portainer and What's Up Docker offered, no Diun or Watchtower card, one Rocket.Chat entry with its
+  Covers: Arcane, Portainer, What's Up Docker and (headless) Diun offered, no Watchtower card, card details, one Rocket.Chat entry with its
   installations, the corrected status, expandable service details (roles, health, exit codes, dependencies, networks),
   no scroll jump, the duplicate-installation panel, secrets never shown, and the phone layout. Screenshots go to
   -ScreenshotDir.
@@ -24,6 +24,7 @@ $repo = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
 Import-Module (Join-Path $repo 'lib\AppCatalog.psm1') -Force
 Import-Module (Join-Path $repo 'lib\ComposeLifecycle.psm1') -Force
 Import-Module (Join-Path $repo 'tests\WebUiTestHelpers.psm1') -Force
+Import-Module (Join-Path $repo 'tests\TestResources.psm1') -Force
 Import-Module (Join-Path $repo 'tests\EdgeCdp.psm1') -Force
 $script:Results = New-Object System.Collections.ArrayList
 function Add-Result([string]$Status, [string]$Name, [string]$Detail) {
@@ -55,11 +56,28 @@ $failFacts = @($facts | ForEach-Object { $c = [ordered]@{}; foreach ($k in $_.Ke
 $lcFail = Get-DeploymentLifecycle -Containers $failFacts -Manifest $rcm
 $appA = [ordered]@{ project = 'rocket-chat'; instanceId = 'legacy-rocket-chat'; appId = 'rocketchat'; recordedAppId = 'rocket-chat'; applicationId = 'rocketchat'; availability = 'offered'; name = 'Rocket.Chat'; label = ''; origin = 'installed'; archived = $false; archivedAt = ''
   folder = 'C:\Users\me\.docker\projects\rocket-chat'; installedAt = '2026-10-21T21:34:33'; folderExists = $true; containers = @(); running = 3; total = 5; lifecycle = $lcRun; siblings = @('rocketchat'); localUrl = 'http://127.0.0.1:3100/'
-  routes = @([ordered]@{ name = 'rocket-chat'; hostnames = @('chat.example.com'); publish = $true; authProvider = 'authentik' }); prepared = $false; composeChanged = $false; updateAvailable = $false; updates = @(); catalog = $null }
+  routes = @([ordered]@{ name = 'rocket-chat'; hostnames = @('chat.example.com'); publish = $true; authProvider = 'authentik' }); prepared = $false; composeChanged = $false; updateAvailable = $false; updates = @(); catalog = $null
+  composeFiles = @('compose.yaml', 'compose.database.yaml', 'compose.messaging.yaml', 'compose.setup.yaml'); installState = ''; hasStack = $true }
 $appB = [ordered]@{}; foreach ($k in $appA.Keys) { $appB[$k] = $appA[$k] }
 $appB.project = 'rocketchat'; $appB.instanceId = 'legacy-rocketchat'; $appB.folder = 'C:\Users\me\.docker\projects\rocketchat'; $appB.lifecycle = $lcPrep; $appB.siblings = @('rocket-chat'); $appB.localUrl = 'http://127.0.0.1:3101/'; $appB.routes = @(); $appB.prepared = $true; $appB.running = 0; $appB.total = 0; $appB.composeChanged = $null
 $appC = [ordered]@{}; foreach ($k in $appA.Keys) { $appC[$k] = $appA[$k] }
 $appC.project = 'chat-lab'; $appC.label = 'Lab'; $appC.lifecycle = $lcFail; $appC.siblings = @(); $appC.routes = @()
+# An installation interrupted while its files were written.
+$appD = [ordered]@{}; foreach ($k in $appA.Keys) { $appD[$k] = $appA[$k] }
+$appD.project = 'immich-half'; $appD.name = 'Immich'; $appD.appId = 'immich'; $appD.applicationId = 'immich'; $appD.installState = 'writing'; $appD.lifecycle = $lcPrep; $appD.routes = @(); $appD.siblings = @(); $appD.folder = 'C:\Users\me\.docker\projects\immich-half'
+# Stack & routing (GET /api/apps/stack) and backups of the running Rocket.Chat, shaped like the real responses.
+$routeYaml = "svc-rocket-chat:`n  rule: 'Host(``chat.example.com``)'`n  entryPoints: [web]`n  service: svc-rocket-chat"
+$stackView = [ordered]@{ project = 'rocket-chat'; name = 'Rocket.Chat'; folder = $appA.folder; stackSource = 'file'; composeChanged = $false
+  composeFiles = @([ordered]@{ file = 'compose.yaml'; exists = $true; content = "name: rocket-chat`nservices:`n  rocketchat:`n    environment:`n      MONGO_URL: `${MONGO_URL}" }, [ordered]@{ file = 'compose.database.yaml'; exists = $true; content = "services:`n  mongodb:`n    image: mongodb" })
+  stack = [ordered]@{ schema = 1; kind = 'dtc-stack'; project = 'rocket-chat'; startOrder = @('mongodb-fix-permission', 'mongodb', 'mongodb-init', 'nats', 'rocketchat'); dependencies = @([ordered]@{ service = 'mongodb'; role = 'database' }, [ordered]@{ service = 'nats'; role = 'messaging' })
+    networks = [ordered]@{ shared = @('proxynet'); private = @('rocket-chat_internal') }; frontend = [ordered]@{ service = 'rocketchat'; headless = $false; backendUrl = 'http://rocket-chat-rocketchat:3000' } }
+  env = [ordered]@{ file = '.env'; variables = @('COMPOSE_FILE', 'MONGO_URL', 'ROOT_URL') }
+  routing = [ordered]@{ directory = 'traefik\dynamic'; recursive = $false; traefikReachable = $true; routes = @([ordered]@{ name = 'rocket-chat'; hostnames = @('chat.example.com'); file = 'traefik\dynamic\svc-rocket-chat.yml'; exists = $true; loadedByFileProvider = $true
+        routers = @([ordered]@{ name = 'svc-rocket-chat'; yaml = $routeYaml; rule = 'Host(`chat.example.com`)' }); services = @([ordered]@{ name = 'svc-rocket-chat'; yaml = "svc-rocket-chat:`n  loadBalancer:`n    servers:`n      - url: http://rocket-chat-rocketchat:3000"; urls = @('http://rocket-chat-rocketchat:3000') }); middlewares = @()
+        traefik = @([ordered]@{ router = 'svc-rocket-chat'; served = $true; status = 'enabled' }) }) }
+  findings = @([ordered]@{ level = 'ok'; message = 'No problems found.'; fix = '' }, [ordered]@{ level = 'warning'; message = 'The Compose files were changed outside the manager since they were written here.'; fix = 'Review the change.' })
+  backups = @(); checkedAt = '2026-11-16T10:00:00' }
+$backups = [ordered]@{ project = 'rocket-chat'; folder = 'x'; backups = @([ordered]@{ id = '20261116-101500'; createdAt = '2026-11-16T10:15:00'; reason = 'before-update'; volumes = @([ordered]@{ volume = 'rocket-chat_mongodb'; ok = $true; sizeMB = 12.5 }); files = @('compose.yaml', 'compose.database.yaml', '.env'); composeFiles = @('compose.yaml', 'compose.database.yaml'); folders = @(); valid = $true }) }
 $fillers = @(1..4 | ForEach-Object { $x = [ordered]@{}; foreach ($k in $appA.Keys) { $x[$k] = $appA[$k] }; $x.project = "filler-$_"; $x.name = "Filler $_"; $x.appId = 'echo'; $x.applicationId = 'echo'; $x.siblings = @(); $x.routes = @(); $x.lifecycle = (Get-DeploymentLifecycle -Containers @((New-Fact 'rocketchat' 'running' 0 '' $false 'unless-stopped'))); $x })
 $detail = [ordered]@{ project = 'rocket-chat'; instanceId = 'legacy-rocket-chat'; name = 'Rocket.Chat'; label = ''; appId = 'rocketchat'; applicationId = 'rocketchat'; origin = 'installed'; folder = $appA.folder; archived = $false
   lifecycle = $lcRun; cleanup = @(Get-JobCleanupCandidates $lcRun); routes = $appA.routes
@@ -70,7 +88,7 @@ $detail = [ordered]@{ project = 'rocket-chat'; instanceId = 'legacy-rocket-chat'
   cloudflare = @([ordered]@{ hostname = 'chat.example.com'; dnsRecord = $true; accessApp = $false }); authentik = @([ordered]@{ service = 'rocket-chat'; slug = 'dm-rocket-chat' }); composeChanged = $false; checkedAt = '2026-10-25T22:00:00' }
 $existing = @([ordered]@{ source = 'registry'; project = 'rocket-chat'; instanceId = 'legacy-rocket-chat'; label = ''; folder = $appA.folder; archived = $false; origin = 'installed'; state = 'running'; headline = $lcRun.headline; containers = 5; hostnames = @('chat.example.com'); reason = "Registered in the manager as rocketchat (recorded as 'rocket-chat', an alias)." },
   [ordered]@{ source = 'registry'; project = 'rocketchat'; instanceId = 'legacy-rocketchat'; label = ''; folder = $appB.folder; archived = $false; origin = 'installed'; state = 'prepared'; headline = $lcPrep.headline; containers = 0; hostnames = @(); reason = "Registered in the manager as rocketchat (recorded as 'rocket-chat', an alias)." })
-$fixtureJson = ConvertTo-Json -Depth 14 -Compress ([ordered]@{ apps = @(@($appA, $appB, $appC) + $fillers); detail = $detail; existing = $existing; secret = $secret })
+$fixtureJson = ConvertTo-Json -Depth 14 -Compress ([ordered]@{ apps = @(@($appA, $appB, $appC, $appD) + $fillers); detail = $detail; existing = $existing; secret = $secret; stack = $stackView; backups = $backups })
 $Shim = @'
 (() => {
   const realFetch = window.fetch.bind(window);
@@ -81,6 +99,10 @@ $Shim = @'
     const url = new URL(typeof input === 'string' ? input : input.url, location.href);
     const record = () => { calls.push({ path: url.pathname + url.search, body: init && init.body ? String(init.body) : '' }); sessionStorage.setItem('apcalls', JSON.stringify(calls)); };
     if (url.pathname === '/api/apps') { record(); return json({ apps: F.apps, archived: [], discovered: [], checkedAt: '2026-10-25T22:00:00' }); }
+    if (url.pathname === '/api/apps/stack') { record(); return json(F.stack); }
+    if (url.pathname === '/api/apps/backups') { record(); return json(F.backups); }
+    if (url.pathname === '/api/apps/restore-data/plan') { record(); return json({ project: 'rocket-chat', backup: '20261116-101500', restoreFiles: true, key: 'k1', volumes: [{ volume: 'rocket-chat_mongodb', sizeMB: 12.5, available: true }], files: ['compose.yaml', 'compose.database.yaml', '.env'], folders: [], steps: ['Back up the current state first (safety backup, so this restore can be undone).', 'Stop the app.'], keeps: ['Folders you chose are never touched.'] }); }
+    if (url.pathname === '/api/apps/restore-data') { record(); return json({ ok: true, project: 'rocket-chat', backup: '20261116-101500', safetyBackup: '20261116-103000', steps: [{ name: 'Safety backup of the current state', status: 'Done', message: '20261116-103000' }, { name: 'Restore volume rocket-chat_mongodb', status: 'Done', message: '12.5 MB' }], health: null }); }
     if (url.pathname === '/api/apps/detail') { record(); return url.searchParams.get('project') === 'rocket-chat' ? json(F.detail) : json(Object.assign({}, F.detail, { project: url.searchParams.get('project'), lifecycle: (F.apps.find((a) => a.project === url.searchParams.get('project')) || {}).lifecycle, cleanup: [], networks: [], published: [], volumes: [] })); }
     if (url.pathname === '/api/catalog/defaults') { record(); const r = await realFetch(input, init); const d = await r.json(); if (url.searchParams.get('id') === 'rocketchat') d.existing = F.existing; return json(d); }
     if (url.pathname === '/api/catalog/plan') { record(); }
@@ -91,6 +113,10 @@ $Shim = @'
 
 $id = [Guid]::NewGuid().ToString('N').Substring(0, 6)
 $work = Join-Path ([IO.Path]::GetTempPath()) "tpm-apb-$id"
+# Earlier runs killed hard (out of memory, closed window) skip `finally`: remove what their dead owners left, then
+# register this run's prefix so an interruption of this run is swept the same way (tests\Find-TestOrphans.ps1 lists them).
+foreach ($orphanLine in (Invoke-TestOrphanSweep)) { Write-Host "  [orphans] $orphanLine" -ForegroundColor DarkYellow }
+Register-TestRun -Prefix "tpm-apb-$id" -Suite 'Test-AppsBrowser'
 New-Item -ItemType Directory -Force -Path $work | Out-Null
 if ($ScreenshotDir) { New-Item -ItemType Directory -Force -Path $ScreenshotDir | Out-Null; $ScreenshotDir = (Resolve-Path $ScreenshotDir).Path }
 $apiToken = 'mockTok_' + [Guid]::NewGuid().ToString('N')
@@ -120,17 +146,36 @@ try {
   $ok = Go 'catalog?level=intermediate' "document.querySelectorAll('.cat-card').length > 5"
   $cards = [string](Js "[...document.querySelectorAll('.cat-card')].map((c) => c.dataset.app).join(',')")
   Test-Condition 'catalog: Arcane, Portainer and What''s Up Docker have Install buttons' ($ok -and [int](Js "['arcane','portainer','whats-up-docker'].filter((i) => document.querySelector('.cat-card[data-app=' + JSON.stringify(i) + '] a[href=' + JSON.stringify('#install/' + i) + ']')).length") -eq 3) $cards
-  Test-Condition 'catalog: Diun and Watchtower are not offered (no card, no install link)' ($cards -notmatch '(^|,)(diun|watchtower)(,|$)' -and [int](Js "document.querySelectorAll('a[href=\'#install/diun\'], a[href=\'#install/watchtower\']').length") -eq 0) $cards
+  Test-Condition 'catalog: Watchtower is not offered (no card, no install link); Diun is offered as a headless app' ($cards -notmatch '(^|,)watchtower(,|$)' -and [int](Js "document.querySelectorAll('a[href=\'#install/watchtower\']').length") -eq 0 -and [string](Js "(document.querySelector('.cat-card[data-app=diun]') || {}).innerText || ''") -match 'No web interface' -and [int](Js "document.querySelectorAll('a[href=\'#install/diun\']').length") -eq 1) $cards
+  $kuma = [string](Js "(document.querySelector('.cat-card[data-app=uptime-kuma]') || {}).innerText || ''")
+  Test-Condition 'catalog: a card shows the publisher, host compatibility and how sign-in fits' ($kuma -match 'by Louis Lam' -and $kuma -match 'Compatible with this PC' -and $kuma -match 'Sign-in: own clients') $kuma
+  $null = Js "document.querySelector('.cat-card[data-app=rocketchat] details.cat-details').open = true; true"
+  $rcDet = [string](Js "document.querySelector('.cat-card[data-app=rocketchat] details.cat-details').innerText")
+  Test-Condition 'catalog: View details lists source, images, CPU architectures, requirements, Compose files, sign-in, limitations and updates' ($rcDet -match 'github\.com/RocketChat' -and $rcDet -match 'amd64, arm64' -and $rcDet -match 'compose\.database\.yaml' -and $rcDet -match 'compose\.messaging\.yaml' -and $rcDet -match 'WebSockets' -and $rcDet -match 'single-node replica set' -and $rcDet -match 'nothing updates automatically') $rcDet
   $rcCard = [string](Js "(document.querySelector('.cat-card[data-app=rocketchat]') || {}).innerText || ''")
   Test-Condition 'catalog: one Rocket.Chat entry, marked installed (2 instances) with Manage and "Install another…"' ([int](Js "[...document.querySelectorAll('.cat-card h2')].filter((x) => x.textContent === 'Rocket.Chat').length") -eq 1 -and $rcCard -match 'Installed: 2 instances' -and $rcCard -match 'Manage installations' -and $rcCard -match 'Install another') $rcCard
   Test-Condition 'catalog: Arcane is recommended; Dispatcharr''s modular compose is listed under Dispatcharr, not as its own card' ([string](Js "document.querySelector('.cat-card[data-app=arcane]').innerText") -match 'Recommended' -and $cards -notmatch 'dispatcharr-modular' -and [string](Js "document.querySelector('.cat-card[data-app=dispatcharr]').innerText") -match 'other ways to install') $cards
   Test-Condition 'catalog: PostgreSQL and Redis are building blocks, not app cards' ($cards -notmatch 'postgresql|redis' -and [string](Js "(document.querySelector('#cat-reference') || {}).textContent || ''") -match 'PostgreSQL') ''
   Shot 'catalog-offered'
-  $null = Go 'catalog?level=advanced' "!!document.querySelector('#cat-retired')"
-  $null = Js "document.querySelector('#cat-retired').open = true; document.querySelector('#cat-retired').scrollIntoView(); true"
-  $ret = [string](Js "document.querySelector('#cat-retired').innerText")
-  Test-Condition 'catalog (advanced): Diun and Watchtower are explained as no longer offered, existing installations kept' ($ret -match 'Diun' -and $ret -match 'Watchtower' -and $ret -match 'never removed' -and [int](Js "document.querySelectorAll('#cat-retired a[href^=\'#install\']').length") -eq 0) $ret
-  Shot 'catalog-no-longer-offered'
+  # Retired entries are no longer part of the catalog: without an installation of them, not even the advanced view names them.
+  $null = Go 'catalog?level=advanced' "document.querySelectorAll('.cat-card').length > 5"
+  Test-Condition 'catalog (advanced): Watchtower appears nowhere while it is not installed (no card, no retired section, no install link)' (-not [bool](Js "!!document.querySelector('#cat-retired')") -and [int](Js "document.querySelectorAll('.cat-card[data-app=watchtower], a[href=\'#install/watchtower\']').length") -eq 0) ''
+  # Installation-state filter: one state per card; manual-setup entries never get an install action.
+  $null = Js "(() => { const s = document.querySelector('#cat-state'); s.value = 'manual'; s.dispatchEvent(new Event('change')); return true; })()"
+  $manual = [string](Js "[...document.querySelectorAll('.cat-card')].map((c) => c.dataset.app + ':' + c.dataset.state).join(',')")
+  $shin = [string](Js "(document.querySelector('.cat-card[data-app=shinobi]') || {}).innerText || ''")
+  Test-Condition 'catalog filter: "Requires manual setup" lists Shinobi (listed only, no install action) and installable apps with setup steps' ($manual -match 'shinobi:manual' -and $shin -match 'Requires manual setup' -and $shin -match 'moving image tags' -and [int](Js "document.querySelectorAll('a[href=\'#install/shinobi\'], [data-provision=shinobi]').length") -eq 0 -and $manual -match 'plex:') $manual
+  Shot 'catalog-filter-manual'
+  $null = Js "(() => { const s = document.querySelector('#cat-state'); s.value = 'installed'; s.dispatchEvent(new Event('change')); return true; })()"
+  $inst2 = @([string](Js "[...document.querySelectorAll('.cat-card')].map((c) => c.dataset.installed + ':' + c.dataset.state).join(',')") -split ',' | Where-Object { $_ })
+  Test-Condition 'catalog filter: "Already installed" shows only managed or detected apps (Rocket.Chat managed)' ($inst2.Count -ge 1 -and -not @($inst2 | Where-Object { $_ -notmatch '^true:(managed|detected)$' }).Count -and [bool](Js "!!document.querySelector('.cat-card[data-app=rocketchat][data-state=managed]')")) ($inst2 -join ',')
+  $det = [string](Js "[...document.querySelectorAll('.cat-card[data-state=detected]')].map((c) => c.dataset.app + '|' + [...c.querySelectorAll('.actions a.btn.primary')].map((a) => a.textContent).join('/')).join(',')")
+  Test-Condition 'catalog: a detected (not managed) installation offers Review and adopt or Inspect and route as its primary action, never a plain Install' (-not @(($det -split ',') | Where-Object { $_ -and $_ -notmatch '\|(Review and adopt|Inspect and route)' }).Count) $det
+  Shot 'catalog-filter-installed'
+  $null = Js "(() => { const s = document.querySelector('#cat-state'); s.value = ''; s.dispatchEvent(new Event('change')); return true; })()"
+  $vw = [string](Js "(document.querySelector('.cat-card[data-app=vaultwarden]') || {}).innerText || ''")
+  $nc = [string](Js "(document.querySelector('.cat-card[data-app=nextcloud]') || {}).innerText || ''")
+  Test-Condition 'catalog: cards show what was verified (Vaultwarden live-tested, otherwise static checks only)' ($vw -match 'Live-tested' -and ($nc -match 'Static checks only' -or $nc -match 'Live-tested')) "$vw | $nc"
 
   # --- Installed apps -----------------------------------------------------------------------------------------------------
   $ok = Go 'apps?level=intermediate' "document.querySelectorAll('.dep-card').length >= 3"
@@ -189,6 +234,30 @@ try {
   $body = [string](Js "JSON.stringify((window.__apcalls || []).filter((c) => c.path === '/api/catalog/plan').slice(-1)[0] || {})")
   Test-Condition 'install: choosing "another, separate instance" asks for a label and sends it with the preview' ($okL -and $okP -and $body -match 'anotherInstance\\":true' -and $body -match 'Testing') $body
 
+  # --- Interrupted installation, Stack & routing, Restore ------------------------------------------------------------------
+  $ok = Go 'apps?level=intermediate' "!!document.querySelector('#dep-immich-half-card')"
+  $int = [string](Js "document.querySelector('#dep-immich-half-card').innerText")
+  Test-Condition 'apps: an interrupted installation is its own card: "Installation interrupted", only Discard, no Start/Logs/Update' ($ok -and $int -match 'Installation interrupted' -and [int](Js "document.querySelectorAll('#dep-immich-half-card button').length") -eq 1 -and [bool](Js "!!document.querySelector('#dep-immich-half-discard')")) $int
+  $null = Js "document.querySelector('button[aria-label=""Stack and routing of Rocket.Chat""]').click(); true"
+  $ok = Wait-PageCondition $cdp "!!document.querySelector('#dep-rocket-chat-stack')" 15
+  $stTxt = [string](Js "document.querySelector('#dep-rocket-chat-stack').innerText")
+  $order = [string](Js "[...document.querySelectorAll('#dep-rocket-chat-stack .checks')][0].innerText")
+  Test-Condition 'stack view: findings (worst first), start order, networks, compose files, routing split into router/service with Traefik status; .env names only' ($ok -and $order.IndexOf('changed outside') -lt $order.IndexOf('No problems') -and $stTxt -match 'mongodb-fix-permission . mongodb' -and $stTxt -match 'rocket-chat_internal' -and $stTxt -match 'compose\.database\.yaml' -and $stTxt -match 'Router svc-rocket-chat' -and $stTxt -match 'Served by Traefik' -and $stTxt -match 'MONGO_URL' -and $stTxt -notmatch [regex]::Escape('Sup3rSecretPw')) $stTxt
+  Shot 'apps-stack-routing'
+  $null = Js "document.querySelector('button[aria-label=""Restore Rocket.Chat from a backup""]').click(); true"
+  $ok = Wait-PageCondition $cdp "document.querySelector('#confirm-dialog').open && !!document.querySelector('#restore-backup')" 15
+  $opt = [string](Js "document.querySelector('#restore-backup').selectedOptions[0].textContent")
+  Shot 'apps-restore-choose'
+  $null = Js "document.querySelector('#confirm-ok').click(); true"
+  $ok2 = Wait-PageCondition $cdp "document.querySelector('#confirm-dialog').open && document.querySelector('#confirm-title').textContent.includes('20261116-101500')" 15
+  $dlg = [string](Js "document.querySelector('#confirm-content').innerText")
+  $okDisabled = [bool](Js "document.querySelector('#confirm-ok').disabled")
+  $null = Js "document.querySelector('#confirm-check').click(); document.querySelector('#confirm-ok').click(); true"
+  $ok3 = Wait-PageCondition $cdp "!!document.querySelector('#dep-rocket-chat-restored')" 15
+  $res = [string](Js "(document.querySelector('#dep-rocket-chat-restored') || {}).innerText || ''")
+  $sent = [string](Js "JSON.stringify(window.__apcalls.filter((c) => c.path === '/api/apps/restore-data'))")
+  Test-Condition 'restore: choose a backup (date, reason, volumes), review the steps (safety backup first), confirm explicitly, then the result and the undo backup are shown' ($ok -and $opt -match '2026-11-16 10:15 . Before an update . 1 volume' -and $ok2 -and $dlg -match 'safety backup' -and $okDisabled -and $ok3 -and $res -match 'Restore volume rocket-chat_mongodb' -and $res -match '20261116-103000' -and $sent -match '\\"key\\":\\"k1\\"') "$opt | $res | $sent"
+
   # --- Phone layout ---------------------------------------------------------------------------------------------------------
   Set-Viewport $cdp 390 844 -Mobile
   $ok = Go 'apps/rocket-chat?level=intermediate' "document.querySelectorAll('#dep-rocket-chat .dep-svc').length === 5"
@@ -204,6 +273,8 @@ try {
   if ($mock) { Stop-TestServer $mock }
   Get-ChildItem $work -Recurse -File -ErrorAction SilentlyContinue | Where-Object IsReadOnly | ForEach-Object { $_.IsReadOnly = $false }
   Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue
+  $orphaned = @(Complete-TestRun "tpm-apb-$id")
+  Test-Condition 'teardown: nothing with this run''s prefix is left (containers, volumes, networks, folder)' ($orphaned.Count -eq 0) ($orphaned -join ', ')
 }
 
 $fail = @($script:Results | Where-Object { $_.Status -eq 'FAIL' }).Count

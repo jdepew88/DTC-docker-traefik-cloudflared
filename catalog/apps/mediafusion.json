@@ -1,0 +1,246 @@
+{
+  "schema": 1,
+  "manifestVersion": "2026.11.17",
+  "id": "mediafusion",
+  "name": "MediaFusion",
+  "category": "media",
+  "group": "C",
+  "description": "Self-hosted Stremio and Kodi add-on that indexes stream sources into its own database. Minimal stack: API, background worker, PostgreSQL and Valkey; Prowlarr is not included.",
+  "maintainer": "Mohamed Zumair and contributors",
+  "license": "MIT",
+  "source": {
+    "type": "curated",
+    "url": "https://github.com/mhdzumair/MediaFusion"
+  },
+  "docs": [
+    {
+      "title": "MediaFusion documentation",
+      "url": "https://mhdzumair.github.io/MediaFusion/docs/"
+    },
+    {
+      "title": "Docker Compose deployment",
+      "url": "https://mhdzumair.github.io/MediaFusion/docs/deployment/docker-compose/"
+    },
+    {
+      "title": "Environment reference",
+      "url": "https://github.com/mhdzumair/MediaFusion/blob/main/docs/reference/env-reference.md"
+    }
+  ],
+  "platforms": {
+    "windows-docker-desktop": "supported",
+    "linux-docker": "untested",
+    "unraid": "untested",
+    "podman": "untested"
+  },
+  "architectures": [
+    "amd64",
+    "arm64"
+  ],
+  "installable": true,
+  "services": {
+    "mediafusion": {
+      "image": "mhdzumair/mediafusion:6.2.0@sha256:a90bb2f3ac15e913581ecc333c9af7f12e93e15b5b0f7d0f252bef337784955c",
+      "role": "app",
+      "label": "MediaFusion API and web interface",
+      "ports": [
+        {
+          "container": 8000,
+          "protocol": "http",
+          "primary": true
+        }
+      ],
+      "environment": {
+        "HOST_URL": "{{appUrl}}",
+        "SECRET_KEY": "{{input:secretKey}}",
+        "API_PASSWORD": "{{input:apiPassword}}",
+        "POSTGRES_URI": "postgresql+asyncpg://mediafusion:{{input:dbPassword}}@mediafusion-db:5432/mediafusion",
+        "REDIS_URL": "redis://mediafusion-redis:6379",
+        "IS_SCRAP_FROM_PROWLARR": "false",
+        "DISABLE_PROWLARR_FEED_SCRAPER": "true",
+        "ENABLE_RATE_LIMIT": "true"
+      },
+      "dependsOn": [
+        {
+          "service": "mediafusion-db",
+          "condition": "service_healthy"
+        },
+        {
+          "service": "mediafusion-redis",
+          "condition": "service_started"
+        }
+      ],
+      "healthcheck": {
+        "test": [
+          "CMD",
+          "curl",
+          "-f",
+          "http://localhost:8000/health"
+        ],
+        "interval": "30s",
+        "timeout": "10s",
+        "retries": 5,
+        "start_period": "300s"
+      },
+      "resources": {
+        "memoryMB": 150,
+        "diskMB": 700
+      }
+    },
+    "mediafusion-worker": {
+      "image": "mhdzumair/mediafusion:6.2.0@sha256:a90bb2f3ac15e913581ecc333c9af7f12e93e15b5b0f7d0f252bef337784955c",
+      "role": "worker",
+      "label": "Background scrapers",
+      "command": [
+        "/usr/local/bin/mediafusion-worker"
+      ],
+      "environment": {
+        "HOST_URL": "{{appUrl}}",
+        "SECRET_KEY": "{{input:secretKey}}",
+        "API_PASSWORD": "{{input:apiPassword}}",
+        "POSTGRES_URI": "postgresql+asyncpg://mediafusion:{{input:dbPassword}}@mediafusion-db:5432/mediafusion",
+        "REDIS_URL": "redis://mediafusion-redis:6379",
+        "IS_SCRAP_FROM_PROWLARR": "false",
+        "DISABLE_PROWLARR_FEED_SCRAPER": "true"
+      },
+      "dependsOn": [
+        {
+          "service": "mediafusion",
+          "condition": "service_started"
+        }
+      ],
+      "resources": {
+        "memoryMB": 150,
+        "diskMB": 0
+      }
+    },
+    "mediafusion-db": {
+      "image": "postgres:18-alpine@sha256:b6972e1115a4ff8eba5d7f7d19184926d1e16d7d1136ae1e1a7ebf286da0f015",
+      "role": "database",
+      "label": "PostgreSQL",
+      "stateful": true,
+      "environment": {
+        "POSTGRES_USER": "mediafusion",
+        "POSTGRES_PASSWORD": "{{input:dbPassword}}",
+        "POSTGRES_DB": "mediafusion"
+      },
+      "volumes": [
+        {
+          "name": "pgdata",
+          "target": "/var/lib/postgresql",
+          "kind": "volume",
+          "description": "PostgreSQL 18 data (PostgreSQL 18 keeps it under /var/lib/postgresql). Must be a Docker volume on Windows."
+        }
+      ],
+      "healthcheck": {
+        "test": [
+          "CMD-SHELL",
+          "pg_isready -U mediafusion -d mediafusion"
+        ],
+        "interval": "10s",
+        "timeout": "5s",
+        "retries": 6,
+        "start_period": "20s"
+      },
+      "shmSize": "128mb",
+      "resources": {
+        "memoryMB": 250,
+        "diskMB": 300
+      }
+    },
+    "mediafusion-redis": {
+      "image": "docker.io/valkey/valkey:9@sha256:c123e3715db63d06d4ad6964884037aa0d5d4d703939b9929954112889708e1d",
+      "role": "cache",
+      "label": "Valkey (cache)",
+      "volumes": [
+        {
+          "name": "valkey",
+          "target": "/data",
+          "kind": "volume",
+          "backup": false,
+          "description": "Cache and queue state (rebuilt automatically)."
+        }
+      ],
+      "healthcheck": {
+        "test": [
+          "CMD-SHELL",
+          "valkey-cli ping | grep -q PONG || exit 1"
+        ],
+        "interval": "10s",
+        "timeout": "5s",
+        "retries": 6
+      },
+      "resources": {
+        "memoryMB": 40,
+        "diskMB": 60
+      }
+    }
+  },
+  "inputs": [
+    {
+      "id": "secretKey",
+      "type": "generated",
+      "bytes": 16,
+      "label": "Secret key (encrypts user configurations)"
+    },
+    {
+      "id": "apiPassword",
+      "type": "password",
+      "label": "API password (protects the scraper and admin pages)"
+    },
+    {
+      "id": "dbPassword",
+      "type": "generated",
+      "bytes": 24,
+      "label": "Database password"
+    }
+  ],
+  "privileges": [],
+  "dependencies": [
+    "PostgreSQL 18",
+    "Valkey"
+  ],
+  "security": [
+    "MediaFusion indexes torrent and other stream sources found on the Internet. It supplies no content; what you index and watch is your responsibility and subject to the law where you live.",
+    "No debrid or indexer account is created or stored by the manager; add your own in its configuration page if you use any.",
+    "Prowlarr is not part of this stack."
+  ],
+  "authentication": {
+    "forwardAuth": "unsuitable",
+    "native": [
+      "api-password"
+    ],
+    "notes": [
+      "Stremio and Kodi fetch the add-on manifest and streams without a browser session: ForwardAuth or Cloudflare Access on the whole host breaks them. Its API password protects the admin pages."
+    ]
+  },
+  "limitations": [
+    "Results stay sparse for the first hour while the background scrapers fill the database.",
+    "Changing the secret key later invalidates every add-on link already installed in Stremio."
+  ],
+  "manualSetup": [
+    "Open /configure to create your add-on link and install it in Stremio or Kodi.",
+    "An existing MediaFusion installation is detected and offered for adoption instead of a second one."
+  ],
+  "update": {
+    "strategy": "pinned-digest",
+    "notes": "MediaFusion migrates its database on start; the update backs up the database volume first."
+  },
+  "web": {
+    "service": "mediafusion",
+    "path": "/",
+    "localPort": 8001
+  },
+  "exposure": {
+    "default": "local"
+  },
+  "resources": {
+    "memoryMB": 590,
+    "diskMB": 1060
+  },
+  "testStatus": {
+    "static": "passed",
+    "live": "passed",
+    "date": "2026-11-17",
+    "notes": "Installed in isolation: health, own API, network isolation, modular stack, stop/start, Traefik file route, backup and restore, removal with data."
+  }
+}

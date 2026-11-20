@@ -312,6 +312,12 @@ every sign-in redirect points there: it works only on the PC running authentik. 
 - reports such a redirect as **misrouted** (not "sign-in required") in every check, and a current failed check outranks
   older sign-in evidence.
 
+The application's own address (the proxy provider's external host, the return address after signing in, and the Host
+every check sends through Traefik) uses the scheme and port of the public sign-in address: `https://<host>` in
+production. authentik's outpost matches the forwarded Host, port included, against the provider's address and answers
+404 for anything else, so the two must agree. After protecting, the manager waits up to a minute for the outpost to
+reload a corrected sign-in address before reporting the result.
+
 ### Cloudflare Access left in front
 
 Turning **Require Cloudflare Access** off (on the Services page, or *Remove Cloudflare Access* when protecting) now deletes
@@ -337,6 +343,14 @@ Windows-specific today: DPAPI (`lib\SecretStore.psm1`, one adapter with four fun
 `curl.exe` in tests. Portable: route generation, the authentik API client and sync logic, the model, the catalog
 manifest (plain Linux containers). Debian, Arch and Unraid need a secret-store adapter and testing; not done here.
 
+## Identity contract (universal provisioning)
+
+The New app page (universal provisioning engine) protects new applications through seven contract functions in
+webui.ps1 that wrap this subsystem; it never talks to authentik itself and never creates a second authentication
+system. Readiness, protectability, providers and the rollback rules are pure functions in `lib\IdentityContract.psm1`.
+Details, and what the provisioner may and may never change: [provisioning.md](provisioning.md#identity-contract-authentik)
+and the checkpoint [provisioning-identity-compatibility.md](provisioning-identity-compatibility.md).
+
 ## Tests
 
 | Test | What it covers |
@@ -347,6 +361,7 @@ manifest (plain Linux containers). Debian, Arch and Unraid need a secret-store a
 | `tests\Test-RoutingBrowser.ps1` | No Docker: the Authentication & Routing page in headless Edge with models from the real model code: link and way back, application selection, both views, failed-stage details, help, Run checks, redaction, 1366 px and 390 px. |
 | `tests\Test-IdentityProtectBrowser.ps1` | No Docker: step 8 and 9 completion (8/8, green checks kept when revisiting), a failing check, a deliberate skip, protecting more applications and removing protection safely. |
 | `tests\Test-IdentityWizardBrowser.ps1` | No Docker, small footprint: the wizard in headless Edge with the authentik side of `/api/identity` answered in the page. Select all / Clear all / count, ticking without the page moving, already protected applications never selectable, exactly the ticked applications sent, review before apply, per-application result, 390 px. Real protection is covered by the live test. |
+| `tests\Test-Provisioning.ps1` | The identity contract: readiness, providers, ForwardAuth suitability, auth choices per access, rollback rules, and the real `Sync-AuthentikAppProtection` / `Remove-AuthentikAppProtection` against an in-memory authentik (preview changes nothing, create, reuse without duplicates, rollback deletes only what the operation created, a reused application is only unassigned). |
 | `node tests\ui-logic.test.js` | Browser-side helpers (state vocabulary, redirect URI, client ID, credential status, next step). |
 
 ## Limitations

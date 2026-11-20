@@ -82,7 +82,9 @@ try {
   $dockerBefore = Get-DockerSnapshot
   # --- Fixtures --------------------------------------------------------------------------------------------------------
   # A: an installed deployment whose application files are older than this manager (version 1.1.0), Cloudflare connected.
-  $null = New-TestInstance -Repo $repo -Path $pathA -StackName $stackA -Subnet '172.30.197.0/28'
+  # Test subnets stay in 172.31.238-241: Docker hands out whole /16s from 172.17 upwards to new networks (immich_internal
+  # took 172.30.0.0/16 on a real PC), and install.ps1 rightly refuses a tunnel subnet that overlaps one.
+  $null = New-TestInstance -Repo $repo -Path $pathA -StackName $stackA -Subnet '172.31.238.0/28'
   (Get-Content -Raw (Join-Path $pathA '.env')).Replace("PROXY_NETWORK=$stackA-proxy", 'PROXY_NETWORK=bridge') | Set-Content -NoNewline (Join-Path $pathA '.env')
   $manifest = [ordered]@{}
   foreach ($rel in (Get-ManagedFileList $repo)) {
@@ -110,14 +112,14 @@ try {
   $null = Invoke-ServicePlan -Settings $sA -Plan (Get-ServicePlan -Settings $sA -Services @($svc)) -NoReload
   Remove-Item -LiteralPath (Join-Path $pathA 'backups') -Recurse -Force -ErrorAction SilentlyContinue
   # B: a second, independent installed deployment whose token was saved by another Windows account (unreadable).
-  $null = New-TestInstance -Repo $repo -Path $pathB -StackName $stackB -Subnet '172.30.196.0/28'
+  $null = New-TestInstance -Repo $repo -Path $pathB -StackName $stackB -Subnet '172.31.239.0/28'
   '{}' | Set-Content -LiteralPath (Join-Path $pathB '.install-manifest.json')
   New-Item -ItemType Directory -Force -Path (Join-Path $pathB 'secrets') | Out-Null
   '{"version":1,"scope":"DPAPI-CurrentUser","user":"OTHERPC\\someone","savedAt":"2026-01-01T00:00:00","data":"AQAAANCMnd8BFdERjHoAwE"}' | Set-Content -LiteralPath (Join-Path $pathB 'secrets\cloudflare_api.dpapi')
   '{ "version": 1, "accountId": "acc0000000000000000000000000001", "accountName": "Test Account", "tunnelId": "11111111-2222-3333-4444-555555555555", "tunnelName": "existing-tunnel", "domains": [], "managed": {} }' | Set-Content -LiteralPath (Join-Path $pathB 'config\cloudflare.json')
   # C: setup choices saved, not installed.  L: the earlier single-app layout.  X: unrelated.  P: a copy of the program.  E: empty.
   New-Item -ItemType Directory -Force -Path (Join-Path $pathC 'config'), (Join-Path $pathL 'traefik'), $pathX, $pathP, $pathE | Out-Null
-  '{ "version": 1, "settings": { "STACK_NAME": "draft-one", "TRAEFIK_HTTP_PORT": "18480", "TRAEFIK_DASHBOARD_PORT": "18481", "PROXY_NETWORK": "draft-one-proxy", "TUNNEL_SUBNET": "172.30.195.0/28", "TUNNEL_IP_RANGE": "172.30.195.0/29", "CLOUDFLARED_IP": "172.30.195.10" }, "deployment": { "mode": "local" } }' | Set-Content -LiteralPath (Join-Path $pathC 'config\setup.json')
+  '{ "version": 1, "settings": { "STACK_NAME": "draft-one", "TRAEFIK_HTTP_PORT": "18480", "TRAEFIK_DASHBOARD_PORT": "18481", "PROXY_NETWORK": "draft-one-proxy", "TUNNEL_SUBNET": "172.31.240.0/28", "TUNNEL_IP_RANGE": "172.31.240.0/29", "CLOUDFLARED_IP": "172.31.240.10" }, "deployment": { "mode": "local" } }' | Set-Content -LiteralPath (Join-Path $pathC 'config\setup.json')
   "name: legacy-proxy`nservices:`n  traefik:`n    image: traefik:v3.1`n    container_name: traefik`n" | Set-Content -LiteralPath (Join-Path $pathL 'compose.yaml')
   'api: {}' | Set-Content -LiteralPath (Join-Path $pathL 'traefik\traefik.yml')
   'hello' | Set-Content -LiteralPath (Join-Path $pathX 'readme.txt')
@@ -170,7 +172,7 @@ try {
   Test-Condition 'inspect A: containers of a never-started instance are reported missing (not invented)' ($it['traefik'].status -eq 'missing') ($it['traefik'] | ConvertTo-Json -Compress)
   # A real-world token limited to account resources cannot list /accounts but works on the account.
   $pathD = Join-Path $work 'no-accounts'
-  $null = New-TestInstance -Repo $repo -Path $pathD -StackName "tpx-pj-d-$id" -Subnet '172.30.194.0/28'
+  $null = New-TestInstance -Repo $repo -Path $pathD -StackName "tpx-pj-d-$id" -Subnet '172.31.241.0/28'
   Copy-Item -LiteralPath (Join-Path $pathA 'config\cloudflare.json') -Destination (Join-Path $pathD 'config\cloudflare.json')
   Save-CloudflareApiToken -Settings (Get-StackSettings -InstallPath $pathD) -Token ('mockNoAccounts_' + [Guid]::NewGuid().ToString('N'))
   $idd = Invoke-WebUi $ui POST '/api/projects/inspect' @{ path = $pathD; cloudflare = $true }

@@ -141,11 +141,26 @@ function Get-WorstState([string[]]$States) {
 #   networks   @{ proxy; traefik[]; authentik[]; backend[] }
 #   health     Get-ServiceHealth result (checks) or $null; challenge  Test-ForwardAuthChallenge result or $null
 #   publicAuth @{ status; location; error } or $null;  allowHttp (tests)
+# The address browsers use for a protected application. Applications are served by the same Traefik entry point as
+# the sign-in page, so they share the scheme and port of the public sign-in address (https://auth.<domain> in
+# production: https://<host>, no port). authentik's outpost matches the forwarded Host, port included, against the
+# provider's address, so the provider (Url) and every probe through Traefik (HostPort, HostHeader) must use the same one.
+function Get-IdentityAppAddress([string]$PublicUrl, [string]$Hostname) {
+  $scheme = 'https'; $port = 0
+  $u = $null
+  if ($PublicUrl -and [Uri]::TryCreate($PublicUrl, [UriKind]::Absolute, [ref]$u) -and $u.Scheme -in 'http', 'https') {
+    $scheme = $u.Scheme
+    if (-not $u.IsDefaultPort) { $port = $u.Port }
+  }
+  $sfx = $(if ($port) { ":$port" } else { '' })
+  return [pscustomobject]@{ Url = "${scheme}://$Hostname$sfx"; HostPort = $port; HostHeader = "$Hostname$sfx" }
+}
+
 function Get-RoutingModel {
   param([Parameter(Mandatory = $true)]$Facts)
   $svc = $Facts.service
   $h = [string]$svc.hostname
-  $appUrl = "https://$h"
+  $appUrl = (Get-IdentityAppAddress ([string](Get-Fact (Get-Fact $Facts 'identity' $null) 'publicUrl' '')) $h).Url
   $probed = [bool](Get-Fact $Facts 'health' $null)
   $allowHttp = [bool](Get-Fact $Facts 'allowHttp' $false)
   $chk = @{}; foreach ($c in @(Get-Fact $Facts 'health.checks' @())) { $chk[[string]$c.id] = $c }
@@ -385,4 +400,4 @@ function Get-RoutingModel {
   }
 }
 
-Export-ModuleMember -Function Get-EndpointKind, Test-BrowserEndpoint, Get-RedactedUrl, Get-UrlQueryValue, ConvertFrom-AuthRedirect, Get-RoutingModel, Get-WorstState, New-RoutingStage
+Export-ModuleMember -Function Get-IdentityAppAddress, Get-EndpointKind, Test-BrowserEndpoint, Get-RedactedUrl, Get-UrlQueryValue, ConvertFrom-AuthRedirect, Get-RoutingModel, Get-WorstState, New-RoutingStage

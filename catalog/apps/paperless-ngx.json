@@ -1,0 +1,306 @@
+{
+  "schema": 1,
+  "manifestVersion": "2026.11.17",
+  "id": "paperless-ngx",
+  "name": "Paperless-ngx",
+  "category": "productivity",
+  "group": "D",
+  "description": "Document archive: scans and PDFs are OCRed, tagged and made searchable. Modular stack: web server, PostgreSQL, Valkey broker, and optional Gotenberg and Tika for office documents.",
+  "maintainer": "Paperless-ngx community",
+  "license": "GPL-3.0",
+  "source": {
+    "type": "curated",
+    "url": "https://github.com/paperless-ngx/paperless-ngx"
+  },
+  "docs": [
+    {
+      "title": "Paperless-ngx documentation",
+      "url": "https://docs.paperless-ngx.com/"
+    },
+    {
+      "title": "Docker setup",
+      "url": "https://docs.paperless-ngx.com/setup/#docker"
+    },
+    {
+      "title": "Configuration",
+      "url": "https://docs.paperless-ngx.com/configuration/"
+    },
+    {
+      "title": "Migrating to v3",
+      "url": "https://github.com/paperless-ngx/paperless-ngx/blob/main/docs/migration-v3.md"
+    }
+  ],
+  "platforms": {
+    "windows-docker-desktop": "supported",
+    "linux-docker": "untested",
+    "unraid": "untested",
+    "podman": "untested"
+  },
+  "architectures": [
+    "amd64",
+    "arm64"
+  ],
+  "website": "https://docs.paperless-ngx.com",
+  "installable": true,
+  "aliases": [
+    "paperless"
+  ],
+  "services": {
+    "paperless": {
+      "image": "ghcr.io/paperless-ngx/paperless-ngx:3.4.2@sha256:d704e84f88300eb6ab001ab15720a2330ff99169cf9f94d6b8fcc44b63a84c84",
+      "role": "app",
+      "label": "Paperless-ngx web server and workers",
+      "ports": [
+        {
+          "container": 8000,
+          "protocol": "http",
+          "primary": true
+        }
+      ],
+      "environment": {
+        "PAPERLESS_REDIS": "redis://paperless-broker:6379",
+        "PAPERLESS_DBENGINE": "postgresql",
+        "PAPERLESS_DBHOST": "paperless-db",
+        "PAPERLESS_DBNAME": "paperless",
+        "PAPERLESS_DBUSER": "paperless",
+        "PAPERLESS_DBPASS": "{{input:dbPassword}}",
+        "PAPERLESS_SECRET_KEY": "{{input:secretKey}}",
+        "PAPERLESS_TIME_ZONE": "{{timezone}}",
+        "PAPERLESS_OCR_LANGUAGE": "{{input:ocrLanguage}}",
+        "PAPERLESS_ADMIN_USER": "{{input:adminUser}}",
+        "PAPERLESS_ADMIN_PASSWORD": "{{input:adminPassword}}",
+        "PAPERLESS_CONSUMER_POLLING_INTERVAL": "10",
+        "USERMAP_UID": "1000",
+        "USERMAP_GID": "1000",
+        "PAPERLESS_TIKA_ENABLED": "{{input:officeDocs}}",
+        "PAPERLESS_TIKA_ENDPOINT": "http://paperless-tika:9998",
+        "PAPERLESS_TIKA_GOTENBERG_ENDPOINT": "http://paperless-gotenberg:3000"
+      },
+      "volumes": [
+        {
+          "name": "data",
+          "target": "/usr/src/paperless/data",
+          "kind": "volume",
+          "description": "Search index, classifier and settings."
+        },
+        {
+          "name": "media",
+          "target": "/usr/src/paperless/media",
+          "kind": "volume",
+          "description": "Your documents: originals and searchable archive copies."
+        },
+        {
+          "name": "export",
+          "target": "/usr/src/paperless/export",
+          "kind": "volume",
+          "description": "Output of the document exporter (portable backup)."
+        },
+        {
+          "name": "consume",
+          "target": "/usr/src/paperless/consume",
+          "kind": "volume",
+          "input": "consumeFolder",
+          "backup": false,
+          "description": "Inbox: files placed here are imported and then removed."
+        }
+      ],
+      "dependsOn": [
+        {
+          "service": "paperless-db",
+          "condition": "service_healthy"
+        },
+        {
+          "service": "paperless-broker",
+          "condition": "service_started"
+        }
+      ],
+      "resources": {
+        "memoryMB": 1000,
+        "diskMB": 2000
+      }
+    },
+    "paperless-db": {
+      "image": "postgres:18-alpine@sha256:b6972e1115a4ff8eba5d7f7d19184926d1e16d7d1136ae1e1a7ebf286da0f015",
+      "role": "database",
+      "label": "PostgreSQL",
+      "stateful": true,
+      "environment": {
+        "POSTGRES_USER": "paperless",
+        "POSTGRES_PASSWORD": "{{input:dbPassword}}",
+        "POSTGRES_DB": "paperless"
+      },
+      "volumes": [
+        {
+          "name": "pgdata",
+          "target": "/var/lib/postgresql",
+          "kind": "volume",
+          "description": "PostgreSQL 18 data (PostgreSQL 18 keeps it under /var/lib/postgresql). Must be a Docker volume on Windows."
+        }
+      ],
+      "healthcheck": {
+        "test": [
+          "CMD-SHELL",
+          "pg_isready -U paperless -d paperless"
+        ],
+        "interval": "10s",
+        "timeout": "5s",
+        "retries": 6,
+        "start_period": "20s"
+      },
+      "shmSize": "128mb",
+      "resources": {
+        "memoryMB": 200,
+        "diskMB": 300
+      }
+    },
+    "paperless-broker": {
+      "image": "docker.io/valkey/valkey:9@sha256:c123e3715db63d06d4ad6964884037aa0d5d4d703939b9929954112889708e1d",
+      "role": "cache",
+      "label": "Valkey (task broker)",
+      "volumes": [
+        {
+          "name": "valkey",
+          "target": "/data",
+          "kind": "volume",
+          "backup": false,
+          "description": "Cache and queue state (rebuilt automatically)."
+        }
+      ],
+      "healthcheck": {
+        "test": [
+          "CMD-SHELL",
+          "valkey-cli ping | grep -q PONG || exit 1"
+        ],
+        "interval": "10s",
+        "timeout": "5s",
+        "retries": 6
+      },
+      "resources": {
+        "memoryMB": 40,
+        "diskMB": 60
+      }
+    },
+    "paperless-gotenberg": {
+      "image": "gotenberg/gotenberg:8.38@sha256:aa552cc115db488e0f0bcb07446aac13071ad51505b642c84bb894500907b42b",
+      "role": "support",
+      "label": "Gotenberg (office documents to PDF)",
+      "when": "officeDocs",
+      "command": [
+        "gotenberg",
+        "--chromium-disable-javascript=true",
+        "--chromium-allow-list=file:///tmp/.*"
+      ],
+      "resources": {
+        "memoryMB": 400,
+        "diskMB": 1500
+      }
+    },
+    "paperless-tika": {
+      "image": "apache/tika:3.3.1.0@sha256:90b7fa1dc018434075fce9e1d9b88b1e3d0ea6979d0cf86e116c79a8073ae973",
+      "role": "support",
+      "label": "Apache Tika (text from office documents)",
+      "when": "officeDocs",
+      "resources": {
+        "memoryMB": 400,
+        "diskMB": 600
+      }
+    }
+  },
+  "inputs": [
+    {
+      "id": "adminUser",
+      "type": "text",
+      "label": "Administrator user name",
+      "default": "admin",
+      "pattern": "^[A-Za-z0-9._@-]{2,40}$"
+    },
+    {
+      "id": "adminPassword",
+      "type": "password",
+      "label": "Administrator password"
+    },
+    {
+      "id": "ocrLanguage",
+      "type": "text",
+      "label": "OCR language(s)",
+      "default": "eng",
+      "pattern": "^[a-z_]{3,10}(\\+[a-z_]{3,10})*$",
+      "help": "Tesseract codes joined with +, e.g. deu+eng. eng, deu, fra, ita and spa are built in."
+    },
+    {
+      "id": "consumeFolder",
+      "type": "folder",
+      "label": "Inbox folder (optional)",
+      "help": "A Windows folder to drop scans into (polled every 10 seconds). Files are removed from it after import. Leave empty to upload in the browser."
+    },
+    {
+      "id": "officeDocs",
+      "type": "boolean",
+      "label": "Office documents (Word, Excel, e-mail) with Gotenberg and Tika",
+      "default": "false",
+      "help": "Adds two services and about 800 MB of memory."
+    },
+    {
+      "id": "secretKey",
+      "type": "generated",
+      "bytes": 32,
+      "label": "Secret key"
+    },
+    {
+      "id": "dbPassword",
+      "type": "generated",
+      "bytes": 24,
+      "label": "Database password"
+    }
+  ],
+  "privileges": [],
+  "dependencies": [
+    "PostgreSQL 18",
+    "Valkey",
+    "Gotenberg and Apache Tika (optional)"
+  ],
+  "security": [
+    "Documents are stored unencrypted in the media volume (Paperless 3 removed its document encryption): protect backups accordingly.",
+    "Files in the inbox folder are deleted after a successful import."
+  ],
+  "authentication": {
+    "forwardAuth": "caution",
+    "native": [
+      "local",
+      "oidc"
+    ],
+    "notes": [
+      "Mobile apps and API tokens call /api directly: ForwardAuth on the whole host blocks them. Paperless supports OpenID Connect (allauth) with authentik."
+    ]
+  },
+  "limitations": [
+    "On x86 the CPU needs SSE4.2 (any PC from the last decade).",
+    "Windows folders do not deliver file-change events into Docker: the inbox is polled every 10 seconds instead.",
+    "Paperless 3.5.0 was released on 2026-11-17; this catalog pins 3.4.2 until 3.5 has settled."
+  ],
+  "manualSetup": [
+    "When you publish it on a hostname, set PAPERLESS_URL=https://<hostname> in .env and restart, or logins from that address are refused (CSRF)."
+  ],
+  "update": {
+    "strategy": "pinned-digest",
+    "notes": "Database migrations run on start and cannot be undone; updates back up the database and media volumes first."
+  },
+  "web": {
+    "service": "paperless",
+    "path": "/",
+    "localPort": 8010
+  },
+  "exposure": {
+    "default": "access"
+  },
+  "resources": {
+    "memoryMB": 1240,
+    "diskMB": 2360
+  },
+  "testStatus": {
+    "static": "passed",
+    "live": "passed",
+    "date": "2026-11-17",
+    "notes": "Installed in isolation: health, administrator API token, network isolation, modular stack, stop/start, Traefik file route, backup and restore, removal with data. Gotenberg/Tika (optional) not started."
+  }
+}

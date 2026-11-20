@@ -29,6 +29,10 @@
     "unraid": "untested",
     "podman": "untested"
   },
+  "architectures": [
+    "amd64",
+    "arm64"
+  ],
   "installable": true,
   "services": {
     "web": {
@@ -198,6 +202,18 @@
     "The database and cache stay on the app's private network.",
     "Uses Valkey instead of the unpinned redis:latest of the upstream file (protocol-compatible, BSD licence)."
   ],
+  "authentication": {
+    "forwardAuth": "caution",
+    "native": [
+      "local"
+    ],
+    "notes": [
+      "M3U, EPG and HDHomeRun endpoints are fetched by media servers without a browser session; ForwardAuth blocks them. Protect the web interface only, or keep it local."
+    ]
+  },
+  "limitations": [
+    "SSDP/HDHomeRun discovery from LAN devices does not reach containers on Docker Desktop: add tuners and clients by URL."
+  ],
   "update": {
     "strategy": "pinned-digest",
     "notes": "PostgreSQL major upgrades need a dump and restore."
@@ -213,5 +229,11 @@
   "resources": {
     "memoryMB": 1130,
     "diskMB": 2140
+  },
+  "testStatus": {
+    "static": "passed",
+    "live": "passed",
+    "date": "2026-11-17",
+    "notes": "Installed in isolation: health, web interface, network isolation, 4-file modular stack, stop/start, Traefik file route, backup and restore, removal with data."
   }
 }

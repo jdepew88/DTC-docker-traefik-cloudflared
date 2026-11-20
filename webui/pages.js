@@ -358,7 +358,7 @@
       pub.append(h('p', null, ext(d.publicUrl)), h('p', { class: 'muted small' }, 'Cloudflare asks for a login first; only /dashboard/ and /api are routed. Requests that did not pass Cloudflare Access get 404 from Traefik.'),
         h('div', { class: 'actions' }, h('button', { type: 'button', class: 'btn danger-outline', onclick: (e) => ctx.startDashboardPlan({ disable: true }, e.currentTarget) }, 'Remove public dashboard…')));
     } else if (!d.cloudflareReady) {
-      pub.append(h('p', { class: 'muted' }, 'Publishing needs Cloudflare automation (API token with the Access permission, account and tunnel). It is always protected by a Cloudflare Access login; Turnstile is not a login and is never used instead.'));
+      pub.append(h('p', { class: 'muted' }, 'Publishing needs Cloudflare automation (API token with the Access permission, account and tunnel). It is always protected by a Cloudflare Access login.'));
     } else {
       const f = s.forms.pubdash || (s.forms.pubdash = { sub: d.subdomain, custom: d.subdomainCustom, zoneId: d.zoneId, emails: arr(d.accessEmails).join(', ') || d.contactEmail || '' });
       const sub = h('input', { value: f.sub, spellcheck: 'false', autocomplete: 'off', id: 'dash-sub-ops' });
@@ -569,8 +569,8 @@
       h('section', { class: 'card' }, h('h2', null, 'The manager itself'),
         h('p', { class: 'muted small' }, 'This website runs on this PC only. Stopping it does not stop your deployments: Traefik, cloudflared and your apps keep running.'),
         ctx.state.session.canStop ? h('div', { class: 'actions' }, h('button', { type: 'button', class: 'btn danger-outline', onclick: async (e) => {
-          const ok = await U.confirmDialog({ title: 'Stop the manager?', body: 'The website stops. Your deployments keep running. Start it again with START-HERE.cmd.', okText: 'Stop the manager', danger: true });
-          if (ok) await withBusy(e.currentTarget, async () => { await api('POST', '/api/manager/stop', { confirm: true }); fill(main, h('div', { class: 'callout' }, h('h1', null, 'The manager has stopped.'), h('p', null, 'You can close this tab. Double-click START-HERE.cmd to start it again.'))); });
+          const ok = await U.confirmDialog({ title: 'Stop the manager?', body: 'The website stops. Your deployments keep running. Start it again with the DTC shortcut (or START-HERE.cmd).', okText: 'Stop the manager', danger: true });
+          if (ok) await withBusy(e.currentTarget, async () => { await api('POST', '/api/manager/stop', { confirm: true }); fill(main, h('div', { class: 'callout' }, h('h1', null, 'The manager has stopped.'), h('p', null, 'You can close this tab. Start it again with the DTC shortcut, Open Dashboard in the DTC tray menu, or START-HERE.cmd.'))); });
         } }, 'Stop the manager')) : h('p', { class: 'small' }, 'To stop it, close its PowerShell window or press Ctrl+C there. Started with START-HERE.cmd, it can also be stopped here or with STOP-MANAGER.cmd.')));
   };
 

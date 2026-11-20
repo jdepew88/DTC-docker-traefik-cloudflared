@@ -33,7 +33,11 @@ $script:MaxArchiveBytes = 8MB
 $script:MaxArchiveEntries = 200
 # traefik\dynamic files that come from the manager package (never restored from a backup) or are generated.
 $script:PackageDynamicFiles = @('security.yml', 'dashboard.yml')
-$script:ConfigFiles = @('config\services.json', 'config\cloudflare.json', 'config\setup.json', 'config\dashboard.json', 'config\identity.json')
+$script:ConfigFiles = @('config\services.json', 'config\cloudflare.json', 'config\setup.json', 'config\dashboard.json', 'config\identity.json', 'config\applications.json', 'config\managers.json')
+# Configuration files restored as whole files (created when missing here; an existing file is kept and reported).
+$script:RestorableConfig = @('config\applications.json', 'config\managers.json')
+# The application contract version this manager reads (same value as $ContractVersion in lib\AppContract.psm1).
+$script:ApplicationContractVersion = 1
 $script:CustomFilePattern = '^[A-Za-z0-9][A-Za-z0-9._-]{0,80}\.ya?ml$'
 $script:EmailPattern = '^[A-Za-z0-9._%+''-]{1,64}@[A-Za-z0-9.-]{1,253}\.[A-Za-z]{2,63}$'
 $script:HostnamePattern = '^(?=.{1,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$'
@@ -107,7 +111,27 @@ function Get-CredentialInventory($Settings) {
       id = 'authentik-api-token'; label = 'authentik API token'; file = 'secrets\authentik_api.dpapi'; present = (Test-Path -LiteralPath (Join-Path $Settings.InstallPath 'secrets\authentik_api.dpapi')); included = $false
       recover = 'Not exported (encrypted for one Windows account). Reconnect it on Identity & Access: "Use the token created at installation", or paste an API token created in authentik (Directory > Tokens). The Google client secret is never stored by the manager; it lives only in authentik (and in authentik''s own database backup).'
     }
+  ) + @(Get-ConnectorCredentialInventory $Settings) + @(
+    [ordered]@{
+      id = 'ai-api-key'; label = 'Anthropic API key (optional AI assistance)'; file = 'secrets\ai_anthropic_api_key.dpapi'; present = (Test-Path -LiteralPath (Join-Path $Settings.InstallPath 'secrets\ai_anthropic_api_key.dpapi')); included = $false
+      recover = 'Not exported. Paste the key again in the Add application wizard (AI settings) if you use AI assistance; everything else works without it.'
+    }
   )
+}
+
+# One entry per Portainer / Arcane connector in config\managers.json (its API key is a DPAPI secret, never exported).
+function Get-ConnectorCredentialInventory($Settings) {
+  $path = Join-Path $Settings.InstallPath 'config\managers.json'
+  if (-not (Test-Path -LiteralPath $path)) { return @() }
+  $doc = $null; try { $doc = [IO.File]::ReadAllText($path) | ConvertFrom-Json } catch { return @() }
+  return @(@(Get-Prop $doc 'connectors' @()) | Where-Object { $_ -and [string](Get-Prop $_ 'id' '') -match '^[a-z0-9][a-z0-9-]{1,30}$' } | ForEach-Object {
+      $id = [string]$_.id; $kind = [string](Get-Prop $_ 'kind' '')
+      $label = $(if ($kind -eq 'portainer') { 'Portainer' } elseif ($kind -eq 'arcane') { 'Arcane' } else { 'Connector' })
+      [ordered]@{
+        id = "manager-$id"; label = "$label API key (connector $id)"; file = "secrets\manager-$id-api.dpapi"; present = (Test-Path -LiteralPath (Join-Path $Settings.InstallPath "secrets\manager-$id-api.dpapi")); included = $false
+        recover = "Not exported. The connector's address comes back with config\managers.json; create a new read-only API key in $label, save it on the Applications page (Connectors), and revoke the old key there. Until then ownership is detected from Docker labels only."
+      }
+    })
 }
 
 # The portable manifest of one instance (no credentials, no file contents).
@@ -258,6 +282,8 @@ function New-ConfigBackupArchive {
       'config\setup.json' { 'Setup wizard choices' }
       'config\dashboard.json' { 'Public dashboard settings' }
       'config\identity.json' { 'Identity & Access choices (no secrets)' }
+      'config\applications.json' { 'Application registry: integrated and observed applications, their routes and protection (no secrets)' }
+      'config\managers.json' { 'Portainer / Arcane connectors: addresses only (API keys are not exported)' }
       'traefik\dynamic\svc-*' { 'Generated route (regenerated from the service registry on restore)' }
       'traefik\dynamic\admin-dashboard.yml' { 'Generated public dashboard route (written again only after Access is confirmed)' }
       'traefik\dynamic\security.yml' { 'Package file (comes from the installed manager on restore)' }
@@ -376,7 +402,7 @@ function Read-ConfigBackup {
   param([Parameter(Mandatory = $true)][byte[]]$Bytes, [string]$FileName = '')
   $errors = New-Object System.Collections.ArrayList
   $warnings = New-Object System.Collections.ArrayList
-  $result = [ordered]@{ Kind = ''; FileName = $FileName; Manifest = $null; Files = @{}; Errors = $errors; Warnings = $warnings; Sha256 = '' }
+  $result = [ordered]@{ Kind = ''; FileName = $FileName; Manifest = $null; Files = @{}; Config = @{}; Errors = $errors; Warnings = $warnings; Sha256 = '' }
   $sha = [Security.Cryptography.SHA256]::Create()
   $result.Sha256 = [BitConverter]::ToString($sha.ComputeHash($Bytes)).Replace('-', '')
   if ($Bytes.Length -eq 0) { $null = $errors.Add('The file is empty.'); return [pscustomobject]$result }
@@ -437,6 +463,10 @@ function Read-ConfigBackup {
     $name = $Matches[1]
     if ($name -notmatch $script:CustomFilePattern -or $script:PackageDynamicFiles -contains $name -or $name.StartsWith('svc-') -or $name -eq (Get-DashboardRouteFile)) { continue }
     $result.Files[$name] = $texts[$k].Replace("`r`n", "`n")
+  }
+  foreach ($rel in $script:RestorableConfig) {
+    $k = 'files/' + $rel.Replace('\', '/')
+    if ($texts.Contains($k)) { $result.Config[$rel] = $texts[$k].Replace("`r`n", "`n") }
   }
   return [pscustomobject]$result
 }
@@ -632,6 +662,28 @@ function Get-RestorePlan {
       $writes['config\identity.json'] = (ConvertTo-StableJson $m.identity) + "`n"
       $null = $items.Add((New-RestoreItem 'identity' 'create' "Identity & Access settings: $($m.identity.provider)$(if ($m.identity.authentik.hostname) { ", sign-in at $($m.identity.authentik.hostname)" })" 'Choices only: authentik itself, its database and the Google client secret are restored with authentik''s own backup. Reconnect the API token afterwards; nothing is marked verified until it is checked again.'))
     }
+  }
+
+  # Application registry and connectors (whole files; created when missing, an existing file is never overwritten).
+  $cfgTexts = $(if ($Backup.PSObject.Properties['Config'] -and $Backup.Config) { $Backup.Config } else { @{} })
+  foreach ($rel in $script:RestorableConfig) {
+    if (-not $cfgTexts.Contains($rel)) { continue }
+    $text = [string]$cfgTexts[$rel]
+    $doc = $null; try { $doc = $text | ConvertFrom-Json } catch { }
+    $area = $(if ($rel -eq 'config\applications.json') { 'applications' } else { 'connectors' })
+    if ($null -eq $doc) { $null = $localErrors.Add("$rel in the backup is not valid JSON."); continue }
+    if ($rel -eq 'config\applications.json') {
+      $v = 0; [int]::TryParse([string](Get-Prop $doc 'contractVersion' '0'), [ref]$v) | Out-Null
+      if ($v -gt $script:ApplicationContractVersion) { $null = $localErrors.Add("config\applications.json in the backup was written by a newer Deployment Manager (contract version $v; this one understands $($script:ApplicationContractVersion)). Update the manager first."); continue }
+    }
+    $what = $(if ($area -eq 'applications') { "Application registry: $(@(Get-Prop $doc 'instances' @()).Count) integrated or observed application(s)" } else { "Portainer / Arcane connectors: $(@(Get-Prop $doc 'connectors' @()).Count)" })
+    $path = Join-Path $root $rel
+    $old = $(if (Test-Path -LiteralPath $path) { ([IO.File]::ReadAllText($path)).Replace("`r`n", "`n") } else { $null })
+    if ($null -eq $old) {
+      $writes[$rel] = $text
+      $null = $items.Add((New-RestoreItem $area 'create' $what $(if ($area -eq 'applications') { 'Routes come back with the service registry; check drift on the Applications page afterwards (containers may have been recreated in the meantime).' } else { 'Addresses only: save each connector''s API key again on the Applications page.' })))
+    } elseif ($old.TrimEnd() -eq $text.TrimEnd()) { $null = $items.Add((New-RestoreItem $area 'unchanged' "$what (already the same)")) }
+    else { $null = $items.Add((New-RestoreItem $area 'keep' "$rel already exists here; kept" 'It differs from the backup. Restoring over it would discard newer integrations, so it is not replaced automatically.' (Get-LineDiff $old $text))) }
   }
 
   $dynamicChanges = ($customWrites.Count -gt 0) -or $servicePlan.FileChanges -gt 0

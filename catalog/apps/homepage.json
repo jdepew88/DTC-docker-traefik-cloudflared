@@ -32,6 +32,10 @@
     "unraid": "untested",
     "podman": "untested"
   },
+  "architectures": [
+    "amd64",
+    "arm64"
+  ],
   "installable": true,
   "services": {
     "app": {
@@ -99,6 +103,18 @@
     "No Docker socket and no API keys: the page shows links and HTTP status only, never Docker or Traefik controls.",
     "Homepage has no login unless you enable it; publish it behind Cloudflare Access."
   ],
+  "authentication": {
+    "forwardAuth": "compatible",
+    "native": [
+      "none"
+    ],
+    "notes": [
+      "Homepage has no sign-in: protect it with authentik ForwardAuth or Cloudflare Access before publishing."
+    ]
+  },
+  "limitations": [
+    "Resource widgets show the Docker Desktop VM, not Windows."
+  ],
   "update": {
     "strategy": "pinned-digest",
     "notes": "Configuration files in the project folder are kept across updates."
@@ -114,5 +130,11 @@
   "resources": {
     "memoryMB": 150,
     "diskMB": 300
+  },
+  "testStatus": {
+    "static": "passed",
+    "live": "passed",
+    "date": "2026-11-17",
+    "notes": "Installed in isolation: health, its web interface, network isolation, stack on disk, stop/start, Traefik file route, backup and restore, removal with data."
   }
 }

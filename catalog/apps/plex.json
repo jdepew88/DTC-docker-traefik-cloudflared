@@ -1,0 +1,208 @@
+{
+  "schema": 1,
+  "manifestVersion": "2026.11.17",
+  "id": "plex",
+  "name": "Plex Media Server",
+  "category": "media",
+  "group": "C",
+  "description": "Organizes your movies, TV shows and music and streams them to Plex apps on TVs, phones and browsers. Official Plex image with the server built in (pinned version).",
+  "maintainer": "Plex, Inc.",
+  "license": "Proprietary (free; Plex Pass optional)",
+  "source": {
+    "type": "curated",
+    "url": "https://github.com/plexinc/pms-docker"
+  },
+  "docs": [
+    {
+      "title": "Plex Docker image",
+      "url": "https://github.com/plexinc/pms-docker"
+    },
+    {
+      "title": "Claim a server",
+      "url": "https://www.plex.tv/claim/"
+    },
+    {
+      "title": "Hardware transcoding",
+      "url": "https://support.plex.tv/articles/115002178853-using-hardware-accelerated-streaming/"
+    },
+    {
+      "title": "Network ports",
+      "url": "https://support.plex.tv/articles/201543147-what-network-ports-do-i-need-to-allow-through-my-firewall/"
+    }
+  ],
+  "platforms": {
+    "windows-docker-desktop": "supported",
+    "linux-docker": "untested",
+    "unraid": "untested",
+    "podman": "untested"
+  },
+  "architectures": [
+    "amd64",
+    "arm64",
+    "arm/v7"
+  ],
+  "website": "https://www.plex.tv",
+  "installable": true,
+  "aliases": [
+    "plex-media-server",
+    "pms"
+  ],
+  "identifiedBy": [
+    "lscr.io/linuxserver/plex",
+    "linuxserver/plex",
+    "ghcr.io/linuxserver/plex",
+    "ghcr.io/hotio/plex",
+    "hotio/plex"
+  ],
+  "services": {
+    "app": {
+      "image": "plexinc/pms-docker:1.43.5.11079-b3b13e506@sha256:6d778d41daae68f89115aa87a44ae14a96b23e71a2093da173b5a9aac4091336",
+      "role": "app",
+      "label": "Plex Media Server",
+      "stateful": true,
+      "ports": [
+        {
+          "container": 32400,
+          "protocol": "http",
+          "primary": true,
+          "publish": {
+            "hostPort": 32400,
+            "address": "lan",
+            "when": "lanAccess"
+          }
+        }
+      ],
+      "environment": {
+        "TZ": "{{timezone}}",
+        "PLEX_CLAIM": "{{input:claimToken}}",
+        "ADVERTISE_IP": "{{input:advertiseUrl}}",
+        "ALLOWED_NETWORKS": "{{input:allowedNetworks}}"
+      },
+      "volumes": [
+        {
+          "name": "config",
+          "target": "/config",
+          "kind": "volume",
+          "description": "Plex database, metadata and settings (can grow to many GB). Must be a Docker volume: the database needs file locking that Windows folders do not provide."
+        },
+        {
+          "name": "transcode",
+          "target": "/transcode",
+          "kind": "volume",
+          "backup": false,
+          "description": "Temporary transcoding files."
+        },
+        {
+          "name": "media",
+          "target": "/data",
+          "kind": "folder",
+          "input": "mediaFolder",
+          "readOnly": true,
+          "description": "Your media library (movies, TV, music), read-only."
+        }
+      ],
+      "gpus": "nvidiaGpu",
+      "resources": {
+        "memoryMB": 500,
+        "diskMB": 1500
+      }
+    }
+  },
+  "inputs": [
+    {
+      "id": "mediaFolder",
+      "type": "folder",
+      "label": "Media folder",
+      "required": true,
+      "help": "The folder that holds your Movies, TV Shows and Music folders (e.g. D:\\Media). Mounted read-only; Plex never changes your files."
+    },
+    {
+      "id": "claimToken",
+      "type": "secret",
+      "label": "Claim token (optional)",
+      "pattern": "^claim-[A-Za-z0-9_-]+$",
+      "help": "From https://www.plex.tv/claim/ (valid for a few minutes). Links the server to your Plex account on first start; without it, finish setup from this PC at http://127.0.0.1:<port>/web."
+    },
+    {
+      "id": "lanAccess",
+      "type": "boolean",
+      "label": "Direct access from your network (port 32400 on this PC)",
+      "default": "true",
+      "help": "TVs and phones at home connect directly instead of through plex.tv relays."
+    },
+    {
+      "id": "advertiseUrl",
+      "type": "text",
+      "label": "Address to advertise (optional)",
+      "pattern": "^https?://[A-Za-z0-9.-]+(:\\d+)?/?(,https?://[A-Za-z0-9.-]+(:\\d+)?/?)*$",
+      "help": "e.g. http://192.168.1.20:32400/ so apps find the server on your network."
+    },
+    {
+      "id": "allowedNetworks",
+      "type": "text",
+      "label": "Networks allowed without sign-in (optional)",
+      "pattern": "^[0-9./,]*$",
+      "help": "CIDR list, e.g. 192.168.1.0/24. Leave empty to always require a Plex account."
+    },
+    {
+      "id": "nvidiaGpu",
+      "type": "boolean",
+      "label": "NVIDIA GPU transcoding (Plex Pass)",
+      "default": "false",
+      "help": "Passes the NVIDIA GPU through WSL2. Not verified on this PC; Intel Quick Sync is not available on Docker Desktop."
+    }
+  ],
+  "privileges": [
+    {
+      "kind": "gpu",
+      "explain": "Only when NVIDIA GPU transcoding is chosen: the container gets access to the GPU through Docker Desktop's WSL2 GPU support."
+    }
+  ],
+  "dependencies": [],
+  "security": [
+    "Your media folder is mounted read-only.",
+    "Remote access through plex.tv is a setting inside Plex; installing publishes nothing to the Internet."
+  ],
+  "authentication": {
+    "forwardAuth": "unsuitable",
+    "native": [
+      "plex-account"
+    ],
+    "notes": [
+      "Plex apps and TVs sign in with plex.tv accounts and tokens; ForwardAuth and Cloudflare Access break them. Use direct local access and Plex's own remote access instead of a sign-in gate."
+    ]
+  },
+  "limitations": [
+    "Plex does not recommend Docker on Windows; this keeps its database in a Docker volume inside WSL2, which avoids the file-locking problem.",
+    "Local discovery (GDM, DLNA) needs multicast, which Docker Desktop does not pass: apps may need the server address entered or found through plex.tv.",
+    "Intel Quick Sync (/dev/dri) is not available on Docker Desktop; NVIDIA transcoding through WSL2 is untested here.",
+    "Media on another Windows drive is read through Docker Desktop's file sharing: scans are slower than on Linux."
+  ],
+  "manualSetup": [
+    "Get a claim token at https://www.plex.tv/claim/ right before installing, or finish setup at http://127.0.0.1:<local port>/web from this PC.",
+    "In Plex, add libraries pointing at /data/<folder> (e.g. /data/Movies).",
+    "An existing Plex installation is detected and offered for adoption instead; its libraries and metadata are never changed."
+  ],
+  "update": {
+    "strategy": "pinned-digest",
+    "notes": "Pinned server version: the image does not download a newer server at start. Updates back up the config volume first (it can be large)."
+  },
+  "web": {
+    "service": "app",
+    "path": "/web",
+    "localPort": 32400
+  },
+  "exposure": {
+    "default": "local"
+  },
+  "resources": {
+    "memoryMB": 500,
+    "diskMB": 1500
+  },
+  "testStatus": {
+    "static": "passed",
+    "live": "passed",
+    "date": "2026-11-17",
+    "notes": "Installed in isolation: health, own API, network isolation, modular stack, stop/start, Traefik file route, backup and restore, removal with data."
+  }
+}

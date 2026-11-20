@@ -272,6 +272,13 @@ try {
   $errs = @(Test-AppManifest $m)
   $wenv = $m.services.worker.environment
   Test-Condition 'catalog: authentik manifest valid; bootstrap administrator, email and API token on server and worker' (-not $errs.Count -and $wenv.AUTHENTIK_BOOTSTRAP_TOKEN -eq '{{input:apiToken}}' -and $wenv.AUTHENTIK_BOOTSTRAP_PASSWORD -eq '{{input:adminPassword}}' -and $m.services.server.environment.AUTHENTIK_BOOTSTRAP_EMAIL -eq '{{input:adminEmail}}') ($errs -join '; ')
+  # --- Address of a protected application (authentik's outpost matches the forwarded Host, port included) -----------------
+  Import-Module (Join-Path $repo 'lib\RoutingModel.psm1') -Force
+  $a1 = Get-IdentityAppAddress 'https://auth.example.test' 'app.example.test'
+  $a2 = Get-IdentityAppAddress 'http://auth.idtest.example:49464/' 'echo.idtest.example'
+  $a3 = Get-IdentityAppAddress '' 'app.example.test'
+  $a4 = Get-IdentityAppAddress 'https://auth.example.test:443/' 'app.example.test'
+  Test-Condition 'protect: the application address follows the public sign-in address (https without port in production; scheme and port of a test entry point)' ($a1.Url -eq 'https://app.example.test' -and $a1.HostPort -eq 0 -and $a1.HostHeader -eq 'app.example.test' -and $a2.Url -eq 'http://echo.idtest.example:49464' -and $a2.HostPort -eq 49464 -and $a2.HostHeader -eq 'echo.idtest.example:49464' -and $a3.Url -eq 'https://app.example.test' -and $a4.Url -eq 'https://app.example.test') "$($a1.Url) $($a2.Url) $($a3.Url) $($a4.Url)"
   # --- The sign-in hostname through Cloudflare (API mock; no authentik, no real Cloudflare) ------------------------------------
   $inst = Join-Path $work 'inst'
   New-Item -ItemType Directory -Force -Path $inst | Out-Null

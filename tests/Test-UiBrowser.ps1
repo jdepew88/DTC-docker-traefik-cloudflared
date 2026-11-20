@@ -217,7 +217,7 @@ try {
   # --- Step 6 ----------------------------------------------------------------------------------------------------------------
   $ok = Wait-PageCondition $cdp "document.querySelector('#rv-cf-dashboard') && document.querySelector('#rv-cf-dashboard').innerText.includes('Access')" 60; Prepare-Page
   $t6 = [string](Js "document.querySelector('#step-6').innerText")
-  Test-Condition 'step 6: Cloudflare changes reviewed separately: tunnel, dashboard (Access first), DNS (email records untouched), security' ($ok -and $t6 -match 'Reuse tunnel' -and $t6 -match 'MX, SPF, DKIM, DMARC' -and $t6 -match 'Turnstile' -and $t6 -match 'traefik-dash\.example\.test') ($t6.Substring(0, [Math]::Min(500, $t6.Length)))
+  Test-Condition 'step 6: Cloudflare changes reviewed separately: tunnel, dashboard (Access first), DNS (email records untouched), security' ($ok -and $t6 -match 'Reuse tunnel' -and $t6 -match 'MX, SPF, DKIM, DMARC' -and $t6 -match 'requires a Cloudflare Access login' -and $t6 -match 'traefik-dash\.example\.test') ($t6.Substring(0, [Math]::Min(500, $t6.Length)))
   Shot 'setup-6-cloudflare-review-intermediate-1366'
   $null = Js "if (!document.querySelector('#step-body-7')) document.querySelector('#step-7 .rv-toggle').click(); true"; Start-Sleep -Milliseconds 300; Prepare-Page
   $installEnabledBefore = -not [bool](Js "__t.btn('Install and verify', document.querySelector('#step-body-7')).disabled")
@@ -240,8 +240,8 @@ try {
   Set-Viewport $cdp 820 1180 -Mobile
   Go 'help' "document.querySelector('.learn-card')"; Shot 'help-tablet-820'
   Set-Viewport $cdp 1366 900
-  Go 'help/cf-turnstile' "document.querySelector('#topic-cf-turnstile.focus')"
-  Test-Condition 'help: contextual links open the matching learning topic' ([bool](Js "document.activeElement && document.activeElement.id === 'topic-cf-turnstile'")) ''
+  Go 'help/cf-access' "document.querySelector('#topic-cf-access.focus')"
+  Test-Condition 'help: contextual links open the matching learning topic' ([bool](Js "document.activeElement && document.activeElement.id === 'topic-cf-access'")) ''
   Open-Page $cdp 'about:blank'; Start-Sleep -Milliseconds 300
   Go 'setup' "document.querySelector('#step-1 h2')"
   Send-Key $cdp 'Tab'
@@ -355,7 +355,10 @@ try {
     Test-Condition 'expert: exact URL, network identities and subnets, generated Traefik service, redacted test output' ($exp -match 'Exact backend URL' -and $exp -match 'Docker subnets' -and $exp -match 'Network identities' -and $exp -match 'Generated Traefik service' -and $exp -match 'Connection test output') $exp.Substring(0, [Math]::Min(500, $exp.Length))
     Shot 'services-add-expert-1366'
     # A deliberate override (Advanced) survives other changes; protocol choices are not replaced by recommendations.
-    $null = Js "TPMUI.setLevel('advanced'); document.querySelector('#svc-custom').closest('.field').querySelector('input[type=checkbox]').click(); true"; Start-Sleep -Milliseconds 200
+    # A level switch re-renders the page asynchronously (app.js route()): wait for the new form before using it.
+    $null = Js "TPMUI.setLevel('advanced'); true"
+    if (-not (Wait-PageCondition $cdp "__t.visible('#svc-custom')" 30)) { throw 'The custom backend field did not appear after switching to Advanced.' }
+    $null = Js "document.querySelector('#svc-custom').closest('.field').querySelector('input[type=checkbox]').click(); true"; Start-Sleep -Milliseconds 200
     $null = Js "__t.set('#svc-custom', 'http://192.0.2.77:8080'); true"
     $ok = Wait-PageCondition $cdp "document.querySelector('#svc-backend').innerText.includes('192.0.2.77:8080')" 60
     $null = Js "__t.set('#svc-display', 'Win App 2'); true"; Start-Sleep -Milliseconds 1200

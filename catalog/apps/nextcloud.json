@@ -1,0 +1,281 @@
+{
+  "schema": 1,
+  "manifestVersion": "2026.11.17",
+  "id": "nextcloud",
+  "name": "Nextcloud",
+  "category": "files",
+  "group": "D",
+  "description": "Your own file sync and sharing cloud with calendars, contacts and office apps. Modular stack: Nextcloud (Apache), background jobs (cron), PostgreSQL and Valkey for caching and file locking.",
+  "maintainer": "Nextcloud GmbH and community",
+  "license": "AGPL-3.0",
+  "source": {
+    "type": "curated",
+    "url": "https://github.com/nextcloud/docker"
+  },
+  "docs": [
+    {
+      "title": "Nextcloud Docker image",
+      "url": "https://github.com/nextcloud/docker"
+    },
+    {
+      "title": "Administration manual",
+      "url": "https://docs.nextcloud.com/server/latest/admin_manual/"
+    },
+    {
+      "title": "Reverse proxy configuration",
+      "url": "https://docs.nextcloud.com/server/latest/admin_manual/configuration_server/reverse_proxy_configuration.html"
+    },
+    {
+      "title": "System requirements",
+      "url": "https://docs.nextcloud.com/server/latest/admin_manual/installation/system_requirements.html"
+    }
+  ],
+  "platforms": {
+    "windows-docker-desktop": "supported",
+    "linux-docker": "untested",
+    "unraid": "untested",
+    "podman": "untested"
+  },
+  "architectures": [
+    "amd64",
+    "arm64"
+  ],
+  "website": "https://nextcloud.com",
+  "installable": true,
+  "services": {
+    "nextcloud": {
+      "image": "nextcloud:34.0.6-apache@sha256:3031e7f87baaceb863a755921ebf463bc26ea71855c07ad7858e2ae25a5a0ad7",
+      "role": "app",
+      "label": "Nextcloud (Apache)",
+      "stateful": true,
+      "ports": [
+        {
+          "container": 80,
+          "protocol": "http",
+          "primary": true
+        }
+      ],
+      "environment": {
+        "POSTGRES_HOST": "nextcloud-db",
+        "POSTGRES_DB": "nextcloud",
+        "POSTGRES_USER": "nextcloud",
+        "POSTGRES_PASSWORD": "{{input:dbPassword}}",
+        "REDIS_HOST": "nextcloud-redis",
+        "TZ": "{{timezone}}",
+        "NEXTCLOUD_ADMIN_USER": "{{input:adminUser}}",
+        "NEXTCLOUD_ADMIN_PASSWORD": "{{input:adminPassword}}",
+        "NEXTCLOUD_TRUSTED_DOMAINS": "localhost 127.0.0.1 {{project}} {{input:hostname}}",
+        "TRUSTED_PROXIES": "10.0.0.0/8 172.16.0.0/12 192.168.0.0/16",
+        "PHP_MEMORY_LIMIT": "512M",
+        "PHP_UPLOAD_LIMIT": "2G",
+        "APACHE_DISABLE_REWRITE_IP": "1"
+      },
+      "volumes": [
+        {
+          "name": "html",
+          "target": "/var/www/html",
+          "kind": "volume",
+          "description": "Nextcloud code, configuration (config.php), apps and user files (data/). Must be a Docker volume on Windows: NTFS folders break its permission checks."
+        }
+      ],
+      "dependsOn": [
+        {
+          "service": "nextcloud-db",
+          "condition": "service_healthy"
+        },
+        {
+          "service": "nextcloud-redis",
+          "condition": "service_started"
+        }
+      ],
+      "healthcheck": {
+        "test": [
+          "CMD-SHELL",
+          "curl -fsS http://localhost/status.php | grep -q '\"installed\":true' || exit 1"
+        ],
+        "interval": "30s",
+        "timeout": "10s",
+        "retries": 10,
+        "start_period": "300s"
+      },
+      "resources": {
+        "memoryMB": 600,
+        "diskMB": 1600
+      }
+    },
+    "nextcloud-cron": {
+      "image": "nextcloud:34.0.6-apache@sha256:3031e7f87baaceb863a755921ebf463bc26ea71855c07ad7858e2ae25a5a0ad7",
+      "role": "worker",
+      "label": "Background jobs (cron.php every 5 minutes)",
+      "entrypoint": [
+        "/cron.sh"
+      ],
+      "environment": {
+        "POSTGRES_HOST": "nextcloud-db",
+        "POSTGRES_DB": "nextcloud",
+        "POSTGRES_USER": "nextcloud",
+        "POSTGRES_PASSWORD": "{{input:dbPassword}}",
+        "REDIS_HOST": "nextcloud-redis",
+        "TZ": "{{timezone}}"
+      },
+      "volumes": [
+        {
+          "name": "html",
+          "target": "/var/www/html",
+          "kind": "volume",
+          "description": "Nextcloud code, configuration (config.php), apps and user files (data/). Must be a Docker volume on Windows: NTFS folders break its permission checks."
+        }
+      ],
+      "dependsOn": [
+        {
+          "service": "nextcloud",
+          "condition": "service_started"
+        }
+      ],
+      "resources": {
+        "memoryMB": 100,
+        "diskMB": 0
+      }
+    },
+    "nextcloud-db": {
+      "image": "postgres:18-alpine@sha256:b6972e1115a4ff8eba5d7f7d19184926d1e16d7d1136ae1e1a7ebf286da0f015",
+      "role": "database",
+      "label": "PostgreSQL",
+      "stateful": true,
+      "environment": {
+        "POSTGRES_USER": "nextcloud",
+        "POSTGRES_PASSWORD": "{{input:dbPassword}}",
+        "POSTGRES_DB": "nextcloud"
+      },
+      "volumes": [
+        {
+          "name": "pgdata",
+          "target": "/var/lib/postgresql",
+          "kind": "volume",
+          "description": "PostgreSQL 18 data (PostgreSQL 18 keeps it under /var/lib/postgresql). Must be a Docker volume on Windows."
+        }
+      ],
+      "healthcheck": {
+        "test": [
+          "CMD-SHELL",
+          "pg_isready -U nextcloud -d nextcloud"
+        ],
+        "interval": "10s",
+        "timeout": "5s",
+        "retries": 6,
+        "start_period": "20s"
+      },
+      "shmSize": "128mb",
+      "resources": {
+        "memoryMB": 250,
+        "diskMB": 300
+      }
+    },
+    "nextcloud-redis": {
+      "image": "docker.io/valkey/valkey:9@sha256:c123e3715db63d06d4ad6964884037aa0d5d4d703939b9929954112889708e1d",
+      "role": "cache",
+      "label": "Valkey (cache and file locking)",
+      "volumes": [
+        {
+          "name": "valkey",
+          "target": "/data",
+          "kind": "volume",
+          "backup": false,
+          "description": "Cache and queue state (rebuilt automatically)."
+        }
+      ],
+      "healthcheck": {
+        "test": [
+          "CMD-SHELL",
+          "valkey-cli ping | grep -q PONG || exit 1"
+        ],
+        "interval": "10s",
+        "timeout": "5s",
+        "retries": 6
+      },
+      "resources": {
+        "memoryMB": 60,
+        "diskMB": 60
+      }
+    }
+  },
+  "inputs": [
+    {
+      "id": "adminUser",
+      "type": "text",
+      "label": "Administrator user name",
+      "default": "admin",
+      "pattern": "^[A-Za-z0-9._@-]{2,40}$"
+    },
+    {
+      "id": "adminPassword",
+      "type": "password",
+      "label": "Administrator password"
+    },
+    {
+      "id": "hostname",
+      "type": "text",
+      "label": "Public host name (optional)",
+      "pattern": "^([a-z0-9-]+(\\.[a-z0-9-]+)+)?$",
+      "help": "The name you will publish it under, e.g. cloud.example.com. Can be added later with occ."
+    },
+    {
+      "id": "dbPassword",
+      "type": "generated",
+      "bytes": 24,
+      "label": "Database password"
+    }
+  ],
+  "privileges": [],
+  "dependencies": [
+    "PostgreSQL 18",
+    "Valkey (Redis-compatible cache and file locking)"
+  ],
+  "security": [
+    "Installed and configured automatically with the administrator account above; no setup page is left open.",
+    "Publish it only with HTTPS. Its own login (with two-factor authentication) protects it; desktop and mobile sync apps need direct access.",
+    "User files live in the html volume; back it up together with the database (the manager does both in one backup)."
+  ],
+  "authentication": {
+    "forwardAuth": "caution",
+    "native": [
+      "local",
+      "oidc",
+      "ldap"
+    ],
+    "notes": [
+      "Desktop and mobile sync clients, WebDAV and app passwords use /remote.php, /ocs and Login Flow: ForwardAuth breaks them. Prefer Nextcloud's own login, or OpenID Connect with authentik through the user_oidc app."
+    ]
+  },
+  "limitations": [
+    "User files stay in a Docker volume: Windows folders (NTFS) fail Nextcloud's ownership and permission checks and are slow through Docker Desktop.",
+    "Big uploads through Cloudflare are limited to 100 MB per request on free plans; the sync clients upload in chunks, browsers may not.",
+    "Major upgrades must go one major version at a time (34 to 35, and so on)."
+  ],
+  "manualSetup": [
+    "After publishing it on a hostname with HTTPS, run in its folder: docker compose exec -u www-data nextcloud php occ config:system:set overwriteprotocol --value=https",
+    "Check Administration settings > Overview for warnings (phone region, maintenance window)."
+  ],
+  "update": {
+    "strategy": "pinned-digest",
+    "notes": "Nextcloud 34 is the production line (its stable tag); 35 is newer and not yet promoted. Updates back up the html and database volumes first and run the upgrade on start; never skip a major version."
+  },
+  "web": {
+    "service": "nextcloud",
+    "path": "/",
+    "localPort": 8090
+  },
+  "exposure": {
+    "default": "local"
+  },
+  "resources": {
+    "memoryMB": 1010,
+    "diskMB": 1960
+  },
+  "testStatus": {
+    "static": "passed",
+    "live": "passed",
+    "date": "2026-11-17",
+    "notes": "Installed in isolation: health, own API, network isolation, modular stack, stop/start, Traefik file route, backup and restore, removal with data."
+  }
+}

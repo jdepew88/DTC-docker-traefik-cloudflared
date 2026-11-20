@@ -30,3 +30,6 @@ zipped project start/
 __pycache__/
 # Local-only notes that may hold credentials
 API key*
+# Launcher built locally by Setup-Launcher.cmd (lib\Launcher.psm1 New-LauncherExe)
+launcher/DTC.exe
+launcher/DTC.ico

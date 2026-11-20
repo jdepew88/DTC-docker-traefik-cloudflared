@@ -38,7 +38,24 @@
     else if (!first) window.scrollTo(0, y);
   };
 
+  // An installation interrupted before all its files were written: nothing can be managed; it can be discarded.
+  function interruptedCard(a, reload) {
+    const id = domId(a.project);
+    return h('article', { class: 'card disc-card dep-card', id: `${id}-card`, 'aria-label': L.instanceTitle(a), 'data-state': 'interrupted' },
+      h('div', { class: 'card-head' }, h('span', { class: 'xp-icon' }, brand(a.applicationId || a.appId, 'box')), h('h2', null, L.instanceTitle(a)), plainChip(a.project), h('span', { class: 'grow' }), plainChip('Installation interrupted', 'err')),
+      h('div', { class: 'callout warn' }, h('p', null, 'The manager stopped before every file of this installation was written. Its folder may be incomplete, so it is not managed.'),
+        h('p', { class: 'small' }, 'Discard it (its generated files, any containers and the record; data volumes and folders you chose are kept), then install it again from the App Catalog.')),
+      U.gateSpan('intermediate', h('p', { class: 'mono small' }, a.folder)),
+      h('div', { class: 'actions' }, h('button', { type: 'button', class: 'btn small danger-outline', id: `${id}-discard`, 'aria-label': `Discard the interrupted installation of ${a.name}`, onclick: (e) => withBusy(e.currentTarget, async () => {
+        const ok = await U.confirmDialog({ title: `Discard ${a.project}`, okText: 'Discard', danger: true, body: [`Removes the files the manager generated in ${a.folder}, any containers of ${a.project}, and its record.`, 'Data volumes and folders you chose are kept.'] });
+        if (!ok) return;
+        try { const r = await api('POST', '/api/apps/discard', { project: a.project, confirm: true }); toast(`Discarded ${a.project}${r.folderKept ? ' (folder kept: it holds other files)' : ''}.`); } catch (x) { toast(x.message, true); }
+        reload();
+      }) }, 'Discard…')));
+  }
+
   function installedCard(ctx, a, reload) {
+    if (a.installState === 'writing') return interruptedCard(a, reload);
     const s = ctx.state;
     const lc = a.lifecycle || { state: a.prepared ? 'prepared' : 'absent', headline: '', health: { text: '' }, services: [] };
     const st = L.deploymentState(lc.state);
@@ -69,13 +86,14 @@
       h('p', { class: `dep-health small ${lc.health && lc.health.verified ? 'ok' : ''}` }, lc.health ? lc.health.text : ''),
       arr(a.siblings).length ? h('p', { class: 'small hint' }, icon('info'), ` Another installation of ${a.name} is registered: ${a.siblings.join(', ')}. They are separate deployments; nothing is shared or merged.`) : null,
       a.updateAvailable ? h('p', null, plainChip('Update available', 'info')) : null,
-      a.composeChanged ? h('p', { class: 'small hint warn' }, icon('alert'), ' compose.yaml was changed outside the manager (for example in Arcane or Portainer). The manager keeps those edits and asks before changing the file.') : null,
+      a.composeChanged ? h('p', { class: 'small hint warn' }, icon('alert'), ` ${arr(a.composeFiles).length > 1 ? 'Its Compose files were' : 'compose.yaml was'} changed outside the manager (for example in Arcane or Portainer). The manager keeps those edits and asks before changing the files.`) : null,
+      arr(a.composeFiles).length > 1 ? U.gateSpan('intermediate', h('p', { class: 'small muted' }, `Modular stack: ${a.composeFiles.join(', ')}`)) : null,
       routes.length ? h('ul', { class: 'checks' }, routes.map((r) => checkItem('ok', `Published as ${r.hostnames.join(', ')}`, `${r.publish ? 'Through Cloudflare' : 'Local route'}${r.authProvider ? ` · protected by ${r.authProvider}` : ''}`))) : h('p', { class: 'small muted' }, 'Not published.'),
       U.gateSpan('intermediate', h('p', { class: 'mono small' }, a.folder)),
       h('div', { class: 'actions' },
         a.localUrl && running ? h('a', { class: 'btn small', href: a.localUrl, target: '_blank', rel: 'noopener noreferrer' }, 'Open ', icon('external')) : null,
         routes.length ? h('a', { class: 'btn small', href: `https://${routes[0].hostnames[0]}/`, target: '_blank', rel: 'noopener noreferrer' }, 'Open site ', icon('external'))
-          : running ? h('a', { class: 'btn small', href: `#publish/${encodeURIComponent((arr(lc.services).find((x) => x.web) || arr(a.containers)[0] || { container: a.project }).container || a.project)}` }, icon('globe'), 'Publish…') : null,
+          : running && !(a.catalog && a.catalog.web && a.catalog.web.headless) ? h('a', { class: 'btn small', href: `#publish/${encodeURIComponent((arr(lc.services).find((x) => x.web) || arr(a.containers)[0] || { container: a.project }).container || a.project)}` }, icon('globe'), 'Publish…') : null,
         running ? action('restart', 'Restart') : action('start', 'Start'), running ? action('stop', 'Stop') : null,
         h('button', { type: 'button', class: 'btn small', 'aria-label': `Logs of ${a.name}`, onclick: (e) => withBusy(e.currentTarget, async () => {
           const r = await api('GET', `/api/apps/logs?project=${encodeURIComponent(a.project)}&tail=200`);
@@ -89,6 +107,8 @@
           const r = await api('POST', '/api/apps/backup', { project: a.project, confirm: true });
           fill(out, h('ul', { class: 'checks' }, checkItem(r.ok ? 'ok' : 'err', 'Backup', r.folder), arr(r.volumes).map((v) => checkItem(v.ok ? 'ok' : 'err', v.volume, `${v.sizeMB} MB`)), arr(r.skipped).map((v) => checkItem('neutral', v, 'Not backed up (cache or user data).'))));
         }) }, icon('archive'), 'Back up'),
+        a.origin !== 'adopted' ? h('button', { type: 'button', class: 'btn small', 'aria-label': `Restore ${a.name} from a backup`, onclick: (e) => withBusy(e.currentTarget, () => restoreFlow(a, out, reload)) }, icon('refresh'), 'Restore…') : null,
+        h('button', { type: 'button', class: 'btn small', 'aria-label': `Stack and routing of ${a.name}`, onclick: (e) => withBusy(e.currentTarget, () => stackFlow(a, out, reload)) }, icon('info'), 'Stack & routing'),
         !running ? h('button', { type: 'button', class: 'btn small', 'aria-label': `Archive the record of ${a.project}`, onclick: (e) => withBusy(e.currentTarget, () => archiveFlow(a, reload)) }, icon('archive'), 'Archive record…') : null,
         h('button', { type: 'button', class: 'btn small danger-outline', 'aria-label': `Remove ${a.name}`, onclick: (e) => withBusy(e.currentTarget, () => removeFlow(a, reload)) }, 'Remove…')),
       detail, out);
@@ -176,8 +196,79 @@
       checkbox: p.externalChanges ? 'I reviewed the changes made outside the manager; update the image lines only.' : 'I read the release notes; the app restarts during the update.' });
     if (!ok) return;
     const r = await api('POST', '/api/apps/update/apply', { project: a.project, previewKey: p.previewKey, acknowledgeExternalChanges: !!p.externalChanges, confirm: true });
-    toast(r.ok ? `${a.name} updated (backup ${r.backup})` : `${a.name}: update failed`, !r.ok);
-    reload();
+    toast(r.ok ? `${a.name} updated (backup ${r.backupId})` : `${a.name}: update failed`, !r.ok);
+    await reload();
+    // The backup made before the update can roll it back (Compose files and data as they were).
+    const card = document.getElementById(`${domId(a.project)}-card`);
+    const host = card ? $('.app-out', card) : null;
+    if (host && r.backupId) {
+      fill(host, h('div', { class: `callout ${r.ok ? '' : 'warn'}`, id: `${domId(a.project)}-rollback` }, h('p', null, r.ok ? `${a.name} was updated. A backup was made first (${r.backupId}).` : `The update of ${a.name} failed. A backup was made first (${r.backupId}).`),
+        h('div', { class: 'actions' }, h('button', { type: 'button', class: 'btn small', onclick: (e) => withBusy(e.currentTarget, () => restoreFlow(a, host, reload, r.backupId)) }, icon('refresh'), 'Roll back this update…'))));
+    }
+  }
+
+  // Restore (and roll back): choose a backup, review what happens, then restore. A safety backup of the current state is
+  // made first, so a restore can itself be undone.
+  async function restoreFlow(a, out, reload, preselect) {
+    const list = await api('GET', `/api/apps/backups?project=${encodeURIComponent(a.project)}`);
+    const backups = arr(list.backups).filter((b) => b.valid);
+    if (!backups.length) { toast(`${a.name} has no backups yet. Use Back up first.`, true); return; }
+    const sel = h('select', { id: 'restore-backup' }, backups.map((b) => h('option', { value: b.id, selected: b.id === preselect }, L.backupTitle(b))));
+    const files = h('input', { type: 'checkbox', id: 'restore-files', checked: true });
+    const chosen = await U.confirmDialog({ title: `Restore ${a.name}`, okText: 'Review',
+      body: [field({ id: 'restore-backup', label: 'Backup', control: sel }), h('label', { class: 'check' }, files, h('span', null, 'Also put back the Compose files and .env from the backup (rolls back an update)')),
+        h('p', { class: 'small muted' }, 'Folders you chose (media, photos) are never touched.')] });
+    if (!chosen) return;
+    let plan;
+    try { plan = await api('POST', '/api/apps/restore-data/plan', { project: a.project, backup: sel.value, restoreFiles: files.checked }); } catch (x) { toast(x.message, true); return; }
+    const ok = await U.confirmDialog({ title: `Restore ${a.name} from ${plan.backup}`, okText: 'Restore', danger: true,
+      body: [h('ol', null, arr(plan.steps).map((st) => h('li', { class: 'small' }, st))),
+        arr(plan.volumes).length ? h('ul', null, plan.volumes.map((v) => h('li', { class: 'small mono' }, `${v.volume}: ${v.available ? `${v.sizeMB} MB` : 'missing in the backup, left as it is'}`))) : null,
+        h('ul', null, arr(plan.keeps).map((k) => h('li', { class: 'small' }, k)))],
+      checkbox: 'Replace the current data with the backup (a safety backup is made first).' });
+    if (!ok) return;
+    let r;
+    try { r = await api('POST', '/api/apps/restore-data', { project: a.project, backup: plan.backup, restoreFiles: plan.restoreFiles, key: plan.key, confirm: true }); } catch (x) { toast(x.message, true); return; }
+    toast(r.ok ? `${a.name} restored from ${r.backup}` : `${a.name}: restore had problems`, !r.ok);
+    await reload();
+    const card = document.getElementById(`${domId(a.project)}-card`);
+    const host = card ? $('.app-out', card) : out;
+    fill(host, h('ul', { class: 'checks', id: `${domId(a.project)}-restored` }, arr(r.steps).map((x) => checkItem(x.status === 'Done' ? 'ok' : 'err', x.name, x.message)),
+      checkItem('neutral', 'Undo', `The state before this restore is in backup ${r.safetyBackup}.`)));
+  }
+
+  // Stack & routing: the app's own Compose files, its stack description, its routes split into routers, services and
+  // middlewares (and whether Traefik serves them), variable names of .env, health and findings. Read-only.
+  async function stackFlow(a, out, reload) {
+    const d = await api('GET', `/api/apps/stack?project=${encodeURIComponent(a.project)}`);
+    const st = d.stack || {};
+    const describe = d.stackSource === 'derived' ? h('button', { type: 'button', class: 'btn small', id: `${domId(a.project)}-describe`, onclick: (e) => withBusy(e.currentTarget, async () => {
+      const ok = await U.confirmDialog({ title: `Describe ${a.project}`, okText: 'Write dtc-stack.json', body: ['Writes dtc-stack.json (services, networks, volumes, dependencies; no secrets) into the app folder.', 'Nothing else changes: the Compose files, .env, containers, volumes and routes stay exactly as they are.'] });
+      if (!ok) return;
+      try { await api('POST', '/api/apps/stack/describe', { project: a.project, confirm: true }); toast('dtc-stack.json written.'); } catch (x) { toast(x.message, true); }
+      stackFlow(a, out, reload);
+    }) }, 'Write dtc-stack.json…') : null;
+    const routes = arr(d.routing && d.routing.routes);
+    fill(out, h('section', { class: 'dep-stack', id: `${domId(a.project)}-stack`, 'aria-label': `Stack and routing of ${a.name}` },
+      h('h3', null, 'Diagnostics'), h('ul', { class: 'checks' }, L.sortFindings(d.findings).map((f) => checkItem(L.findingTone(f.level), f.message, f.fix))),
+      h('h3', null, 'Stack'),
+      kv([['Folder', h('span', { class: 'mono small' }, d.folder)], ['Compose files', arr(d.composeFiles).map((f) => `${f.file}${f.exists ? '' : ' (missing)'}`).join(', ')],
+        ['Start order', arr(st.startOrder).join(' → ') || '-'], ['Dependencies', arr(st.dependencies).map((x) => `${x.service} (${x.role})`).join(', ') || 'none'],
+        ['Shared network', arr(st.networks && st.networks.shared).join(', ') || 'none'], ['Private network', arr(st.networks && st.networks.private).join(', ') || 'none'],
+        ['Web front end', st.frontend ? (st.frontend.headless ? 'none (headless)' : (st.frontend.backendUrl || st.frontend.service)) : '-'],
+        ['Description', d.stackSource === 'file' ? 'dtc-stack.json' : d.stackSource === 'derived' ? 'read from the Compose files (no dtc-stack.json yet)' : 'not available'],
+        ['.env', `${arr(d.env && d.env.variables).length} variables (names only): ${arr(d.env && d.env.variables).join(', ')}`]]),
+      describe ? h('div', { class: 'actions' }, describe) : null,
+      arr(d.composeFiles).map((f) => technical(String(f.content || '').split('\n'), f.file)),
+      st && Object.keys(st).length ? technical(JSON.stringify(st, null, 2).split('\n'), 'dtc-stack.json') : null,
+      h('h3', null, 'Routing'),
+      h('p', { class: 'small muted' }, `Explicit Traefik file-provider definitions in ${d.routing ? d.routing.directory : 'traefik\\dynamic'} (loaded directly; sub-folders are not read). ${d.routing && d.routing.traefikReachable ? '' : 'The Traefik API did not answer, so serving status is unknown.'}`),
+      routes.length ? routes.map((r) => h('div', { class: 'dep-route', 'data-route': r.name },
+        h('p', null, h('strong', null, r.name), ` · ${arr(r.hostnames).join(', ')} · ${r.file}${r.exists ? '' : ' (missing)'}`),
+        h('ul', { class: 'checks' }, arr(r.traefik).map((x) => checkItem(x.served ? 'ok' : x.status === 'unknown' ? 'neutral' : 'err', `Router ${x.router}`, x.served ? `Served by Traefik (${x.status})` : x.status === 'unknown' ? 'Traefik not reachable' : 'Not served by Traefik'))),
+        ['routers', 'services', 'middlewares'].map((k) => arr(r[k]).map((x) => technical(String(x.yaml).split('\n'), `${k.slice(0, -1)} ${x.name}${x.rule ? `: ${x.rule}` : ''}`)))))
+        : h('p', { class: 'small muted' }, a.catalog && a.catalog.web && a.catalog.web.headless ? 'No web interface: nothing to route.' : 'No route yet: the app is not published. Use Publish… to create one.')));
+    const det = $('details', out); if (det) det.open = true;
   }
 
   async function cleanupFlow(a, reload) {
@@ -235,7 +326,7 @@
         list('Containers', inv.containers, (c) => `${c.name}: ${c.action}`), list('Data volumes', inv.volumes, (v) => `${v.anonymous ? `anonymous volume ${v.name.slice(0, 12)}… of ${v.usedBy} (${v.target})` : v.name}: ${v.action}${arr(v.sharedWith).length ? ` (${v.sharedWith.join(', ')})` : ''}`),
         list('Networks', inv.networks, (n) => `${n.name}: ${n.action}`), list('Files', inv.files, (f) => `${f.name}: ${f.action}`), list('Left unchanged', inv.references, (r) => r),
         h('label', { class: 'check' }, vols, h('span', null, inv.dataDeletionAllowed ? 'Also delete its data volumes (cannot be undone)' : 'Data volumes cannot be deleted here (shared or not created by the manager)')),
-        h('label', { class: 'check' }, files, h('span', null, 'Also delete compose.yaml, .env and README.md in its folder')),
+        h('label', { class: 'check' }, files, h('span', null, `Also delete ${arr(a.composeFiles).length > 1 ? a.composeFiles.join(', ') : 'compose.yaml'}, .env, README.md and dtc-stack.json in its folder`)),
         field({ id: 'rm-typed', label: `To delete data, type the project name (${a.project})`, control: typed }),
         h('p', { class: 'small muted' }, 'Folders you chose for media or files are never deleted.')],
       checkbox: 'Remove the containers.' });
@@ -257,7 +348,7 @@
     another.addEventListener('change', () => { f.anotherInstance = another.checked; f.plan = null; f.reviewed = false; onChange(); });
     label.addEventListener('change', () => { f.instanceLabel = label.value.trim(); f.plan = null; f.reviewed = false; onChange(); });
     const item = (e) => h('li', { class: 'dep-existing', 'data-project': e.project },
-      h('div', null, h('strong', null, e.project), ' ', e.archived ? plainChip('archived record', 'neutral') : e.source === 'docker' ? plainChip('not registered', 'warn') : plainChip(e.headline || e.state || 'registered', e.state === 'running' ? 'ok' : 'neutral'),
+      h('div', null, h('strong', null, e.project), ' ', e.archived ? plainChip('archived record', 'neutral') : e.source === 'docker' ? plainChip('not registered', 'warn') : e.source === 'container' ? plainChip('container without Compose', 'warn') : plainChip(e.headline || e.state || 'registered', e.state === 'running' ? 'ok' : 'neutral'),
         h('p', { class: 'small muted' }, `${e.folder || ''}${arr(e.hostnames).length ? ` · ${e.hostnames.join(', ')}` : ''}`), h('p', { class: 'small' }, e.reason)),
       h('div', { class: 'actions' },
         e.source === 'registry' && !e.archived ? h('a', { class: 'btn small', href: `#apps/${encodeURIComponent(e.project)}` }, 'Manage existing') : null,

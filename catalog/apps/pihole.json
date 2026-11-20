@@ -1,0 +1,166 @@
+{
+  "schema": 1,
+  "manifestVersion": "2026.11.17",
+  "id": "pihole",
+  "name": "Pi-hole",
+  "category": "networking",
+  "group": "A",
+  "description": "Network-wide ad and tracker blocking DNS server with a web dashboard. Installed without changing any DNS setting of this PC or your network.",
+  "maintainer": "Pi-hole LLC and contributors",
+  "license": "EUPL-1.2",
+  "source": {
+    "type": "curated",
+    "url": "https://github.com/pi-hole/docker-pi-hole"
+  },
+  "docs": [
+    {
+      "title": "Pi-hole in Docker",
+      "url": "https://docs.pi-hole.net/docker/"
+    },
+    {
+      "title": "Configuration (FTLCONF)",
+      "url": "https://docs.pi-hole.net/docker/configuration/"
+    },
+    {
+      "title": "Upgrading from v5",
+      "url": "https://docs.pi-hole.net/docker/upgrading/v5-v6/"
+    }
+  ],
+  "platforms": {
+    "windows-docker-desktop": "supported",
+    "linux-docker": "untested",
+    "unraid": "untested",
+    "podman": "untested"
+  },
+  "architectures": [
+    "amd64",
+    "arm64",
+    "arm/v7",
+    "386"
+  ],
+  "website": "https://pi-hole.net",
+  "installable": true,
+  "aliases": [
+    "pi-hole"
+  ],
+  "services": {
+    "app": {
+      "image": "pihole/pihole:2026.11.0@sha256:66c798d79a95c2691f280329c3611dba1746117c61c9f331907ca35a06a52778",
+      "role": "app",
+      "label": "Pi-hole",
+      "ports": [
+        {
+          "container": 80,
+          "protocol": "http",
+          "primary": true
+        },
+        {
+          "container": 53,
+          "protocol": "udp",
+          "label": "DNS (UDP)",
+          "publish": {
+            "hostPort": 53,
+            "address": "lan",
+            "when": "publishDns"
+          }
+        },
+        {
+          "container": 53,
+          "protocol": "tcp",
+          "label": "DNS (TCP)",
+          "publish": {
+            "hostPort": 53,
+            "address": "lan",
+            "when": "publishDns"
+          }
+        }
+      ],
+      "environment": {
+        "TZ": "{{timezone}}",
+        "FTLCONF_webserver_api_password": "{{input:adminPassword}}",
+        "FTLCONF_dns_listeningMode": "ALL",
+        "FTLCONF_dns_upstreams": "{{input:upstreams}}"
+      },
+      "volumes": [
+        {
+          "name": "etc-pihole",
+          "target": "/etc/pihole",
+          "kind": "volume",
+          "description": "Settings (pihole.toml), blocklists, query log database."
+        }
+      ],
+      "resources": {
+        "memoryMB": 120,
+        "diskMB": 300
+      }
+    }
+  },
+  "inputs": [
+    {
+      "id": "adminPassword",
+      "type": "password",
+      "label": "Web interface password"
+    },
+    {
+      "id": "upstreams",
+      "type": "text",
+      "label": "Upstream DNS servers",
+      "default": "1.1.1.1;1.0.0.1",
+      "pattern": "^[0-9a-fA-F.:#;]+$",
+      "help": "Separated by semicolons."
+    },
+    {
+      "id": "publishDns",
+      "type": "boolean",
+      "label": "Answer DNS for other devices (port 53 on this PC)",
+      "default": "false",
+      "help": "Off: the dashboard works, but no device uses Pi-hole. On: port 53 must be free; you then point devices or your router at this PC yourself."
+    }
+  ],
+  "privileges": [],
+  "dependencies": [],
+  "security": [
+    "Installing changes no DNS setting: not on this PC, not on your router. Using Pi-hole is a separate decision you make on each device or on the router.",
+    "If this PC sleeps or Docker stops, devices that use it as DNS lose name resolution."
+  ],
+  "authentication": {
+    "forwardAuth": "caution",
+    "native": [
+      "local"
+    ],
+    "notes": [
+      "The dashboard has its own password. Its API (/api) is used by apps and widgets that ForwardAuth would block; DNS itself is not HTTP and is unaffected."
+    ]
+  },
+  "limitations": [
+    "Docker Desktop puts DNS clients behind its network proxy: queries may all appear to come from one address, so per-device statistics and DHCP do not work.",
+    "Port 53 can be in use on Windows (Internet Connection Sharing, Hyper-V DNS proxy); the plan checks it before installing.",
+    "For a household DNS server, an always-on Linux host or Raspberry Pi is more reliable than a Windows desktop."
+  ],
+  "manualSetup": [
+    "Sign in to the dashboard at /admin with the password from credentials.txt.",
+    "Only if you want Pi-hole to filter: enable port 53, then set this PC's address as the DNS server on one test device before changing your router."
+  ],
+  "update": {
+    "strategy": "pinned-digest",
+    "notes": "Gravity (blocklists) updates itself weekly inside the container; the image changes only with a catalog update."
+  },
+  "web": {
+    "service": "app",
+    "path": "/admin/",
+    "localPort": 8053
+  },
+  "exposure": {
+    "default": "local"
+  },
+  "resources": {
+    "memoryMB": 120,
+    "diskMB": 300
+  },
+  "testStatus": {
+    "static": "passed",
+    "live": "passed",
+    "date": "2026-11-17",
+    "notes": "Installed in isolation: health, own API, network isolation, modular stack, stop/start, Traefik file route, backup and restore, removal with data."
+  }
+}

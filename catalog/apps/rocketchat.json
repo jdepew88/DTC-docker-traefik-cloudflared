@@ -35,6 +35,10 @@
     "unraid": "untested",
     "podman": "untested"
   },
+  "architectures": [
+    "amd64",
+    "arm64"
+  ],
   "installable": true,
   "services": {
     "rocketchat": {
@@ -205,6 +209,22 @@
     "Create the administrator account in the setup wizard right after the first start.",
     "Set ROOT_URL (in .env) to the public address after publishing."
   ],
+  "authentication": {
+    "forwardAuth": "caution",
+    "native": [
+      "local",
+      "oauth",
+      "ldap"
+    ],
+    "notes": [
+      "Desktop and mobile clients and federation use their own authentication; ForwardAuth blocks them. Use Rocket.Chat's custom OAuth with authentik instead.",
+      "WebSockets are required (Traefik passes them through)."
+    ]
+  },
+  "limitations": [
+    "MongoDB runs as a single-node replica set (no high availability).",
+    "Mobile push notifications need a Rocket.Chat Cloud registration."
+  ],
   "update": {
     "strategy": "pinned-digest",
     "notes": "MongoDB major upgrades follow Rocket.Chat's documented procedure; Rocket.Chat 8.x needs MongoDB 8.0 or later."
@@ -220,5 +240,11 @@
   "resources": {
     "memoryMB": 2530,
     "diskMB": 2730
+  },
+  "testStatus": {
+    "static": "passed",
+    "live": "passed",
+    "date": "2026-11-17",
+    "notes": "Installed in isolation (Rocket.Chat 8.9.0, MongoDB replica set, NATS, setup jobs): /api/info, network isolation, 4-file modular stack, stop/start, Traefik file route, backup and restore, removal with data."
   }
 }
