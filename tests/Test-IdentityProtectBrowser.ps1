@@ -68,7 +68,44 @@ $Shim = @'
       d.apps = st.protected.map((n) => ({ service: n, displayName: label(n), hostname: host(n), protected: true, authentik: true, enabled: true, slug: `dm-${n}`, verifiedAt: '', rules: 1, ownerOnly: true,
         forwardAuth: { configured: true, loaded: true },
         challenge: probe ? (st.failing.includes(n) ? { State: 'open', Message: 'The application answered without asking for sign-in.' } : { State: 'auth', Message: 'Sign-in required (authentik).' }) : null }));
+      // Launcher rows as the server builds them (lib\AccessDiagnostics.psm1): C is stopped, E's container is missing,
+      // D still has the Cloudflare Access application DTC created (a redundant second login) until it is removed.
+      d.adminLinks.public = true;
+      const ctrs = { c: 'exited', e: 'missing' };
+      d.launcher = names.map((n) => {
+        const prot = st.protected.includes(n);
+        const redundant = prot && n === 'd' && !st.accessRemoved;
+        const ctr = ctrs[n] || 'running';
+        const problems = [];
+        if (redundant) problems.push({ state: 'redundant-access', tone: 'warn', label: 'Redundant Cloudflare login', message: "Cloudflare Access application 'd.idtest.example (stack)' asks for its own login (email code) before authentik. It was created by DTC and is no longer wanted: authentik protects this application.", fix: 'Remove the redundant Cloudflare Access (preview first).' });
+        if (ctr === 'missing') problems.push({ state: 'missing-container', tone: 'err', label: 'Container missing', message: 'The target container does not exist. After signing in, visitors get "Bad gateway".', fix: 'Install or start the application.' });
+        if (ctr === 'exited') problems.push({ state: 'stopped', tone: 'warn', label: 'Stopped', message: 'The container is exited. After signing in, visitors get "Bad gateway" (an availability error, not a sign-in problem).', fix: 'Start the application on the Installed apps page.' });
+        const first = problems[0] || (prot ? { state: 'healthy', tone: 'ok', label: 'Healthy, protected', message: '', fix: '' } : n === 'b' ? { state: 'missing-protection', tone: 'warn', label: 'Public without sign-in', message: 'Anyone on the Internet can open it.', fix: '' } : { state: 'unpublished', tone: 'neutral', label: 'Local only (not published)', message: '', fix: '' });
+        return { service: n, displayName: label(n), hostname: host(n), openUrl: n === 'b' ? `https://${host(n)}/` : `http://${host(n)}:8180/`, publish: n === 'b', enabled: true,
+          authentikUrl: prot ? `https://auth.idtest.example/if/admin/#/core/applications/dm-${n}` : '', authentikUrlPublic: true,
+          container: { name: n, state: ctr }, router: 'enabled', target: `http://${n}:80`, authMode: prot ? 'authentik' : 'none', authModeLabel: prot ? 'authentik ForwardAuth' : 'No external sign-in',
+          access: { checked: true, error: '', managedAppId: redundant ? 'acc-d' : '', apps: redundant ? [{ id: 'acc-d', name: 'd.idtest.example (stack)', pattern: host('d'), wildcard: false, pathOnly: false, createdByTool: true }] : [] },
+          diagnosis: Object.assign({}, first, { problems }) };
+      });
       return json(d);
+    }
+    if (url.pathname === '/api/identity/trace') {
+      const n = body.service; const red = n === 'd' && !st.accessRemoved;
+      const hop = red ? { url: `https://${host(n)}/`, status: 302, kind: 'cloudflare-access', next: `https://team.cloudflareaccess.com/cdn-cgi/access/login/${host(n)}`, error: '' } : { url: `https://${host(n)}/`, status: 302, kind: 'authentik', next: 'https://auth.idtest.example/application/o/authorize/', error: '' };
+      return json({ service: n, hostname: host(n), mode: 'authentik', modeLabel: 'authentik ForwardAuth', checkedAt: '2026-11-24T10:00:00',
+        public: { hops: [hop], component: red ? 'Cloudflare Access' : 'authentik', message: red ? 'Cloudflare Access answers first and asks for its own login (email code or its identity providers), before Traefik and authentik see the request. This is a redundant second login: authentik already protects this application.' : 'Traefik asked authentik (ForwardAuth); an anonymous visitor is sent to the central authentik sign-in.' },
+        local: { hops: [{ url: `http://${host(n)}/ (via this PC's Traefik)`, status: 302, kind: 'authentik', next: 'https://auth.idtest.example/application/o/authorize/', error: '' }], component: 'authentik', message: 'Traefik asked authentik (ForwardAuth).' } });
+    }
+    if (url.pathname === '/api/identity/access/plan') {
+      const n = body.service;
+      return json({ planId: 'plan-a', service: n, hostname: host(n), canApply: true, challenge: { state: 'auth', message: 'Sign-in required: redirected to auth.idtest.example/application/o/authorize/.' },
+        actions: [{ id: `access:delete:${host(n)}`, summary: `Delete Access application '${host(n)} (stack)' (created by this tool)`, detail: `Cloudflare Access was already turned off for ${host(n)}, but the Access application this tool created was left behind, so Cloudflare no longer asks for its own login (email code) first. authentik stays the sign-in.` }],
+        notes: [], keeps: [`authentik ForwardAuth in front of ${host(n)} (verified just now: anonymous visitors are sent to sign in)`, 'The Traefik route, DNS record and tunnel route', 'Access applications DTC did not create'],
+        rollback: `To put the Cloudflare login back, edit '${n}' on the Services page, turn on "Require Cloudflare Access" and choose layered authentication.` });
+    }
+    if (url.pathname === '/api/identity/access/apply') {
+      st.accessRemoved = true; persist();
+      return json({ ok: true, service: 'd', hostname: host('d'), steps: [{ name: `Delete Access application '${host('d')} (stack)' (created by this tool)`, status: 'Done', message: '' }], message: `Done: ${host('d')} now goes straight to authentik.` });
     }
     if (url.pathname === '/api/identity/wizard') { if (body && body.skip === 'apps') { st.skippedAt = '2026-10-26T09:00:00'; persist(); } return json({ ok: true }); }
     const tf = (n) => ({ traefik: { changes: [{ action: 'update', file: `svc-${n}.yml`, diff: '' }], issues: [] }, cloudflare: { actions: [] } });
@@ -164,10 +201,54 @@ try {
   $st = [string](Js "document.querySelector('#id-apps-status').innerText")
   Test-Condition 'failing check: step 8 and 9 are not complete; the status names the application' ($ok -and $s8f.cls -notmatch '\bdone\b' -and $s9f.cls -notmatch '\bdone\b' -and $st -match 'not working for c') $st
 
+  # --- Application launcher: links, status, diagnostics, trace, redundant Cloudflare login ------------------------------
+  Set-Mock @('a', 'c', 'd', 'e', 'f', 'g', 'h')
+  $ok = Go 'identity/apps?level=beginner' "$panelReady && !!document.querySelector('tr[data-app=d] .app-actions')"
+  $rowA = Js "(() => { const r = document.querySelector('tr[data-app=a]'); const host = r.querySelector('a.app-host'); const open = [...r.querySelectorAll('.app-actions a')].find((a) => a.textContent.startsWith('Open')); const ak = [...r.querySelectorAll('.app-actions a')].find((a) => a.textContent.startsWith('Authentik')); return JSON.stringify({ host: host && host.getAttribute('href'), hostText: host && host.textContent.trim(), hostTarget: host && host.target, hostRel: host && host.rel, open: open && open.getAttribute('href'), openTarget: open && open.target, ak: ak && ak.getAttribute('href'), akTarget: ak && ak.target }); })()" | ConvertFrom-Json
+  Test-Condition 'launcher: the hostname is a link to the application''s own address, in a new tab (no sign-in started by DTC)' ($ok -and $rowA.host -eq 'http://a.idtest.example:8180/' -and $rowA.hostText -match '^a\.idtest\.example' -and $rowA.hostTarget -eq '_blank' -and $rowA.hostRel -match 'noopener') ($rowA | ConvertTo-Json -Compress)
+  Test-Condition 'launcher: Open goes to the same application address in a new tab' ($rowA.open -eq $rowA.host -and $rowA.openTarget -eq '_blank') ($rowA | ConvertTo-Json -Compress)
+  Test-Condition 'launcher: Authentik opens the application''s admin page at the PUBLIC authentik address (not 127.0.0.1)' ($rowA.ak -eq 'https://auth.idtest.example/if/admin/#/core/applications/dm-a' -and $rowA.akTarget -eq '_blank' -and $rowA.ak -notmatch '127\.0\.0\.1') ($rowA | ConvertTo-Json -Compress)
+  $rowB = Js "(() => { const r = document.querySelector('tr[data-app=b]'); return JSON.stringify({ open: ([...r.querySelectorAll('.app-actions a')].find((a) => a.textContent.startsWith('Open')) || {}).href || '', ak: !![...r.querySelectorAll('.app-actions a')].find((a) => a.textContent.startsWith('Authentik')), text: r.innerText }); })()" | ConvertFrom-Json
+  Test-Condition 'launcher: a published application opens at https://<hostname>/; unprotected rows have no Authentik button and warn' ($rowB.open -eq 'https://b.idtest.example/' -and -not $rowB.ak -and $rowB.text -match 'Public without sign-in') ($rowB | ConvertTo-Json -Compress)
+  $rowC = [string](Js "document.querySelector('tr[data-app=c]').innerText"); $rowE = [string](Js "document.querySelector('tr[data-app=e]').innerText"); $rowF = [string](Js "document.querySelector('tr[data-app=f]').innerText")
+  Test-Condition 'launcher: a stopped container is shown as an availability problem, not as a sign-in failure' ($rowC -match 'Stopped \(exited\)' -and $rowC -match 'availability error, not a sign-in problem' -and $rowC -notmatch 'Not enforced|failing') $rowC
+  Test-Condition 'launcher: a missing container and a healthy protected application are distinguished' ($rowE -match 'Container missing' -and $rowF -match 'Running' -and $rowF -match 'Healthy, protected') "$rowE || $rowF"
+  $banner = [string](Js "(document.querySelector('#id-redundant-access') || {}).innerText || ''")
+  $rowD = [string](Js "document.querySelector('tr[data-app=d]').innerText")
+  Test-Condition 'launcher: a redundant Cloudflare login is reported (banner + row), with its Access application' ($banner -match '1 application\(s\) ask visitors to sign in twice' -and $banner -match 'd\.idtest\.example' -and $rowD -match 'Redundant Cloudflare login' -and $rowD -match 'Cloudflare Access: d\.idtest\.example \(stack\)') "$banner || $rowD"
+  Test-Condition 'launcher: no Authentik link uses the local 127.0.0.1 address' ([int](Js "[...document.querySelectorAll('.launcher-table a')].filter((a) => /127\.0\.0\.1/.test(a.href)).length") -eq 0) ''
+  Shot 'identity-launcher'
+  # Trace: read-only, shows which component asks for authentication first.
+  $null = Js "[...document.querySelectorAll('tr[data-app=d] button')].find((b) => b.textContent === 'Trace').click(); true"
+  $okT = Wait-PageCondition $cdp "!!document.querySelector('#id-trace-d')" 10
+  $trace = [string](Js "(document.querySelector('#id-trace-d') || {}).innerText || ''")
+  Test-Condition 'trace: names Cloudflare Access as the component asking first, without query strings' ($okT -and $trace -match 'Cloudflare Access:' -and $trace -match 'redundant second login' -and $trace -notmatch '\?') $trace
+  Shot 'identity-trace'
+  # Remove the redundant Cloudflare login: preview (authentik verified first, what stays), acknowledgement, apply.
+  $null = Js "document.querySelector('#id-cleanup-d').click(); true"
+  $okC = Wait-PageCondition $cdp "!!document.querySelector('#id-cleanup-review')" 10
+  $rev = [string](Js "document.querySelector('#id-cleanup-review').innerText")
+  $applyDisabled = [bool](Js "document.querySelector('#id-cleanup-apply').disabled")
+  Test-Condition 'cleanup: the preview shows authentik verified, the one deletion, what stays and how to undo; Apply waits for the acknowledgement' ($okC -and $rev -match 'authentik protection verified just now' -and $rev -match "Delete Access application 'd\.idtest\.example \(stack\)'" -and $rev -match 'Stays as it is' -and $rev -match 'Access applications DTC did not create' -and $rev -match 'layered authentication' -and $applyDisabled) $rev
+  Shot 'identity-cleanup-preview'
+  $null = Js "document.querySelector('#id-cleanup-ack').click(); document.querySelector('#id-cleanup-apply').click(); true"
+  $okC2 = Wait-PageCondition $cdp "!!document.querySelector('#id-cleanup-result') && !document.querySelector('#id-redundant-access')" 15
+  $cleanCall = Js "JSON.stringify(window.__idpmock.calls.filter((c) => c.path === '/api/identity/access/apply').pop().body)" | ConvertFrom-Json
+  Test-Condition 'cleanup: one confirmed apply with the preview id; afterwards no redundant login is reported' ($okC2 -and $cleanCall.planId -eq 'plan-a' -and $cleanCall.confirm -and [string](Js "document.querySelector('#id-cleanup-result').innerText") -match 'now goes straight to authentik') ($cleanCall | ConvertTo-Json -Compress)
+  $opt = [string](Js "[...document.querySelectorAll('#id-p-access option')].map((o) => o.value + (o.selected ? '*' : '') + ':' + o.textContent).join(' | ')")
+  Test-Condition 'protect: authentik-only is the default; layered (two sign-ins) is an explicit choice' ($opt -match '^remove\*:authentik only' -and $opt -match 'layered:Layered: keep Cloudflare Access in front as well \(two sign-ins\)') $opt
+  # Narrow screen: the table becomes stacked rows without horizontal scrolling of the page.
+  Set-Viewport $cdp 390 844 -Mobile
+  Start-Sleep -Milliseconds 400
+  $over = [int](Js "document.documentElement.scrollWidth - document.documentElement.clientWidth")
+  Test-Condition 'launcher: no horizontal page scroll at phone width' ($over -le 1) "overflow $over px"
+  Shot 'identity-launcher-mobile'
+  Set-Viewport $cdp 1366 800
+
   # --- Remove protection safely -------------------------------------------------------------------------------------------
   Set-Mock @('a', 'b', 'c', 'd', 'e', 'f', 'g', 'h')
   $ok = Go 'identity/apps?level=beginner' "$panelReady && document.querySelectorAll('.protect-table tbody tr.protected').length === 8"
-  $null = Js "[...document.querySelectorAll('.protect-table tbody tr')].find((r) => r.innerText.includes('App B')).querySelector('button.ghost').click(); true"
+  $null = Js "[...[...document.querySelectorAll('.protect-table tbody tr')].find((r) => r.innerText.includes('App B')).querySelectorAll('button')].find((b) => b.textContent.startsWith('Remove protection')).click(); true"
   $okR = Wait-PageCondition $cdp "!!document.querySelector('#id-protect-review') && !!document.querySelector('#id-unprotect-keeps')" 10
   $planBody = Js "JSON.stringify(window.__idpmock.calls.filter((c) => c.path === '/api/identity/unprotect/plan').pop().body)" | ConvertFrom-Json
   $review = [string](Js "document.querySelector('#id-protect-review').innerText")

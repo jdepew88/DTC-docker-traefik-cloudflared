@@ -613,6 +613,32 @@ dialog::backdrop { background: rgba(5, 8, 12, .65); }
 .sel-count { color: var(--muted); font-size: .9rem; }
 .protect-table tr.protected td { color: var(--muted); }
 .protect-table label { cursor: pointer; }
+/* Identity & Access application launcher: every application with its address, status, sign-in and actions. */
+.launcher-table tr.protected td { color: inherit; }
+.launcher-table td { vertical-align: top; }
+.launcher-table .app-name { font-weight: 600; }
+.launcher-table td:first-child, .launcher-table th:first-child { width: 2rem; min-width: 0; padding-right: 0; }
+.launcher-table .app-cell { min-width: 12rem; }
+.launcher-table .signin-cell { min-width: 14rem; }
+.launcher-table .app-host { overflow-wrap: break-word; word-break: normal; }
+.launcher-table .chip-row { display: flex; flex-wrap: wrap; gap: .25rem; margin: .3rem 0 0; }
+.launcher-table .chip { max-width: 100%; white-space: normal; }
+.launcher-table .app-diag { margin-top: .35rem; display: grid; gap: .2rem; }
+.launcher-table .app-actions { width: 1%; }
+.launcher-table .app-actions > * { display: flex; justify-content: center; width: 100%; margin: 0 0 .3rem; white-space: nowrap; }
+.launcher-table tr.trace-row td { border-top: 0; padding-top: 0; }
+.launcher-table ol.trace { margin: .25rem 0 .5rem 1.25rem; padding: 0; }
+.launcher-table ol.trace code { overflow-wrap: anywhere; }
+/* The wizard panel is narrow below wide desktop widths: each application becomes a stacked card. */
+@media (max-width: 1100px) {
+  .launcher-table thead { display: none; }
+  .launcher-table tr { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: .25rem .5rem; padding: .6rem .25rem; border-bottom: 1px solid var(--border); }
+  .launcher-table td { border: 0; padding: .1rem .25rem; min-width: 0; }
+  .launcher-table td:nth-child(n+3) { grid-column: 2; }
+  .launcher-table .app-actions { width: auto; display: flex; flex-wrap: wrap; gap: .3rem; }
+  .launcher-table .app-actions > * { width: auto; margin: 0; }
+  .launcher-table tr.trace-row { padding-top: 0; }
+}
 .protect-res { margin: .6rem 0; }
 ol.gsteps li { margin: .45rem 0; }
 .login-preview { display: flex; justify-content: center; margin: .4rem 0 1rem; }

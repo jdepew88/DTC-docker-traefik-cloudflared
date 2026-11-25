@@ -59,6 +59,7 @@ Set-StrictMode -Version 2.0
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
 Import-Module (Join-Path $here 'lib\TraefikProxy.psm1') -Force
 Import-Module (Join-Path $here 'lib\CloudflareApi.psm1') -Force
+Import-Module (Join-Path $here 'lib\AccessDiagnostics.psm1') -Force
 Import-Module (Join-Path $here 'lib\Dashboard.psm1') -Force
 Import-Module (Join-Path $here 'lib\ConfigBackup.psm1') -Force
 Import-Module (Join-Path $here 'lib\ProjectDiscovery.psm1') -Force
@@ -127,6 +128,7 @@ $State = @{
   AppPlans  = @{}
   IdpPlans  = @{}
   IdpChecks = @{}
+  AccessApps = $null
   ProvisionPlans = @{}
   IntegrationPlans = @{}
   ManagerSnapshots = @{}
@@ -400,17 +402,20 @@ function Get-ServiceFromBody($Body) {
   $hostnames = @(Get-Field $svc 'hostnames' @())
   if ($hostnames.Count -gt 20) { Stop-Request 400 'At most 20 hostnames per service.' }
   $displayName = ([string](Get-Field $svc 'displayName' '')).Trim()
+  # Cloudflare Access defaults to on for a published service without another sign-in. When the request names authentik,
+  # Access stays off unless it is asked for explicitly (with layered authentication): never two logins by default.
+  $namesAuthentik = [bool]($svc.PSObject.Properties['auth'] -and $null -ne $svc.auth -and [string](Get-Field $svc.auth 'provider' '') -eq 'authentik')
   $def = @{
     name = Get-Field $svc 'name' ''; displayName = $displayName.Substring(0, [Math]::Min(80, $displayName.Length)); description = ([string](Get-Field $svc 'description' '')).Substring(0, [Math]::Min(200, ([string](Get-Field $svc 'description' '')).Length))
     enabled = [bool](Get-Field $svc 'enabled' $true); hostnames = $hostnames; pathPrefix = Get-Field $svc 'pathPrefix' ''
     stripPrefix = [bool](Get-Field $svc 'stripPrefix' $false); middlewares = @(Get-Field $svc 'middlewares' @('default-headers@file'))
     target = @{ type = $resolved.Type; host = $resolved.Host; port = (Get-Field $target 'port' 0); protocol = (Get-Field $target 'protocol' 'http'); tlsSkipVerify = [bool](Get-Field $target 'tlsSkipVerify' $false) }
-    cloudflare = @{ publish = [bool](Get-Field (Get-Field $svc 'cloudflare' $null) 'publish' $true); access = [bool](Get-Field (Get-Field $svc 'cloudflare' $null) 'access' $true) }
+    cloudflare = @{ publish = [bool](Get-Field (Get-Field $svc 'cloudflare' $null) 'publish' $true); access = [bool](Get-Field (Get-Field $svc 'cloudflare' $null) 'access' (-not $namesAuthentik)) }
   }
   # Sign-in (ForwardAuth): only when the request names it. A form that does not send 'auth' keeps whatever the
   # service had (Build-ChangePlan), so editing a protected service never silently removes its protection.
   $hasAuth = [bool]($svc.PSObject.Properties['auth'])
-  if ($hasAuth -and $null -ne $svc.auth) { $def.auth = @{ provider = [string](Get-Field $svc.auth 'provider' ''); endpoint = [string](Get-Field $svc.auth 'endpoint' '') } }
+  if ($hasAuth -and $null -ne $svc.auth) { $def.auth = @{ provider = [string](Get-Field $svc.auth 'provider' ''); endpoint = [string](Get-Field $svc.auth 'endpoint' ''); layered = [bool](Get-Field $svc.auth 'layered' $false) } }
   $definition = ConvertTo-ServiceDefinition $def
   return [pscustomobject]@{ Service = $definition; Note = $resolved.Note; HasAuth = $hasAuth }
 }
@@ -3578,6 +3583,200 @@ function Invoke-ManagerStop($Body) {
 # in authentik is previewed first (the sync functions' dry run), applied once after confirmation, and recomputed right
 # before applying; the Traefik side goes through the same plan/validate/backup/apply path as every service change.
 
+# --- Application launcher, authentication diagnostics and redundant Cloudflare Access cleanup ------------------------
+# Read-only facts for every application on the Identity & Access page (lib\AccessDiagnostics.psm1 turns them into one
+# diagnosis each). Cloudflare Access applications are listed at most every two minutes (immediately on "Run checks").
+
+function Get-IdentityAccessApps($Settings, $Cloudflare, [switch]$Refresh) {
+  $c = $State.AccessApps
+  if (-not $Refresh -and $c -and ((Get-Date) - $c.At).TotalSeconds -lt 120) { return $c }
+  $r = [pscustomobject]@{ At = (Get-Date); Ok = $false; Apps = @(); Error = '' }
+  if (-not $Cloudflare.accountId -or -not (Get-CloudflareApiTokenInfo -Settings $Settings).Stored) { $r.Error = 'Cloudflare automation is not connected, so Cloudflare Access was not checked.' }
+  else {
+    try { $r.Apps = @(Invoke-CloudflareApi -Settings $Settings -Path "/accounts/$($Cloudflare.accountId)/access/apps" -All); $r.Ok = $true }
+    catch { $r.Error = $(if ($_.Exception.Data['cfStatus'] -in 401, 403) { 'The Cloudflare API token cannot read Access applications, so a Cloudflare login in front of an application cannot be detected.' } else { $_.Exception.Message }) }
+  }
+  $State.AccessApps = $r
+  return $r
+}
+
+function Get-IdentityLauncher {
+  param($Settings, $Config, $Services, $Inventory, $Routers, $AppFacts, $Cloudflare, $Install, [switch]$Refresh)
+  $acc = Get-IdentityAccessApps $Settings $Cloudflare -Refresh:$Refresh
+  $bb = Get-AuthentikBrowserBase ([string]$Config.authentik.publicUrl) ([string]$Config.authentik.localUrl)
+  $out = @()
+  foreach ($s in @($Services)) {
+    if ($Install -and $s.target.type -eq 'docker' -and $s.target.host -eq $Install.serverContainer) { continue }
+    if ($Config.authentik.service -and $s.name -eq $Config.authentik.service) { continue }
+    $h = [string]@($s.hostnames)[0]
+    $fact = @($AppFacts | Where-Object { $_.service -eq $s.name })[0]
+    $mode = Get-ServiceAuthMode $s
+    $ctr = [ordered]@{ name = ''; state = 'host' }
+    if ($s.target.type -eq 'docker') {
+      $c = @($Inventory | Where-Object { $_.name -eq $s.target.host })[0]
+      $ctr.name = [string]$s.target.host
+      $ctr.state = $(if ($c) { [string]$c.state } elseif (@($Inventory).Count) { 'missing' } else { 'unknown' })
+    }
+    $rt = $(if ($null -eq $Routers) { $null } else { @($Routers | Where-Object { $null -ne $_ -and $_.name -eq "svc-$($s.name)@file" })[0] })
+    $router = $(if ($null -eq $Routers) { 'unknown' } elseif (-not $s.enabled) { 'off' } elseif ($rt) { [string]$rt.status } else { 'missing' })
+    $managedId = $(if ($h) { Get-ManagedResource $Cloudflare $h 'accessAppId' } else { '' })
+    $coverage = $null
+    if ($acc.Ok -and $h) { $coverage = @(Get-AccessCoverage -Apps $acc.Apps -Hostname $h -ManagedAppId $managedId) }
+    $facts = @{ hostname = $h; enabled = [bool]$s.enabled; publish = [bool]$s.cloudflare.publish; authMode = $mode; container = $ctr.state; router = $router }
+    if ($null -ne $coverage) { $facts.accessCoverage = $coverage }
+    if ($fact) {
+      $facts.forwardAuthConfigured = [bool]$fact.forwardAuth.configured
+      if ($null -ne $fact.forwardAuth.loaded) { $facts.forwardAuthLoaded = [bool]$fact.forwardAuth.loaded }
+      if ($fact.authentikChecked) { $facts.authentikApp = [bool]$fact.authentik }
+      $ext = [string]$fact.provider.externalHost
+      if ($ext) {
+        $u = $null
+        $facts.providerExternalHost = $ext; $facts.providerMode = [string]$fact.provider.mode
+        $facts.expectedExternalHost = $(if ([Uri]::TryCreate($ext, [UriKind]::Absolute, [ref]$u) -and $u.Host -eq $h) { $ext } else { "https://$h" })
+      }
+      if ($null -ne $fact.provider.onOutpost) { $facts.outpostAssigned = [bool]$fact.provider.onOutpost }
+      if ($fact.challenge) { $facts.challenge = [string]$fact.challenge.State }
+    }
+    $diag = Get-AppAccessDiagnosis $facts
+    $slug = $(if ($fact) { [string]$fact.slug } else { "dm-$($s.name)" })
+    $protected = ($mode -in @('authentik', 'layered', 'layered-unconfirmed'))
+    $out += [ordered]@{
+      service = $s.name; displayName = $(if ($s.PSObject.Properties['displayName'] -and $s.displayName) { $s.displayName } else { $s.name }); hostname = $h
+      openUrl = (Get-ServiceOpenUrl $s ([int]$Settings.HttpPort)); publish = [bool]$s.cloudflare.publish; enabled = [bool]$s.enabled
+      authentikUrl = $(if ($protected -and $bb.Base) { "$($bb.Base)/if/admin/#/core/applications/$slug" } else { '' }); authentikUrlPublic = [bool]$bb.Public
+      container = $ctr; router = $router; target = (Get-ServiceUrl $s); authMode = $mode; authModeLabel = (Get-AuthModeLabel $mode)
+      access = [ordered]@{ checked = [bool]$acc.Ok; error = $(if ($acc.Ok) { '' } else { [string]$acc.Error }); managedAppId = $managedId
+        apps = @(@($coverage) | Where-Object { $_ } | ForEach-Object { [ordered]@{ id = $_.Id; name = $_.Name; pattern = $_.Pattern; wildcard = $_.Wildcard; pathOnly = $_.PathOnly; createdByTool = $_.CreatedByTool } }) }
+      diagnosis = $diag
+    }
+  }
+  return $out
+}
+
+# One request without following redirects, cookies or credentials; only status, Location and a few response headers.
+function Invoke-TraceHop([string]$Url, [string]$HostHeader = '') {
+  $r = [ordered]@{ status = 0; location = ''; headers = @{}; error = '' }
+  try {
+    [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+    $req = [System.Net.HttpWebRequest]::Create($Url)
+    $req.Method = 'GET'; $req.AllowAutoRedirect = $false; $req.Timeout = 10000; $req.ReadWriteTimeout = 10000
+    $req.UserAgent = 'DTC-identity-trace/1 (read-only)'
+    if (([Uri]$Url).IsLoopback) { $req.Proxy = $null }
+    if ($HostHeader) { $req.Host = $HostHeader }
+    $resp = $null
+    try { $resp = $req.GetResponse() } catch [System.Net.WebException] { if ($_.Exception.Response) { $resp = $_.Exception.Response } else { throw } }
+    $r.status = [int]$resp.StatusCode; $r.location = [string]$resp.Headers['Location']
+    foreach ($k in 'cf-mitigated', 'server') { $v = $resp.Headers[$k]; if ($v) { $r.headers[$k] = [string]$v } }
+    $resp.Close()
+  } catch { $r.error = ($_.Exception.Message -replace '[?#]\S*', '') }
+  return $r
+}
+
+# Follows plain redirects (http -> https, trailing slashes) and stops at the first component that asks for
+# authentication or answers. Recorded URLs carry no query string (no codes, states or tokens).
+function Get-RedirectTrace([string]$Url, [string]$HostHeader = '', [string]$AuthHostname = '', [string]$Mode = '', [int]$MaxHops = 5) {
+  $hops = @(); $cur = $Url
+  for ($i = 0; $i -lt $MaxHops; $i++) {
+    $x = Invoke-TraceHop $cur $HostHeader
+    $kind = Get-RedirectHopKind -Status $x.status -Location $x.location -AuthHostname $AuthHostname -Headers $x.headers
+    $shown = $(if ($HostHeader) { $u = [Uri]$cur; "$($u.Scheme)://$HostHeader$($u.AbsolutePath) (via this PC's Traefik)" } else { ConvertTo-SafeUrl $cur })
+    $hops += [ordered]@{ url = $shown; status = $x.status; kind = $kind; next = (ConvertTo-SafeUrl $x.location); error = $x.error }
+    if ($kind -ne 'redirect' -or -not $x.location -or $HostHeader) { break }
+    $cur = (New-Object Uri ([Uri]$cur), $x.location).AbsoluteUri
+  }
+  $v = Get-RedirectVerdict $hops $Mode
+  return [ordered]@{ hops = $hops; component = $v.component; message = $v.message }
+}
+
+# POST /api/identity/trace { service }: which component answers first and who asks for authentication, through the
+# public address (Cloudflare) and through this PC's Traefik. Read-only, anonymous, no cookies.
+function Invoke-IdentityTrace($Body) {
+  Assert-Installed
+  $name = [string](Get-Field $Body 'service' '')
+  $settings = Get-Settings
+  $cfg = Read-IdentityConfig -Settings $settings
+  $svc = @((Read-ServiceRegistry -Settings $settings).services | Where-Object { $_.name -eq $name })[0]
+  if (-not $svc) { Stop-Request 404 "No service named '$name'." }
+  $h = [string]@($svc.hostnames)[0]
+  if (-not $h) { Stop-Request 400 "'$name' has no hostname." }
+  $mode = Get-ServiceAuthMode $svc
+  $authHost = [string]$cfg.authentik.hostname
+  $result = [ordered]@{ service = $svc.name; hostname = $h; mode = $mode; modeLabel = (Get-AuthModeLabel $mode); public = $null; local = $null; checkedAt = (Get-Date -Format 's') }
+  if ($svc.cloudflare.publish) { $result.public = Get-RedirectTrace -Url "https://$h/" -AuthHostname $authHost -Mode $mode }
+  if ($svc.enabled) { $result.local = Get-RedirectTrace -Url "http://127.0.0.1:$($settings.HttpPort)/" -HostHeader $h -AuthHostname $authHost -Mode $mode -MaxHops 1 }
+  Write-Audit 'identity-trace' "$($svc.name) public=$(if ($result.public) { $result.public.component } else { '-' }) local=$(if ($result.local) { $result.local.component } else { '-' })"
+  return $result
+}
+
+# Removes the Cloudflare Access application DTC created in front of an authentik-protected application (the second,
+# redundant login). Preconditions, checked at preview and again at apply: the service uses authentik (not layered),
+# its route asks authentik, an anonymous request is sent to sign in right now (ForwardAuth enforced, fails closed),
+# and the Access application is the one DTC recorded when it created it. Access applications DTC did not create are
+# never touched. Nothing else changes: no Traefik file, DNS record or tunnel route.
+function Invoke-IdentityAccessCleanup($Body, [switch]$Apply) {
+  Assert-Installed
+  if ($Apply) { $p = Use-IdpPlan $Body 'access-cleanup'; $name = $p.Service } else { $name = [string](Get-Field $Body 'service' '') }
+  $ctx = Get-IdentityContext
+  Assert-IdentityConnection $ctx
+  $svc = @($ctx.Services | Where-Object { $_.name -eq $name })[0]
+  if (-not $svc) { Stop-Request 404 "No service named '$name'." }
+  $h = [string]@($svc.hostnames)[0]
+  $mode = Get-ServiceAuthMode $svc
+  if ($mode -ne 'authentik') { Stop-Request 409 $(if ($mode -eq 'layered') { "'$name' uses layered authentication on purpose; change that on the Services page first." } else { "'$name' is not protected by authentik, so its Cloudflare login is not redundant." }) }
+  $fact = @($ctx.Facts.apps | Where-Object { $_.service -eq $name })[0]
+  if (-not $fact -or -not $fact.forwardAuth.configured -or $fact.forwardAuth.loaded -eq $false) { Stop-Request 409 "The route of '$name' does not ask authentik (ForwardAuth not configured or not loaded). The Cloudflare login is kept." }
+  $challenge = Test-ForwardAuthChallenge -TraefikPort $ctx.Settings.HttpPort -Hostname $h -HostPort (Get-IdentityAppAddress ([string]$ctx.Config.authentik.publicUrl) $h).HostPort -AuthHostname $ctx.Config.authentik.hostname
+  $State.IdpChecks[$name] = $challenge
+  if ($challenge.State -ne 'auth') { Stop-Request 409 "authentik protection of $h is not verified right now ($($challenge.Message)). The Cloudflare login is kept." }
+  if (-not (Get-ManagedResource $ctx.Cloudflare $h 'accessAppId')) { Stop-Request 409 "DTC did not create a Cloudflare Access application for $h. Access applications created elsewhere are not changed here: narrow or remove them in Cloudflare Zero Trust." }
+  # authentik must also decide WHO may sign in: its application for this service exists and has at least one access rule.
+  if (-not $fact.authentik -or -not ($fact.rules -ge 1)) { Stop-Request 409 "authentik has no application with an access rule for '$name' (dm-$name), or it could not be checked, so who may sign in is not verified. The Cloudflare login is kept." }
+  # The application DTC recorded must still exist and cover exactly this hostname (never a wildcard, path or multi-domain one).
+  $acct = [string]$ctx.Cloudflare.accountId
+  $appId = [string](Get-ManagedResource $ctx.Cloudflare $h 'accessAppId')
+  $live = $null
+  try { $live = Invoke-CloudflareApi -Settings $ctx.Settings -Path "/accounts/$acct/access/apps/$appId" } catch { Stop-Request 409 "The Cloudflare Access application of $h could not be read ($($_.Exception.Message)). Nothing was changed." }
+  $shd = @(); if ($live.PSObject.Properties['self_hosted_domains']) { $shd = @($live.self_hosted_domains) }
+  $domains = @(@($live.domain) + $shd | Where-Object { $_ } | ForEach-Object { ([string]$_).ToLowerInvariant().TrimEnd('/') } | Select-Object -Unique)
+  if ([string]$live.type -ne 'self_hosted' -or $domains.Count -ne 1 -or $domains[0] -ne $h.ToLowerInvariant()) { Stop-Request 409 "The Cloudflare Access application recorded for $h now covers '$($domains -join ', ')' (type $($live.type)), not exactly $h. It is not changed here: review it in Cloudflare Zero Trust." }
+  $policies = $null
+  try { $policies = @(Invoke-CloudflareApi -Settings $ctx.Settings -Path "/accounts/$acct/access/apps/$appId/policies" -All) } catch { if ($live.PSObject.Properties['policies']) { $policies = @($live.policies) } }
+  if ($null -eq $policies) { Stop-Request 409 "The policies of the Cloudflare Access application of $h could not be read, so no restorable copy can be saved. Nothing was changed." }
+  $copy =$svc | ConvertTo-Json -Depth 8 | ConvertFrom-Json
+  $copy.cloudflare.access = $false
+  $changeBody = [pscustomobject]@{ op = 'update'; name = $svc.name; service = $copy; cloudflare = [pscustomobject]@{ automate = $true; accessEmails = @(); cleanup = $true } }
+  $plan = Build-ChangePlan $changeBody
+  $other = @($plan.Cloudflare.Actions | Where-Object { $_.Kind -ne 'none' -and -not ($_.Step -eq 'access' -and $_.Kind -eq 'delete') })
+  if ($other.Count -or $plan.Traefik.FileChanges -gt 0) { Stop-Request 409 "Removing the Cloudflare login of $h would also change other things ($((@($other | ForEach-Object { $_.Summary }) + $(if ($plan.Traefik.FileChanges) { 'Traefik route' })) -join '; ')). Use the Services page for that change." }
+  $deletes = @($plan.Cloudflare.Actions | Where-Object { $_.Step -eq 'access' -and $_.Kind -eq 'delete' })
+  if (-not $deletes.Count) { Stop-Request 409 "There is no Cloudflare Access application created by DTC in front of $h any more. $(@($plan.Cloudflare.Errors) -join ' ')" }
+  if (-not $Apply) {
+    $id = New-IdpPlanId ([pscustomobject]@{ Kind = 'access-cleanup'; Service = $svc.name; TraefikKey = $plan.TraefikKey; CfFingerprint = $plan.Cloudflare.Fingerprint })
+    return [ordered]@{ planId = $id; service = $svc.name; hostname = $h; canApply = $true; challenge = [ordered]@{ state = $challenge.State; message = $challenge.Message }
+      actions = @($deletes | ForEach-Object { [ordered]@{ id = $_.Id; summary = $_.Summary; detail = $_.Detail } })
+      notes = @(@($plan.Cloudflare.Notes) | Where-Object { $_ -notmatch 'still asks visitors' })
+      keeps = @("authentik ForwardAuth in front of $h (verified just now: anonymous visitors are sent to sign in)", "authentik application dm-$name with $($fact.rules) access rule(s)$(if ($fact.ownerOnly) { ' (DTC owners only)' })", 'The Traefik route, DNS record and tunnel route', 'Access applications DTC did not create', 'A copy of the Access application and its policies is saved in backups\cloudflare-access before it is removed')
+      rollback = "To put the Cloudflare login back, edit '$($svc.name)' on the Services page, turn on ""Require Cloudflare Access"" and choose layered authentication." }
+  }
+  if ($plan.TraefikKey -ne $p.TraefikKey -or $plan.Cloudflare.Fingerprint -ne $p.CfFingerprint) { Stop-Request 409 'The configuration or Cloudflare changed since the preview. Preview again.' }
+  # Restorable copy first; without it nothing is deleted.
+  $snap = Join-Path (Join-Path $ctx.Settings.BackupRoot 'cloudflare-access') ('{0}-{1}.json' -f (Get-Date -Format 'yyyyMMdd-HHmmss'), $h)
+  try {
+    New-Item -ItemType Directory -Force -Path (Split-Path $snap) | Out-Null
+    $json = [ordered]@{ savedAt = (Get-Date).ToString('o'); service = $svc.name; hostname = $h; accountId = $acct; app = $live; policies = $policies } | ConvertTo-Json -Depth 15
+    [IO.File]::WriteAllText($snap, $json)
+    $back = Get-Content -LiteralPath $snap -Raw | ConvertFrom-Json
+    if ([string]$back.app.id -ne $appId) { throw 'read-back mismatch' }
+  } catch { Stop-Request 500 "A copy of the Access application of $h could not be saved ($($_.Exception.Message)). Nothing was changed." }
+  $res = Invoke-ChangePlanSteps $plan @()
+  $State.AccessApps = $null
+  $after = $null
+  if ($res.ok -and $svc.cloudflare.publish) { Start-Sleep -Seconds 2; $after = Get-RedirectTrace -Url "https://$h/" -AuthHostname $ctx.Config.authentik.hostname -Mode 'authentik' }
+  Write-Audit 'identity-access-cleanup' "$($svc.name) app=$appId ok=$($res.ok) after=$(if ($after) { $after.component } else { '-' }) snapshot=$snap"
+  return [ordered]@{ ok = [bool]$res.ok; service = $svc.name; hostname = $h; steps = @($res.steps); after = $after; snapshot = $snap
+    message = $(if (-not $res.ok) { 'Cloudflare did not accept the change; the Access application is unchanged.' } elseif ($after -and $after.component -eq 'authentik') { "Done: $h now goes straight to authentik." } elseif ($after) { "Removed. The public address still answers through $($after.component); Cloudflare can take a minute to apply the change." } else { 'Removed.' }) }
+}
+
 function Get-IdentityContext([switch]$Deep, [switch]$ProbeApps) {
   $settings = Get-Settings
   $cfg = Read-IdentityConfig -Settings $settings
@@ -3645,9 +3844,16 @@ function Get-IdentityContext([switch]$Deep, [switch]$ProbeApps) {
     $known = Get-IdentityApp $cfg $s.name
     $exists = $false; $appPk = ''
     $rules = $null; $ownerOnly = $false
+    $prov = [ordered]@{ pk = ''; externalHost = ''; mode = ''; onOutpost = $null }
     if ($conn) {
       try {
         $a = Invoke-AuthentikApi $conn GET "/core/applications/dm-$($s.name)/"; $exists = [bool]$a.provider; $appPk = [string]$a.pk
+        # Read only: the provider's external address and mode, and whether the embedded outpost serves it.
+        if ($a.provider) {
+          $prov.pk = [string]$a.provider
+          try { $pp = Invoke-AuthentikApi $conn GET "/providers/proxy/$($a.provider)/"; $prov.externalHost = [string]$pp.external_host; $prov.mode = [string]$pp.mode } catch { }
+          if ($overview -and $overview.Outpost) { $prov.onOutpost = [bool](@($overview.Outpost.Providers) -contains [int]$a.provider) }
+        }
         # Read only: who may open it is authentik's business; the manager only shows how many rules there are.
         $b = @(Get-AuthentikList $conn "/policies/bindings/?target=$([string]$a.pbm_uuid)"); $rules = $b.Count
         $og = Get-AuthentikGroup $conn (Get-AuthentikOwnersGroupName); $ownerOnly = [bool]($og -and $b.Count -eq 1 -and [string]$b[0].group -eq [string]$og.pk)
@@ -3668,8 +3874,10 @@ function Get-IdentityContext([switch]$Deep, [switch]$ProbeApps) {
     $fa = [ordered]@{ configured = [bool](@($rf.middlewares) -contains "svc-$($s.name)-authentik" -and $rf.forwardAuthAddress)
       loaded = $(if ($null -eq $routers) { $null } else { [bool]($rt.Count -and [string]$rt[0].status -eq 'enabled' -and @(if ($rt[0].PSObject.Properties['middlewares']) { $rt[0].middlewares }) -contains "svc-$($s.name)-authentik@file") }) }
     $appFacts += [ordered]@{ service = $s.name; displayName = $(if ($s.PSObject.Properties['displayName']) { $s.displayName } else { $s.name }); hostname = @($s.hostnames)[0]; protected = $true; authentik = $exists; challenge = $check; verifiedAt = $verifiedAt
-      verifiedBy = [string](Get-IdProp2 (Get-IdentityApp $cfg $s.name) 'verifiedBy' ''); forwardAuth = $fa; enabled = [bool]$s.enabled; rules = $rules; ownerOnly = $ownerOnly; cloudflareAccess = [bool]$s.cloudflare.access; publish = [bool]$s.cloudflare.publish; slug = "dm-$($s.name)" }
+      verifiedBy = [string](Get-IdProp2 (Get-IdentityApp $cfg $s.name) 'verifiedBy' ''); forwardAuth = $fa; enabled = [bool]$s.enabled; rules = $rules; ownerOnly = $ownerOnly; cloudflareAccess = [bool]$s.cloudflare.access; publish = [bool]$s.cloudflare.publish; slug = "dm-$($s.name)"
+      provider = $prov; authentikChecked = [bool]$conn }
   }
+  $launcher = @(Get-IdentityLauncher -Settings $settings -Config $cfg -Services $services -Inventory $inv -Routers $routers -AppFacts $appFacts -Cloudflare (Read-CloudflareConfig -Settings $settings) -Install $install -Refresh:$Deep)
   if ($changed) { Save-IdentityConfig -Settings $settings -Config $cfg }
   $pub = $(if ($State.IdpChecks.ContainsKey('__public')) { $State.IdpChecks['__public'] } else { $null })
   if ($Deep -and $cfg.authentik.hostname -and $route -and $route.publish) {
@@ -3679,7 +3887,7 @@ function Get-IdentityContext([switch]$Deep, [switch]$ProbeApps) {
     $State.IdpChecks['__public'] = $pub
   }
   $facts = [ordered]@{ provider = $cfg.provider; install = $install; health = $health; token = $token; overview = $overview; hostname = $cfg.authentik.hostname; publicUrl = $cfg.authentik.publicUrl; owner = $cfg.authentik.owner; authMode = $cfg.authMode
-    route = $route; cloudflare = $cfFacts; publicCheck = $pub; google = $google; apps = $appFacts }
+    route = $route; cloudflare = $cfFacts; publicCheck = $pub; google = $google; apps = $appFacts; launcher = $launcher }
   return [pscustomobject]@{ Settings = $settings; Config = $cfg; Installs = $installs; Install = $install; BaseUrl = $baseUrl; Conn = $conn; Overview = $overview; OverviewError = $overviewError; Credential = $credential
     Facts = $facts; Services = $services; Cloudflare = $cf }
 }
@@ -3761,7 +3969,10 @@ function Get-IdentityData([switch]$Deep, [switch]$ProbeApps) {
     overview = $(if ($ctx.Overview) { [ordered]@{ version = $ctx.Overview.Version; user = $ctx.Overview.User; missingFlows = @($ctx.Overview.MissingFlows); outpost = $(if ($ctx.Overview.Outpost) { [ordered]@{ name = $ctx.Overview.Outpost.Name; authentikHost = $ctx.Overview.Outpost.AuthentikHost; providers = @($ctx.Overview.Outpost.Providers) } } else { $null })
         settings = $ctx.Overview.Settings; sources = @($ctx.Overview.OAuthSources); loginStage = $ctx.Overview.LoginStage } } else { $null })
     route = $ctx.Facts.route; cloudflare = $ctx.Facts.cloudflare; publicCheck = $ctx.Facts.publicCheck; google = $ctx.Facts.google; googleValues = $googleValues; apps = @($ctx.Facts.apps)
-    adminLinks = $(if ($ctx.BaseUrl) { $b = $ctx.BaseUrl.TrimEnd('/'); [ordered]@{ base = $b; users = "$b/if/admin/#/identity/users"; groups = "$b/if/admin/#/identity/groups"; invitations = "$b/if/admin/#/core/invitations"; applications = "$b/if/admin/#/core/applications"; flows = "$b/if/admin/#/flow/flows"; sources = "$b/if/admin/#/core/sources"; policies = "$b/if/admin/#/policy/policies" } } else { $null })
+    launcher = @($ctx.Facts.launcher)
+    # Links a browser opens: the public authentik address (where the owner's session and Google sign-in work). The
+    # local API address is only for the manager itself; Google rejects sign-in there (redirect_uri_mismatch).
+    adminLinks = $(if ($ctx.BaseUrl -or $cfg.authentik.publicUrl) { $bb = Get-AuthentikBrowserBase ([string]$cfg.authentik.publicUrl) ([string]$ctx.BaseUrl); $b = $bb.Base; [ordered]@{ base = $b; public = $bb.Public; local = [string]$ctx.BaseUrl; users = "$b/if/admin/#/identity/users"; groups = "$b/if/admin/#/identity/groups"; invitations = "$b/if/admin/#/core/invitations"; applications = "$b/if/admin/#/core/applications"; flows = "$b/if/admin/#/flow/flows"; sources = "$b/if/admin/#/core/sources"; policies = "$b/if/admin/#/policy/policies" } } else { $null })
     model = $model; domains = $domains; suggestedHostname = $suggested; routeBody = $routeBody; catalogDefaults = $catalogDefaults; contactEmail = [string](Read-SetupDraft).contactEmail
     cloudflareReady = [bool]($ctx.Cloudflare.tunnelId -and (Get-CloudflareApiTokenInfo -Settings $settings).Stored)
     services = @($ctx.Services | ForEach-Object { [ordered]@{ name = $_.name; displayName = $(if ($_.PSObject.Properties['displayName']) { $_.displayName } else { '' }); hostnames = @($_.hostnames); enabled = [bool]$_.enabled
@@ -4127,11 +4338,18 @@ function Get-ProtectRequest([string]$Name, $Ctx, [string]$AccessChoice = 'keep',
     if (@($svc.hostnames).Count -ne 1) { Stop-Request 400 "'$($svc.name)' has several hostnames; authentik identifies an application by one address." }
     if (-not $Ctx.Install.onProxyNetwork) { Stop-Request 409 "authentik ($($Ctx.Install.serverContainer)) is not on the shared network, so Traefik cannot ask it whether a visitor may pass." }
   }
-  if ($AccessChoice -notin 'keep', 'remove') { Stop-Request 400 'cloudflareAccess must be keep or remove.' }
+  # remove (default when protecting): authentik becomes the only interactive sign-in; a Cloudflare Access application
+  # this tool created is deleted. layered: Cloudflare Access stays in front on purpose (two sign-ins). keep: the
+  # previous name of layered; when removing protection it keeps Cloudflare Access as the remaining gate.
+  if ($AccessChoice -notin 'keep', 'remove', 'layered') { Stop-Request 400 'cloudflareAccess must be remove, layered or keep.' }
   $copy = $svc | ConvertTo-Json -Depth 8 | ConvertFrom-Json
   if ($AccessChoice -eq 'remove') { $copy.cloudflare.access = $false }
   if ($Remove) { $copy.PSObject.Properties.Remove('auth') | Out-Null; $copy | Add-Member -NotePropertyName auth -NotePropertyValue ([pscustomobject]@{ provider = 'none' }) -Force }
-  else { $copy | Add-Member -NotePropertyName auth -NotePropertyValue ([pscustomobject]@{ provider = 'authentik'; endpoint = "http://$($Ctx.Install.serverContainer):9000" }) -Force }
+  else {
+    $auth = [pscustomobject][ordered]@{ provider = 'authentik'; endpoint = "http://$($Ctx.Install.serverContainer):9000" }
+    if ($copy.cloudflare.access) { $auth | Add-Member -NotePropertyName layered -NotePropertyValue $true }
+    $copy | Add-Member -NotePropertyName auth -NotePropertyValue $auth -Force
+  }
   $cfReady = [bool]($Ctx.Cloudflare.tunnelId -and (Get-CloudflareApiTokenInfo -Settings $Ctx.Settings).Stored)
   return [pscustomobject]@{ Service = $svc; ChangeBody = [pscustomobject]@{ op = 'update'; name = $svc.name; service = $copy; cloudflare = [pscustomobject]@{ automate = [bool]($cfReady -and $copy.cloudflare.publish); accessEmails = @(Get-ManagedAccessEmails $Ctx.Cloudflare @($svc.hostnames)[0]); cleanup = ($AccessChoice -eq 'remove') } } }
 }
@@ -4193,7 +4411,9 @@ function Invoke-IdentityProtectPlan($Body, [switch]$Remove) {
   if (-not $names.Count) { Stop-Request 400 'Select at least one application.' }
   if ($Remove -and $names.Count -ne 1) { Stop-Request 400 'Remove protection from one application at a time.' }
   if ($names.Count -gt 20) { Stop-Request 400 'At most 20 applications at once.' }
-  $access = [string](Get-Field $Body 'cloudflareAccess' 'keep')
+  # Protecting: authentik becomes the only login unless layered authentication is chosen explicitly. Removing
+  # protection: Cloudflare Access (if any) stays as the remaining gate unless asked otherwise.
+  $access = [string](Get-Field $Body 'cloudflareAccess' $(if ($Remove) { 'keep' } else { 'remove' }))
   $items = @(); $stored = @()
   foreach ($n in $names) {
     $req = Get-ProtectRequest $n $ctx $access -Remove:$Remove
@@ -5568,6 +5788,9 @@ function Invoke-ApiRoute($Request, $Body) {
     'POST /api/identity/protect/apply' { return Invoke-IdentityProtectApply $Body }
     'POST /api/identity/unprotect/plan' { return Invoke-IdentityProtectPlan $Body -Remove }
     'POST /api/identity/unprotect/apply' { return Invoke-IdentityProtectApply $Body -Remove }
+    'POST /api/identity/trace' { return Invoke-IdentityTrace $Body }
+    'POST /api/identity/access/plan' { return Invoke-IdentityAccessCleanup $Body }
+    'POST /api/identity/access/apply' { return Invoke-IdentityAccessCleanup $Body -Apply }
     'GET /api/applications' { return Get-ApplicationsData }
     'GET /api/managers' { return Get-ManagersData }
     'POST /api/managers/save' { return Invoke-ManagerSave $Body }

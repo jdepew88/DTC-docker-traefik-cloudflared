@@ -160,7 +160,7 @@ try {
   $okP = Wait-PageCondition $cdp "!!document.querySelector('#id-protect-review') && [...document.querySelectorAll('#id-protect-review button')].some((b) => b.textContent.includes('Protect 7'))" 20
   $planReq = Js "JSON.stringify(window.__idmock.calls.filter((c) => c.path === '/api/identity/protect/plan').pop().body)" | ConvertFrom-Json
   $sent = @($planReq.services | Sort-Object) -join ','
-  Test-Condition 'protect: exactly the seven ticked applications are sent (not b3, not the already protected echo2)' ($okP -and $sent -eq 'b1,b2,b4,b5,b6,b7,echo' -and $planReq.cloudflareAccess -eq 'keep') $sent
+  Test-Condition 'protect: exactly the seven ticked applications are sent (not b3, not the already protected echo2), authentik-only by default' ($okP -and $sent -eq 'b1,b2,b4,b5,b6,b7,echo' -and $planReq.cloudflareAccess -eq 'remove') $sent
   Test-Condition 'protect: Apply stays disabled until the preview was reviewed' ([bool](Js "[...document.querySelectorAll('#id-protect-review button')].find((b) => b.textContent.includes('Protect 7')).disabled")) ''
   Shot 'wizard-8-apps-review'
   $null = Js "(() => { document.querySelector('#id-protect-review input[type=checkbox]').click(); [...document.querySelectorAll('#id-protect-review button')].find((b) => b.textContent.includes('Protect 7')).click(); return true; })()"

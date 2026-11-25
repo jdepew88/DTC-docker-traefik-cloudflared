@@ -196,7 +196,9 @@
   function apiSection(ctx, d, reload) {
     const C = window.TPMCredentials;
     const v = d.credential || { status: 'missing', stored: false };
-    const local = d.install && d.install.localUrl;
+    // The public sign-in address when there is one: the browser's authentik session and Google sign-in work there. The
+    // local address (127.0.0.1) works for akadmin's password only; Google rejects sign-in there (redirect_uri_mismatch).
+    const local = (d.adminLinks && d.adminLinks.base) || (d.install && d.install.localUrl);
     const remove = (e) => withBusy(e.currentTarget, async () => {
       if (!await U.confirmDialog({ title: 'Remove the authentik API token', okText: 'Remove', danger: true, body: ['The manager can no longer read or change authentik. authentik itself and the token inside authentik are not changed (revoke it there under Directory > Tokens).'] })) return;
       await api('POST', '/api/identity/token/delete', { confirm: true }); await reload(false);
@@ -454,8 +456,10 @@
     const connected = d.token && d.token.ok;
     const services = arr(d.services).filter((s) => !s.isIdentity);
     const byName = Object.fromEntries(arr(d.apps).map((a) => [a.service, a]));
-    if (!f.protect) f.protect = { selected: {}, access: 'keep', plan: null, result: null };
+    const launch = Object.fromEntries(arr(d.launcher).map((x) => [x.service, x]));
+    if (!f.protect) f.protect = { selected: {}, access: 'remove', plan: null, result: null };
     const pf = f.protect;
+    if (!pf.traces) pf.traces = {};
     const compatible = (s) => s.enabled && arr(s.hostnames).length === 1 && s.auth !== 'authentik';
     const why = (s) => (!s.enabled ? 'disabled' : arr(s.hostnames).length !== 1 ? 'several hostnames' : '');
     const link = d.adminLinks;
@@ -484,19 +488,52 @@
         boxes.push(box); cell = box;
       }
       const access = prot && a ? (a.rules === null || a.rules === undefined ? '' : a.ownerOnly ? 'owner only (DTC owners)' : a.rules ? `${a.rules} rule(s) in authentik` : 'no rule (everyone signed in)') : '';
-      return h('tr', { class: prot ? 'protected' : '' },
+      const x = launch[s.name];
+      const dg = x && x.diagnosis;
+      const label = s.displayName || s.name;
+      // The hostname and Open go straight to the application's own address (new tab). No sign-in is started here:
+      // Traefik and authentik decide whether one is needed, and an existing authentik session is reused.
+      const openUrl = x && x.openUrl;
+      const hostCell = arr(s.hostnames).length ? arr(s.hostnames).map((hn, i) => (i === 0 && openUrl ? h('a', { class: 'app-host', href: openUrl, target: '_blank', rel: 'noopener noreferrer', 'aria-label': `${hn} (opens ${label} in a new tab)` }, hn, ' ', icon('external')) : h('span', { class: 'app-host' }, hn)))
+        : h('span', { class: 'muted' }, 'No hostname');
+      const ctr = x && x.container;
+      const ctrChip = !ctr ? null : ctr.state === 'running' ? plainChip('Running', 'ok') : ctr.state === 'host' ? plainChip('Windows / LAN service', 'neutral') : ctr.state === 'missing' ? plainChip('Container missing', 'err') : ctr.state === 'unknown' ? plainChip('Container unknown', 'neutral') : plainChip(`Stopped (${ctr.state})`, 'warn');
+      const routeChip = !x ? null : x.router === 'enabled' ? (x.publish ? plainChip('Published', 'ok') : plainChip('Local only', 'neutral')) : x.router === 'off' ? plainChip('Route off', 'neutral') : x.router === 'unknown' ? plainChip('Route unknown', 'neutral') : plainChip(x.router === 'missing' ? 'Route missing' : 'Route error', 'err');
+      const accessApps = x ? arr(x.access.apps).filter((ap) => !ap.pathOnly) : [];
+      const problems = dg ? arr(dg.problems) : [];
+      const diagBlock = dg ? h('div', { class: 'app-diag' }, plainChip(dg.label, dg.tone === 'neutral' ? null : dg.tone),
+        dg.message ? h('div', { class: 'small' }, dg.message, dg.fix ? h('span', { class: 'muted' }, ` ${dg.fix}`) : null) : null,
+        problems.length > 1 ? h('details', { class: 'more small' }, h('summary', null, `${problems.length} findings`), h('ul', { class: 'checks' }, problems.map((p) => checkItem(p.tone === 'neutral' ? 'neutral' : p.tone, p.label, `${p.message}${p.fix ? ` ${p.fix}` : ''}`)))) : null,
+        x && !x.access.checked && x.publish ? h('div', { class: 'small muted' }, x.access.error) : null) : null;
+      const signin = prot ? [stateChip(state), access ? h('div', { class: 'small muted' }, access) : null]
+        : s.publish && s.access ? plainChip('Cloudflare Access', 'info') : !s.publish ? plainChip('Local only') : plainChip('Public, no sign-in', 'warn');
+      const canCleanup = problems.some((p) => p.state === 'redundant-access');
+      const tr = pf.traces[s.name];
+      const row = h('tr', { class: prot ? 'protected' : '', 'data-app': s.name },
         h('td', null, cell),
-        h('td', null, h('label', { for: prot ? null : `sel-${s.name}` }, s.displayName || s.name), why(s) && !prot ? h('span', { class: 'small muted' }, ` (${why(s)})`) : null),
-        h('td', null, arr(s.hostnames).join(', ')),
-        h('td', null, prot ? [h('span', { class: 'small' }, 'Already protected '), stateChip(state), access ? h('div', { class: 'small muted' }, access) : null] : s.publish && s.access ? plainChip('Cloudflare Access', 'info') : !s.publish ? plainChip('Local only') : plainChip('Public', 'warn')),
-        h('td', null, prot ? [link ? h('a', { class: 'btn small', href: `${link.base}/if/admin/#/core/applications/${a ? a.slug : `dm-${s.name}`}`, target: '_blank', rel: 'noopener noreferrer' }, 'Open in authentik ', icon('external')) : null,
-          h('button', { type: 'button', class: 'btn small ghost', onclick: (e) => withBusy(e.currentTarget, async () => { pf.plan = await api('POST', '/api/identity/unprotect/plan', { service: s.name, cloudflareAccess: 'keep' }); pf.plan.remove = true; pf.result = null; rerender(); }) }, 'Remove protection…')] : null));
+        h('td', { class: 'app-cell' }, h('label', { for: prot ? null : `sel-${s.name}`, class: 'app-name' }, label), why(s) && !prot ? h('span', { class: 'small muted' }, ` (${why(s)})`) : null,
+          h('div', { class: 'small' }, hostCell), x ? h('div', { class: 'small muted' }, x.authModeLabel) : null,
+          h('div', { class: 'chip-row' }, ctrChip, routeChip), accessApps.length ? h('div', { class: 'chip-row' }, plainChip(`Cloudflare Access: ${accessApps.map((ap) => ap.wildcard ? `${ap.name} (wildcard)` : ap.name).join(', ')}`, s.access ? 'info' : 'warn')) : null),
+        h('td', { class: 'signin-cell' }, signin, diagBlock),
+        h('td', { class: 'app-actions' },
+          openUrl ? h('a', { class: 'btn small', href: openUrl, target: '_blank', rel: 'noopener noreferrer', 'aria-label': `Open ${label} in a new tab` }, 'Open ', icon('external')) : null,
+          prot && x && x.authentikUrl ? h('a', { class: 'btn small', href: x.authentikUrl, target: '_blank', rel: 'noopener noreferrer', 'aria-label': `${label} in authentik (administration)`, title: x.authentikUrlPublic ? '' : 'Local authentik address: Google sign-in does not work there; sign in as akadmin.' }, 'Authentik ', icon('external')) : null,
+          arr(s.hostnames).length && s.enabled ? h('button', { type: 'button', class: 'btn small ghost', 'aria-label': `Trace sign-in for ${label}`, onclick: (e) => withBusy(e.currentTarget, async () => { pf.traces[s.name] = await api('POST', '/api/identity/trace', { service: s.name }); rerender(); }) }, 'Trace') : null,
+          canCleanup ? h('button', { type: 'button', class: 'btn small', id: `id-cleanup-${s.name}`, onclick: (e) => withBusy(e.currentTarget, async () => { pf.cleanup = await api('POST', '/api/identity/access/plan', { service: s.name }); pf.cleanupResult = null; rerender(); const r = document.getElementById('id-cleanup-review'); if (r) r.scrollIntoView({ block: 'start' }); }) }, 'Remove Cloudflare login…') : null,
+          prot ? h('button', { type: 'button', class: 'btn small ghost', onclick: (e) => withBusy(e.currentTarget, async () => { pf.plan = await api('POST', '/api/identity/unprotect/plan', { service: s.name, cloudflareAccess: 'keep' }); pf.plan.remove = true; pf.result = null; rerender(); }) }, 'Remove protection…') : null));
+      if (!tr) return row;
+      const traceList = (t, title) => t ? [h('h4', null, title), h('ol', { class: 'trace small' }, arr(t.hops).map((hp) => h('li', null, h('code', null, hp.url), ` → ${hp.status || 'no answer'} `, plainChip(hp.kind, null), hp.next ? [' → ', h('code', null, hp.next)] : null, hp.error ? h('span', { class: 'muted' }, ` ${hp.error}`) : null))),
+        h('p', { class: 'small' }, h('strong', null, `${t.component}: `), t.message)] : null;
+      return [row, h('tr', { class: 'trace-row' }, h('td', null), h('td', { colspan: 3 }, h('div', { class: 'callout', role: 'status', id: `id-trace-${s.name}` },
+        h('p', { class: 'small muted' }, `Anonymous request, no cookies; query strings are not recorded. Checked ${tr.checkedAt}.`),
+        traceList(tr.public, 'Through the Internet (Cloudflare)'), traceList(tr.local, 'Through this PC\'s Traefik'),
+        h('button', { type: 'button', class: 'btn small ghost', onclick: () => { delete pf.traces[s.name]; rerender(); } }, 'Close'))))];
     });
     const selAll = h('button', { type: 'button', class: 'btn small', id: 'id-sel-all', disabled: !candidates.length || !connected, onclick: () => { candidates.forEach((s) => { pf.selected[s.name] = true; }); pf.plan = null; sync(); } }, 'Select all');
     const clrAll = h('button', { type: 'button', class: 'btn small ghost', id: 'id-sel-none', onclick: () => { pf.selected = {}; pf.plan = null; sync(); } }, 'Clear all');
-    const table = services.length ? h('table', { class: 'table protect-table' }, h('thead', null, h('tr', null, h('th', null, h('span', { class: 'sr-only' }, 'Select')), h('th', null, 'Application'), h('th', null, 'Address'), h('th', null, 'Sign-in'), h('th', null, ''))), h('tbody', null, rows))
+    const table = services.length ? h('div', { class: 'table-wrap' }, h('table', { class: 'table protect-table launcher-table' }, h('thead', null, h('tr', null, h('th', null, h('span', { class: 'sr-only' }, 'Select')), h('th', null, 'Application and status'), h('th', null, 'Sign-in'), h('th', null, h('span', { class: 'sr-only' }, 'Actions')))), h('tbody', null, rows)))
       : h('p', { class: 'muted' }, 'No services yet. Publish an application on the Services page first.');
-    const accessSel = h('select', { id: 'id-p-access' }, h('option', { value: 'keep', selected: pf.access === 'keep' }, 'Keep Cloudflare Access as it is (default)'), h('option', { value: 'remove', selected: pf.access === 'remove' }, 'Remove Cloudflare Access from the selected applications (authentik becomes the only login)'));
+    const accessSel = h('select', { id: 'id-p-access' }, h('option', { value: 'remove', selected: pf.access !== 'layered' }, 'authentik only: remove a Cloudflare Access login DTC created (recommended)'), h('option', { value: 'layered', selected: pf.access === 'layered' }, 'Layered: keep Cloudflare Access in front as well (two sign-ins)'));
     accessSel.addEventListener('change', () => { pf.access = accessSel.value; pf.plan = null; });
     protectBtn.addEventListener('click', () => withBusy(protectBtn, async () => {
       const chosen = Object.keys(pf.selected).filter((k) => pf.selected[k]);
@@ -545,13 +582,37 @@
           checkItem(x.challenge ? (['auth', 'misrouted'].includes(x.challenge.State) ? 'ok' : 'err') : 'neutral', 'ForwardAuth enforced', x.challenge ? (x.challenge.State === 'misrouted' ? 'Anonymous visitors are stopped by authentik.' : x.challenge.Message) : (x.message || 'Not checked.')),
           x.challenge && ['auth', 'misrouted'].includes(x.challenge.State) ? checkItem(x.challenge.State === 'auth' ? 'ok' : 'err', 'Browsers sent to the public sign-in page', x.challenge.State === 'auth' ? 'The sign-in redirect uses the public address.' : x.challenge.Message) : null,
           checkItem('neutral', 'Sign-in verified', 'Shown as Verified after someone opened it through authentik.'))))) : null;
+    // Removing a redundant Cloudflare Access login (created by DTC) in front of an authentik-protected application.
+    let cleanup = null;
+    if (pf.cleanup) {
+      const c = pf.cleanup;
+      const ok = h('input', { type: 'checkbox', id: 'id-cleanup-ack' });
+      const apply = h('button', { type: 'button', class: 'btn primary', id: 'id-cleanup-apply', disabled: true }, 'Remove the Cloudflare login');
+      ok.addEventListener('change', () => { apply.disabled = !ok.checked; });
+      apply.addEventListener('click', () => withBusy(apply, async () => {
+        pf.cleanupResult = await api('POST', '/api/identity/access/apply', { planId: c.planId, confirm: true }); pf.cleanup = null; await reload(false);
+      }));
+      cleanup = h('div', { class: 'card inset', id: 'id-cleanup-review' }, h('h3', null, `Preview: remove the Cloudflare login in front of ${c.hostname}`),
+        h('ul', { class: 'checks' }, checkItem('ok', 'authentik protection verified just now', c.challenge.message), arr(c.actions).map((a) => checkItem('warn', a.summary, a.detail))),
+        arr(c.notes).map((n) => h('div', { class: 'callout' }, h('p', null, n))),
+        h('h4', null, 'Stays as it is'), h('ul', { class: 'checks' }, arr(c.keeps).map((k) => checkItem('ok', k, ''))),
+        h('p', { class: 'small muted' }, c.rollback),
+        h('div', { class: 'actions' }, h('label', { class: 'check grow' }, ok, h('span', null, 'Visitors will sign in once, with authentik. I reviewed this change.')), apply, h('button', { type: 'button', class: 'btn ghost', onclick: () => { pf.cleanup = null; rerender(); } }, 'Cancel')));
+    }
+    const cr = pf.cleanupResult;
+    const cleanupResult = cr ? h('div', { class: `callout ${cr.ok ? '' : 'err'}`, role: 'status', id: 'id-cleanup-result' }, h('p', null, h('strong', null, cr.ok ? 'Done. ' : 'Not completed. '), cr.message),
+      h('ul', { class: 'checks' }, arr(cr.steps).map((st) => checkItem(st.status === 'Done' ? 'ok' : st.status === 'Failed' ? 'err' : 'warn', st.name, st.message || ''))),
+      cr.snapshot ? h('p', { class: 'muted' }, `Saved copy of the removed Access application: ${cr.snapshot}`) : null) : null;
+    const redundant = arr(d.launcher).filter((x) => arr(x.diagnosis && x.diagnosis.problems).some((p) => p.state === 'redundant-access' || p.state === 'access-conflict'));
     const out = [
+      d.adminLinks && !d.adminLinks.public ? h('div', { class: 'callout warn', id: 'id-admin-local' }, h('p', null, 'authentik has no public address yet, so the Authentik buttons open it on this PC (127.0.0.1). Sign in there as akadmin: Google sign-in only works at the public address.')) : null,
+      redundant.length ? h('div', { class: 'callout warn', id: 'id-redundant-access' }, h('p', null, h('strong', null, `${redundant.length} application(s) ask visitors to sign in twice. `), `Cloudflare Access (email code) is in front of authentik for: ${redundant.map((x) => x.hostname).join(', ')}. authentik already protects them; use "Remove Cloudflare login…" on each row (DTC verifies authentik first).`)) : null,
       h('p', null, 'Tick the applications that should require signing in. New ones start owner-only (group DTC owners); applications that already have rules in authentik keep them. Already protected applications are not affected by what you tick.', help('forwardauth', 'ForwardAuth'), help('dtc-owners', 'DTC owners')),
       !connected ? h('p', { class: 'hint' }, 'Connect the manager to authentik first.') : null,
       h('div', { class: 'sel-bar' }, selAll, clrAll, count),
       table,
       h('div', { class: 'protect-bar' }, field({ id: 'id-p-access', label: 'Cloudflare Access', control: accessSel }), h('div', { class: 'actions' }, protectBtn)),
-      review, result,
+      review, result, cleanup, cleanupResult,
     ];
     sync();
     return out;
