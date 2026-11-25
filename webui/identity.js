@@ -601,7 +601,8 @@
     }
     const cr = pf.cleanupResult;
     const cleanupResult = cr ? h('div', { class: `callout ${cr.ok ? '' : 'err'}`, role: 'status', id: 'id-cleanup-result' }, h('p', null, h('strong', null, cr.ok ? 'Done. ' : 'Not completed. '), cr.message),
-      h('ul', { class: 'checks' }, arr(cr.steps).map((st) => checkItem(st.status === 'Done' ? 'ok' : st.status === 'Failed' ? 'err' : 'warn', st.name, st.message || '')))) : null;
+      h('ul', { class: 'checks' }, arr(cr.steps).map((st) => checkItem(st.status === 'Done' ? 'ok' : st.status === 'Failed' ? 'err' : 'warn', st.name, st.message || ''))),
+      cr.snapshot ? h('p', { class: 'muted' }, `Saved copy of the removed Access application: ${cr.snapshot}`) : null) : null;
     const redundant = arr(d.launcher).filter((x) => arr(x.diagnosis && x.diagnosis.problems).some((p) => p.state === 'redundant-access' || p.state === 'access-conflict'));
     const out = [
       d.adminLinks && !d.adminLinks.public ? h('div', { class: 'callout warn', id: 'id-admin-local' }, h('p', null, 'authentik has no public address yet, so the Authentik buttons open it on this PC (127.0.0.1). Sign in there as akadmin: Google sign-in only works at the public address.')) : null,

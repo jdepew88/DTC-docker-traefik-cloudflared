@@ -273,7 +273,10 @@ Every application (protected or not) is one row with:
   Access, Cloudflare challenge, authentik, Google, a local address, tunnel, Traefik or the application);
 - **Remove Cloudflare login…** when a Cloudflare Access application *created by DTC* still sits in front of an
   authentik-protected application. Preview and apply both check first that the route asks authentik and that an
-  anonymous request is sent to sign in right now (fails closed); only that Access application is deleted; the route,
+  anonymous request is sent to sign in right now (fails closed), that authentik has an application with at least one
+  access rule for it, and that the recorded Access application still covers exactly that hostname (never a wildcard,
+  path or multi-domain one). Before deleting, a copy of the Access application and its policies is written to
+  `backups\cloudflare-access\<time>-<hostname>.json`; if that copy cannot be saved nothing is deleted. Only that Access application is deleted; the route,
   DNS record, tunnel route and Access applications DTC did not create stay. Undo: edit the service, choose
   *Internet, layered: Cloudflare Access + authentik*.
 

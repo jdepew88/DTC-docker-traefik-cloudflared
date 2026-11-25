@@ -3729,7 +3729,20 @@ function Invoke-IdentityAccessCleanup($Body, [switch]$Apply) {
   $State.IdpChecks[$name] = $challenge
   if ($challenge.State -ne 'auth') { Stop-Request 409 "authentik protection of $h is not verified right now ($($challenge.Message)). The Cloudflare login is kept." }
   if (-not (Get-ManagedResource $ctx.Cloudflare $h 'accessAppId')) { Stop-Request 409 "DTC did not create a Cloudflare Access application for $h. Access applications created elsewhere are not changed here: narrow or remove them in Cloudflare Zero Trust." }
-  $copy = $svc | ConvertTo-Json -Depth 8 | ConvertFrom-Json
+  # authentik must also decide WHO may sign in: its application for this service exists and has at least one access rule.
+  if (-not $fact.authentik -or -not ($fact.rules -ge 1)) { Stop-Request 409 "authentik has no application with an access rule for '$name' (dm-$name), or it could not be checked, so who may sign in is not verified. The Cloudflare login is kept." }
+  # The application DTC recorded must still exist and cover exactly this hostname (never a wildcard, path or multi-domain one).
+  $acct = [string]$ctx.Cloudflare.accountId
+  $appId = [string](Get-ManagedResource $ctx.Cloudflare $h 'accessAppId')
+  $live = $null
+  try { $live = Invoke-CloudflareApi -Settings $ctx.Settings -Path "/accounts/$acct/access/apps/$appId" } catch { Stop-Request 409 "The Cloudflare Access application of $h could not be read ($($_.Exception.Message)). Nothing was changed." }
+  $shd = @(); if ($live.PSObject.Properties['self_hosted_domains']) { $shd = @($live.self_hosted_domains) }
+  $domains = @(@($live.domain) + $shd | Where-Object { $_ } | ForEach-Object { ([string]$_).ToLowerInvariant().TrimEnd('/') } | Select-Object -Unique)
+  if ([string]$live.type -ne 'self_hosted' -or $domains.Count -ne 1 -or $domains[0] -ne $h.ToLowerInvariant()) { Stop-Request 409 "The Cloudflare Access application recorded for $h now covers '$($domains -join ', ')' (type $($live.type)), not exactly $h. It is not changed here: review it in Cloudflare Zero Trust." }
+  $policies = $null
+  try { $policies = @(Invoke-CloudflareApi -Settings $ctx.Settings -Path "/accounts/$acct/access/apps/$appId/policies" -All) } catch { if ($live.PSObject.Properties['policies']) { $policies = @($live.policies) } }
+  if ($null -eq $policies) { Stop-Request 409 "The policies of the Cloudflare Access application of $h could not be read, so no restorable copy can be saved. Nothing was changed." }
+  $copy =$svc | ConvertTo-Json -Depth 8 | ConvertFrom-Json
   $copy.cloudflare.access = $false
   $changeBody = [pscustomobject]@{ op = 'update'; name = $svc.name; service = $copy; cloudflare = [pscustomobject]@{ automate = $true; accessEmails = @(); cleanup = $true } }
   $plan = Build-ChangePlan $changeBody
@@ -3742,16 +3755,25 @@ function Invoke-IdentityAccessCleanup($Body, [switch]$Apply) {
     return [ordered]@{ planId = $id; service = $svc.name; hostname = $h; canApply = $true; challenge = [ordered]@{ state = $challenge.State; message = $challenge.Message }
       actions = @($deletes | ForEach-Object { [ordered]@{ id = $_.Id; summary = $_.Summary; detail = $_.Detail } })
       notes = @(@($plan.Cloudflare.Notes) | Where-Object { $_ -notmatch 'still asks visitors' })
-      keeps = @("authentik ForwardAuth in front of $h (verified just now: anonymous visitors are sent to sign in)", 'The Traefik route, DNS record and tunnel route', 'Access applications DTC did not create')
+      keeps = @("authentik ForwardAuth in front of $h (verified just now: anonymous visitors are sent to sign in)", "authentik application dm-$name with $($fact.rules) access rule(s)$(if ($fact.ownerOnly) { ' (DTC owners only)' })", 'The Traefik route, DNS record and tunnel route', 'Access applications DTC did not create', 'A copy of the Access application and its policies is saved in backups\cloudflare-access before it is removed')
       rollback = "To put the Cloudflare login back, edit '$($svc.name)' on the Services page, turn on ""Require Cloudflare Access"" and choose layered authentication." }
   }
   if ($plan.TraefikKey -ne $p.TraefikKey -or $plan.Cloudflare.Fingerprint -ne $p.CfFingerprint) { Stop-Request 409 'The configuration or Cloudflare changed since the preview. Preview again.' }
+  # Restorable copy first; without it nothing is deleted.
+  $snap = Join-Path (Join-Path $ctx.Settings.BackupRoot 'cloudflare-access') ('{0}-{1}.json' -f (Get-Date -Format 'yyyyMMdd-HHmmss'), $h)
+  try {
+    New-Item -ItemType Directory -Force -Path (Split-Path $snap) | Out-Null
+    $json = [ordered]@{ savedAt = (Get-Date).ToString('o'); service = $svc.name; hostname = $h; accountId = $acct; app = $live; policies = $policies } | ConvertTo-Json -Depth 15
+    [IO.File]::WriteAllText($snap, $json)
+    $back = Get-Content -LiteralPath $snap -Raw | ConvertFrom-Json
+    if ([string]$back.app.id -ne $appId) { throw 'read-back mismatch' }
+  } catch { Stop-Request 500 "A copy of the Access application of $h could not be saved ($($_.Exception.Message)). Nothing was changed." }
   $res = Invoke-ChangePlanSteps $plan @()
   $State.AccessApps = $null
   $after = $null
   if ($res.ok -and $svc.cloudflare.publish) { Start-Sleep -Seconds 2; $after = Get-RedirectTrace -Url "https://$h/" -AuthHostname $ctx.Config.authentik.hostname -Mode 'authentik' }
-  Write-Audit 'identity-access-cleanup' "$($svc.name) ok=$($res.ok) after=$(if ($after) { $after.component } else { '-' })"
-  return [ordered]@{ ok = [bool]$res.ok; service = $svc.name; hostname = $h; steps = @($res.steps); after = $after
+  Write-Audit 'identity-access-cleanup' "$($svc.name) app=$appId ok=$($res.ok) after=$(if ($after) { $after.component } else { '-' }) snapshot=$snap"
+  return [ordered]@{ ok = [bool]$res.ok; service = $svc.name; hostname = $h; steps = @($res.steps); after = $after; snapshot = $snap
     message = $(if (-not $res.ok) { 'Cloudflare did not accept the change; the Access application is unchanged.' } elseif ($after -and $after.component -eq 'authentik') { "Done: $h now goes straight to authentik." } elseif ($after) { "Removed. The public address still answers through $($after.component); Cloudflare can take a minute to apply the change." } else { 'Removed.' }) }
 }
 
