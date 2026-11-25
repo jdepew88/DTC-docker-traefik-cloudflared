@@ -83,7 +83,7 @@ $Shim = @'
         const first = problems[0] || (prot ? { state: 'healthy', tone: 'ok', label: 'Healthy, protected', message: '', fix: '' } : n === 'b' ? { state: 'missing-protection', tone: 'warn', label: 'Public without sign-in', message: 'Anyone on the Internet can open it.', fix: '' } : { state: 'unpublished', tone: 'neutral', label: 'Local only (not published)', message: '', fix: '' });
         return { service: n, displayName: label(n), hostname: host(n), openUrl: n === 'b' ? `https://${host(n)}/` : `http://${host(n)}:8180/`, publish: n === 'b', enabled: true,
           authentikUrl: prot ? `https://auth.idtest.example/if/admin/#/core/applications/dm-${n}` : '', authentikUrlPublic: true,
-          container: { name: n, state: ctr }, router: 'enabled', target: `http://${n}:80`, authMode: prot ? 'authentik' : 'none', authModeLabel: prot ? 'authentik ForwardAuth' : 'No external sign-in',
+          container: n === 'b' ? { name: '', state: 'host', listening: false } : { name: n, state: ctr }, router: 'enabled', target: `http://${n}:80`, authMode: prot ? 'authentik' : 'none', authModeLabel: prot ? 'authentik ForwardAuth' : 'No external sign-in',
           access: { checked: true, error: '', managedAppId: redundant ? 'acc-d' : '', apps: redundant ? [{ id: 'acc-d', name: 'd.idtest.example (stack)', pattern: host('d'), wildcard: false, pathOnly: false, createdByTool: true }] : [] },
           diagnosis: Object.assign({}, first, { problems }) };
       });
@@ -209,6 +209,7 @@ try {
   Test-Condition 'launcher: Open goes to the same application address in a new tab' ($rowA.open -eq $rowA.host -and $rowA.openTarget -eq '_blank') ($rowA | ConvertTo-Json -Compress)
   Test-Condition 'launcher: Authentik opens the application''s admin page at the PUBLIC authentik address (not 127.0.0.1)' ($rowA.ak -eq 'https://auth.idtest.example/if/admin/#/core/applications/dm-a' -and $rowA.akTarget -eq '_blank' -and $rowA.ak -notmatch '127\.0\.0\.1') ($rowA | ConvertTo-Json -Compress)
   $rowB = Js "(() => { const r = document.querySelector('tr[data-app=b]'); return JSON.stringify({ open: ([...r.querySelectorAll('.app-actions a')].find((a) => a.textContent.startsWith('Open')) || {}).href || '', ak: !![...r.querySelectorAll('.app-actions a')].find((a) => a.textContent.startsWith('Authentik')), text: r.innerText }); })()" | ConvertFrom-Json
+  Test-Condition 'launcher: a Windows-host target with nothing listening on its port says the service is not running' ($rowB.text -match 'Windows service not running') ($rowB | ConvertTo-Json -Compress)
   Test-Condition 'launcher: a published application opens at https://<hostname>/; unprotected rows have no Authentik button and warn' ($rowB.open -eq 'https://b.idtest.example/' -and -not $rowB.ak -and $rowB.text -match 'Public without sign-in') ($rowB | ConvertTo-Json -Compress)
   $rowC = [string](Js "document.querySelector('tr[data-app=c]').innerText"); $rowE = [string](Js "document.querySelector('tr[data-app=e]').innerText"); $rowF = [string](Js "document.querySelector('tr[data-app=f]').innerText")
   Test-Condition 'launcher: a stopped container is shown as an availability problem, not as a sign-in failure' ($rowC -match 'Stopped \(exited\)' -and $rowC -match 'availability error, not a sign-in problem' -and $rowC -notmatch 'Not enforced|failing') $rowC

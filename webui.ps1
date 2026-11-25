@@ -3637,6 +3637,13 @@ function Get-IdentityLauncher {
       if ($null -ne $fact.provider.onOutpost) { $facts.outpostAssigned = [bool]$fact.provider.onOutpost }
       if ($fact.challenge) { $facts.challenge = [string]$fact.challenge.State }
     }
+    # Windows-host targets: when nothing on this PC listens on the target port, Traefik's connection is refused for
+    # certain, so the row says so instead of "Healthy" (LAN targets are not probed here; Run checks does that).
+    if ($s.target.type -eq 'host' -and [string]$s.target.host -in @('host.docker.internal', 'gateway.docker.internal', 'localhost', '127.0.0.1') -and [int]$s.target.port -gt 0) {
+      $listening = $null
+      try { $listening = @(Get-NetTCPConnection -LocalPort ([int]$s.target.port) -State Listen -ErrorAction Stop).Count -gt 0 } catch { if ([string]$_.CategoryInfo.Category -eq 'ObjectNotFound') { $listening = $false } }
+      if ($null -ne $listening) { $ctr.listening = $listening; if (-not $listening) { $facts.backend = 'unreachable' } }
+    }
     $diag = Get-AppAccessDiagnosis $facts
     $slug = $(if ($fact) { [string]$fact.slug } else { "dm-$($s.name)" })
     $protected = ($mode -in @('authentik', 'layered', 'layered-unconfirmed'))

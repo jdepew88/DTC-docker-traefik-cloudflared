@@ -497,7 +497,7 @@
       const hostCell = arr(s.hostnames).length ? arr(s.hostnames).map((hn, i) => (i === 0 && openUrl ? h('a', { class: 'app-host', href: openUrl, target: '_blank', rel: 'noopener noreferrer', 'aria-label': `${hn} (opens ${label} in a new tab)` }, hn, ' ', icon('external')) : h('span', { class: 'app-host' }, hn)))
         : h('span', { class: 'muted' }, 'No hostname');
       const ctr = x && x.container;
-      const ctrChip = !ctr ? null : ctr.state === 'running' ? plainChip('Running', 'ok') : ctr.state === 'host' ? plainChip('Windows / LAN service', 'neutral') : ctr.state === 'missing' ? plainChip('Container missing', 'err') : ctr.state === 'unknown' ? plainChip('Container unknown', 'neutral') : plainChip(`Stopped (${ctr.state})`, 'warn');
+      const ctrChip = !ctr ? null : ctr.state === 'running' ? plainChip('Running', 'ok') : ctr.state === 'host' ? (ctr.listening === false ? plainChip('Windows service not running', 'warn') : plainChip('Windows / LAN service', 'neutral')) : ctr.state === 'missing' ? plainChip('Container missing', 'err') : ctr.state === 'unknown' ? plainChip('Container unknown', 'neutral') : plainChip(`Stopped (${ctr.state})`, 'warn');
       const routeChip = !x ? null : x.router === 'enabled' ? (x.publish ? plainChip('Published', 'ok') : plainChip('Local only', 'neutral')) : x.router === 'off' ? plainChip('Route off', 'neutral') : x.router === 'unknown' ? plainChip('Route unknown', 'neutral') : plainChip(x.router === 'missing' ? 'Route missing' : 'Route error', 'err');
       const accessApps = x ? arr(x.access.apps).filter((ap) => !ap.pathOnly) : [];
       const problems = dg ? arr(dg.problems) : [];
