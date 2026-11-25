@@ -113,6 +113,7 @@ $ManagedFiles = @(
   'lib\AppSources.psm1',
   'lib\HostPlatform.psm1',
   'lib\ProvisionPolicy.psm1',
+  'lib\AccessDiagnostics.psm1',
   'lib\IdentityContract.psm1',
   'lib\AiAssist.psm1',
   'lib\Recipes.psm1',

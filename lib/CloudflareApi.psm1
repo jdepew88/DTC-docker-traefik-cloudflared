@@ -23,6 +23,7 @@ $script:ManagedComment = 'Managed by traefik-proxy'
 Add-Type -AssemblyName System.Security
 # Token-file, ACL and atomic-write helpers.
 Import-Module (Join-Path $PSScriptRoot 'TraefikProxy.psm1')
+Import-Module (Join-Path $PSScriptRoot 'AccessDiagnostics.psm1')
 
 # --- API endpoint --------------------------------------------------------------------------------------------
 
@@ -599,16 +600,20 @@ function Get-CloudflareServicePlan {
   $observed['ingress'] = $ingress.ToArray()
   $accessApps = @()
   $needAccess = $Service -and $Service.cloudflare.access -and $publish.Count -gt 0
-  # Access off on a published hostname: an Access application this tool created for it would still show Cloudflare's
-  # login in front, so it is looked up too.
+  # Access off on a published hostname: an Access application this tool created for it, or any other one covering it
+  # (exact, path-scoped, wildcard or multi-domain), would still show Cloudflare's login in front, so they are looked
+  # up too. Without the optional Access permission that lookup is skipped (reported), unless Access is required.
   $managedAccess = @($publish | Where-Object { -not ($Service -and $Service.cloudflare.access) -and (Get-ManagedResource $config $_ 'accessAppId') })
   if ($needAccess -or $unpublish.Count -gt 0 -or $managedAccess.Count -gt 0) { $accessApps = @(Invoke-CloudflareApi -Settings $Settings -Path "/accounts/$acct/access/apps" -All) }
+  elseif ($publish.Count -gt 0) {
+    try { $accessApps = @(Invoke-CloudflareApi -Settings $Settings -Path "/accounts/$acct/access/apps" -All) }
+    catch { $plan.Notes += 'Cloudflare Access applications could not be checked (the API token has no Access permission), so an Access login in front of this hostname would not be detected.' }
+  }
   $observed['accessApps'] = @($accessApps | ForEach-Object { "$($_.id)|$($_.domain)" })
 
   $hostRule = { param($h) @($ingress | Where-Object { $_.PSObject.Properties['hostname'] -and $_.hostname -eq $h -and -not ($_.PSObject.Properties['path'] -and $_.path) }) }
-  $accessFor = { param($h) @($accessApps | Where-Object {
-        ($_.PSObject.Properties['domain'] -and ($_.domain -eq $h -or $_.domain -like "$h/*")) -or
-        ($_.PSObject.Properties['self_hosted_domains'] -and @($_.self_hosted_domains) -contains $h) }) }
+  $accessFor = { param($h) @(Get-AccessCoverage -Apps $accessApps -Hostname $h -ManagedAppId (Get-ManagedResource $config $h 'accessAppId') | ForEach-Object { $c = $_; @($accessApps | Where-Object { [string]$_.id -eq $c.Id })[0] } | Where-Object { $_ }) }
+  $isAuthentik = [bool]($Service -and $Service.PSObject.Properties['auth'] -and $Service.auth -and [string]$Service.auth.provider -eq 'authentik')
   $actions = @()
 
   foreach ($h in $publish) {
@@ -643,12 +648,17 @@ function Get-CloudflareServicePlan {
       $appId = Get-ManagedResource $config $h 'accessAppId'
       $apps = @($accessApps | Where-Object { $appId -and $_.id -eq $appId })
       $wasOn = [bool]($PreviousService -and $PreviousService.PSObject.Properties['cloudflare'] -and $PreviousService.cloudflare.access -and (@(Get-PublishedHostnames $PreviousService) -contains $h))
-      if ($apps.Count -gt 0 -and $wasOn) {
-        $actions += New-CfAction 'access' 'delete' $h "Delete Access application '$($apps[0].name)' (created by this tool)" "Cloudflare Access is turned off for $h, so Cloudflare no longer asks for its own login first." $false ([pscustomobject]@{ AppId = $appId })
+      if ($apps.Count -gt 0 -and ($wasOn -or $Cleanup)) {
+        # Turned off in this change, or left over from an earlier change that turned it off (cleanup requested): only an
+        # Access application this tool created and recorded is ever deleted.
+        $why = $(if ($wasOn) { "Cloudflare Access is turned off for $h" } else { "Cloudflare Access was already turned off for $h, but the Access application this tool created was left behind" })
+        $actions += New-CfAction 'access' 'delete' $h "Delete Access application '$($apps[0].name)' (created by this tool)" "$why, so Cloudflare no longer asks for its own login (email code) first.$(if ($isAuthentik) { ' authentik stays the sign-in.' })" $false ([pscustomobject]@{ AppId = $appId })
       } elseif ($apps.Count -gt 0) {
-        $plan.Notes += "Cloudflare Access application '$($apps[0].name)' (created by this tool) still asks visitors of $h for a Cloudflare login, although Access is off for this service. Delete it in Cloudflare Zero Trust (Access > Applications) if authentik alone should protect $h."
-      } elseif (@(& $accessFor $h).Count -gt 0) {
-        $plan.Notes += "An Access application not created by this tool covers $h; Cloudflare asks for its login first. It is left alone."
+        $plan.Notes += "Cloudflare Access application '$($apps[0].name)' (created by this tool) still asks visitors of $h for a Cloudflare login, although Access is off for this service. Remove it with 'Remove redundant Cloudflare login' on the Identity & Access page (preview first)."
+      }
+      foreach ($other in @(Get-AccessCoverage -Apps $accessApps -Hostname $h -ManagedAppId $appId | Where-Object { -not $_.CreatedByTool })) {
+        $kind = $(if ($other.Wildcard) { "wildcard Access application '$($other.Name)' ($($other.Pattern))" } elseif ($other.PathOnly) { "path-scoped Access application '$($other.Name)' ($($other.Pattern))" } else { "Access application '$($other.Name)'" })
+        $plan.Notes += "A $kind not created by this tool covers $h; Cloudflare asks for its login first$(if ($isAuthentik) { ', so visitors sign in twice (Cloudflare, then authentik)' }). It is left alone: narrow or remove it in Cloudflare Zero Trust if that is not intended."
       }
     }
     # 2. Tunnel route

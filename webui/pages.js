@@ -142,6 +142,9 @@
       exposure: sv ? (!sv.cloudflare.publish ? 'local' : sv.cloudflare.access ? 'access' : 'public') : (cfReady(s.setup) ? 'access' : 'local'),
       emails: s.setup.contactEmail || '', path: sv ? sv.pathPrefix : '', strip: sv ? !!sv.stripPrefix : false, extra: sv ? arr(sv.hostnames).slice(1).join(', ') : '',
       tls: sv ? !!sv.target.tlsSkipVerify : false, middlewares: sv ? arr(sv.middlewares) : ['default-headers@file'], enabled: sv ? !!sv.enabled : true, description: sv ? sv.description : '',
+      // authentik-protected services: "Internet" means authentik is the login; Cloudflare Access in front as well is
+      // only possible as an explicit layered choice.
+      authentik: !!(sv && sv.auth && sv.auth.provider === 'authentik'), auth: sv && sv.auth ? sv.auth : null,
     };
     P.initBackendState(f, sv);
     f.hostname = sv ? arr(sv.hostnames)[0] : '';
@@ -181,9 +184,11 @@
     const hostHint = f.where === 'this-computer' ? h('p', { class: 'hint', 'data-min-level': 'intermediate' }, 'The app must listen on all interfaces (0.0.0.0), not only 127.0.0.1, and Windows Firewall must allow the port from Docker Desktop.') : null;
     const ready = cfReady(s.setup);
     const exposure = h('div', { class: 'choice-cards', role: 'radiogroup', 'aria-label': 'Who can reach it?' },
-      [['access', 'Internet, Cloudflare Access login', 'Recommended: only the emails you allow can sign in.', !ready],
-        ['public', 'Internet, no extra login', 'Only for apps with their own secure login.', !ready],
-        ['local', 'Local only', 'A Traefik route on this PC; nothing in Cloudflare.', false]].map(([v, title, text, needsCf]) =>
+      (f.authentik ? [['public', 'Internet, authentik sign-in', 'Recommended: visitors sign in once with authentik (your existing session is reused).', !ready],
+        ['access', 'Internet, layered: Cloudflare Access + authentik', 'Two separate sign-ins (Cloudflare email code or IdP, then authentik). Only if you want both gates.', !ready]]
+        : [['access', 'Internet, Cloudflare Access login', 'Recommended: only the emails you allow can sign in.', !ready],
+          ['public', 'Internet, no extra login', 'Only for apps with their own secure login.', !ready]]).concat([
+        ['local', 'Local only', 'A Traefik route on this PC; nothing in Cloudflare.', false]]).map(([v, title, text, needsCf]) =>
         h('label', { class: `choice ${needsCf ? 'disabled' : ''}` }, h('input', { type: 'radio', name: 'svc-exp', value: v, checked: f.exposure === v, disabled: needsCf, onchange: () => { f.exposure = v; renderForm(ctx); } }),
           h('strong', null, title), h('span', { class: 'small muted' }, needsCf ? 'Connect Cloudflare (tunnel) first.' : text))));
     const emails = h('input', { value: f.emails, spellcheck: 'false', placeholder: 'you@example.com, family@example.com' });
@@ -211,7 +216,8 @@
       backendInputs, hostHint, backend.node,
       h('div', { class: 'field' }, h('span', { class: 'label' }, 'Who can reach it?'), exposure),
       f.exposure === 'access' ? field({ id: 'svc-emails', label: 'Allowed emails (Cloudflare Access)', control: emails, helpId: 'cf-access', hint: 'Used only when an Access application has to be created.' }) : null,
-      f.exposure === 'public' ? h('div', { class: 'callout warn' }, h('p', null, 'Anyone on the Internet can reach this app. Only choose this when the app has its own secure login.')) : null,
+      f.exposure === 'public' && !f.authentik ? h('div', { class: 'callout warn' }, h('p', null, 'Anyone on the Internet can reach this app. Only choose this when the app has its own secure login.')) : null,
+      f.exposure === 'access' && f.authentik ? h('div', { class: 'callout warn', id: 'svc-layered' }, h('p', null, 'Layered authentication: Cloudflare Access asks for its own login before authentik. Visitors sign in twice.')) : null,
       gate('advanced', h('details', { class: 'more', open: !!(f.path || f.extra || f.tls) || null }, h('summary', null, 'Advanced routing'),
         h('div', { class: 'grid' },
           field({ id: 'svc-path', label: 'Path prefix', control: path, helpId: 'path-routing', hint: 'Route only this path, e.g. /notflix. Many apps need their base path configured for this; prefer a subdomain.' }),
@@ -248,6 +254,8 @@
           cloudflare: { publish: f.exposure !== 'local', access: f.exposure === 'access' } },
         cloudflare: { automate: f.exposure !== 'local' && ready, accessEmails: L.splitEmails(f.emails), cleanup: true },
       };
+      // Keeping authentik while choosing Cloudflare Access too is recorded as layered authentication (chosen here).
+      if (f.authentik && f.auth) body.service.auth = { provider: 'authentik', endpoint: f.auth.endpoint, layered: f.exposure === 'access' };
       ctx.state.afterApply = () => { s.forms.svc = null; };
       ctx.startPlan(body, e.submitter || form.querySelector('[type=submit]'));
     });

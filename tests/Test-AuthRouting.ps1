@@ -217,6 +217,16 @@ try {
     Test-Condition 'cloudflare: turning Access off removes the Access application this tool created (listed in the preview)' ($del.Count -eq 1 -and $del[0].Data.AppId -eq $app.id -and -not $del[0].Overwrite) (($p1.Actions | ForEach-Object { "$($_.Step):$($_.Kind)" }) -join ', ')
     $p2 = Get-CloudflareServicePlan -Settings $settings -Service $off -PreviousService $off
     Test-Condition 'cloudflare: a leftover Access application is reported, never removed without an explicit change' (@($p2.Actions | Where-Object { $_.Step -eq 'access' -and $_.Kind -eq 'delete' }).Count -eq 0 -and @($p2.Notes | Where-Object { $_ -match 'still asks visitors' }).Count -eq 1) (($p2.Notes) -join ' | ')
+    # A leftover from an earlier change that turned Access off (the registry already says off): removed only when the
+    # change explicitly asks for cleanup, and only because this tool recorded creating it.
+    $offAk = [pscustomobject]@{ name = 'app'; enabled = $true; hostnames = @('app.example.test'); cloudflare = [pscustomobject]@{ publish = $true; access = $false }; auth = [pscustomobject]@{ provider = 'authentik'; endpoint = 'http://authentik-server:9000' } }
+    $p3 = Get-CloudflareServicePlan -Settings $settings -Service $offAk -PreviousService $offAk -Cleanup
+    $del3 = @($p3.Actions | Where-Object { $_.Step -eq 'access' -and $_.Kind -eq 'delete' })
+    Test-Condition 'cloudflare: with cleanup, a leftover Access application this tool created is removed (stale drift repaired, authentik stays)' ($del3.Count -eq 1 -and $del3[0].Data.AppId -eq $app.id -and $del3[0].Detail -match 'left behind' -and $del3[0].Detail -match 'authentik stays') (($p3.Actions | ForEach-Object { "$($_.Step):$($_.Kind) $($_.Detail)" }) -join ' | ')
+    $wild = Invoke-CloudflareApi -Settings $settings -Method POST -Path "/accounts/$acct/access/apps" -Body @{ name = 'Everything'; domain = '*.example.test'; type = 'self_hosted'; policies = @() }
+    $p4 = Get-CloudflareServicePlan -Settings $settings -Service $offAk -PreviousService $offAk -Cleanup
+    Test-Condition 'cloudflare: a wildcard Access application not created by this tool is detected (sign in twice) and never deleted' (@($p4.Notes | Where-Object { $_ -match "wildcard Access application 'Everything'" -and $_ -match 'sign in twice' }).Count -eq 1 -and @($p4.Actions | Where-Object { $_.Kind -eq 'delete' -and $_.Data.AppId -eq $wild.id }).Count -eq 0) (($p4.Notes) -join ' | ')
+    $null = Invoke-CloudflareApi -Settings $settings -Method DELETE -Path "/accounts/$acct/access/apps/$($wild.id)"
     $r = Invoke-CloudflareServicePlan -Settings $settings -Plan $p1 -ServiceName 'app'
     $left = @((Get-MockState $mock).apps | Where-Object { $_.id -eq $app.id })
     Test-Condition 'cloudflare: applying the turn-off deletes the Access application and forgets it' ($left.Count -eq 0 -and -not (Get-ManagedResource (Read-CloudflareConfig -Settings $settings) 'app.example.test' 'accessAppId')) ($r | ConvertTo-Json -Compress -Depth 4)

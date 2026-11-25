@@ -247,9 +247,37 @@ loaded by Traefik and ForwardAuth enforcement separately (sign-in verification f
 - the Traefik route with ForwardAuth (diff, validation in a throwaway Traefik, backup, reload). The route switches only
   after the outpost has loaded the provider, and the application counts as protected only after an unauthenticated
   request was sent to sign in (loops are detected);
-- Cloudflare Access stays as it is unless you choose *Remove Cloudflare Access* for the selection.
+- Cloudflare Access: by default authentik becomes the only interactive sign-in and an Access application this manager
+  created for the hostname is deleted (listed in the preview). Keeping Cloudflare Access in front as well is an explicit
+  choice, *Layered*, stored as `auth.layered` on the service (two sign-ins).
 
-Each protected application shows its status, how many access rules authentik has (read only) and **Open in authentik**.
+### Application launcher (same step)
+
+Every application (protected or not) is one row with:
+
+- its name, the hostname as a link and **Open**: both go straight to the application's configured address
+  (`https://<hostname>/` when published, `http://<hostname>:<Traefik port>/` when local only) in a new tab. DTC does not
+  start a sign-in: Traefik and authentik decide whether one is needed, so an existing authentik session is reused;
+- **Authentik**: the application's page in authentik's admin interface at the **public** authentik address
+  (`<publicUrl>/if/admin/#/core/applications/dm-<service>`). Only when authentik has no public address yet does it fall
+  back to the local address, with a warning: Google sign-in cannot work there (see below);
+- container status (running, stopped, missing, Windows/LAN service), route and publication status, the authentication
+  mode, any Cloudflare Access application that covers the hostname (exact, path-scoped, wildcard or multi-domain, read
+  from the Cloudflare API at most every two minutes), and one diagnosis from `lib\AccessDiagnostics.psm1`: healthy,
+  local only, stopped, missing container, backend unreachable, missing route, missing protection, provider error
+  (application missing, wrong external address or mode), outpost error, ForwardAuth not enforced or misrouted,
+  redundant Cloudflare login, foreign Access conflict, Access missing, OAuth configuration. Availability problems are
+  never reported as authentication failures: a stopped container is "Stopped (after signing in, Bad gateway)";
+- **Trace** (read-only): one anonymous request without cookies to the public address and one through this PC's Traefik,
+  listing each hop (no query strings, codes or tokens) and which component asked for authentication first (Cloudflare
+  Access, Cloudflare challenge, authentik, Google, a local address, tunnel, Traefik or the application);
+- **Remove Cloudflare login…** when a Cloudflare Access application *created by DTC* still sits in front of an
+  authentik-protected application. Preview and apply both check first that the route asks authentik and that an
+  anonymous request is sent to sign in right now (fails closed); only that Access application is deleted; the route,
+  DNS record, tunnel route and Access applications DTC did not create stay. Undo: edit the service, choose
+  *Internet, layered: Cloudflare Access + authentik*.
+
+Each protected application also shows how many access rules authentik has (read only).
 
 **Remove protection…** (one application at a time) previews exactly what changes: the route drops the ForwardAuth
 middleware and the provider is unassigned from the embedded outpost. It also lists what stays: the container, the route
@@ -322,8 +350,60 @@ reload a corrected sign-in address before reporting the result.
 
 Turning **Require Cloudflare Access** off (on the Services page, or *Remove Cloudflare Access* when protecting) now deletes
 the Access application this manager created for that hostname, listed in the preview. An Access application left over
-from an earlier version is reported (Services preview note, health check and routing page: "Cloudflare challenge") and is
-never removed without an explicit change; Access applications created by hand are left alone.
+from an earlier change that turned Access off (the registry already says off, but the application was never deleted) is
+reported everywhere and removed when a change explicitly asks for cleanup: *Remove Cloudflare login…* on Identity &
+Access, or saving the service on the Services page (cleanup is part of that preview). Only Access applications this
+manager recorded creating are ever deleted; ones created by hand, including wildcard (`*.example.com`) and multi-domain
+applications, are detected and reported ("visitors sign in twice"), never changed.
+
+## Authentication architecture and modes
+
+```
+Browser -> Cloudflare (DNS, HTTPS, tunnel) -> Traefik -> authentik ForwardAuth -> application
+```
+
+- **Google** is only an upstream identity source of authentik (one OAuth client, one redirect URI:
+  `<authentik public URL>/source/oauth/callback/<source slug>/`). Adding an application never touches Google.
+- **authentik** holds the session (a cookie on its own hostname), decides who may open what (per-application bindings),
+  and sends unauthenticated visitors through its flow (Google when configured).
+- **Traefik** enforces authentik's decision with a ForwardAuth middleware per route and fails closed: authentik
+  unreachable means the request is refused.
+- **Cloudflare** provides DNS, HTTPS and the tunnel. It adds no interactive login in front of an authentik application
+  unless layered authentication was chosen.
+
+Modes (one per service; `Get-ServiceAuthMode`): `authentik` (normal, reusable), `cloudflare-access` (Access only, for
+apps without authentik), `layered` (both, explicit `auth.layered`), `native` (the application's own login), `none`
+(published without any sign-in: warned). Validation refuses authentik + Cloudflare Access unless `layered` is set, and a
+service request that names authentik gets Access off by default.
+
+### Per-application ForwardAuth (`forward_single`) versus domain-level (`forward_domain`)
+
+| | Per application (used) | Domain level |
+| --- | --- | --- |
+| Session reuse | Yes: the authentik session (on the sign-in hostname) is reused; each application adds one invisible redirect to set its own cookie | Yes: one cookie on the parent domain, no extra redirect |
+| Authorization | Per application: own provider, application and bindings (owner-only by default) | One application for the whole domain: per-application rules need extra policies keyed on the host |
+| Cookie scope | Host-only cookie per application | Cookie for `.example.com`, sent to every subdomain, including applications not behind authentik |
+| Outpost | One provider per application on the embedded outpost | One provider; every route uses it |
+| Risk | A mistake affects one application | A leaked domain cookie or a mis-scoped rule affects every subdomain |
+
+The manager keeps per-application providers: session reuse already works, and application-specific access control is
+not sacrificed. Domain level would remove one redirect per first visit only.
+
+### Why Google can report `redirect_uri_mismatch`
+
+authentik builds the Google callback from the address the browser used. Opening authentik at its local address
+(`http://127.0.0.1:9000`) — earlier versions linked **Open in authentik** there — starts a fresh sign-in with
+`redirect_uri=http://127.0.0.1:9000/source/oauth/callback/google/`, which is not registered with Google. Links now use the
+public address. Never register local or per-application redirect URIs with Google.
+
+### Integration contract for other front ends (e.g. a Claude skill)
+
+Install through the provisioning engine (`/api/provision/import` → `plan` with `auth: "authentik"` → `apply`) or protect an
+existing service with `/api/identity/protect/plan|apply`. Do not create Cloudflare Access applications, Google clients,
+authentik providers or Traefik middlewares directly: the engine creates the provider, binds `DTC owners`, assigns the
+embedded outpost, writes the route with ForwardAuth, verifies it fails closed and leaves Access off. `GET /api/identity`
+returns `launcher[]` (open URL, authentik admin URL, diagnosis) and `POST /api/identity/trace` explains any sign-in
+problem.
 
 ## Recovery
 
@@ -359,7 +439,8 @@ and the checkpoint [provisioning-identity-compatibility.md](provisioning-identit
 | `tests\Test-IdentityLive.ps1` | Disposable instance + authentik installed through the catalog API: bootstrap, readiness, network isolation, adopt, token, sign-in route, outpost, Google source with **synthetic** credentials (redirect check, idempotency, secret never leaks), protect/unprotect, sign-ins through the real outpost (allowed, denied, wrong password, group), access evidence, loop detection, fail closed, interrupted setup, rollback, persistence, bootstrap-only-once, browser (screenshots). Removes everything it created and checks that no other container changed. |
 | `tests\Test-AuthRouting.ps1` | No Docker: browser versus internal addresses, sign-in redirects leaking 127.0.0.1, LAN or Docker-only addresses, the return address after signing in, redaction, the routing model's states for healthy and broken paths (missing or unhealthy authentication endpoint, broken router, missing network, tunnel to localhost, leftover Access), the ForwardAuth probe against a stub outpost, the public sign-in address guard, Access cleanup on turn-off (Cloudflare API mock). |
 | `tests\Test-RoutingBrowser.ps1` | No Docker: the Authentication & Routing page in headless Edge with models from the real model code: link and way back, application selection, both views, failed-stage details, help, Run checks, redaction, 1366 px and 390 px. |
-| `tests\Test-IdentityProtectBrowser.ps1` | No Docker: step 8 and 9 completion (8/8, green checks kept when revisiting), a failing check, a deliberate skip, protecting more applications and removing protection safely. |
+| `tests\Test-IdentityProtectBrowser.ps1` | No Docker: step 8 and 9 completion (8/8, green checks kept when revisiting), a failing check, a deliberate skip, protecting more applications and removing protection safely; the launcher (hostname and Open links, Authentik at the public address, stopped/missing containers, redundant Cloudflare login, Trace, Remove Cloudflare login preview and apply, authentik-only default, 390 px). |
+| `tests\Test-AccessDiagnostics.ps1` | No Docker: Access coverage (exact, path, wildcard, multi-domain, destinations), modes, every diagnosis state, redirect-hop classification, redaction, browser addresses, the layered validation rule. |
 | `tests\Test-IdentityWizardBrowser.ps1` | No Docker, small footprint: the wizard in headless Edge with the authentik side of `/api/identity` answered in the page. Select all / Clear all / count, ticking without the page moving, already protected applications never selectable, exactly the ticked applications sent, review before apply, per-application result, 390 px. Real protection is covered by the live test. |
 | `tests\Test-Provisioning.ps1` | The identity contract: readiness, providers, ForwardAuth suitability, auth choices per access, rollback rules, and the real `Sync-AuthentikAppProtection` / `Remove-AuthentikAppProtection` against an in-memory authentik (preview changes nothing, create, reuse without duplicates, rollback deletes only what the operation created, a reused application is only unassigned). |
 | `node tests\ui-logic.test.js` | Browser-side helpers (state vocabulary, redirect URI, client ID, credential status, next step). |
@@ -371,8 +452,11 @@ and the checkpoint [provisioning-identity-compatibility.md](provisioning-identit
 - Native OpenID Connect for applications is not configured by the manager (ForwardAuth only).
 - The manager uses an authentik administrator's API token; a dedicated service account with a narrower RBAC role is
   possible in authentik but not set up automatically yet.
-- Domain-level ForwardAuth (one sign-in for a whole domain, `forward_domain`) is not offered; every application gets
-  its own provider and rules.
+- Domain-level ForwardAuth (`forward_domain`) is deliberately not offered (see the comparison above); every application
+  gets its own provider and rules, and the authentik session is reused across them.
+- Reading Cloudflare Access applications needs the token's optional *Access: Apps and Policies* permission. WAF,
+  Turnstile, zone security settings and Zero Trust identity providers are not read (the token has no permission for them).
+- `native` (the application's own login) is a mode in the diagnostics; the Services form does not set it yet.
 - Services with more than one hostname cannot be protected yet (authentik identifies an application by one address).
 - The App Catalog's memory check uses Windows' *free* physical memory; on PCs where WSL already reserves most memory it
   can refuse to start authentik (about 1.5 GB) even when Docker has room. The API accepts an explicit override

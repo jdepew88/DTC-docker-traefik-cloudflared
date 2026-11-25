@@ -366,6 +366,11 @@ function ConvertTo-ServiceDefinition($InputObject) {
   if ($target -is [hashtable]) { $target = [pscustomobject]$target }
   $cloudflare = Get-ServiceProperty $InputObject 'cloudflare' $null
   if ($cloudflare -is [hashtable]) { $cloudflare = [pscustomobject]$cloudflare }
+  # Cloudflare Access defaults to on, except for a service protected by authentik: two interactive logins are never a
+  # default (layered authentication is chosen explicitly).
+  $authIn = Get-ServiceProperty $InputObject 'auth' $null
+  if ($authIn -is [hashtable]) { $authIn = [pscustomobject]$authIn }
+  $accessDefault = -not (([string](Get-ServiceProperty $authIn 'provider' '')).Trim().ToLowerInvariant() -eq 'authentik')
 
   $type = ([string](Get-ServiceProperty $target 'type' 'docker')).Trim().ToLowerInvariant()
   $hostValue = ([string](Get-ServiceProperty $target 'host' '')).Trim()
@@ -395,7 +400,7 @@ function ConvertTo-ServiceDefinition($InputObject) {
     middlewares = $middlewares
     cloudflare  = [pscustomobject][ordered]@{
       publish = [bool](Get-ServiceProperty $cloudflare 'publish' $true)
-      access  = [bool](Get-ServiceProperty $cloudflare 'access' $true)
+      access  = [bool](Get-ServiceProperty $cloudflare 'access' $accessDefault)
     }
   }
   # Optional human-readable name ("Notflix"); the name above stays the id. Only stored when set, so registries
@@ -413,6 +418,8 @@ function ConvertTo-ServiceDefinition($InputObject) {
       provider = $authProvider
       endpoint = ([string](Get-ServiceProperty $auth 'endpoint' '')).Trim().TrimEnd('/')
     }
+    # Layered authentication (Cloudflare Access in front of authentik) is a deliberate choice, stored only when made.
+    if ([bool](Get-ServiceProperty $auth 'layered' $false)) { $definition['auth'] | Add-Member -NotePropertyName layered -NotePropertyValue $true }
   }
   # Optional owner of the route (docs/universal-apps.md): the integration or instance that created it, so removing an
   # integration removes only its own routes. Only stored when set, so registries without it are unchanged.
@@ -605,7 +612,9 @@ function Test-ServiceDefinition {
       if (($m -split '@')[0] -match $script:AuthMiddlewareHint) { & $err 'middlewares' "Middleware '$m' looks like another sign-in (ForwardAuth) middleware. Only one sign-in provider may protect a route; remove it or choose 'No additional sign-in'." }
     }
     if ($s.cloudflare.publish -and $s.cloudflare.access) {
-      & $warn 'auth' 'Cloudflare Access and authentik both ask for a login: visitors sign in twice (first Cloudflare, then authentik). Keep both only if you want two separate gates.'
+      # Two interactive gateways are never enabled silently: Cloudflare Access + authentik must be chosen as layered.
+      if ($a.PSObject.Properties['layered'] -and $a.layered) { & $warn 'auth' 'Layered authentication: visitors sign in twice (first Cloudflare Access, then authentik). Chosen explicitly.' }
+      else { & $err 'auth' 'Cloudflare Access and authentik would both ask for a login (two sign-ins). authentik already protects this service: turn off "Require Cloudflare Access", or choose layered authentication explicitly.' }
     }
   }
   if ($s.middlewares -notcontains 'default-headers@file' -and $s.middlewares -notcontains 'default-headers') {
@@ -613,7 +622,7 @@ function Test-ServiceDefinition {
   }
 
   if ($s.cloudflare.publish) {
-    if (-not $s.cloudflare.access) {
+    if (-not $s.cloudflare.access -and -not $s.PSObject.Properties['auth']) {
       & $warn 'cloudflare.access' 'Without Cloudflare Access anyone on the Internet can reach this app. Only do this if the app has its own login.'
     }
     $text = ($n + ' ' + $s.description + ' ' + ($s.hostnames -join ' '))
