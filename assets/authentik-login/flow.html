@@ -1,0 +1,16 @@
+{% extends "if/flow.html" %}
+{% comment %}
+  Deployment Manager (DTC) sign-in experience. Installed as custom-templates/if/flow.html (mounted at /templates) and
+  extends authentik's own if/flow.html, so authentik renders its page unchanged. It adds something only when the
+  brand opted in with the attribute "dtc_login" for exactly this flow, outside recovery sessions (safe mode).
+  Source: assets/authentik-login/ in the Deployment Manager repository. Delete this file to remove it.
+{% endcomment %}
+{% block head %}
+{{ block.super }}
+{% if not safe_mode and brand.attributes.dtc_login and brand.attributes.dtc_login.flowSlug == flow.slug %}
+{{ brand.attributes.dtc_login|json_script:"dtc-login-config" }}
+<script data-id="dtc-login">
+{% include "dtc/login-experience.js" %}
+</script>
+{% endif %}
+{% endblock %}
