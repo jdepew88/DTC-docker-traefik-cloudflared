@@ -60,11 +60,11 @@ Test-Condition 'routed: a redirect to the app''s own login page is "authenticati
 $lo = @(Get-LanTargetIssues '127.0.0.1')
 $lh = @(Get-LanTargetIssues 'localhost')
 Test-Condition 'LAN target: 127.0.0.1 / localhost inside a container is the container itself; host.docker.internal is suggested' ($lo.Count -eq 1 -and $lo[0].state -eq 'failed' -and $lo[0].message -match 'host\.docker\.internal' -and $lh.Count -eq 1) ''
-$own = @(Get-LanTargetIssues '10.10.0.11' @('10.10.0.11', '192.168.56.1') @())
+$own = @(Get-LanTargetIssues '10.20.30.11' @('10.20.30.11', '192.168.56.1') @())
 Test-Condition 'LAN target: this PC''s own LAN address is a warning pointing at host.docker.internal' ($own.Count -eq 1 -and $own[0].state -eq 'warning' -and $own[0].message -match 'host\.docker\.internal') ''
-$cap = @(Get-LanTargetIssues '10.10.0.11' @('10.10.0.11') @([ordered]@{ name = 'unifi-lan_unifi_net'; subnet = '10.10.0.0/24' }, [ordered]@{ name = 'proxynet'; subnet = '172.25.0.0/16' }))
-Test-Condition 'LAN target: an address inside a Docker network''s subnet fails and names that network' (@($cap | Where-Object { $_.state -eq 'failed' -and $_.message -match 'unifi-lan_unifi_net' -and $_.message -match '10\.10\.0\.0/24' }).Count -eq 1) ($cap | ConvertTo-Json -Compress)
-Test-Condition 'LAN target: an ordinary LAN device raises nothing' (@(Get-LanTargetIssues '10.10.0.50' @('10.10.0.11') @([ordered]@{ name = 'proxynet'; subnet = '172.25.0.0/16' })).Count -eq 0) ''
+$cap = @(Get-LanTargetIssues '10.20.30.11' @('10.20.30.11') @([ordered]@{ name = 'unifi-lan_unifi_net'; subnet = '10.20.30.0/24' }, [ordered]@{ name = 'proxynet'; subnet = '172.25.0.0/16' }))
+Test-Condition 'LAN target: an address inside a Docker network''s subnet fails and names that network' (@($cap | Where-Object { $_.state -eq 'failed' -and $_.message -match 'unifi-lan_unifi_net' -and $_.message -match '10.20.30.0/24' }).Count -eq 1) ($cap | ConvertTo-Json -Compress)
+Test-Condition 'LAN target: an ordinary LAN device raises nothing' (@(Get-LanTargetIssues '10.20.30.50' @('10.20.30.11') @([ordered]@{ name = 'proxynet'; subnet = '172.25.0.0/16' })).Count -eq 0) ''
 $sd = Test-ServiceDefinition -Service ([pscustomobject]@{ name = 'loop'; hostnames = @('a.example.com'); target = [pscustomobject]@{ type = 'lan'; host = '127.0.0.1'; port = 80; protocol = 'http' } })
 $sh = Test-ServiceDefinition -Service ([pscustomobject]@{ name = 'hst'; hostnames = @('a.example.com'); target = [pscustomobject]@{ type = 'host'; host = '127.0.0.1'; port = 80; protocol = 'http' } })
 Test-Condition 'validation: a loopback LAN target and a Windows-host target other than host.docker.internal are errors' (@($sd | Where-Object { $_.Level -eq 'Error' -and $_.Field -eq 'target.host' }).Count -eq 1 -and @($sh | Where-Object { $_.Level -eq 'Error' -and $_.Message -match 'host\.docker\.internal' }).Count -eq 1) ''
@@ -74,7 +74,7 @@ $svc = New-Svc 'docker' 'web' 8080
 $probe = { param($Tries) [ordered]@{ performed = $true; tries = @($Tries); timeout = 5; hostname = 'app.example.com' } }
 $closed = ConvertFrom-BackendProbe (& $probe @(New-Try 'http' 'closed')) $svc 'proxynet'
 Test-Condition 'backend: connection refused names a wrong port (inside the container, not the published Windows port)' ($closed[0] -eq 'failed' -and $closed[1] -match 'refused' -and $closed[1] -match 'inside its container') ($closed -join ' ')
-$to = ConvertFrom-BackendProbe (& $probe @(New-Try 'http' 'timeout')) (New-Svc 'lan' '10.10.0.11' 4119) 'proxynet'
+$to = ConvertFrom-BackendProbe (& $probe @(New-Try 'http' 'timeout')) (New-Svc 'lan' '10.20.30.11' 4119) 'proxynet'
 Test-Condition 'backend: a timeout names Docker routing, Windows Firewall and loopback-only listeners' ($to[0] -eq 'failed' -and $to[1] -match 'within 5 seconds' -and $to[1] -match 'Firewall' -and $to[1] -match 'captures') ($to -join ' ')
 $dns = ConvertFrom-BackendProbe (& $probe @(New-Try 'http' 'error' 0 'The container name does not resolve on that network.')) $svc 'proxynet'
 Test-Condition 'backend: a name that does not resolve points at the shared network' ($dns[0] -eq 'failed' -and $dns[1] -match "not attached to 'proxynet'") ($dns -join ' ')

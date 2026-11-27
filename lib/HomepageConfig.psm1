@@ -102,7 +102,7 @@ function New-HomepageCards {
     if ($type -eq 'docker' -and $appNames -contains $h) { continue }
     $name = [string](Get-Prop3 $p 'displayName' (Get-Prop3 $p 'name' ''))
     if ($name -cmatch '^[a-z]') { $name = $name.Substring(0, 1).ToUpper() + $name.Substring(1) }
-    $card = [ordered]@{ group = $(if ([string]$p.name -match 'notflix|jellyfin|plex|emby') { 'Media' } else { 'Other services' }); name = $name; icon = $(if ([string]$p.name -match 'prowlarr') { 'prowlarr.png' } else { 'mdi-web' }) }
+    $card = [ordered]@{ group = $(if ([string]$p.name -match 'media|jellyfin|plex|emby') { 'Media' } else { 'Other services' }); name = $name; icon = $(if ([string]$p.name -match 'prowlarr') { 'prowlarr.png' } else { 'mdi-web' }) }
     switch ($type) {
       'lan' { $card.href = "${proto}://${h}:$port/"; $card.siteMonitor = "${proto}://${h}:$port"; $card.description = "LAN device $h" }
       'host' { $card.href = "${proto}://127.0.0.1:$port/"; $card.siteMonitor = "${proto}://${h}:$port"; $card.description = 'Not installed by the App Catalog' }

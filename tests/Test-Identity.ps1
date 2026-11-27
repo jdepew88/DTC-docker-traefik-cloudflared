@@ -81,9 +81,9 @@ try {
   }
 
   # --- Google values ----------------------------------------------------------------------------------------------------------
-  $gv = Get-GoogleOAuthSettings -PublicUrl 'https://auth.jrtechconsult.com/' -Slug 'google' -Domain 'jrtechconsult.com'
-  Test-Condition 'google: redirect URI derived from the public URL and slug' ($gv.RedirectUri -eq 'https://auth.jrtechconsult.com/source/oauth/callback/google/') $gv.RedirectUri
-  Test-Condition 'google: Web application client, authorized domain, minimal identity scopes only' ($gv.ClientType -eq 'Web application' -and $gv.AuthorizedDomain -eq 'jrtechconsult.com' -and (@($gv.ScopeNames) -join ',') -eq 'openid,email,profile' -and -not @($gv.Scopes | Where-Object { $_ -match 'gmail|drive|calendar|cloud-platform' }).Count) ''
+  $gv = Get-GoogleOAuthSettings -PublicUrl 'https://auth.example.com/' -Slug 'google' -Domain 'example.com'
+  Test-Condition 'google: redirect URI derived from the public URL and slug' ($gv.RedirectUri -eq 'https://auth.example.com/source/oauth/callback/google/') $gv.RedirectUri
+  Test-Condition 'google: Web application client, authorized domain, minimal identity scopes only' ($gv.ClientType -eq 'Web application' -and $gv.AuthorizedDomain -eq 'example.com' -and (@($gv.ScopeNames) -join ',') -eq 'openid,email,profile' -and -not @($gv.Scopes | Where-Object { $_ -match 'gmail|drive|calendar|cloud-platform' }).Count) ''
   $gv2 = Get-GoogleOAuthSettings -PublicUrl 'https://login.example.org' -Slug 'gws'
   Test-Condition 'google: nothing is hard-coded to one domain' ($gv2.RedirectUri -eq 'https://login.example.org/source/oauth/callback/gws/' -and $gv2.AppName -match 'login.example.org' -and $gv2.AuthorizedDomain -eq 'example.org') ($gv2 | ConvertTo-Json -Compress)
   Test-Condition 'google: client ID and secret shapes' ((Test-GoogleClientId '123456789012-abcdefgh12345678.apps.googleusercontent.com') -and -not (Test-GoogleClientId 'abc.apps.googleusercontent.com') -and -not (Test-GoogleClientId '1234567-x.apps.googleusercontent.com.evil.com') -and (Test-GoogleClientSecret 'GOCSPX-abcdefghijklmnop_1234') -and -not (Test-GoogleClientSecret 'bad secret with spaces')) ''
@@ -110,8 +110,8 @@ try {
   $ep = ConvertFrom-GoogleClientJson -Json (& $j $w4) -ExpectedRedirectUri $redir
   Test-Condition 'json import: non-Google endpoints are refused' (-not $ep.Ok -and (@($ep.Errors) -join ' ') -match 'token endpoint') ''
   Test-Condition 'json import: oversized input is refused; the secret is never part of an error message' (-not (ConvertFrom-GoogleClientJson -Json ('x' * 30000)).Ok -and -not (@($wrong.Errors + $nosec.Errors + $ep.Errors) -join ' ' -match 'unitTestSecretValue')) ''
-  $gvA = Get-GoogleOAuthSettings -PublicUrl 'https://auth.jrtechconsult.com' -Domain 'jrtechconsult.com'
-  Test-Condition 'google: one ASCII application name is used for the app and the client' ($gvA.AppName -eq 'jrtechconsult.com Sign-in' -and $gvA.ClientName -eq $gvA.AppName -and $gvA.AppName -match '^[A-Za-z0-9 ._-]+$') $gvA.AppName
+  $gvA = Get-GoogleOAuthSettings -PublicUrl 'https://auth.example.com' -Domain 'example.com'
+  Test-Condition 'google: one ASCII application name is used for the app and the client' ($gvA.AppName -eq 'example.com Sign-in' -and $gvA.ClientName -eq $gvA.AppName -and $gvA.AppName -match '^[A-Za-z0-9 ._-]+$') $gvA.AppName
 
   # --- Initial owner (no user lists in the manager) ---------------------------------------------------------------------------
   Test-Condition 'owner: the address is normalized; quotes and code are rejected (no injection into the policy)' ((ConvertTo-OwnerEmail ' Owner@Example.COM ') -eq 'owner@example.com' -and $(try { $null = ConvertTo-OwnerEmail 'x"; return True #@a.com'; $false } catch { $true }) -and $(try { $null = ConvertTo-OwnerEmail 'not-an-email'; $false } catch { $true })) ''
@@ -160,7 +160,7 @@ try {
   $m3 = Get-IdentityModel -Facts ($base + @{ google = @{ clientId = '1-x.apps.googleusercontent.com'; source = $src; redirect = [pscustomobject]@{ ok = $true; message = 'ok' }; verifiedAt = '' }; apps = @() })
   Test-Condition 'model: a configured Google source that redirects correctly is "configured", never "verified" without a real sign-in' ((& $st $m3 'google') -eq 'configured' -and (& $co $m3 'google-login') -eq 'awaiting-user' -and (& $co $m3 'google-callback') -eq 'configured') ''
   Test-Condition 'model: saved route + DNS is "configured" until the public address is checked' ((& $st $m3 'hostname') -eq 'configured' -and (& $co $m3 'outpost') -eq 'configured') ''
-  $m4 = Get-IdentityModel -Facts ($base + @{ publicCheck = @{ state = 'ok'; message = 'answers' }; google = @{ source = $src; redirect = [pscustomobject]@{ ok = $true; message = 'ok' }; verifiedAt = '2026-10-25T10:00:00'; verifiedBy = 'joe' }; apps = @() })
+  $m4 = Get-IdentityModel -Facts ($base + @{ publicCheck = @{ state = 'ok'; message = 'answers' }; google = @{ source = $src; redirect = [pscustomobject]@{ ok = $true; message = 'ok' }; verifiedAt = '2026-10-25T10:00:00'; verifiedBy = 'owner' }; apps = @() })
   Test-Condition 'model: Google is verified only with sign-in evidence; the public address only after its check' ((& $st $m4 'google') -eq 'verified' -and (& $st $m4 'hostname') -eq 'verified') ''
   $m5 = Get-IdentityModel -Facts ($base + @{ google = @{ source = $src; redirect = [pscustomobject]@{ ok = $false; message = 'redirect URI mismatch' } } })
   Test-Condition 'model: a wrong redirect URI fails the Google step' ((& $st $m5 'google') -eq 'failed') ''
@@ -249,9 +249,9 @@ try {
   Import-Module (Join-Path $repo 'lib\ConfigBackup.psm1') -Force
   $bk = Read-IdentityConfig -Settings $settings
   $bk.provider = 'authentik'; $bk.authentik.hostname = 'auth.example.com'; $bk.authentik.google.clientId = '123456789012-abcdefgh12345678.apps.googleusercontent.com'
-  $bk.authentik.google.verifiedAt = '2026-10-25T10:00:00'; $bk.authentik.google.verifiedBy = 'joe'
+  $bk.authentik.google.verifiedAt = '2026-10-25T10:00:00'; $bk.authentik.google.verifiedBy = 'owner'
   $bk.authentik.owner.email = 'Owner@Example.com'; $bk.authentik.owner.verifiedAt = '2026-10-25T10:00:00'; $bk.authentik.owner.username = 'owner'
-  Set-IdentityApp $bk 'wiki' ([pscustomobject]@{ slug = 'dm-wiki'; initialAccess = 'owner-only'; verifiedAt = '2026-10-25T10:00:00'; verifiedBy = 'joe' })
+  Set-IdentityApp $bk 'wiki' ([pscustomobject]@{ slug = 'dm-wiki'; initialAccess = 'owner-only'; verifiedAt = '2026-10-25T10:00:00'; verifiedBy = 'owner' })
   Save-IdentityConfig -Settings $settings -Config $bk
   $man = Get-ConfigManifest -Settings $settings -SourceRoot $repo
   $mj = ConvertTo-ManifestJson $man

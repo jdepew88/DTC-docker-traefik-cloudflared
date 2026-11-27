@@ -13,7 +13,7 @@
   const WHERE_TEXT = {
     docker: ['Docker container', 'box', 'Connect to an application running in Docker using its container network name and internal port.', 'http://uptime-kuma:3001'],
     'this-computer': ['Application on this computer', 'monitor', 'Connect to an HTTP application running directly on this Windows computer.', 'http://host.docker.internal:80'],
-    lan: ['Another computer or network device', 'server', 'Connect to an HTTP application using an IP address or hostname on your network.', 'http://10.10.0.8:8080'],
+    lan: ['Another computer or network device', 'server', 'Connect to an HTTP application using an IP address or hostname on your network.', 'http://10.20.30.8:8080'],
   };
   const EXPLAIN = {
     docker: 'Traefik reaches an app in Docker by its container name and the port the app listens on inside the container. No Windows address is involved.',
@@ -244,7 +244,7 @@
         field({ id: 'svc-container-name', label: 'Container name or network alias', control: name, minLevel: 'advanced' }),
         field({ id: 'svc-port', label: 'Port inside the container', control: port, hint: 'The port the app listens on inside its container, not a port published on Windows.' }));
     } else {
-      const addr = h('input', { value: f.address, autocomplete: 'off', spellcheck: 'false', placeholder: f.where === 'lan' ? '10.10.0.8 or nas.home.arpa' : 'host.docker.internal, this PC\'s LAN address, or just the port' });
+      const addr = h('input', { value: f.address, autocomplete: 'off', spellcheck: 'false', placeholder: f.where === 'lan' ? '10.20.30.8 or nas.home.arpa' : 'host.docker.internal, this PC\'s LAN address, or just the port' });
       addr.addEventListener('input', () => {
         f.address = addr.value.trim();
         const p = L.parseBackendAddress(f.address);
@@ -261,7 +261,7 @@
     protoSel.addEventListener('change', () => { f.protocol = protoSel.value; f.touched.protocol = true; rerender(); });
     const customOn = h('input', { type: 'checkbox', checked: f.override });
     const customErr = h('p', { class: 'form-error small', id: 'svc-custom-error', role: 'status' });
-    const custom = h('input', { value: f.custom, autocomplete: 'off', spellcheck: 'false', placeholder: 'http://10.10.0.8:8080', disabled: !f.override, 'aria-describedby': 'svc-custom-error' });
+    const custom = h('input', { value: f.custom, autocomplete: 'off', spellcheck: 'false', placeholder: 'http://10.20.30.8:8080', disabled: !f.override, 'aria-describedby': 'svc-custom-error' });
     const showCustomError = () => { const p = f.override && f.custom ? L.parseBackendUrl(f.custom) : null; customErr.textContent = p && !p.ok ? p.error : ''; };
     customOn.addEventListener('change', () => {
       f.override = customOn.checked; custom.disabled = !f.override;
@@ -277,6 +277,6 @@
         field({ id: 'svc-protocol', label: 'Protocol to the app', control: protoSel, helpId: 'ports-protocols', hint: 'Usually http: Cloudflare already encrypts the public side, and Traefik talks to the app inside your network.' }),
         h('div', { class: 'field' }, h('label', { class: 'check' }, customOn, h('span', null, 'Use a custom backend URL')),
           Object.assign(custom, { id: 'svc-custom', 'aria-label': 'Custom backend URL' }), customErr,
-          h('p', { class: 'hint' }, 'A complete URL with protocol, host and port, e.g. http://10.10.0.8:8080. Kept exactly as typed; test it before saving. 127.0.0.1 is never accepted: inside Traefik it is Traefik.')))));
+          h('p', { class: 'hint' }, 'A complete URL with protocol, host and port, e.g. http://10.20.30.8:8080. Kept exactly as typed; test it before saving. 127.0.0.1 is never accepted: inside Traefik it is Traefik.')))));
   };
 })();

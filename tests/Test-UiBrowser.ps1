@@ -162,13 +162,13 @@ try {
   $null = Js "document.querySelector('input[name=detail-level][value=advanced]').click(); true"
   $null = Wait-PageCondition $cdp "document.querySelector('#wiz-TUNNEL_SUBNET')" 10; Prepare-Page
   Test-Condition 'Advanced: network, subnet and static address fields are shown' ((Js "__t.visible('#wiz-TUNNEL_SUBNET')") -and (Js "__t.visible('#wiz-CLOUDFLARED_IP')") -and (Js "__t.visible('#wiz-PROXY_NETWORK')")) ''
-  $null = Js "__t.set('#wiz-STACK_NAME', 'traefik-ext1'); true"
+  $null = Js "__t.set('#wiz-STACK_NAME', 'traefik-home'); true"
   $sub1 = [string](Js "document.querySelector('#dash-sub').value"); $prev1 = [string](Js "document.querySelector('#dash-preview').textContent")
   $null = Js "__t.set('#dash-sub', 'admin'); __t.set('#wiz-STACK_NAME', 'traefik-ext2'); true"
   $sub2 = [string](Js "document.querySelector('#dash-sub').value")
   $null = Js "__t.click('Reset to automatic', document.querySelector('#step-3')); true"; Prepare-Page
   $sub3 = [string](Js "document.querySelector('#dash-sub').value")
-  Test-Condition 'naming: dashboard hostname follows the instance name, a manual edit is kept, reset restores it' ($sub1 -eq 'traefik-ext1' -and $prev1 -eq 'https://traefik-ext1.example.test/dashboard/' -and $sub2 -eq 'admin' -and $sub3 -eq 'traefik-ext2') "$sub1 $prev1 $sub2 $sub3"
+  Test-Condition 'naming: dashboard hostname follows the instance name, a manual edit is kept, reset restores it' ($sub1 -eq 'traefik-home' -and $prev1 -eq 'https://traefik-home.example.test/dashboard/' -and $sub2 -eq 'admin' -and $sub3 -eq 'traefik-ext2') "$sub1 $prev1 $sub2 $sub3"
   $sugg = Invoke-WebUi $ui POST '/api/setup/suggest' @{}
   $null = Js "__t.set('#wiz-STACK_NAME', '$($sugg.Data.settings.STACK_NAME)'); __t.set('#dash-sub', 'traefik-dash'); __t.click('Save settings', document.querySelector('#step-3')); true"
   $ok = Wait-PageCondition $cdp "document.querySelector('#step-3 .step-summary').innerText.includes('Instance ')" 30
@@ -290,11 +290,11 @@ try {
     Go 'services' "document.querySelector('main h1') && document.querySelector('main h1').textContent === 'Services'"; Prepare-Page
     $null = Js "location.hash = '#services/add'; true"
     $null = Wait-PageCondition $cdp "document.querySelector('#svc-display')" 10; Prepare-Page
-    $null = Js "__t.set('#svc-display', 'Notflix'); true"
+    $null = Js "__t.set('#svc-display', 'Mediabox'); true"
     $s1 = [string](Js "document.querySelector('#svc-sub').value")
-    $null = Js "__t.set('#svc-sub', 'movies'); __t.set('#svc-display', 'Notflix HD'); true"
+    $null = Js "__t.set('#svc-sub', 'movies'); __t.set('#svc-display', 'Mediabox HD'); true"
     $s2 = [string](Js "document.querySelector('#svc-sub').value"); $disp = [string](Js "document.querySelector('#svc-display').value")
-    Test-Condition 'services: subdomain suggested from the display name; a manual subdomain survives later name changes' ($s1 -eq 'notflix' -and $s2 -eq 'movies' -and $disp -eq 'Notflix HD') "$s1 $s2 $disp"
+    Test-Condition 'services: subdomain suggested from the display name; a manual subdomain survives later name changes' ($s1 -eq 'mediabox' -and $s2 -eq 'movies' -and $disp -eq 'Mediabox HD') "$s1 $s2 $disp"
     # How should Traefik connect to this application? Another device: its address is kept as typed, without a local-host warning.
     Test-Condition 'wizard: "How should Traefik connect to this application?" offers a Docker container, this computer and another device' ([int](Js "document.querySelectorAll('input[name=svc-where]').length") -eq 3 -and [string](Js "document.querySelector('[role=radiogroup][aria-label=\'How should Traefik connect to this application?\']') ? 'yes' : ''") -eq 'yes') ''
     $null = Js "document.querySelector('input[name=svc-where][value=lan]').click(); true"
@@ -303,8 +303,8 @@ try {
     $ok = Wait-PageCondition $cdp "document.querySelector('#svc-backend').innerText.includes('http://10.99.0.5:4119')" 60; Prepare-Page
     Test-Condition 'wizard: another device keeps its own address (10.99.0.5:4119) with no local-host warning' ($ok -and -not [bool](Js "!!document.querySelector('[data-guidance=loopback], [data-guidance=own-lan-ip]')")) ([string](Js "document.querySelector('#svc-backend').innerText"))
     $null = Js "document.querySelector('#svc-display').closest('form').requestSubmit(); true"
-    $ok = Wait-PageCondition $cdp "document.querySelector('#plan-dialog').open && document.querySelector('#plan-title').textContent.includes('notflix')" 90; Prepare-Page
-    Test-Condition 'services: Preview opens the change dialog (Traefik diff, nothing applied yet)' ($ok -and -not (Test-Path -LiteralPath (Join-Path $pathB 'traefik\dynamic\svc-notflix.yml'))) ([string](Js "document.querySelector('#plan-title').textContent"))
+    $ok = Wait-PageCondition $cdp "document.querySelector('#plan-dialog').open && document.querySelector('#plan-title').textContent.includes('mediabox')" 90; Prepare-Page
+    Test-Condition 'services: Preview opens the change dialog (Traefik diff, nothing applied yet)' ($ok -and -not (Test-Path -LiteralPath (Join-Path $pathB 'traefik\dynamic\svc-mediabox.yml'))) ([string](Js "document.querySelector('#plan-title').textContent"))
     $planText = [string](Js "document.querySelector('#plan-content').innerText")
     Test-Condition 'preview: the connection test from Traefik is shown; a backend that does not answer is not green and needs an explicit "Save the route anyway"' ($planText -match 'Connection test from Traefik' -and $planText -match 'Timeout' -and [bool](Js "!!document.querySelector('#plan-backend-ack')") -and [bool](Js "(() => { document.querySelector('#plan-reviewed').click(); const b = __t.btn('Apply changes', document.querySelector('#plan-dialog')); const d = b.disabled; document.querySelector('#plan-reviewed').click(); return d; })()")) $planText.Substring(0, [Math]::Min(600, $planText.Length))
     Shot 'services-preview-1366'
@@ -313,9 +313,9 @@ try {
     $null = Js "document.querySelector('#plan-dialog').close(); true"
     Go 'services' "document.querySelector('tbody tr')"; Prepare-Page
     $row = [string](Js "document.querySelector('tbody tr').innerText")
-    Test-Condition 'services: applied; the list shows the display name and the manual hostname' ($ok -and $row -match 'Notflix HD' -and $row -match 'movies\.example\.test') $row
+    Test-Condition 'services: applied; the list shows the display name and the manual hostname' ($ok -and $row -match 'Mediabox HD' -and $row -match 'movies\.example\.test') $row
     $reg = Get-Content -Raw (Join-Path $pathB 'config\services.json') | ConvertFrom-Json
-    Test-Condition 'services: registry keeps id (from the name), display name and the manual hostname separately' ($reg.services[0].name -eq 'notflix-hd' -and $reg.services[0].displayName -eq 'Notflix HD' -and $reg.services[0].hostnames[0] -eq 'movies.example.test') ($reg | ConvertTo-Json -Depth 5 -Compress)
+    Test-Condition 'services: registry keeps id (from the name), display name and the manual hostname separately' ($reg.services[0].name -eq 'mediabox-hd' -and $reg.services[0].displayName -eq 'Mediabox HD' -and $reg.services[0].hostnames[0] -eq 'movies.example.test') ($reg | ConvertTo-Json -Depth 5 -Compress)
 
     # Edit Service: the saved backend is kept and shown; the location question is preselected.
     $null = Js "__t.click('Edit', document.querySelector('tbody tr')); true"

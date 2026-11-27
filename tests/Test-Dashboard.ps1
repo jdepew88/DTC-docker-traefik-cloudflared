@@ -67,9 +67,9 @@ $mock = $null; $ui = $null
 
 try {
   # --- Route generation and Traefik validation ------------------------------------------------------------------
-  $yaml = ConvertTo-DashboardRouteYaml 'traefik-ext1.jrtechconsult.com'
+  $yaml = ConvertTo-DashboardRouteYaml 'traefik-home.example.com'
   Test-Condition 'route: Host + /dashboard + /api to api@internal on the web entry point, Access header required' (
-    $yaml -match [regex]::Escape("rule: 'Host(``traefik-ext1.jrtechconsult.com``) && (PathPrefix(``/dashboard``) || PathPrefix(``/api``)) && HeaderRegexp(``Cf-Access-Jwt-Assertion``, ``.+``)'") -and
+    $yaml -match [regex]::Escape("rule: 'Host(``traefik-home.example.com``) && (PathPrefix(``/dashboard``) || PathPrefix(``/api``)) && HeaderRegexp(``Cf-Access-Jwt-Assertion``, ``.+``)'") -and
     $yaml -match 'service: api@internal' -and $yaml -match 'entryPoints: \[web\]' -and $yaml -notmatch 'entryPoints: \[traefik\]' -and $yaml -match "replacement: '/dashboard/'") $yaml
   $null = New-TestInstance -Repo $repo -Path $path -StackName $stack
   $settings = Get-StackSettings -InstallPath $path
@@ -78,7 +78,7 @@ try {
     $deep = Test-TraefikDynamicConfig -Settings $settings -ExtraFiles @{ 'admin-dashboard.yml' = (ConvertTo-DashboardRouteYaml $hostname) } -ExpectRouters @('public-dashboard@file', 'public-dashboard-root@file')
     Test-Condition 'route: Traefik accepts it (throwaway container), local dashboard router unchanged' ($deep.Ok -and @($deep.Routers | Where-Object { $_.Name -eq 'public-dashboard@file' }).Count -eq 1) (@($deep.Errors) -join ' | ')
   } else { Add-Result 'SKIP' 'route: Traefik accepts it' 'Docker is not running' }
-  Test-Condition 'default subdomain is the instance name' ((Get-DashboardDefaultSubdomain (ConvertTo-StackSettings -InstallPath $path -Values @{ STACK_NAME = 'traefik-ext1' })) -eq 'traefik-ext1') ''
+  Test-Condition 'default subdomain is the instance name' ((Get-DashboardDefaultSubdomain (ConvertTo-StackSettings -InstallPath $path -Values @{ STACK_NAME = 'traefik-home' })) -eq 'traefik-home') ''
 
   $mock = Start-CloudflareMock -Repo $repo -WorkDir $work -Token $apiToken
   $ui = Start-WebUiServer -Script (Join-Path $repo 'webui.ps1') -InstallPath $path -WorkDir $work -ApiBase $mock.Base

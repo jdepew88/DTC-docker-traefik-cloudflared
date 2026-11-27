@@ -45,14 +45,14 @@ $apps = @(
 $states = @{ 'traefik-manager' = @{ running = 1; total = 1 }; portainer = @{ running = 1; total = 1 }; homepage = @{ running = 1; total = 1 }; kuma = @{ running = 0; total = 1 }
   lldap = @{ running = 1; total = 1 }; rc = @{ running = 3; total = 4 } }
 $published = @(
-  [pscustomobject]@{ name = 'notflix'; enabled = $true; hostnames = @('notflix.example.com'); target = [pscustomobject]@{ type = 'lan'; host = '10.10.0.11'; port = 4119; protocol = 'http' }; verified = @{ 'notflix.example.com' = $false } },
+  [pscustomobject]@{ name = 'mediabox'; enabled = $true; hostnames = @('mediabox.example.com'); target = [pscustomobject]@{ type = 'lan'; host = '10.20.30.11'; port = 4119; protocol = 'http' }; verified = @{ 'mediabox.example.com' = $false } },
   [pscustomobject]@{ name = 'homepage'; enabled = $true; hostnames = @('home.example.com'); target = [pscustomobject]@{ type = 'docker'; host = 'homepage'; port = 3000; protocol = 'http' }; verified = @{ 'home.example.com' = $true } }
 )
 $infra = @{ traefikContainer = 'x-traefik'; dashboardUrl = 'http://127.0.0.1:8181/dashboard/'; managerUrl = 'http://127.0.0.1:8190/'; tunnelName = 'x tunnel' }
 $cards = New-HomepageCards -Apps $apps -States $states -Manifests $manifests -Published $published -Infra $infra -NotInstalled @('jellyfin', 'channels-dvr', 'immich')
 
 $tm = Find-Card $cards 'Traefik Manager'; $po = Find-Card $cards 'Portainer CE'; $im = Find-Card $cards 'Immich'; $ku = Find-Card $cards 'Uptime Kuma'
-$ld = Find-Card $cards 'LLDAP (directory)'; $rc = Find-Card $cards 'Rocket.Chat'; $jf = Find-Card $cards 'Jellyfin'; $nf = Find-Card $cards 'Notflix'
+$ld = Find-Card $cards 'LLDAP (directory)'; $rc = Find-Card $cards 'Rocket.Chat'; $jf = Find-Card $cards 'Jellyfin'; $nf = Find-Card $cards 'Mediabox'
 Test-Condition 'cards: a running app links to its local URL and is checked on the shared network (declared status port)' ($tm.href -eq 'http://127.0.0.1:5000/' -and $tm.siteMonitor -eq 'http://traefik-manager:5000' -and $po.siteMonitor -eq 'http://portainer:9000' -and $tm.group -eq 'Infrastructure') ($tm | ConvertTo-Json -Compress)
 Test-Condition 'cards: a prepared app has no link and no status check (never shown as up)' (-not $im.Contains('href') -and -not $im.Contains('siteMonitor') -and $im.description -match 'Prepared') ($im | ConvertTo-Json -Compress)
 Test-Condition 'cards: a stopped app is marked stopped, without link or status check' ($ku.description -eq 'Stopped' -and -not $ku.Contains('siteMonitor') -and -not $ku.Contains('href')) ($ku | ConvertTo-Json -Compress)
@@ -60,7 +60,7 @@ Test-Condition 'cards: an app kept off the shared network (LLDAP) gets no status
 Test-Condition 'cards: a partly running multi-service app says so and checks its web container' ($rc.description -match 'Partly running \(3 of 4\)' -and $rc.siteMonitor -eq 'http://rc-rocketchat:3000') ($rc | ConvertTo-Json -Compress)
 Test-Condition 'cards: not-installed apps are listed without link; an installed one is not listed twice; Homepage has no card of its own' (-not $jf.Contains('href') -and $jf.description -match 'Not installed' -and @($cards | Where-Object { $_.name -eq 'Immich' }).Count -eq 1 -and -not (Find-Card $cards 'Homepage') -and -not (Find-Card $cards 'Arcane')) ''
 Test-Condition 'cards: Traefik dashboard (status + read-only widget), Deployment Manager and tunnel (no unverifiable status)' ((Find-Card $cards 'Traefik Dashboard').widget.type -eq 'traefik' -and (Find-Card $cards 'Traefik Dashboard').siteMonitor -eq 'http://x-traefik:8080/ping' -and -not (Find-Card $cards 'Cloudflare Tunnel').Contains('siteMonitor') -and -not (Find-Card $cards 'Deployment Manager').Contains('siteMonitor')) ''
-Test-Condition 'cards: a published LAN service gets its LAN link and check; a published installed app is not added twice' ($nf.href -eq 'http://10.10.0.11:4119/' -and $nf.siteMonitor -eq 'http://10.10.0.11:4119' -and $nf.group -eq 'Media' -and @($nf.publicHosts).Count -eq 0 -and @($cards | Where-Object { $_.name -eq 'Homepage' }).Count -eq 0) ($nf | ConvertTo-Json -Compress)
+Test-Condition 'cards: a published LAN service gets its LAN link and check; a published installed app is not added twice' ($nf.href -eq 'http://10.20.30.11:4119/' -and $nf.siteMonitor -eq 'http://10.20.30.11:4119' -and $nf.group -eq 'Media' -and @($nf.publicHosts).Count -eq 0 -and @($cards | Where-Object { $_.name -eq 'Homepage' }).Count -eq 0) ($nf | ConvertTo-Json -Compress)
 
 # --- Merging -------------------------------------------------------------------------------------------------------------
 $legacy = "# Apps installed by the Deployment Manager when Homepage was installed. Edit freely; it is never overwritten.`n# Status checks (siteMonitor) use the shared Docker network; no Docker socket is used.`n- Apps:`n    - `"Traefik Manager`":`n        href: http://127.0.0.1:5000/`n        siteMonitor: http://traefik-manager:5000`n    - `"Portainer CE`":`n        href: https://127.0.0.1:9443/`n"
@@ -78,7 +78,7 @@ $custom2 = "# hand-written, mentions the old header later`n- Apps:`n    - `"Trae
 Test-Condition 'merge: a hand-written file is never taken over' (-not (Merge-HomepageServices $custom2 $cards).adopted) ''
 Test-Condition 'merge: no secrets, tokens or API keys in the generated text' ($m1.text -notmatch '(?i)(password|token|secret|api[_-]?key|key)\s*:') $m1.text
 $bm = Merge-HomepageBookmarks "[]`n" $cards @{ Homepage = @('home.example.com') }
-Test-Condition 'bookmarks: only verified public addresses; the default [] is replaced' ($bm.text -match 'https://home\.example\.com/' -and $bm.text -notmatch 'notflix' -and $bm.text -notmatch '(?m)^\[\]') $bm.text
+Test-Condition 'bookmarks: only verified public addresses; the default [] is replaced' ($bm.text -match 'https://home\.example\.com/' -and $bm.text -notmatch 'mediabox' -and $bm.text -notmatch '(?m)^\[\]') $bm.text
 $wg = Merge-HomepageWidgets "- greeting:`n    text: Home lab`n"
 $wg2 = Merge-HomepageWidgets "- resources:`n    cpu: true`n"
 Test-Condition 'widgets: a resources widget is added once, and not when the user has one' ($wg.text -match '- resources:' -and $wg.text.StartsWith('- greeting:') -and ([regex]::Matches($wg2.text, '- resources:')).Count -eq 1) "$($wg.text) | $($wg2.text)"

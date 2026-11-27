@@ -33,7 +33,7 @@ $script:MaxArchiveBytes = 8MB
 $script:MaxArchiveEntries = 200
 # traefik\dynamic files that come from the manager package (never restored from a backup) or are generated.
 $script:PackageDynamicFiles = @('security.yml', 'dashboard.yml')
-$script:ConfigFiles = @('config\services.json', 'config\cloudflare.json', 'config\setup.json', 'config\dashboard.json', 'config\identity.json', 'config\applications.json', 'config\managers.json', 'config\login-experience.json')
+$script:ConfigFiles = @('config\services.json', 'config\cloudflare.json', 'config\setup.json', 'config\dashboard.json', 'config\identity.json', 'config\applications.json', 'config\managers.json')
 # Configuration files restored as whole files (created when missing here; an existing file is kept and reported).
 $script:RestorableConfig = @('config\applications.json', 'config\managers.json')
 # The application contract version this manager reads (same value as $ContractVersion in lib\AppContract.psm1).
@@ -284,7 +284,6 @@ function New-ConfigBackupArchive {
       'config\identity.json' { 'Identity & Access choices (no secrets)' }
       'config\applications.json' { 'Application registry: integrated and observed applications, their routes and protection (no secrets)' }
       'config\managers.json' { 'Portainer / Arcane connectors: addresses only (API keys are not exported)' }
-      'config\login-experience.json' { 'Sign-in page settings: Google button text and picture shortcut points (no secrets)' }
       'traefik\dynamic\svc-*' { 'Generated route (regenerated from the service registry on restore)' }
       'traefik\dynamic\admin-dashboard.yml' { 'Generated public dashboard route (written again only after Access is confirmed)' }
       'traefik\dynamic\security.yml' { 'Package file (comes from the installed manager on restore)' }

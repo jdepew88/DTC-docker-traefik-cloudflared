@@ -78,11 +78,11 @@ $infra = ConvertFrom-DockerInspect ('{"Id":"a","Name":"/x-traefik","Config":{"Im
 $who = ConvertFrom-DockerInspect ('{"Id":"b","Name":"/who","Config":{"Image":"traefik/whoami:v1.12.0"},"State":{"Status":"running"},"NetworkSettings":{}}' | ConvertFrom-Json)
 Test-Condition 'inspect: reverse proxies and tunnel connectors are infrastructure; whoami is an application' ($infra.infrastructure -and -not $who.infrastructure) ''
 
-$services = @([pscustomobject]@{ name = 'notflix'; hostnames = @('notflix.example.com') })
-$routers = @([pscustomobject]@{ name = 'manual@file'; rule = 'Host(`manual.example.com`)'; provider = 'file' }, [pscustomobject]@{ name = 'svc-notflix@file'; rule = 'Host(`notflix.example.com`)'; provider = 'file' })
-$claims = @(Find-HostnameClaims -Hostname 'notflix.example.com' -Services $services -Routers $routers -Containers @($c))
+$services = @([pscustomobject]@{ name = 'mediabox'; hostnames = @('mediabox.example.com') })
+$routers = @([pscustomobject]@{ name = 'manual@file'; rule = 'Host(`manual.example.com`)'; provider = 'file' }, [pscustomobject]@{ name = 'svc-mediabox@file'; rule = 'Host(`mediabox.example.com`)'; provider = 'file' })
+$claims = @(Find-HostnameClaims -Hostname 'mediabox.example.com' -Services $services -Routers $routers -Containers @($c))
 Test-Condition 'claims: a hostname of another registry service is an error' (@($claims).Count -eq 1 -and $claims[0].source -eq 'registry' -and $claims[0].level -eq 'error') ($claims | ConvertTo-Json -Compress)
-Test-Condition 'claims: editing the owning service itself is not a conflict' (@(Find-HostnameClaims -Hostname 'notflix.example.com' -Services $services -Routers $routers -OwnService 'notflix').Count -eq 0) ''
+Test-Condition 'claims: editing the owning service itself is not a conflict' (@(Find-HostnameClaims -Hostname 'mediabox.example.com' -Services $services -Routers $routers -OwnService 'mediabox').Count -eq 0) ''
 $m = @(Find-HostnameClaims -Hostname 'MANUAL.example.com' -Services $services -Routers $routers)
 Test-Condition 'claims: a router of another provider in this Traefik is an error (case-insensitive)' (@($m).Count -eq 1 -and $m[0].source -eq 'traefik:file' -and $m[0].level -eq 'error') ($m | ConvertTo-Json -Compress)
 $l = @(Find-HostnameClaims -Hostname 'prow.example.com' -Containers @($c))

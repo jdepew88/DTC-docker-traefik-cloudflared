@@ -18,10 +18,10 @@
   tests run short-lived, read-only probe containers in Traefik's network namespace.
 
 .PARAMETER AppAddress
-  This computer's LAN address of an HTTP app running directly on Windows (e.g. HFS on 10.10.0.11:80).
+  This computer's LAN address of an HTTP app running directly on Windows (e.g. HFS on 10.20.30.11:80).
 
 .EXAMPLE
-  powershell -ExecutionPolicy Bypass -File .\tests\Test-WizardBrowser.ps1 -InstallPath $env:USERPROFILE\.docker\projects\traefik-proxy -AppAddress 10.10.0.11 -AppPort 80 -Subdomain files -ScreenshotDir .\wizard-shots
+  powershell -ExecutionPolicy Bypass -File .\tests\Test-WizardBrowser.ps1 -InstallPath $env:USERPROFILE\.docker\projects\traefik-proxy -AppAddress 10.20.30.11 -AppPort 80 -Subdomain files -ScreenshotDir .\wizard-shots
 #>
 [CmdletBinding()]
 param(
@@ -32,7 +32,7 @@ param(
   [string]$Domain = '',
   [string]$Container = 'uptime-kuma',
   [string]$ContainerUrl = 'http://uptime-kuma:3001',
-  [string]$EditService = 'notflix',
+  [string]$EditService = 'mediabox',
   # Allowed email for the Cloudflare Access preview (the preview is blocked without one, by design).
   [string]$AccessEmail = '',
   [string]$ScreenshotDir

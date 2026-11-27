@@ -7,6 +7,13 @@ config/services.json
 config/cloudflare.json
 config/setup.json
 config/dashboard.json
+# Every other deployment's own settings (identity, credentials, applications, managers, provisioning, personal
+# customizations); only the shipped examples are tracked.
+config/*.json
+!config/*.example.json
+config/provision/
+# Private notes about one deployment
+notes/
 traefik/dynamic/admin-dashboard.yml
 logs/
 traefik/dynamic/svc-*.yml

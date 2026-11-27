@@ -19,7 +19,7 @@ Internet --HTTPS--> Cloudflare edge (+ Access) ==tunnel==> cloudflared
                                                               |
               +-----------------------------+-----------------+--------------------+
               | docker target               | host target                          | lan target
-       network: proxy (shared)       host.docker.internal:<port>           10.10.0.11:32800
+       network: proxy (shared)       host.docker.internal:<port>           10.20.30.11:32800
        http://<container>:<port>     (app on this Windows PC)              (another device)
 
 traefik --socket-internal (internal)--> socket-proxy --> docker.sock (read-only, GET only)
@@ -55,7 +55,7 @@ Run `Setup-Launcher.cmd -Autostart` (or use the tray menu or the Deployments pag
 DTC then starts silently when you sign in: it waits for Docker Desktop and opens no browser. Once you have opened the
 dashboard from the tray, a bookmark to `http://127.0.0.1:8190/` keeps working. See [docs/launcher.md](docs/launcher.md).
 
-### Reopening an existing deployment (for example `traefik-ext1`)
+### Reopening an existing deployment (for example `traefik-home`)
 
 Start the manager with `START-HERE.cmd`; under *Continue where you left off* select the deployment (or *Open another
 folder…* and choose its folder, such as `C:\Users\<you>\.docker\projects\traefik-proxy`), then **Review and open**.
@@ -204,8 +204,8 @@ separately and select *Install* (step 7):
 3. **Configure the deployment**: install folder (default under your profile), instance name, ports and, in
    Advanced, the Docker network, tunnel subnet and static address. Values that collide with nothing on this PC
    are pre-filled (*Suggest free values* re-computes them); subnet validation always runs, even when hidden. The
-   Traefik dashboard hostname is suggested from the instance name (`traefik-ext1` →
-   `traefik-ext1.<allowed domain>`); you can edit it, and later name changes no longer overwrite your edit until
+   Traefik dashboard hostname is suggested from the instance name (`traefik-home` →
+   `traefik-home.<allowed domain>`); you can edit it, and later name changes no longer overwrite your edit until
    you select *Reset to automatic*.
 4. **Configure ingress**: *Cloudflare Tunnel* (new or existing dashboard-managed tunnel, with a summary of the
    account, domains, connector, Traefik destination and DNS behaviour) or *Local only* (no Cloudflare; how
@@ -284,7 +284,7 @@ The Backups page:
   automatically. The change is refused if the recovery point cannot be written.
 
 **Adding a service** (Services > Add a service): *name → hostname → destination → publish*. Enter a display name
-(for example *Notflix*); the subdomain is suggested from it (`notflix`) and can be changed (`movies`, giving
+(for example *Mediabox*); the subdomain is suggested from it (`mediabox`) and can be changed (`movies`, giving
 `movies.<domain>`) without changing the display name, and a manual subdomain is not overwritten by later name
 changes. The domain is chosen from the allowed Cloudflare domains, never typed again. Choose where the app runs:
 a Docker container on the shared network (reached by its container name, for example
@@ -352,7 +352,7 @@ files plus validation errors and warnings) and do nothing unless `-Apply` is giv
 
 ```powershell
 .\services.ps1 list
-.\services.ps1 add -Name plex -Hostname plex.example.com -TargetType lan -TargetHost 10.10.0.11 -Port 32800
+.\services.ps1 add -Name plex -Hostname plex.example.com -TargetType lan -TargetHost 10.20.30.11 -Port 32800
 .\services.ps1 add -Name wiki -Hostname wiki.example.com -TargetType docker -TargetHost wikijs -Port 3000 -Apply
 .\services.ps1 add -Name grafana -Hostname grafana.example.com -TargetType host -Port 3000 -Apply
 .\services.ps1 add -Name nas -Hostname nas.example.com -TargetType lan -TargetHost 192.168.1.20 -Port 5001 -Protocol https -TlsSkipVerify -LocalOnly -Apply
@@ -376,7 +376,7 @@ without Cloudflare Access, public IPs as LAN targets, self-signed HTTPS by IP, a
 ### Example: Plex on another device
 
 ```powershell
-.\services.ps1 add -Name plex -Hostname plex.jrtechconsult.com -TargetType lan -TargetHost 10.10.0.11 -Port 32800 -Description 'Plex Media Server'
+.\services.ps1 add -Name plex -Hostname plex.example.com -TargetType lan -TargetHost 10.20.30.11 -Port 32800 -Description 'Plex Media Server'
 ```
 
 generates `traefik\dynamic\svc-plex.yml`:
@@ -385,7 +385,7 @@ generates `traefik\dynamic\svc-plex.yml`:
 http:
   routers:
     svc-plex:
-      rule: 'Host(`plex.jrtechconsult.com`)'
+      rule: 'Host(`plex.example.com`)'
       entryPoints: [web]
       middlewares: [default-headers@file]
       service: svc-plex
@@ -394,7 +394,7 @@ http:
       loadBalancer:
         passHostHeader: true
         servers:
-          - url: http://10.10.0.11:32800
+          - url: http://10.20.30.11:32800
 ```
 
 and warns that this looks like a **media streaming** service. Cloudflare's self-serve terms restrict serving
@@ -417,14 +417,14 @@ Traefik's own network before anything is saved:
 | --- | --- | --- |
 | A container on the shared network (`uptime-kuma`) | `http://uptime-kuma:3001` | Docker DNS name and the port *inside* the container |
 | A Windows app, typed as `127.0.0.1:4119` or `localhost:4119` | `http://host.docker.internal:4119` | Inside Traefik, 127.0.0.1 is Traefik itself (the typed address cannot be selected) |
-| A Windows app, typed as this PC's LAN address (`10.10.0.11:80`) | `http://host.docker.internal:80`, next to `http://10.10.0.11:80` | Both are selectable; the LAN address depends on Docker routing to the LAN |
+| A Windows app, typed as this PC's LAN address (`10.20.30.11:80`) | `http://host.docker.internal:80`, next to `http://10.20.30.11:80` | Both are selectable; the LAN address depends on Docker routing to the LAN |
 | A Windows port that a container publishes (`127.0.0.1:3010`) | `http://homepage:3000` | The container is reached directly, by name and internal port |
-| Another device (`10.10.0.8:8080`, `nas.home.arpa`) | As typed | Never replaced by `host.docker.internal`; a Docker subnet that captures it is reported |
+| Another device (`10.20.30.8:8080`, `nas.home.arpa`) | As typed | Never replaced by `host.docker.internal`; a Docker subnet that captures it is reported |
 | A container on another network | Options: its published port through the host gateway, or a Compose network attachment | Shown as choices, never picked silently; databases and caches are never offered |
 
 **A recommendation is never a requirement.** The form lists every candidate with its own radio button: *Address you
 entered*, *Recommended alternative*, other *Discovered alternatives* and, in Advanced and Expert, a *Custom address*
-(a complete URL such as `http://10.10.0.8:8080`). The address you typed stays selected until you pick another one;
+(a complete URL such as `http://10.20.30.8:8080`). The address you typed stays selected until you pick another one;
 **Use recommended address** switches to the recommendation. The address you select is the one tested, previewed and
 written to the Traefik service (`loadBalancer.servers[0].url`). Editing an existing service keeps its saved backend
 until you choose another one, and a backend picked under one option is kept when you switch options and back.
@@ -437,8 +437,8 @@ after it is verified to resolve inside Traefik (add `extra_hosts: ['host.docker.
 Traefik service otherwise).
 
 **Docker networks that overlap your LAN.** A Docker network whose subnet contains a LAN address (for example a
-Compose network on `10.10.0.0/24` while the LAN is `10.10.0.0/24`) captures that traffic inside Docker Desktop's VM:
-Traefik's requests to `10.10.0.11` go to that bridge, not to Windows, and time out. The form names the network;
+Compose network on `10.20.30.0/24` while the LAN is `10.20.30.0/24`) captures that traffic inside Docker Desktop's VM:
+Traefik's requests to `10.20.30.11` go to that bridge, not to Windows, and time out. The form names the network;
 the fix is to move that network to another subnet in its compose file (or remove it once nothing uses it). The
 manager never changes networks itself.
 
@@ -718,7 +718,7 @@ routes from the old `traefik\dynamic\` folder can be copied over as-is, or re-cr
   restricted to read-only). See [docs/universal-apps.md](docs/universal-apps.md).
 - Credentials are encrypted for one Windows account (DPAPI) and never exported: after a move to another user or PC
   they are entered again; Linux is not supported yet. See [docs/credential-portability.md](docs/credential-portability.md).
-- Release status and the production upgrade/rollback procedure: [docs/release-readiness.md](docs/release-readiness.md),
-  [docs/production-upgrade.md](docs/production-upgrade.md).
+- Upgrading an existing deployment: run `install.ps1 -InstallPath <deployment> -DryRun` first; `tests\Test-UpgradePreflight.ps1`
+  checks a copy of the deployment before the real upgrade.
 - authentik backup and restore: verified on a disposable authentik only; see
   [docs/authentik-recovery.md](docs/authentik-recovery.md) for what is backed up and the disaster-recovery steps.

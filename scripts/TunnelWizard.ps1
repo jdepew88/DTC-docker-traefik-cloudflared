@@ -174,7 +174,7 @@ function Set-AppRoute([string]$Hostname, [string]$AppTarget, [string]$AppProtoco
         $AppTarget = "windows:$port"
       }
       3 {
-        $lanHost = Read-Answer 'Device IP address or DNS name (e.g. 10.10.0.11)' '' '^[A-Za-z0-9.-]+$' 'Letters, digits, dots and dashes.'
+        $lanHost = Read-Answer 'Device IP address or DNS name (e.g. 10.20.30.11)' '' '^[A-Za-z0-9.-]+$' 'Letters, digits, dots and dashes.'
         $port = Read-Answer 'Port the app listens on' '' '^\d{1,5}$' 'Enter a port number.'
         $AppTarget = "lan:${lanHost}:$port"
       }

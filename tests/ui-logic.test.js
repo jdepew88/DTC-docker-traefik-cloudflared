@@ -20,10 +20,10 @@ test('detail levels: order, normalization, visibility', () => {
 });
 
 test('labels: display names become DNS labels', () => {
-  assert.strictEqual(L.suggestLabel('Notflix'), 'notflix');
+  assert.strictEqual(L.suggestLabel('Mediabox'), 'mediabox');
   assert.strictEqual(L.suggestLabel('Home Assistant!'), 'home-assistant');
-  assert.strictEqual(L.suggestLabel('traefik-ext1'), 'traefik-ext1');
-  assert.strictEqual(L.suggestLabel('traefik__ext1'), 'traefik-ext1');
+  assert.strictEqual(L.suggestLabel('traefik-home'), 'traefik-home');
+  assert.strictEqual(L.suggestLabel('traefik__ext1'), 'traefik-home');
   assert.strictEqual(L.suggestLabel('  Café Ünïcode  '), 'cafe-unicode');
   assert.strictEqual(L.suggestLabel('x'.repeat(80)).length, 63);
   assert.strictEqual(L.suggestServiceName('A'.repeat(60)).length, 40);
@@ -31,20 +31,20 @@ test('labels: display names become DNS labels', () => {
 });
 
 test('auto naming: follows the source until edited, then keeps the manual value', () => {
-  let st = L.autoNameFromSource({ value: '', custom: false }, 'Notflix');
-  assert.deepStrictEqual(st, { value: 'notflix', custom: false });
-  st = L.autoNameEdit(st, 'movies', 'Notflix');
+  let st = L.autoNameFromSource({ value: '', custom: false }, 'Mediabox');
+  assert.deepStrictEqual(st, { value: 'mediabox', custom: false });
+  st = L.autoNameEdit(st, 'movies', 'Mediabox');
   assert.deepStrictEqual(st, { value: 'movies', custom: true });
-  st = L.autoNameFromSource(st, 'Notflix 2');
+  st = L.autoNameFromSource(st, 'Mediabox 2');
   assert.strictEqual(st.value, 'movies', 'a later display-name change must not overwrite the edit');
-  st = L.autoNameReset('Notflix 2');
-  assert.deepStrictEqual(st, { value: 'notflix-2', custom: false });
-  st = L.autoNameEdit(st, 'notflix-2', 'Notflix 2');
+  st = L.autoNameReset('Mediabox 2');
+  assert.deepStrictEqual(st, { value: 'mediabox-2', custom: false });
+  st = L.autoNameEdit(st, 'mediabox-2', 'Mediabox 2');
   assert.strictEqual(st.custom, false, 'typing the suggestion is not a manual override');
 });
 
 test('dashboard hostname suggestion from the instance name', () => {
-  assert.strictEqual(L.joinHostname(L.suggestLabel('traefik-ext1'), 'jrtechconsult.com'), 'traefik-ext1.jrtechconsult.com');
+  assert.strictEqual(L.joinHostname(L.suggestLabel('traefik-home'), 'example.com'), 'traefik-home.example.com');
   assert.strictEqual(L.joinHostname('', 'example.com'), 'example.com');
 });
 
@@ -65,7 +65,7 @@ test('target detection', () => {
   assert.strictEqual(L.detectTarget('uptime-kuma'), 'docker');
   assert.strictEqual(L.detectTarget('localhost'), 'host');
   assert.strictEqual(L.detectTarget('127.0.0.1'), 'host');
-  assert.strictEqual(L.detectTarget('10.10.0.11'), 'lan');
+  assert.strictEqual(L.detectTarget('10.20.30.11'), 'lan');
   assert.strictEqual(L.detectTarget('nas.lan'), 'lan');
   assert.strictEqual(L.detectTarget('x', 'host'), 'host');
   assert.ok(L.isPrivateIPv4('192.168.1.2') && !L.isPrivateIPv4('8.8.8.8'));
@@ -169,22 +169,22 @@ test('backend: pasted addresses are parsed; loopback is recognised', () => {
   assert.deepStrictEqual(L.parseBackendAddress('http://127.0.0.1:4119/'), { scheme: 'http', host: '127.0.0.1', port: 4119 });
   assert.deepStrictEqual(L.parseBackendAddress('4119'), { scheme: '', host: '', port: 4119 });
   assert.deepStrictEqual(L.parseBackendAddress('NAS.local'), { scheme: '', host: 'nas.local', port: 0 });
-  assert.ok(L.isLoopbackHost('localhost') && L.isLoopbackHost('127.0.0.1') && !L.isLoopbackHost('10.10.0.11'));
+  assert.ok(L.isLoopbackHost('localhost') && L.isLoopbackHost('127.0.0.1') && !L.isLoopbackHost('10.20.30.11'));
 });
 
-// Candidates as the resolver returns them for HFS on this PC, typed as 10.10.0.11:80 under "another device".
-const ENTERED = { type: 'lan', host: '10.10.0.11', port: 80, protocol: 'http', url: 'http://10.10.0.11:80', role: 'entered', rejected: false };
+// Candidates as the resolver returns them for HFS on this PC, typed as 10.20.30.11:80 under "another device".
+const ENTERED = { type: 'lan', host: '10.20.30.11', port: 80, protocol: 'http', url: 'http://10.20.30.11:80', role: 'entered', rejected: false };
 const GATEWAY = { type: 'host', host: 'host.docker.internal', port: 80, protocol: 'http', url: 'http://host.docker.internal:80', role: 'recommended', rejected: false };
 const HFS = { recommended: GATEWAY, suggested: GATEWAY, entered: ENTERED, candidates: [ENTERED, GATEWAY],
-  guidance: [{ id: 'own-lan-ip', severity: 'info', category: 'recommendation', action: 'use-recommended', condition: 'own-lan-ip|10.10.0.11|80', about: ENTERED.url },
-    { id: 'subnet-overlap', severity: 'warn', category: 'connectivity', action: '', condition: 'subnet-overlap|10.10.0.11|unifi', about: ENTERED.url }] };
+  guidance: [{ id: 'own-lan-ip', severity: 'info', category: 'recommendation', action: 'use-recommended', condition: 'own-lan-ip|10.20.30.11|80', about: ENTERED.url },
+    { id: 'subnet-overlap', severity: 'warn', category: 'connectivity', action: '', condition: 'subnet-overlap|10.20.30.11|unifi', about: ENTERED.url }] };
 
 test('backend: the question and the three connection options', () => {
   assert.strictEqual(L.BACKEND_QUESTION, 'How should Traefik connect to this application?');
   assert.deepStrictEqual(L.WHERE, ['docker', 'this-computer', 'lan']);
 });
 
-test('backend: the address entered stays selected; the recommendation is offered next to it, never forced (HFS 10.10.0.11:80)', () => {
+test('backend: the address entered stays selected; the recommendation is offered next to it, never forced (HFS 10.20.30.11:80)', () => {
   const r = L.chooseBackend({}, HFS);
   assert.strictEqual(r.source, 'entered'); assert.ok(L.sameTarget(r.target, ENTERED)); assert.strictEqual(r.needsChoice, false);
   const list = L.backendCandidates(HFS);
@@ -224,7 +224,7 @@ test('backend: no candidates -> no "choose an option" error; a plain instruction
 });
 
 test('backend: an existing service keeps its saved backend; a custom URL is used exactly, an invalid one selects nothing', () => {
-  const saved = { type: 'lan', host: '10.10.0.11', port: 4119 };
+  const saved = { type: 'lan', host: '10.20.30.11', port: 4119 };
   assert.ok(L.sameTarget(L.chooseBackend({ source: 'existing', target: saved }, HFS).target, saved));
   const ov = { type: 'lan', host: '10.20.0.5', port: 8080, url: 'http://10.20.0.5:8080', role: 'custom', rejected: false };
   const r = L.chooseBackend({ override: true }, { override: true, custom: ov, recommended: GATEWAY, candidates: [ov, GATEWAY], guidance: [] });
@@ -235,11 +235,11 @@ test('backend: an existing service keeps its saved backend; a custom URL is used
 });
 
 test('backend: complete backend URLs (Advanced/Expert): protocol, host, port; no loopback, no base path', () => {
-  assert.deepStrictEqual(L.parseBackendUrl('http://10.10.0.8:8080'), { ok: true, scheme: 'http', host: '10.10.0.8', port: 8080, path: '', url: 'http://10.10.0.8:8080' });
+  assert.deepStrictEqual(L.parseBackendUrl('http://10.20.30.8:8080'), { ok: true, scheme: 'http', host: '10.20.30.8', port: 8080, path: '', url: 'http://10.20.30.8:8080' });
   assert.strictEqual(L.parseBackendUrl('https://nas.home.arpa').port, 443);
-  assert.ok(!L.parseBackendUrl('10.10.0.8:8080').ok);
+  assert.ok(!L.parseBackendUrl('10.20.30.8:8080').ok);
   assert.match(L.parseBackendUrl('http://127.0.0.1:80').error, /Traefik itself/);
-  assert.match(L.parseBackendUrl('http://10.10.0.8:8080/files').error, /Path prefix/);
+  assert.match(L.parseBackendUrl('http://10.20.30.8:8080/files').error, /Path prefix/);
   assert.match(L.backendValidation({ override: true, custom: 'http://localhost:1' }), /Traefik itself/);
 });
 
@@ -256,13 +256,13 @@ test('backend: notices - dismissed stay hidden, restrictions always show, a foll
 test('backend: connectivity warnings disappear after the selected backend passes a test, not after a failure', () => {
   const ok = { state: 'ok', result: 'verified', targetUrl: 'http://host.docker.internal:80', target: { protocol: 'http' } };
   assert.deepStrictEqual(L.visibleGuidance(HFS.guidance, {}, { target: GATEWAY, verification: ok, recommended: GATEWAY }).map((x) => x.id), []);
-  const fail = { state: 'failed', result: 'timeout', targetUrl: 'http://10.10.0.11:80', target: { protocol: 'http' } };
+  const fail = { state: 'failed', result: 'timeout', targetUrl: 'http://10.20.30.11:80', target: { protocol: 'http' } };
   assert.ok(L.visibleGuidance(HFS.guidance, {}, { target: ENTERED, verification: fail, recommended: GATEWAY }).some((x) => x.id === 'subnet-overlap'));
 });
 
 test('backend: test headlines - success, could not connect (with the address), hostname rejected', () => {
   assert.strictEqual(L.backendHeadline({ state: 'ok', result: 'verified' }, GATEWAY), 'Traefik successfully connected to the selected application.');
-  assert.strictEqual(L.backendHeadline({ state: 'failed', result: 'timeout' }, ENTERED), 'Traefik could not connect to 10.10.0.11:80. Test another address or explicitly save the route without verification.');
+  assert.strictEqual(L.backendHeadline({ state: 'failed', result: 'timeout' }, ENTERED), 'Traefik could not connect to 10.20.30.11:80. Test another address or explicitly save the route without verification.');
   assert.match(L.backendHeadline({ state: 'failed', result: 'host-rejected' }, ENTERED), /rejected the public hostname/);
   assert.match(L.backendHeadline({ state: 'auth', result: 'auth' }, ENTERED), /login/);
 });
@@ -285,7 +285,7 @@ test('identity: state vocabulary; verified and authentication required are disti
 });
 
 test('identity: Google redirect URI from the public URL and source slug (https only, no hard-coded domain)', () => {
-  assert.strictEqual(L.googleRedirectUri('https://auth.jrtechconsult.com'), 'https://auth.jrtechconsult.com/source/oauth/callback/google/');
+  assert.strictEqual(L.googleRedirectUri('https://auth.example.com'), 'https://auth.example.com/source/oauth/callback/google/');
   assert.strictEqual(L.googleRedirectUri('https://Login.Example.org/', 'gws'), 'https://login.example.org/source/oauth/callback/gws/');
   assert.strictEqual(L.googleRedirectUri('http://auth.example.com'), '');
   assert.strictEqual(L.googleRedirectUri('https://auth.example.com/path'), '');

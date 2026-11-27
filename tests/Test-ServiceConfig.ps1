@@ -38,14 +38,14 @@ function Test-HasError([string]$Name, $Issues, [string]$Field) {
 }
 
 # --- Rendering ---------------------------------------------------------------------------------------
-$plex = New-ServiceDefinition -Name plex -Hostname plex.jrtechconsult.com -TargetType lan -TargetHost 10.10.0.11 -Port 32800
+$plex = New-ServiceDefinition -Name plex -Hostname plex.example.com -TargetType lan -TargetHost 10.20.30.11 -Port 32800
 $expected = @"
 # Generated from config/services.json (service 'plex'). Do not edit by hand:
 # changes here are overwritten. Use services.ps1 or the web UI instead.
 http:
   routers:
     svc-plex:
-      rule: 'Host(``plex.jrtechconsult.com``)'
+      rule: 'Host(``plex.example.com``)'
       entryPoints: [web]
       middlewares: [default-headers@file]
       service: svc-plex
@@ -54,7 +54,7 @@ http:
       loadBalancer:
         passHostHeader: true
         servers:
-          - url: http://10.10.0.11:32800
+          - url: http://10.20.30.11:32800
 
 "@
 $expected = $expected.Replace("`r`n", "`n").TrimEnd("`n") + "`n"
@@ -108,18 +108,18 @@ foreach ($c in $cases) { Test-HasError $c.n (Get-Issues (ConvertTo-ServiceDefini
 
 $dupName = New-ServiceDefinition -Name plex -Hostname other.example.com -TargetType lan -TargetHost 10.0.0.2 -Port 80
 Test-HasError 'error: duplicate service name' (Get-Issues $dupName @($plex)) 'name'
-$dupHost = New-ServiceDefinition -Name plex2 -Hostname plex.jrtechconsult.com -TargetType lan -TargetHost 10.0.0.2 -Port 80
+$dupHost = New-ServiceDefinition -Name plex2 -Hostname plex.example.com -TargetType lan -TargetHost 10.0.0.2 -Port 80
 Test-HasError 'error: hostname already routed by another service' (Get-Issues $dupHost @($plex)) 'hostnames'
-$pathed = New-ServiceDefinition -Name plex-api -Hostname plex.jrtechconsult.com -PathPrefix /api -TargetType lan -TargetHost 10.0.0.2 -Port 80
+$pathed = New-ServiceDefinition -Name plex-api -Hostname plex.example.com -PathPrefix /api -TargetType lan -TargetHost 10.0.0.2 -Port 80
 Test-Condition 'ok: same hostname with a distinct path prefix' (@(Get-Issues $pathed @($plex) | Where-Object { $_.Level -eq 'Error' }).Count -eq 0)
-$disabledDup = New-ServiceDefinition -Name plex2 -Hostname plex.jrtechconsult.com -TargetType lan -TargetHost 10.0.0.2 -Port 80 -Disabled
+$disabledDup = New-ServiceDefinition -Name plex2 -Hostname plex.example.com -TargetType lan -TargetHost 10.0.0.2 -Port 80 -Disabled
 Test-Condition 'ok: disabled service may share a hostname' (@(Get-Issues $disabledDup @($plex) | Where-Object { $_.Level -eq 'Error' }).Count -eq 0)
 
 # --- Registry JSON ---------------------------------------------------------------------------------------
 $json = ConvertTo-RegistryJson @($plex, $multi)
 $back = $json | ConvertFrom-Json
 Test-Condition 'registry JSON: valid and sorted by name' ($back.services.Count -eq 2 -and $back.services[0].name -eq 'nas') $json
-Test-Condition 'registry JSON: one-element arrays stay arrays' ($json -match '"hostnames": \["plex\.jrtechconsult\.com"\]' -and $json -match '"middlewares": \["default-headers@file"\]') $json
+Test-Condition 'registry JSON: one-element arrays stay arrays' ($json -match '"hostnames": \["plex\.example\.com"\]' -and $json -match '"middlewares": \["default-headers@file"\]') $json
 $round = @($back.services | ForEach-Object { ConvertTo-ServiceDefinition $_ })
 Test-Condition 'registry JSON: round trip renders identical YAML' ((ConvertTo-TraefikRouteYaml $round[1]) -eq (ConvertTo-TraefikRouteYaml $plex) -and (ConvertTo-TraefikRouteYaml $round[0]) -eq $y)
 $escaped = New-ServiceDefinition -Name q -Hostname q.example.com -TargetType lan -TargetHost 10.0.0.3 -Port 80 -Description 'He said "hi" \ bye'
@@ -164,7 +164,7 @@ try {
   $edited[0].target.port = 32400
   $planEdit = Get-ServicePlan -Settings $s -Services (@($edited) + $win)
   $update = @($planEdit.Changes | Where-Object { $_.File -eq 'svc-plex.yml' })[0]
-  Test-Condition 'plan: edit -> update with diff' ($update.Action -eq 'update' -and @(Format-ServicePlan $planEdit) -contains '    -           - url: http://10.10.0.11:32800' -and @(Format-ServicePlan $planEdit) -contains '    +           - url: http://10.10.0.11:32400') ((Format-ServicePlan $planEdit) -join "`n")
+  Test-Condition 'plan: edit -> update with diff' ($update.Action -eq 'update' -and @(Format-ServicePlan $planEdit) -contains '    -           - url: http://10.20.30.11:32800' -and @(Format-ServicePlan $planEdit) -contains '    +           - url: http://10.20.30.11:32400') ((Format-ServicePlan $planEdit) -join "`n")
   $null = Invoke-ServicePlan -Settings $s -Plan $planEdit -NoReload
   $current = (Read-ServiceRegistry -Settings $s).services
   @($current | Where-Object { $_.name -eq 'plex' })[0].enabled = $false

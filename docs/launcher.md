@@ -27,7 +27,7 @@ The setup does the following:
      **DTC - Recovery mode**.
 3. Saves the **default deployment**. This is `-DefaultDeployment` if you give it. Otherwise the default already
    saved is kept, or else the deployment the manager opened last becomes the default (for this installation,
-   `traefik-proxy` with stack **traefik-ext1**).
+   `traefik-proxy` with stack **traefik-home**).
 4. With `-Autostart`, adds **Start with Windows** (see below).
 
 Run it again at any time; it updates the shortcuts. Other options:

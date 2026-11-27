@@ -392,7 +392,7 @@ try {
     Test-Condition 'page: the default deployment is marked; others offer Make default' ($isDefault -and $hasMake)
     $shots = Join-Path $work 'shots'; New-Item -ItemType Directory -Force -Path $shots | Out-Null
     Save-PageScreenshot $cdp (Join-Path $shots 'launcher-1-recovery.png')
-    # The chooser also lists real running stacks (e.g. traefik-ext1): click the button of this test's deployment only.
+    # The chooser also lists real running stacks (e.g. traefik-home): click the button of this test's deployment only.
     $clicked = [bool](Invoke-PageScript $cdp "(() => { const b = [...document.querySelectorAll('[data-make-default]')].find((x) => x.dataset.makeDefault === $(ConvertTo-Json $pathB)); if (b) b.click(); return !!b; })()")
     if (-not $clicked) { Add-Result 'FAIL' 'page: Make default button of the test deployment' 'not found' }
     $made = Wait-Until { (Read-LauncherSettings $bst $repo).defaultDeployment -eq $pathB } 20
