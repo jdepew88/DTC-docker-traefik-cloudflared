@@ -1,0 +1,17 @@
+{
+  "_comment": "Defaults of the DTC sign-in experience. Your own copy lives in the deployment's config\\login-experience.json; apply changes with scripts\\Set-AuthentikLogin.ps1 -InstallPath <deployment> -Action Apply (no restart needed). Points are fractions of the picture (x from the left edge, y from the top edge, r = tap radius as a fraction of the picture width). Taps must follow the list order. Find coordinates by opening the sign-in page with #dtc-calibrate at the end of the address.",
+  "ownerEmail": "",
+  "sourceSlug": "google",
+  "buttonLabel": "Continue as {email}",
+  "background": "background.jpg",
+  "pictureShortcut": {
+    "enabled": true,
+    "tapTimeoutMs": 6000,
+    "minTargetRadiusPx": 28,
+    "points": [
+      { "name": "Left snowfield", "x": 0.185, "y": 0.258, "r": 0.035 },
+      { "name": "Right spire", "x": 0.765, "y": 0.215, "r": 0.035 },
+      { "name": "Red cliff", "x": 0.895, "y": 0.565, "r": 0.035 }
+    ]
+  }
+}

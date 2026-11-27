@@ -714,12 +714,16 @@ function Sync-AuthentikLoginPage {
   if (-not $brand) { $brand = @(Get-AuthentikList $Conn '/core/brands/')[0] }
   $prev = [ordered]@{ brand = [string]$brand.brand_uuid; flow = [string](Get-AkProp $brand 'flow_authentication' ''); title = [string](Get-AkProp $brand 'branding_title' '') }
   $patch = @{}
-  if ([string](Get-AkProp $brand 'flow_authentication' '') -ne [string]$flow.pk) { $patch.flow_authentication = $flow.pk }
+  # The DTC sign-in experience (flow dm-login, lib\AuthentikLogin.psm1) builds on this page: a brand that uses it keeps it.
+  $usesLogin = $false
+  if ($ov.Flows.ContainsKey("$($script:Prefix)login") -and [string](Get-AkProp $brand 'flow_authentication' '') -eq [string]$ov.Flows["$($script:Prefix)login"].Pk) { $usesLogin = $true }
+  if (-not $usesLogin -and [string](Get-AkProp $brand 'flow_authentication' '') -ne [string]$flow.pk) { $patch.flow_authentication = $flow.pk }
   if ([string](Get-AkProp $brand 'branding_title' '') -ne $Title) { $patch.branding_title = $Title }
   if ($patch.Count) {
     Add-AkAction $actions 'update' 'brand' $brand.domain "Use the Google-first sign-in page$(if ($patch.ContainsKey('branding_title')) { " titled '$Title'" })" 'The default sign-in flow stays unchanged and reachable for local recovery.'
     if (-not $WhatIf) { $null = Invoke-AuthentikApi $Conn PATCH "/core/brands/$($brand.brand_uuid)/" $patch; Set-AkActionDone $actions }
-  } else { Add-AkAction $actions 'none' 'brand' $brand.domain 'The sign-in page already uses the Google-first form' }
+  } elseif ($usesLogin) { Add-AkAction $actions 'none' 'brand' $brand.domain "The sign-in page uses the DTC sign-in experience ($($script:Prefix)login), which includes the Google-first form" }
+  else { Add-AkAction $actions 'none' 'brand' $brand.domain 'The sign-in page already uses the Google-first form' }
   return [pscustomobject]@{ Actions = $actions.ToArray(); Previous = $prev; FlowSlug = $fslug }
 }
 

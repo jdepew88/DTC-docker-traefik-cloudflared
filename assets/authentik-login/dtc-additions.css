@@ -1,0 +1,106 @@
+/* ===== DTC ADDITIONS (Deployment Manager) =====
+   Appended after the upstream Glassmorphism theme (upstream/theme.css, unmodified) to form the brand's custom CSS.
+   - The picture comes from authentik itself (the brand's default flow background, uploaded through authentik's file
+     API) instead of the theme's imgur link: authentik publishes it per request as --ak-global--background-image.
+   - The personalized Google button and the phone layout below are used only on the page where the DTC sign-in script
+     is active (it sets the data-dtc-login attributes). */
+
+:root {
+    --ak-flow-background: var(--ak-global--background-image);
+    --ak-social-separator-text: "or";
+}
+
+/* Personalized Google button ("Continue as ..."): prominent, light, with Google's G. */
+:host(ak-stage-identification) button[data-dtc-continue].source-button {
+    min-height: 52px !important;
+    padding: 12px 20px 12px 52px !important;
+    border-radius: 14px !important;
+    background-color: rgba(255, 255, 255, 0.94) !important;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 48 48'%3E%3Cpath fill='%23EA4335' d='M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z'/%3E%3Cpath fill='%234285F4' d='M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z'/%3E%3Cpath fill='%23FBBC05' d='M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z'/%3E%3Cpath fill='%2334A853' d='M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.15 1.45-4.92 2.3-8.16 2.3-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z'/%3E%3C/svg%3E") !important;
+    background-repeat: no-repeat !important;
+    background-position: 18px center !important;
+    background-size: 22px 22px !important;
+    border: 1px solid rgba(255, 255, 255, 0.9) !important;
+    color: #1f1f1f !important;
+    font-size: 16px !important;
+    font-weight: 600 !important;
+    letter-spacing: 0.01em !important;
+    white-space: normal !important;
+    overflow-wrap: anywhere !important;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35) !important;
+}
+
+:host(ak-stage-identification) button[data-dtc-continue].source-button:hover {
+    background-color: #ffffff !important;
+    border-color: #ffffff !important;
+    box-shadow: 0 10px 28px rgba(0, 0, 0, 0.45), 0 0 0 3px rgba(138, 180, 248, 0.45) !important;
+}
+
+:host(ak-stage-identification) button[data-dtc-continue].source-button:focus-visible {
+    outline: 3px solid #8ab4f8 !important;
+    outline-offset: 3px !important;
+}
+
+:host(ak-stage-identification) button[data-dtc-continue].source-button::before,
+:host(ak-stage-identification) button[data-dtc-continue].source-button::after {
+    display: none !important;
+    content: none !important;
+}
+
+/* Google first: the sources come before the email / password form on the personalized page. */
+:host(ak-flow-card[data-dtc-login]) {
+    display: flex !important;
+    flex-direction: column !important;
+}
+
+:host(ak-flow-card[data-dtc-login]) .pf-c-login__main-header { order: 0 !important; }
+:host(ak-flow-card[data-dtc-login]) .pf-c-login__main-footer { order: 1 !important; }
+:host(ak-flow-card[data-dtc-login]) .pf-c-login__main-body { order: 2 !important; }
+
+/* The theme pulls the footer up under the form (margin-bottom -36px); above the form it needs normal spacing. */
+:host(ak-flow-card[data-dtc-login]) .pf-c-login__main-footer {
+    margin: 4px 0 0 !important;
+}
+
+:host(ak-flow-card[data-dtc-login]) .pf-c-login__main-body::before {
+    content: var(--ak-social-separator-text, "or");
+    display: block;
+    margin: 6px 0 18px;
+    font-size: 13px;
+    text-align: center;
+    color: rgba(255, 255, 255, 0.65);
+    background: linear-gradient(rgba(255, 255, 255, 0.18), rgba(255, 255, 255, 0.18)) left center / calc(50% - 24px) 1px no-repeat,
+        linear-gradient(rgba(255, 255, 255, 0.18), rgba(255, 255, 255, 0.18)) right center / calc(50% - 24px) 1px no-repeat;
+}
+
+/* One element draws the picture on the sign-in page: body::before (as in the theme). The body itself stays transparent:
+   the theme's phone rules also paint the picture on html and body, and a body background would cover body::before and
+   no longer match the tap targets. */
+html[data-dtc-login] {
+    background: #0e0b12 !important;
+}
+
+html[data-dtc-login] body {
+    background: transparent !important;
+}
+
+/* Portrait screens (phones, tablets held upright): show the whole picture, unblurred, above the card so every landmark
+   can be tapped. It starts below authentik's language menu (--dtc-picture-top). */
+@media (orientation: portrait) {
+    html[data-dtc-login] body::before {
+        top: 0 !important;
+        left: 0 !important;
+        right: auto !important;
+        bottom: auto !important;
+        width: 100vw !important;
+        height: 100vh !important;
+        height: 100dvh !important;
+        background: var(--ak-flow-background) center var(--dtc-picture-top, 64px) / 100% auto no-repeat, #0e0b12 !important;
+        filter: none !important;
+        -webkit-filter: none !important;
+    }
+
+    :host(ak-flow-executor[data-dtc-login]) .pf-c-login {
+        padding-top: calc(var(--dtc-picture-top, 64px) + 100vw / var(--dtc-picture-aspect, 1.5) - 12px) !important;
+    }
+}
