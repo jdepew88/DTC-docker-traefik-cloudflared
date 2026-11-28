@@ -23,7 +23,7 @@ test('labels: display names become DNS labels', () => {
   assert.strictEqual(L.suggestLabel('Mediabox'), 'mediabox');
   assert.strictEqual(L.suggestLabel('Home Assistant!'), 'home-assistant');
   assert.strictEqual(L.suggestLabel('traefik-home'), 'traefik-home');
-  assert.strictEqual(L.suggestLabel('traefik__ext1'), 'traefik-home');
+  assert.strictEqual(L.suggestLabel('traefik__home'), 'traefik-home');
   assert.strictEqual(L.suggestLabel('  Café Ünïcode  '), 'cafe-unicode');
   assert.strictEqual(L.suggestLabel('x'.repeat(80)).length, 63);
   assert.strictEqual(L.suggestServiceName('A'.repeat(60)).length, 40);
