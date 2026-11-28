@@ -45,7 +45,7 @@ function Save-DashboardConfig {
   Write-TextFileAtomic (Join-Path $Settings.InstallPath $script:ConfigFile) ((ConvertTo-StableJson $Config) + "`n")
 }
 
-# Default subdomain: the instance name, made DNS-safe (traefik-ext1 -> traefik-ext1).
+# Default subdomain: the instance name, made DNS-safe (traefik-home -> traefik-home).
 function Get-DashboardDefaultSubdomain($Settings) {
   # Same rule as suggestLabel in webui\logic.js: runs of other characters become one dash.
   $s = ($Settings.StackName.ToLowerInvariant() -replace '[^a-z0-9]+', '-').Trim('-')

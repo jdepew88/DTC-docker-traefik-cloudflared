@@ -64,7 +64,22 @@ $ManifestName = '.install-manifest.json'
 $Timestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 
 # Files earlier versions installed that this version no longer ships (see "Staging files").
-$RetiredFiles = @('catalog\apps\rocket-chat.json')
+# The authentik sign-in customization (assets\authentik-login, lib\AuthentikLogin.psm1, scripts\Set-AuthentikLogin.ps1 and its
+# tests) was shipped by 034af8b only; it is a personal deployment customization, not part of DTC.
+$RetiredFiles = @('catalog\apps\rocket-chat.json',
+  'lib\AuthentikLogin.psm1',
+  'scripts\Set-AuthentikLogin.ps1',
+  'assets\authentik-login\README.md',
+  'assets\authentik-login\flow.html',
+  'assets\authentik-login\login-experience.js',
+  'assets\authentik-login\login-experience.default.json',
+  'assets\authentik-login\dtc-additions.css',
+  'assets\authentik-login\background.jpg',
+  'assets\authentik-login\preview.html',
+  'assets\authentik-login\upstream\theme.css',
+  'assets\authentik-login\upstream\LICENSE',
+  'tests\Test-AuthentikLogin.ps1',
+  'tests\Test-AuthentikLoginBrowser.ps1')
 
 # Files managed by the installer (relative to the package root).
 $ManagedFiles = @(
@@ -114,7 +129,6 @@ $ManagedFiles = @(
   'lib\HostPlatform.psm1',
   'lib\ProvisionPolicy.psm1',
   'lib\AccessDiagnostics.psm1',
-  'lib\AuthentikLogin.psm1',
   'lib\IdentityContract.psm1',
   'lib\AiAssist.psm1',
   'lib\Recipes.psm1',
@@ -171,6 +185,7 @@ $ManagedFiles = @(
   'tests\Test-UiBrowser.ps1',
   'tests\Test-Projects.ps1',
   'tests\Test-Explorer.ps1',
+  'tests\Test-AuthentikSignInHealth.ps1',
   'tests\EdgeCdp.psm1',
   'tests\WebUiTestHelpers.psm1',
   'tests\CloudflareMock.ps1',
@@ -178,18 +193,6 @@ $ManagedFiles = @(
   'scripts\TunnelWizard.ps1',
   'scripts\Update-HomepageConfig.ps1',
   'scripts\Get-NetworkAudit.ps1',
-  'scripts\Set-AuthentikLogin.ps1',
-  'assets\authentik-login\README.md',
-  'assets\authentik-login\flow.html',
-  'assets\authentik-login\login-experience.js',
-  'assets\authentik-login\login-experience.default.json',
-  'assets\authentik-login\dtc-additions.css',
-  'assets\authentik-login\background.jpg',
-  'assets\authentik-login\preview.html',
-  'assets\authentik-login\upstream\theme.css',
-  'assets\authentik-login\upstream\LICENSE',
-  'tests\Test-AuthentikLogin.ps1',
-  'tests\Test-AuthentikLoginBrowser.ps1',
   'install.ps1',
   '.env.example',
   '.gitignore',

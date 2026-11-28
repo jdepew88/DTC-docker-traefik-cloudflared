@@ -159,12 +159,12 @@ credentials, uses no Google API and no browser automation: it guides the console
 
 What the wizard shows (values computed from your hostname, copy buttons, a **?** beside each unfamiliar setting):
 
-| Value | Example (auth.jrtechconsult.com) |
+| Value | Example (auth.example.com) |
 | --- | --- |
-| App name (used for both the Google app and the client; ASCII only) | `jrtechconsult.com Sign-in` |
+| App name (used for both the Google app and the client; ASCII only) | `example.com Sign-in` |
 | Application type | Web application |
-| Authorized redirect URI | `https://auth.jrtechconsult.com/source/oauth/callback/google/` (authentik's `/source/oauth/callback/<slug>/`, verified against 2026.8.5) |
-| Authorized domain | `jrtechconsult.com` |
+| Authorized redirect URI | `https://auth.example.com/source/oauth/callback/google/` (authentik's `/source/oauth/callback/<slug>/`, verified against 2026.8.5) |
+| Authorized domain | `example.com` |
 | Scopes | `openid`, `email`, `profile` (non-sensitive; authentik itself requests `email profile`) |
 
 Your part (about five minutes, Google Auth Platform, direct links in the wizard):
@@ -221,6 +221,21 @@ puts the brand's previous flow and title back. authentik's Google source type do
 parameters, so the manager cannot force Google's account chooser when only one Google account is signed in (Google then
 continues with that account).
 
+**Customized sign-in pages are kept.** If the brand's sign-in flow was changed in authentik to a flow of your own (any
+flow other than `default-authentication-flow` and `dm-authentication`), *Use this sign-in page* leaves it in place and
+says so; only the title is set. A DTC upgrade therefore never replaces a sign-in page you built yourself in authentik
+(your own flow, stages, brand CSS or a template override in the authentik project's `custom-templates`). DTC does not
+ship or manage such customizations; keep them, and the tools you use for them, with your authentik deployment.
+
+### Troubleshooting: the page spins after Google
+
+If sign-in hangs on a spinner after choosing the Google account (about 30 s, then back to the sign-in page), authentik
+most likely cannot reach Google's token endpoint. authentik's server log shows `Unable to fetch access token ...
+oauth2.googleapis.com ... Network is unreachable` (or a timeout) and `Authentication Failure`; the worker log shows the
+same for `version.goauthentik.io`. This is independent of the sign-in page. A hung Docker Desktop engine (`docker ps`
+does not answer, containers have no outbound network) is one known cause; restarting Docker Desktop fixes it.
+`Test-AuthentikGoogleCallback` (`lib\Authentik.psm1`) and `tests\Test-AuthentikSignInHealth.ps1` check exactly this
+return leg: a real OAuth state and a deliberately invalid code that authentik must have rejected by Google within 10 s.
 ## Owner verification
 
 Path B: *Continue with Google* opens authentik's Google sign-in directly (`/source/oauth/login/google/`); after signing
@@ -446,6 +461,7 @@ and the checkpoint [provisioning-identity-compatibility.md](provisioning-identit
 | `tests\Test-AccessDiagnostics.ps1` | No Docker: Access coverage (exact, path, wildcard, multi-domain, destinations), modes, every diagnosis state, redirect-hop classification, redaction, browser addresses, the layered validation rule. |
 | `tests\Test-IdentityWizardBrowser.ps1` | No Docker, small footprint: the wizard in headless Edge with the authentik side of `/api/identity` answered in the page. Select all / Clear all / count, ticking without the page moving, already protected applications never selectable, exactly the ticked applications sent, review before apply, per-application result, 390 px. Real protection is covered by the live test. |
 | `tests\Test-Provisioning.ps1` | The identity contract: readiness, providers, ForwardAuth suitability, auth choices per access, rollback rules, and the real `Sync-AuthentikAppProtection` / `Remove-AuthentikAppProtection` against an in-memory authentik (preview changes nothing, create, reuse without duplicates, rollback deletes only what the operation created, a reused application is only unassigned). |
+| `tests\Test-AuthentikSignInHealth.ps1 -InstallPath <deployment> -ProtectedUrl <app address>` | Live, against your own authentik, bounded waits, Google **not** blocked: the Google callback answers (return leg), the sign-in stage renders without a lingering spinner (desktop and phone), the protected address leads to the brand's sign-in flow with path and query carried, the Google button lands on Google's real sign-in page with `redirect_uri`/`state` and no forced prompt, local admin reaches the password step, the recovery flow loads. Works with any sign-in flow, including one customized in authentik. A real Google sign-in still needs a person. |
 | `node tests\ui-logic.test.js` | Browser-side helpers (state vocabulary, redirect URI, client ID, credential status, next step). |
 
 ## Limitations

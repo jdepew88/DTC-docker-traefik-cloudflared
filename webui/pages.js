@@ -162,9 +162,9 @@
     const s = ctx.state; const f = s.forms.svc; const host = $('#service-form-host');
     if (!host || !f) return;
     const zones = s.zones.map((z) => z.name);
-    const display = h('input', { value: f.display, autocomplete: 'off', placeholder: 'Notflix', maxlength: '60' });
+    const display = h('input', { value: f.display, autocomplete: 'off', placeholder: 'Mediabox', maxlength: '60' });
     const subTag = h('span', { class: 'auto-tag' }, f.sub.custom ? 'edited' : 'automatic');
-    const sub = h('input', { value: f.sub.value, autocomplete: 'off', spellcheck: 'false', placeholder: 'notflix' });
+    const sub = h('input', { value: f.sub.value, autocomplete: 'off', spellcheck: 'false', placeholder: 'mediabox' });
     const preview = h('span', { class: 'mono' });
     const domain = zones.length ? h('select', { 'aria-label': 'Domain' }, zones.map((z) => h('option', { value: z, selected: z === f.domain }, z)))
       : h('input', { value: f.domain, placeholder: 'example.com', 'aria-label': 'Domain', spellcheck: 'false' });
@@ -193,7 +193,7 @@
           h('strong', null, title), h('span', { class: 'small muted' }, needsCf ? 'Connect Cloudflare (tunnel) first.' : text))));
     const emails = h('input', { value: f.emails, spellcheck: 'false', placeholder: 'you@example.com, family@example.com' });
     emails.addEventListener('input', () => { f.emails = emails.value; });
-    const path = h('input', { value: f.path, spellcheck: 'false', placeholder: '/notflix' });
+    const path = h('input', { value: f.path, spellcheck: 'false', placeholder: '/mediabox' });
     path.addEventListener('input', () => { f.path = path.value.trim(); sync(); });
     const extra = h('input', { value: f.extra, spellcheck: 'false', placeholder: 'www.example.com' });
     extra.addEventListener('input', () => { f.extra = extra.value; });
@@ -207,7 +207,7 @@
     const form = h('form', { class: 'card', novalidate: true, 'aria-labelledby': 'svc-form-title' },
       h('div', { class: 'card-head' }, h('h2', { id: 'svc-form-title' }, f.editing ? `Edit ${f.display || f.editing}` : 'Add a service'), h('span', { class: 'grow' }), h('button', { type: 'button', class: 'icon-btn', 'aria-label': 'Close', onclick: () => closeForm(ctx, host) }, icon('x'))),
       h('div', { class: 'grid' },
-        field({ id: 'svc-display', label: 'Service name', control: display, hint: 'Any name, e.g. Notflix. It stays as you typed it.' }),
+        field({ id: 'svc-display', label: 'Service name', control: display, hint: 'Any name, e.g. Mediabox. It stays as you typed it.' }),
         field({ id: 'svc-id', label: 'Service id', control: idInput, minLevel: 'advanced', hint: 'Lowercase id used in file names (svc-<id>.yml); cannot change later.' })),
       h('div', { class: 'field', 'data-help-host': '' }, h('label', { for: 'svc-sub' }, 'Public hostname ', subTag, help('fqdn', 'Hostname')),
         h('div', { class: 'hostname-row' }, Object.assign(sub, { id: 'svc-sub' }), h('span', { class: 'sep' }, '.'), domain),
@@ -220,7 +220,7 @@
       f.exposure === 'access' && f.authentik ? h('div', { class: 'callout warn', id: 'svc-layered' }, h('p', null, 'Layered authentication: Cloudflare Access asks for its own login before authentik. Visitors sign in twice.')) : null,
       gate('advanced', h('details', { class: 'more', open: !!(f.path || f.extra || f.tls) || null }, h('summary', null, 'Advanced routing'),
         h('div', { class: 'grid' },
-          field({ id: 'svc-path', label: 'Path prefix', control: path, helpId: 'path-routing', hint: 'Route only this path, e.g. /notflix. Many apps need their base path configured for this; prefer a subdomain.' }),
+          field({ id: 'svc-path', label: 'Path prefix', control: path, helpId: 'path-routing', hint: 'Route only this path, e.g. /mediabox. Many apps need their base path configured for this; prefer a subdomain.' }),
           field({ id: 'svc-extra', label: 'Additional hostnames', control: extra }),
           field({ id: 'svc-desc', label: 'Description', control: desc })),
         f.path ? cb('strip', 'Strip the path prefix before forwarding') : null,

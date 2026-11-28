@@ -18,7 +18,7 @@
   function isVisibleAt(minLevel, current) { return levelIndex(current) >= levelIndex(minLevel || 'beginner'); }
 
   // --- Naming ----------------------------------------------------------------------------------------------------
-  // A DNS label from a display name: "Notflix" -> "notflix", "Home Assistant!" -> "home-assistant".
+  // A DNS label from a display name: "Mediabox" -> "mediabox", "Home Assistant!" -> "home-assistant".
   function suggestLabel(name, maxLength = 63) {
     let s = String(name || '').toLowerCase().normalize('NFKD').replace(/[̀-ͯ]/g, '');
     s = s.replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').replace(/-{2,}/g, '-');
@@ -139,9 +139,9 @@
   // the request path unchanged) and loopback is refused (inside Traefik it is Traefik).
   function parseBackendUrl(text) {
     const v = String(text || '').trim();
-    if (!v) return { ok: false, error: 'Enter a complete backend URL, e.g. http://10.10.0.8:8080.' };
+    if (!v) return { ok: false, error: 'Enter a complete backend URL, e.g. http://10.20.30.8:8080.' };
     const m = /^(https?|h2c):\/\/(\[[^\]]+\]|[^/:?#\s]+)(?::(\d{1,5}))?([/?#].*)?$/i.exec(v);
-    if (!m) return { ok: false, error: 'Enter a complete backend URL with its protocol, e.g. http://10.10.0.8:8080.' };
+    if (!m) return { ok: false, error: 'Enter a complete backend URL with its protocol, e.g. http://10.20.30.8:8080.' };
     const scheme = m[1].toLowerCase(); const host = m[2].toLowerCase();
     const port = m[3] ? Number(m[3]) : scheme === 'https' ? 443 : 80;
     const path = m[4] && m[4] !== '/' ? m[4] : '';
@@ -472,7 +472,7 @@
   // What each stage is, for the "?" next to it: what it does, why it is needed, what the manager configures, what you
   // may manage yourself, and the usual reasons it fails.
   const ROUTING_HELP = {
-    'public-url': { title: 'Public address', what: 'The https:// address people type or bookmark, for example https://notflix.example.com.', why: 'It is the only address visitors need. Everything behind it stays private.', dtc: 'Publishes the hostname through Cloudflare when you choose "Publish".', you: 'Choose the hostname under a domain you own in Cloudflare.', fails: 'DNS not created yet (wait a few minutes), the tunnel is down, or a Cloudflare login is in front.' },
+    'public-url': { title: 'Public address', what: 'The https:// address people type or bookmark, for example https://mediabox.example.com.', why: 'It is the only address visitors need. Everything behind it stays private.', dtc: 'Publishes the hostname through Cloudflare when you choose "Publish".', you: 'Choose the hostname under a domain you own in Cloudflare.', fails: 'DNS not created yet (wait a few minutes), the tunnel is down, or a Cloudflare login is in front.' },
     dns: { title: 'DNS at Cloudflare', what: 'A DNS record that points the hostname at your Cloudflare Tunnel (a proxied CNAME).', why: 'Browsers find Cloudflare through DNS; Cloudflare then knows to use your tunnel.', dtc: 'Creates and checks the record with your Cloudflare API token.', you: 'Nothing, unless another record already uses the name.', fails: 'An older A/CNAME record with the same name, the record not proxied, or the domain not in your Cloudflare account.' },
     access: { title: 'Cloudflare Access', what: 'An optional Cloudflare login (Zero Trust) that runs at Cloudflare, before the request reaches your PC.', why: 'Useful for apps without a login. With authentik it is a second login and usually not wanted.', dtc: 'Creates an Access application when you tick "Require Cloudflare Access", and removes the one it created when you turn it off.', you: 'Access applications created by hand in Cloudflare Zero Trust are yours; the manager leaves them alone.', fails: 'A leftover Access application still asks for a Cloudflare login (the "challenge" before your sign-in page).' },
     tunnel: { title: 'Cloudflare Tunnel', what: 'An outbound connection from cloudflared on this PC to Cloudflare. Requests come back through it.', why: 'No port on your router has to be opened, and your home IP address stays hidden.', dtc: 'Adds a route hostname -> http://traefik:80 to the tunnel and runs cloudflared next to Traefik.', you: 'Nothing for routes. Tunnels created elsewhere keep their own settings.', fails: 'cloudflared not running or not connected, or the route pointing at localhost (inside the cloudflared container that is cloudflared itself).' },

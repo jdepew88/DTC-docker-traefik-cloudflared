@@ -451,7 +451,7 @@ try {
     $anon = Test-ForwardAuthChallenge -TraefikPort $httpPort -Hostname $appHost -HostPort $httpPort -AuthHostname $authHost
     Test-Condition 'forwardauth: anonymous visitors are sent to the authentik sign-in (no loop)' ($anon.State -eq 'auth' -and $anon.Location -match "^http://${authHost}:$httpPort/") ($anon | ConvertTo-Json -Compress)
 
-    # --- Regression (Notflix): the outpost sends browsers to a local address ---------------------------------------------------
+    # --- Regression (Mediabox): the outpost sends browsers to a local address ---------------------------------------------------
     # ForwardAuth keeps working (Traefik reaches authentik internally), but the sign-in redirect only works on this PC. The
     # probe, the routing view and the next protection must catch it; protecting again restores the public address.
     $bindsBefore = @(Get-AuthentikList $conn '/policies/bindings/').Count

@@ -191,8 +191,8 @@ $rbData = Get-ProvisionRollbackPlan $jr -DeleteData
 Test-Condition 'contract: rollback removes only created resources (newest first), keeps reused and shared ones and keeps data unless asked' ((@($rb.steps | ForEach-Object { $_.kind }) -join ',') -eq 'cloudflare-dns,traefik-route,compose-project' -and @($rb.kept | Where-Object { $_.kind -eq 'authentik-application' -and $_.why -match 'existed before' }).Count -and @($rb.kept | Where-Object { $_.kind -eq 'authentik-outpost' -and $_.why -match 'shared' }).Count -and @($rb.kept | Where-Object { $_.kind -eq 'data-volume' }).Count -and @($rbData.steps | Where-Object { $_.kind -eq 'data-volume' }).Count) (@($rb.steps | ForEach-Object { $_.kind }) -join ',')
 
 # --- Part 1h: AI assistance (mocked provider; nothing leaves this PC) -------------------------------------------------------
-$red = Protect-AiText "DB_PASSWORD=hunter2hunter2 mail owner@example.com ip 192.168.1.20 path C:\Users\Joe\x jwt eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.abcdefghijk token ghp_abcdefghijklmnopqrstuvwxyz0123 app.jrtech.example" @('jrtech.example') @('Joe')
-Test-Condition 'ai: secrets, e-mail, IP addresses, Windows paths, JWTs, API keys, your domains and user name are removed before anything is sent' ($red.Text -notmatch 'hunter2|owner@|192\.168|Joe|eyJhbG|ghp_|jrtech' -and $red.Text -match '<secret>' -and $red.Text -match '<private>') $red.Text
+$red = Protect-AiText "DB_PASSWORD=hunter2hunter2 mail owner@example.com ip 192.168.1.20 path C:\Users\Alex\x jwt eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.abcdefghijk token ghp_abcdefghijklmnopqrstuvwxyz0123 app.acmehome.example" @('acmehome.example') @('Alex')
+Test-Condition 'ai: secrets, e-mail, IP addresses, Windows paths, JWTs, API keys, your domains and user name are removed before anything is sent' ($red.Text -notmatch 'hunter2|owner@|192\.168|Alex|eyJhbG|ghp_|acmehome' -and $red.Text -match '<secret>' -and $red.Text -match '<private>') $red.Text
 $draftM = ConvertTo-OrderedTree (ConvertTo-PlainObject $dm)
 $draftM.source.upstream = 'https://github.com/acme/tool'
 $req = New-AiPlanningRequest -Manifest $draftM -Documentation "# Install`nThe web UI listens on port 8080. Set TOOL_SECRET to a random value and DB_HOST=10.0.0.5 for the database. Contact admin@acme.example.`n# Unrelated`nNothing." -PrivateNames @('acme.example')
@@ -239,10 +239,10 @@ $tam = ($rec | ConvertTo-Json -Depth 25) | ConvertFrom-Json
 $tam.manifest.services.tool.image = 'evil/tool:1'
 Test-Condition 'recipes: a manifest changed after the recipe was made is detected (fingerprint mismatch)' (@(Test-Recipe $tam | Where-Object { $_ -match 'manifestSha256' }).Count -eq 1) ''
 $leaky = ($rec | ConvertTo-Json -Depth 25) | ConvertFrom-Json
-$leaky.knownIssues = @('Worked at 192.168.1.20 on app.jrtech.example for joe@example.com in C:\Users\Joe\apps')
-$sz = ConvertTo-SanitizedRecipe $leaky @('jrtech.example', 'Joe')
+$leaky.knownIssues = @('Worked at 192.168.1.20 on app.acmehome.example for alex@example.com in C:\Users\Alex\apps')
+$sz = ConvertTo-SanitizedRecipe $leaky @('acmehome.example', 'Alex')
 $szText = $sz.Recipe | ConvertTo-Json -Depth 25
-Test-Condition 'recipes: sharing removes addresses, e-mail, paths, your domains and user name, and shows what was removed' ($szText -notmatch '192\.168|jrtech|joe@|Users\\\\Joe' -and @($sz.Removed).Count -ge 3 -and $sz.Recipe.privacy.sanitized -and -not @(Test-Recipe $sz.Recipe).Count) (($sz.Removed | ForEach-Object { $_.kind }) -join ',')
+Test-Condition 'recipes: sharing removes addresses, e-mail, paths, your domains and user name, and shows what was removed' ($szText -notmatch '192\.168|acmehome|alex@|Users\\\\Alex' -and @($sz.Removed).Count -ge 3 -and $sz.Recipe.privacy.sanitized -and -not @(Test-Recipe $sz.Recipe).Count) (($sz.Removed | ForEach-Object { $_.kind }) -join ',')
 $community = ($rec | ConvertTo-Json -Depth 25) | ConvertFrom-Json; $community.provenance.origin = 'community'; $community.trust.status = 'claimed'; $community.trust.deployments = 12
 $arm = ($rec | ConvertTo-Json -Depth 25) | ConvertFrom-Json; $arm.host.architecture = 'linux/arm64'; $arm.provenance.origin = 'curated'
 $rank = @(Get-RecipeRanking @($community, $rec, $arm) $fp)

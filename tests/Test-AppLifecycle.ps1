@@ -163,7 +163,7 @@ $facts = @(
   (New-Fact 'server' 'running' 0 '' $false 'unless-stopped' @() 'labelled' 'example/custom:1'))
 $facts[6].app = 'rocket-chat'
 $facts += (New-Fact 'traefik' 'running' 0 '' $false 'unless-stopped' @() 'other-proxy' 'traefik:v3.6.1'), (New-Fact 'whoami' 'running' 0 '' $false 'unless-stopped' @() 'other-proxy' 'traefik/whoami:v1.12.0')
-$un = @(Get-UnregisteredInstallations $facts $apps @('traefik-ext1'))
+$un = @(Get-UnregisteredInstallations $facts $apps @('traefik-home'))
 $byP = @{}; foreach ($u in $un) { $byP[$u.project] = $u }
 Test-Condition 'existing installations: Diun and Watchtower containers are still recognized (retired apps stay discoverable)' ($byP.ContainsKey('old-diun') -and $byP['old-diun'].appId -eq 'diun' -and $byP['old-diun'].availability -eq 'offered' -and $byP.ContainsKey('wt') -and $byP['wt'].appId -eq 'watchtower') ((@($un | ForEach-Object { "$($_.project)=$($_.appId)" })) -join ',')
 Test-Condition 'existing installations: a database inside another app (PostgreSQL, MongoDB) never makes it an installation of anything' (-not $byP.ContainsKey('ccna') -and -not $byP.ContainsKey('mydb')) ((@($un | ForEach-Object { "$($_.project)=$($_.appId)" })) -join ',')

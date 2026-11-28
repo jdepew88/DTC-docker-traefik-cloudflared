@@ -103,12 +103,12 @@ try {
   [IO.File]::WriteAllText((Join-Path $pathA 'secrets\cloudflare_tunnel_token'), $tunnelToken)
   $cfA = [ordered]@{ version = 1; accountId = $acct; accountName = 'Test Account'; tunnelId = $tunnel; tunnelName = 'existing-tunnel'
     domains = @([ordered]@{ id = $zone1; name = 'example.test'; accountId = $acct })
-    managed = [ordered]@{ 'keep.example.test' = [ordered]@{ service = 'notflix'; dnsRecordId = 'rec-keep'; accessAppId = '' }; 'protected.example.test' = [ordered]@{ service = 'traefik-dashboard'; dnsRecordId = ''; accessAppId = 'app-existing' } } }
+    managed = [ordered]@{ 'keep.example.test' = [ordered]@{ service = 'mediabox'; dnsRecordId = 'rec-keep'; accessAppId = '' }; 'protected.example.test' = [ordered]@{ service = 'traefik-dashboard'; dnsRecordId = ''; accessAppId = 'app-existing' } } }
   ($cfA | ConvertTo-Json -Depth 6) | Set-Content -LiteralPath (Join-Path $pathA 'config\cloudflare.json') -Encoding UTF8
   '{ "version": 1, "enabled": true, "subdomain": "protected", "zoneId": "zone00000000000000000000000000001", "zoneName": "example.test", "hostname": "protected.example.test", "accessEmails": ["owner@example.test"], "enabledAt": "2026-10-21T05:46:40" }' | Set-Content -LiteralPath (Join-Path $pathA 'config\dashboard.json')
   '{ "version": 1, "settings": null, "deployment": { "mode": "tunnel", "tunnelChoice": "existing", "tunnelId": "11111111-2222-3333-4444-555555555555", "tunnelName": "existing-tunnel", "newTunnelName": "" }, "installedAt": "2026-10-21T04:00:03" }' | Set-Content -LiteralPath (Join-Path $pathA 'config\setup.json')
-  $svc = New-ServiceDefinition -Name 'notflix' -Hostname 'keep.example.test' -TargetType lan -TargetHost '10.10.0.11' -Port 4119
-  $svc | Add-Member -NotePropertyName displayName -NotePropertyValue 'Notflix' -Force
+  $svc = New-ServiceDefinition -Name 'mediabox' -Hostname 'keep.example.test' -TargetType lan -TargetHost '10.20.30.11' -Port 4119
+  $svc | Add-Member -NotePropertyName displayName -NotePropertyValue 'Mediabox' -Force
   $null = Invoke-ServicePlan -Settings $sA -Plan (Get-ServicePlan -Settings $sA -Services @($svc)) -NoReload
   Remove-Item -LiteralPath (Join-Path $pathA 'backups') -Recurse -Force -ErrorAction SilentlyContinue
   # B: a second, independent installed deployment whose token was saved by another Windows account (unreadable).
@@ -162,7 +162,7 @@ try {
   $ia = Invoke-WebUi $ui POST '/api/projects/inspect' @{ path = $pathA; cloudflare = $true }
   $it = @{}; foreach ($x in @($ia.Data.items)) { $it[$x.id] = $x }
   Test-Condition 'inspect A: settings, saved files and the service (with display name) are detected' ($ia.Status -eq 200 -and $ia.Data.usable -and $it['instance'].message -eq $stackA -and $it['.env'].status -eq 'detected' -and
-    $it['config\dashboard.json'].status -eq 'detected' -and $it['config\services.json'].status -eq 'detected' -and $it['notflix'].label -eq 'Notflix (notflix)' -and $it['notflix'].status -eq 'detected') (Short $ia)
+    $it['config\dashboard.json'].status -eq 'detected' -and $it['config\services.json'].status -eq 'detected' -and $it['mediabox'].label -eq 'Mediabox (mediabox)' -and $it['mediabox'].status -eq 'detected') (Short $ia)
   Test-Condition 'inspect A: Cloudflare account, tunnel, zone, DNS record and Access app verified with read-only requests' ($ia.Data.cloudflareChecked -and $it['account'].status -eq 'verified' -and $it['tunnel'].status -eq 'verified' -and
     $it["zone-$zone1"].status -eq 'verified' -and $it['res-keep.example.test-DNS record'].status -eq 'verified' -and $it['res-protected.example.test-Access application'].status -eq 'verified' -and @(Get-Writes).Count -eq $writes0) (Short $ia)
   Test-Condition 'inspect A: secrets reported as present/readable only; the connector token matches the tunnel' ($it['token'].status -eq 'detected' -and $it['connector-token'].status -eq 'detected' -and
@@ -198,7 +198,7 @@ try {
   $cfd = Invoke-WebUi $ui GET '/api/cloudflare'
   $ov = Invoke-WebUi $ui GET '/api/overview'
   Test-Condition 'attach A: becomes the active deployment with its own instance, services, dashboard and Cloudflare selections' ($r.Status -eq 200 -and $s.Data.chosen -and $st.Data.instance.stackName -eq $stackA -and
-    @($sv.Data.services | Where-Object { $_.service.displayName -eq 'Notflix' }).Count -eq 1 -and $da.Data.publicUrl -eq 'https://protected.example.test/dashboard/' -and $cfd.Data.config.tunnelName -eq 'existing-tunnel' -and $cfd.Data.token.Readable -and
+    @($sv.Data.services | Where-Object { $_.service.displayName -eq 'Mediabox' }).Count -eq 1 -and $da.Data.publicUrl -eq 'https://protected.example.test/dashboard/' -and $cfd.Data.config.tunnelName -eq 'existing-tunnel' -and $cfd.Data.token.Readable -and
     $ov.Data.upgrade.state -eq 'available') "$(Short $r) $(Short $ov)"
   Test-Condition 'attach A: no file in the deployment folder, no Docker resource and nothing in Cloudflare changed' ((Get-FolderSnapshot $pathA) -eq $snapA -and (Get-DockerSnapshot) -eq $dockerBefore -and @(Get-Writes).Count -eq 0) "writes: $(@(Get-Writes).Count)"
   $state = Get-Content -Raw $stateFile | ConvertFrom-Json
@@ -234,9 +234,9 @@ try {
   $ap0 = Invoke-WebUi $ui POST '/api/projects/upgrade/apply' @{ path = $pathA; confirm = $true; previewKey = 'nope' }
   $ap1 = Invoke-WebUi $ui POST '/api/projects/upgrade/apply' @{ path = $pathA; previewKey = $pv.Data.previewKey }
   Test-Condition 'upgrade apply: needs the preview and an explicit confirmation' ($ap0.Status -eq 409 -and $ap1.Status -eq 400 -and (Get-FolderSnapshot $pathA) -eq $snapA) "$($ap0.Status) $($ap1.Status)"
-  $cfgBefore = (@('.env', 'config\cloudflare.json', 'config\dashboard.json', 'config\services.json', 'config\setup.json', 'secrets\cloudflare_api.dpapi', 'secrets\cloudflare_tunnel_token', 'traefik\dynamic\svc-notflix.yml') | ForEach-Object { Get-FileSha256 (Join-Path $pathA $_) }) -join ','
+  $cfgBefore = (@('.env', 'config\cloudflare.json', 'config\dashboard.json', 'config\services.json', 'config\setup.json', 'secrets\cloudflare_api.dpapi', 'secrets\cloudflare_tunnel_token', 'traefik\dynamic\svc-mediabox.yml') | ForEach-Object { Get-FileSha256 (Join-Path $pathA $_) }) -join ','
   $ap = Invoke-WebUi $ui POST '/api/projects/upgrade/apply' @{ path = $pathA; confirm = $true; previewKey = $pv.Data.previewKey }
-  $cfgAfter = (@('.env', 'config\cloudflare.json', 'config\dashboard.json', 'config\services.json', 'config\setup.json', 'secrets\cloudflare_api.dpapi', 'secrets\cloudflare_tunnel_token', 'traefik\dynamic\svc-notflix.yml') | ForEach-Object { Get-FileSha256 (Join-Path $pathA $_) }) -join ','
+  $cfgAfter = (@('.env', 'config\cloudflare.json', 'config\dashboard.json', 'config\services.json', 'config\setup.json', 'secrets\cloudflare_api.dpapi', 'secrets\cloudflare_tunnel_token', 'traefik\dynamic\svc-mediabox.yml') | ForEach-Object { Get-FileSha256 (Join-Path $pathA $_) }) -join ','
   Test-Condition 'upgrade apply: application files updated, configuration and secrets untouched, recovery point and previous copies kept, no Docker change' ($ap.Status -eq 200 -and $ap.Data.ok -and $ap.Data.upgrade.state -eq 'current' -and
     (Get-FileSha256 (Join-Path $pathA 'lib\TraefikProxy.psm1')) -eq (Get-FileSha256 (Join-Path $repo 'lib\TraefikProxy.psm1')) -and $cfgBefore -eq $cfgAfter -and $ap.Data.recoveryPoint -and
     @(Get-ChildItem -LiteralPath (Join-Path $pathA 'backups') -Recurse -Filter 'TraefikProxy.psm1').Count -eq 1 -and (Get-DockerSnapshot) -eq $dockerBefore -and @(Get-Writes).Count -eq 0) (Short $ap)
@@ -385,8 +385,8 @@ try {
       $li = $json | ConvertFrom-Json
       $lt = @{}; foreach ($x in @($li.items)) { $lt[$x.id] = $x }
       $names = (@($li.items | ForEach-Object { "$($_.id)=$($_.status)" }) -join ', ')
-      Test-Condition 'live (read-only): the installed deployment is discovered from its files and Docker metadata' ($li.usable -and $lt['instance'].message -eq 'traefik-ext1' -and $lt['proxy-network'].label -match 'proxynet' -and
-        $lt['tunnel'].message -match 'notflix-tunnel-tomypc' -and $lt['dashboard'].message -match 'traefik-ext1\.jrtechconsult\.com' -and $lt.ContainsKey('notflix') -and $lt['token'].status -in @('detected', 'verified') -and
+      Test-Condition 'live (read-only): the installed deployment is discovered from its files and Docker metadata' ($li.usable -and [string]$lt['instance'].message -and $lt['proxy-network'].label -match 'proxynet' -and
+        [string]$lt['tunnel'].message -and [string]$lt['dashboard'].message -match '\.' -and $lt['token'].status -in @('detected', 'verified') -and
         $lt['traefik'].status -eq 'verified' -and $lt['socket-proxy'].status -eq 'verified' -and $lt['cloudflared'].status -eq 'verified') $names
       Test-Condition 'live (read-only): Cloudflare account and tunnel verified with read-only requests' ($li.cloudflareChecked -and $lt['account'].status -eq 'verified' -and $lt['tunnel'].status -eq 'verified') $names
       Test-Condition 'live (read-only): no secret in the result; nothing in the folder or Docker changed' ($json -notmatch 'eyJ[A-Za-z0-9_-]{20,}' -and (Get-FolderSnapshot $live) -eq $liveBefore -and (Get-DockerSnapshot) -eq $liveDocker) ''

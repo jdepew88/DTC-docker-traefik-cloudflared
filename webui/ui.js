@@ -296,7 +296,9 @@
     } else ok.disabled = false;
     return new Promise((resolve) => {
       const onOk = () => { cleanup(); dlg.close('ok'); resolve(true); };
-      const onClose = () => { cleanup(); resolve(false); };
+      // A close event queued by the previous dialog can arrive after this one has reopened the same <dialog>; it is
+      // not a cancel of this one.
+      const onClose = () => { if (dlg.open) return; cleanup(); resolve(false); };
       function cleanup() { ok.removeEventListener('click', onOk); dlg.removeEventListener('close', onClose); }
       ok.addEventListener('click', onOk); dlg.addEventListener('close', onClose);
       openDialog(dlg);

@@ -286,7 +286,7 @@
 
   // --- Step 3: Configure the deployment ------------------------------------------------------------------------------------
   const SETTING_FIELDS = {
-    STACK_NAME: ['Instance name', 'Names the containers and the Compose project, e.g. traefik-ext1.', 'instance'],
+    STACK_NAME: ['Instance name', 'Names the containers and the Compose project, e.g. traefik-home.', 'instance'],
     TRAEFIK_HTTP_PORT: ['Traefik HTTP port (127.0.0.1)', 'Where Traefik receives app traffic on this PC.', 'port-publishing'],
     TRAEFIK_DASHBOARD_PORT: ['Local dashboard port (127.0.0.1)', 'Traefik\'s dashboard on this PC.', 'traefik-entrypoints'],
     PROXY_NETWORK: ['Shared Docker network', 'App containers join it so Traefik can reach them by name.', 'docker-networks'],

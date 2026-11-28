@@ -5,8 +5,8 @@ project and deliverable. This note records the plan so the two stay consistent.
 
 ## Purpose and audience
 
-- People with Docker Desktop and a Cloudflare account who want a local app (for example `http://10.10.0.11:4119`)
-  reachable as a secure public hostname (`https://notflix.example.com`) without assembling a reverse-proxy stack
+- People with Docker Desktop and a Cloudflare account who want a local app (for example `http://10.20.30.11:4119`)
+  reachable as a secure public hostname (`https://mediabox.example.com`) without assembling a reverse-proxy stack
   or opening router ports.
 - Experienced users who want to know exactly what the tool changes before trying it.
 

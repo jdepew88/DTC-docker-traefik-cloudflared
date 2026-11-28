@@ -137,7 +137,7 @@ try {
   Test-Condition 'installer preview: runs from the source folder' ($r.Status -eq 200 -and $previewText -match 'Checking Docker Desktop' -and $previewText -notmatch 'is not recognized as the name|module .* was not loaded|TraefikProxy\.psm1') (Short $r)
 
   # Changes that need an installation: refused with a clear 409, never a 500.
-  $body = @{ op = 'add'; name = 'firstrun'; service = @{ name = 'firstrun'; hostnames = @('firstrun.example.test'); target = @{ type = 'auto'; host = '10.10.0.11'; port = 8080; protocol = 'http' }
+  $body = @{ op = 'add'; name = 'firstrun'; service = @{ name = 'firstrun'; hostnames = @('firstrun.example.test'); target = @{ type = 'auto'; host = '10.20.30.11'; port = 8080; protocol = 'http' }
       cloudflare = @{ publish = $false; access = $false }; middlewares = @() }; cloudflare = @{ automate = $false } }
   $r = Invoke-Ui POST '/api/services/plan' $body
   Test-Condition 'service preview: 409 "install first"' ($r.Status -eq 409 -and $r.Data.error -match 'install') (Short $r)

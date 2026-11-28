@@ -714,17 +714,33 @@ function Sync-AuthentikLoginPage {
   if (-not $brand) { $brand = @(Get-AuthentikList $Conn '/core/brands/')[0] }
   $prev = [ordered]@{ brand = [string]$brand.brand_uuid; flow = [string](Get-AkProp $brand 'flow_authentication' ''); title = [string](Get-AkProp $brand 'branding_title' '') }
   $patch = @{}
-  # The DTC sign-in experience (flow dm-login, lib\AuthentikLogin.psm1) builds on this page: a brand that uses it keeps it.
-  $usesLogin = $false
-  if ($ov.Flows.ContainsKey("$($script:Prefix)login") -and [string](Get-AkProp $brand 'flow_authentication' '') -eq [string]$ov.Flows["$($script:Prefix)login"].Pk) { $usesLogin = $true }
-  if (-not $usesLogin -and [string](Get-AkProp $brand 'flow_authentication' '') -ne [string]$flow.pk) { $patch.flow_authentication = $flow.pk }
+  # A sign-in flow chosen in authentik (anything other than authentik's own default-authentication-flow or DTC's
+  # dm-authentication) is the owner's customization: it is kept, never replaced, also by later DTC versions.
+  $custom = Get-AuthentikCustomLoginFlow -Brand $brand -Flows $ov.Flows -ManagedSlug $fslug
+  if (-not $custom -and [string](Get-AkProp $brand 'flow_authentication' '') -ne [string]$flow.pk) { $patch.flow_authentication = $flow.pk }
   if ([string](Get-AkProp $brand 'branding_title' '') -ne $Title) { $patch.branding_title = $Title }
   if ($patch.Count) {
-    Add-AkAction $actions 'update' 'brand' $brand.domain "Use the Google-first sign-in page$(if ($patch.ContainsKey('branding_title')) { " titled '$Title'" })" 'The default sign-in flow stays unchanged and reachable for local recovery.'
+    $what = $(if ($patch.ContainsKey('flow_authentication')) { "Use the Google-first sign-in page$(if ($patch.ContainsKey('branding_title')) { " titled '$Title'" })" } else { "Title the sign-in page '$Title' (its custom sign-in flow '$custom' is kept)" })
+    Add-AkAction $actions 'update' 'brand' $brand.domain $what 'The default sign-in flow stays unchanged and reachable for local recovery.'
     if (-not $WhatIf) { $null = Invoke-AuthentikApi $Conn PATCH "/core/brands/$($brand.brand_uuid)/" $patch; Set-AkActionDone $actions }
-  } elseif ($usesLogin) { Add-AkAction $actions 'none' 'brand' $brand.domain "The sign-in page uses the DTC sign-in experience ($($script:Prefix)login), which includes the Google-first form" }
+  } elseif ($custom) { Add-AkAction $actions 'none' 'brand' $brand.domain "The sign-in page uses the custom sign-in flow '$custom' set in authentik; it is kept" }
   else { Add-AkAction $actions 'none' 'brand' $brand.domain 'The sign-in page already uses the Google-first form' }
-  return [pscustomobject]@{ Actions = $actions.ToArray(); Previous = $prev; FlowSlug = $fslug }
+  return [pscustomobject]@{ Actions = $actions.ToArray(); Previous = $prev; FlowSlug = $fslug; CustomFlow = $custom }
+}
+
+# The slug of the brand's sign-in flow when it was customized outside DTC, otherwise ''. Not custom: no flow set,
+# authentik's own default-authentication-flow, or the flow DTC manages ($ManagedSlug, dm-authentication).
+# $Flows: slug -> object with Pk (Get-AuthentikOverview).
+function Get-AuthentikCustomLoginFlow {
+  param([Parameter(Mandatory = $true)]$Brand, [Parameter(Mandatory = $true)][hashtable]$Flows, [string]$ManagedSlug = "$($script:Prefix)authentication")
+  $pk = [string](Get-AkProp $Brand 'flow_authentication' '')
+  if (-not $pk) { return '' }
+  foreach ($slug in @($Flows.Keys)) {
+    if ([string]$Flows[$slug].Pk -ne $pk) { continue }
+    if ($slug -in 'default-authentication-flow', $ManagedSlug) { return '' }
+    return [string]$slug
+  }
+  return ''
 }
 
 # Points the brand back to its previous sign-in flow and title. The dm-authentication flow is kept (unused).
@@ -952,7 +968,70 @@ function Test-ForwardAuthChallenge {
   return [pscustomobject]@{ State = 'loop'; Status = 0; Location = ''; Chain = $chain; Message = 'More than 8 redirects without reaching a sign-in page.' }
 }
 
+# --- Google return leg ----------------------------------------------------------------------------------------------------
+
+# One request to authentik's own address with the public Host header, cookies carried by hand: for an https page
+# authentik marks its session cookie Secure, which a cookie container would not send back over the direct http
+# connection to authentik. $Client = @{ Base; HostHeader; Scheme; Jar = @{} }.
+function Invoke-AkHostRequest($Client, [string]$Path, [string]$Accept = 'text/html', [int]$TimeoutMs = 20000) {
+  $req = [Net.HttpWebRequest]::Create("$($Client.Base)$Path")
+  $req.Method = 'GET'; $req.AllowAutoRedirect = $false; $req.Proxy = $null; $req.Timeout = $TimeoutMs; $req.ReadWriteTimeout = $TimeoutMs; $req.Host = $Client.HostHeader
+  $req.Headers.Add('X-Forwarded-Proto', $Client.Scheme); $req.Accept = $Accept; $req.UserAgent = 'Mozilla/5.0 (DTC sign-in check)'
+  if ($Client.Jar.Count) { $req.Headers.Add('Cookie', (@($Client.Jar.Keys | ForEach-Object { "$_=$($Client.Jar[$_])" }) -join '; ')) }
+  $sw = [Diagnostics.Stopwatch]::StartNew()
+  try { $r = $req.GetResponse() } catch [Net.WebException] {
+    if ($_.Exception.Response) { $r = $_.Exception.Response }
+    elseif ($_.Exception.Status -eq [Net.WebExceptionStatus]::Timeout) { return [pscustomobject]@{ Status = 0; Location = ''; Body = ''; Ms = $sw.ElapsedMilliseconds; TimedOut = $true } }
+    else { throw }
+  }
+  foreach ($sc in @($r.Headers.GetValues('Set-Cookie'))) { if ($sc -and $sc -match '^\s*([^=;\s]+)=([^;]*)') { $Client.Jar[$Matches[1]] = $Matches[2] } }
+  $sr = New-Object IO.StreamReader($r.GetResponseStream()); $body = $sr.ReadToEnd(); $sr.Close()
+  $o = [pscustomobject]@{ Status = [int]$r.StatusCode; Location = [string]$r.Headers['Location']; Body = $body; Ms = $sw.ElapsedMilliseconds; TimedOut = $false }; $r.Close(); return $o
+}
+
+function ConvertFrom-AkQuery([string]$Url) {
+  $q = @{}
+  foreach ($pair in ([Uri]$Url).Query.TrimStart('?').Split('&')) { $kv = $pair.Split('=', 2); if ($kv.Count -eq 2) { $q[[Uri]::UnescapeDataString($kv[0])] = [Uri]::UnescapeDataString($kv[1].Replace('+', ' ')) } }
+  return $q
+}
+
+<#
+  The return leg of Google sign-in, without a Google account: starts the sign-in like a browser (flow page, executor,
+  /source/oauth/login/<slug>/ for a real OAuth state), then calls authentik's callback with that state and a code that
+  Google will reject. authentik must exchange the code with Google's token endpoint and turn the rejection into a
+  normal sign-in failure within a few seconds. If authentik cannot reach Google (for example containers without
+  outbound network after a hung Docker engine), the callback hangs ~30 s and the browser sits on a spinner; that is
+  reported as a failure. Nobody is signed in by this check; authentik logs one "Authentication Failure" warning.
+  Works with whatever sign-in flow the brand uses.
+#>
+function Test-AuthentikGoogleCallback {
+  param([Parameter(Mandatory = $true)][string]$BaseUrl, [Parameter(Mandatory = $true)][string]$HostHeader, [string]$Scheme = 'https',
+    [Parameter(Mandatory = $true)][string]$FlowSlug, [string]$Slug = 'google', [int]$MaxSeconds = 10)
+  $c = @{ Base = $BaseUrl.TrimEnd('/'); HostHeader = $HostHeader; Scheme = $Scheme; Jar = @{} }
+  $out = [ordered]@{ ok = $false; stage = ''; pageMs = 0; executorMs = 0; executorComponent = ''; googleStatus = 0; callbackStatus = 0; callbackMs = 0; callbackLocation = ''; message = '' }
+  $page = Invoke-AkHostRequest $c "/if/flow/$FlowSlug/?next=%2F" 'text/html'
+  $out.pageMs = $page.Ms
+  if ($page.Status -ne 200) { $out.stage = 'page'; $out.message = "Flow page answered HTTP $($page.Status)."; return [pscustomobject]$out }
+  $exec = Invoke-AkHostRequest $c "/api/v3/flows/executor/$FlowSlug/?query=next%3D%252F" 'application/json'
+  $out.executorMs = $exec.Ms
+  try { $out.executorComponent = [string](($exec.Body | ConvertFrom-Json).component) } catch { }
+  if ($exec.Status -ne 200 -or -not $out.executorComponent) { $out.stage = 'executor'; $out.message = "Flow executor answered HTTP $($exec.Status) without a stage."; return [pscustomobject]$out }
+  $g = Invoke-AkHostRequest $c "/source/oauth/login/$Slug/" 'text/html'
+  $out.googleStatus = $g.Status
+  if ($g.Status -notin 301, 302 -or $g.Location -notmatch '^https://accounts\.google\.com/') { $out.stage = 'google-redirect'; $out.message = "The Google source answered HTTP $($g.Status) instead of redirecting to Google."; return [pscustomobject]$out }
+  $state = [string](ConvertFrom-AkQuery $g.Location)['state']
+  $cb = Invoke-AkHostRequest $c "/source/oauth/callback/$Slug/?state=$([Uri]::EscapeDataString($state))&code=dtc-sign-in-check-invalid-code&scope=email+profile" 'text/html' 60000
+  $out.callbackStatus = $cb.Status; $out.callbackMs = $cb.Ms; $out.callbackLocation = $cb.Location
+  $out.stage = 'callback'
+  if ($cb.TimedOut) { $out.message = 'The Google callback did not answer within 60 s: authentik cannot finish sign-ins (browser spinner).'; return [pscustomobject]$out }
+  if ($cb.Ms -gt $MaxSeconds * 1000) { $out.message = "The Google callback took $([int]($cb.Ms / 1000)) s (limit $MaxSeconds s): authentik most likely cannot reach Google's token endpoint (check the containers' outbound network)."; return [pscustomobject]$out }
+  if ($cb.Status -ge 500) { $out.message = "The Google callback failed with HTTP $($cb.Status)."; return [pscustomobject]$out }
+  $out.ok = $true; $out.stage = 'done'
+  $out.message = "authentik exchanged the (deliberately invalid) code with Google and answered in $($cb.Ms) ms (HTTP $($cb.Status)): the return leg of Google sign-in is reachable."
+  return [pscustomobject]$out
+}
+
 Export-ModuleMember -Function Invoke-AkHttp, Get-AuthentikHealth, New-AuthentikConnection, Invoke-AuthentikApi, Get-AuthentikList, Test-AuthentikToken, Test-AuthentikCredential, Get-AuthentikOverview,
   Get-GoogleOAuthSettings, ConvertFrom-GoogleClientJson, Test-GoogleClientId, Test-GoogleClientSecret, ConvertTo-OwnerEmail, New-OwnerEnrollmentExpression, Get-AuthentikOwnersGroupName, Get-AuthentikGroup, Sync-AuthentikOwnersGroup,
   Sync-AuthentikOutpost, Sync-AuthentikGoogleSource, Find-AuthentikOwner, Get-AuthentikOwnerCheck, Set-AuthentikUserInternal, Complete-AuthentikOwner, Sync-AuthentikLoginPage, Restore-AuthentikLoginPage, Sync-AuthentikAppProtection, Remove-AuthentikAppProtection, Test-AuthentikGoogleRedirect,
-  Get-AuthentikSourceLogins, Get-AuthentikAppAccessEvidence, Wait-AuthentikOutpost, Test-ForwardAuthChallenge
+  Get-AuthentikSourceLogins, Get-AuthentikAppAccessEvidence, Wait-AuthentikOutpost, Test-ForwardAuthChallenge, Get-AuthentikCustomLoginFlow, Test-AuthentikGoogleCallback

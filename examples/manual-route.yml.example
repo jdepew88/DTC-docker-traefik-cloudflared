@@ -32,4 +32,4 @@ http:
       loadBalancer:
         servers:
           - url: http://host.docker.internal:3000
-    # Another device on the LAN would be: - url: http://10.10.0.11:32800
+    # Another device on the LAN would be: - url: http://10.20.30.11:32800

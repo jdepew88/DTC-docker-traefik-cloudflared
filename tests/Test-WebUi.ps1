@@ -63,7 +63,7 @@ $mock = $null; $ui = $null
 function Get-Ingress { return ,@((Get-MockState $mock).configs.$tunnelId.ingress) }
 function Get-Dns([string]$Name) { return ,@((Get-MockState $mock).dns | Where-Object { $_.name -eq $Name }) }
 function Get-Apps([string]$Domain) { return ,@((Get-MockState $mock).apps | Where-Object { $_.domain -eq $Domain }) }
-function New-Body([string]$Op, [string]$Name, [string[]]$Hostnames, [string]$TargetHost = '10.10.0.11', [int]$Port = 8080, [string]$Exposure = 'access', [string[]]$Emails = @(), [bool]$Automate = $true, [bool]$Cleanup = $true) {
+function New-Body([string]$Op, [string]$Name, [string[]]$Hostnames, [string]$TargetHost = '10.20.30.11', [int]$Port = 8080, [string]$Exposure = 'access', [string[]]$Emails = @(), [bool]$Automate = $true, [bool]$Cleanup = $true) {
   return @{
     op = $Op; name = $Name
     service = @{ name = $Name; hostnames = $Hostnames; target = @{ type = 'auto'; host = $TargetHost; port = $Port; protocol = 'http' }
@@ -199,10 +199,10 @@ try {
 
   # --- Primary workflow: add a service ---------------------------------------------------------------------------------
   $before = @(Get-MockRequests $mock).Count
-  $plexBody = New-Body 'add' 'plex' @('plex.example.test') '10.10.0.11' 32800 'access' @('owner@example.com')
+  $plexBody = New-Body 'add' 'plex' @('plex.example.test') '10.20.30.11' 32800 'access' @('owner@example.com')
   $plan = Invoke-WebUi $ui POST '/api/services/plan' $plexBody
   $writes = @(Get-MockRequests $mock | Select-Object -Skip $before | Where-Object { $_.method -ne 'GET' })
-  Test-Condition 'preview: Traefik route diff for plex (LAN 10.10.0.11:32800)' ($plan.Status -eq 200 -and @($plan.Data.traefik.changes | Where-Object { $_.action -eq 'add' -and $_.file -match 'svc-plex.yml' -and ($_.diff -join "`n") -match 'url: http://10\.10\.0\.11:32800' }).Count -eq 1) (Short $plan)
+  Test-Condition 'preview: Traefik route diff for plex (LAN 10.20.30.11:32800)' ($plan.Status -eq 200 -and @($plan.Data.traefik.changes | Where-Object { $_.action -eq 'add' -and $_.file -match 'svc-plex.yml' -and ($_.diff -join "`n") -match 'url: http://10.20.30.11:32800' }).Count -eq 1) (Short $plan)
   Test-Condition 'preview: Access, tunnel route and DNS planned (in that order)' (((@($plan.Data.cloudflare.actions | ForEach-Object { "$($_.step):$($_.kind)" })) -join ',') -eq 'access:create,tunnel:create,dns:create') (($plan.Data.cloudflare.actions | ForEach-Object { $_.id }) -join ',')
   Test-Condition 'preview: media streaming warning shown' (@($plan.Data.traefik.issues | Where-Object { $_.Message -match 'media streaming' }).Count -eq 1)
   Test-Condition 'preview changes nothing (no files, no Cloudflare writes)' ($writes.Count -eq 0 -and -not (Test-Path (Join-Path $install 'traefik\dynamic\svc-plex.yml')) -and -not (Test-Path $settings.RegistryPath)) ($writes | ConvertTo-Json -Compress)
@@ -241,7 +241,7 @@ try {
     $g.Count -eq 1 -and $g[0].target.type -eq 'host' -and $g[0].target.host -eq 'host.docker.internal' -and (($c.Plan.Data.notes -join ' ') -match 'host.docker.internal')) (Short $c.Plan)
 
   # --- Overwrite / blocked / existing resources ------------------------------------------------------------------------
-  $tb = New-Body 'add' 'taken' @('taken.example.test') '10.10.0.12' 80 'public'
+  $tb = New-Body 'add' 'taken' @('taken.example.test') '10.20.30.12' 80 'public'
   $plan = Invoke-WebUi $ui POST '/api/services/plan' $tb
   $ow = Find-Action $plan 'dns:taken.example.test'
   Test-Condition 'existing CNAME elsewhere -> overwrite flagged' ($ow.Count -eq 1 -and $ow[0].kind -eq 'update' -and $ow[0].overwrite) (Short $plan)
@@ -249,24 +249,24 @@ try {
   Test-Condition 'overwrite without per-resource confirmation -> 400, nothing written' ($r.Status -eq 400 -and (Get-Dns 'taken.example.test')[0].content -eq 'elsewhere.example.net' -and -not (Test-Path (Join-Path $install 'traefik\dynamic\svc-taken.yml'))) (Short $r)
   $c = Invoke-WebUiChange $ui $tb @('dns:taken.example.test')
   Test-Condition 'confirmed overwrite repoints the record to the tunnel' ($c.Apply.Status -eq 200 -and (Get-Dns 'taken.example.test')[0].content -eq $tunnelTarget) (Short $c.Apply)
-  $plan = Invoke-WebUi $ui POST '/api/services/plan' (New-Body 'add' 'arec' @('a-record.example.test') '10.10.0.13' 80 'public')
+  $plan = Invoke-WebUi $ui POST '/api/services/plan' (New-Body 'add' 'arec' @('a-record.example.test') '10.20.30.13' 80 'public')
   Test-Condition 'existing A record -> blocked, cannot apply' ($plan.Status -eq 200 -and -not $plan.Data.canApply -and (Find-Action $plan 'dns:a-record.example.test')[0].kind -eq 'blocked') (Short $plan)
   $r = Invoke-WebUi $ui POST '/api/services/apply' @{ planId = $plan.Data.planId; confirm = $true }
   Test-Condition 'blocked plan cannot be applied' ($r.Status -eq 400 -and (Get-Dns 'a-record.example.test')[0].type -eq 'A') (Short $r)
-  $plan = Invoke-WebUi $ui POST '/api/services/plan' (New-Body 'add' 'prot' @('protected.example.test') '10.10.0.14' 80 'access')
+  $plan = Invoke-WebUi $ui POST '/api/services/plan' (New-Body 'add' 'prot' @('protected.example.test') '10.20.30.14' 80 'access')
   Test-Condition 'existing Access app is reused, not duplicated' ((Find-Action $plan 'access:protected.example.test')[0].kind -eq 'none' -and $plan.Data.canApply) (Short $plan)
-  $plan = Invoke-WebUi $ui POST '/api/services/plan' (New-Body 'add' 'noemail' @('noemail.example.test') '10.10.0.15' 80 'access')
+  $plan = Invoke-WebUi $ui POST '/api/services/plan' (New-Body 'add' 'noemail' @('noemail.example.test') '10.20.30.15' 80 'access')
   Test-Condition 'Access without allowed emails -> blocked' ((Find-Action $plan 'access:noemail.example.test')[0].kind -eq 'blocked' -and -not $plan.Data.canApply) (Short $plan)
-  $plan = Invoke-WebUi $ui POST '/api/services/plan' (New-Body 'add' 'nozone' @('app.not-in-account.test') '10.10.0.16' 80 'public')
+  $plan = Invoke-WebUi $ui POST '/api/services/plan' (New-Body 'add' 'nozone' @('app.not-in-account.test') '10.20.30.16' 80 'public')
   Test-Condition 'hostname outside the token''s zones -> blocked' ((Find-Action $plan 'dns:app.not-in-account.test')[0].kind -eq 'blocked' -and -not $plan.Data.canApply) (Short $plan)
-  $plan = Invoke-WebUi $ui POST '/api/services/plan' (New-Body 'add' 'otherzone' @('app.other.test') '10.10.0.16' 80 'public')
+  $plan = Invoke-WebUi $ui POST '/api/services/plan' (New-Body 'add' 'otherzone' @('app.other.test') '10.20.30.16' 80 'public')
   $oz = Find-Action $plan 'dns:app.other.test'
   Test-Condition 'visible but not allowed domain -> blocked, nothing written' ($oz.Count -eq 1 -and $oz[0].kind -eq 'blocked' -and $oz[0].summary -match 'not an allowed domain' -and -not $plan.Data.canApply -and (Get-Dns 'app.other.test').Count -eq 0) ($plan.Data.cloudflare | ConvertTo-Json -Depth 6 -Compress)
   $plan = Invoke-WebUi $ui POST '/api/services/plan' (New-Body 'add' 'Bad Name' @('bad.example.test') '127.0.0.1' 0 'public')
   Test-Condition 'invalid input -> validation errors, cannot apply' ($plan.Status -eq 200 -and -not $plan.Data.canApply -and @($plan.Data.traefik.issues | Where-Object { $_.Level -eq 'Error' }).Count -ge 2) (Short $plan)
-  $plan = Invoke-WebUi $ui POST '/api/services/plan' (New-Body 'add' 'manual' @('manual.example.test') '10.10.0.17' 80 'access' @() $false)
+  $plan = Invoke-WebUi $ui POST '/api/services/plan' (New-Body 'add' 'manual' @('manual.example.test') '10.20.30.17' 80 'access' @() $false)
   Test-Condition 'automation off -> manual Cloudflare steps, no API actions' ($plan.Data.canApply -and @($plan.Data.cloudflare.actions).Count -eq 0 -and @($plan.Data.cloudflare.manualSteps).Count -ge 3) (Short $plan)
-  $r = Invoke-WebUi $ui POST '/api/services/plan' (New-Body 'add' 'badmail' @('m.example.test') '10.10.0.18' 80 'access' @('not-an-email'))
+  $r = Invoke-WebUi $ui POST '/api/services/plan' (New-Body 'add' 'badmail' @('m.example.test') '10.20.30.18' 80 'access' @('not-an-email'))
   Test-Condition 'malformed Access email rejected' ($r.Status -eq 400) (Short $r)
   $r = Invoke-WebUi $ui POST '/api/services/plan' @{ op = 'rename'; name = 'plex' }
   Test-Condition 'unknown operation rejected' ($r.Status -eq 400) (Short $r)
@@ -278,7 +278,7 @@ try {
   $c = Invoke-WebUiChange $ui @{ op = 'enable'; name = 'plex'; cloudflare = @{ automate = $true; cleanup = $false } }
   Test-Condition 'enable: route back, Cloudflare already in place (no changes)' ($c.Apply.Status -eq 200 -and (Test-Path (Join-Path $install 'traefik\dynamic\svc-plex.yml')) -and
     @($c.Plan.Data.cloudflare.actions | Where-Object { $_.kind -ne 'none' }).Count -eq 0) (Short $c.Plan)
-  $upd = New-Body 'update' 'plex' @('media.example.test') '10.10.0.11' 32800 'access' @('owner@example.com')
+  $upd = New-Body 'update' 'plex' @('media.example.test') '10.20.30.11' 32800 'access' @('owner@example.com')
   $c = Invoke-WebUiChange $ui $upd
   $kinds = (@($c.Plan.Data.cloudflare.actions | ForEach-Object { "$($_.id)=$($_.kind)" }) | Sort-Object) -join ','
   Test-Condition 'hostname change: new hostname published, old one cleaned up' ($c.Apply.Status -eq 200 -and $c.Apply.Data.ok -and
@@ -333,7 +333,7 @@ try {
   Test-Condition 'token removal needs confirmation' ($r.Status -eq 400 -and (Test-Path $secretPath)) (Short $r)
   $r = Invoke-WebUi $ui POST '/api/cloudflare/token/delete' @{ confirm = $true }
   Test-Condition 'token removed on confirmation' ($r.Status -eq 200 -and -not (Test-Path $secretPath)) (Short $r)
-  $plan = Invoke-WebUi $ui POST '/api/services/plan' (New-Body 'add' 'after' @('after.example.test') '10.10.0.19' 80 'access' @('a@example.com'))
+  $plan = Invoke-WebUi $ui POST '/api/services/plan' (New-Body 'add' 'after' @('after.example.test') '10.20.30.19' 80 'access' @('a@example.com'))
   Test-Condition 'without a token, plans fall back to manual steps' ($plan.Status -eq 200 -and -not $plan.Data.cloudflare.connected -and @($plan.Data.cloudflare.manualSteps).Count -ge 1) (Short $plan)
 } finally {
   Stop-TestServer $ui

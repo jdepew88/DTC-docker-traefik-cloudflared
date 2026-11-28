@@ -71,5 +71,5 @@ SYSTEM and Administrators, holds:
 - Production authentik backups are your decision: nothing backs up or restores it automatically.
 - The backup holds authentik's secrets in plain text (`.env`, the database) behind an owner-only ACL. Copies taken
   off the PC must be encrypted; see [credential-portability.md](credential-portability.md). Taking the stopped-volume
-  copy stops authentik for a few seconds (sign-in unavailable); the upgrade procedure uses an online `pg_dump` instead
-  ([production-upgrade.md](production-upgrade.md)).
+  copy stops authentik for a few seconds (sign-in unavailable); before an upgrade an online dump avoids that:
+  `docker exec <postgresql container> pg_dump -U <user> -d <database> -Fc > authentik.dump`.

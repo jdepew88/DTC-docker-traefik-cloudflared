@@ -10,7 +10,7 @@ Set-StrictMode -Version 2.0
 
 $script:TraefikImage = 'traefik:v3.7.15'   # keep in sync with compose.yaml
 # Version of this manager (scripts + web UI). Recorded in configuration backups; bump it when the package changes.
-$script:ManagerVersion = '1.4.1'
+$script:ManagerVersion = '1.4.2'
 $script:RegistryVersion = 1
 $script:ManagedPrefix = 'svc-'
 $script:HostnamePattern = '^(?=.{1,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$'
@@ -403,7 +403,7 @@ function ConvertTo-ServiceDefinition($InputObject) {
       access  = [bool](Get-ServiceProperty $cloudflare 'access' $accessDefault)
     }
   }
-  # Optional human-readable name ("Notflix"); the name above stays the id. Only stored when set, so registries
+  # Optional human-readable name ("Mediabox"); the name above stays the id. Only stored when set, so registries
   # written by earlier versions are unchanged.
   $displayName = ([string](Get-ServiceProperty $InputObject 'displayName' '')).Trim()
   if ($displayName) { $definition.Insert(1, 'displayName', $displayName) }
@@ -584,7 +584,7 @@ function Test-ServiceDefinition {
       elseif (Test-IPv4Address $t.host) {
         if (-not (Test-PrivateIPv4 $t.host)) { & $warn 'target.host' "$($t.host) is not a private (RFC 1918) address. Make sure this is really the device you want to publish." }
       } elseif ($t.host -match ':') { & $err 'target.host' 'IPv6 targets are not supported; use an IPv4 address or a DNS name.' }
-      elseif ($t.host -notmatch $script:HostTargetPattern) { & $err 'target.host' 'Enter an IPv4 address (e.g. 10.10.0.11) or a DNS name.' }
+      elseif ($t.host -notmatch $script:HostTargetPattern) { & $err 'target.host' 'Enter an IPv4 address (e.g. 10.20.30.11) or a DNS name.' }
       elseif ($t.host -notmatch '\.') { & $warn 'target.host' "Single-label names like '$($t.host)' often do not resolve inside Docker Desktop; prefer an IP address or a fully qualified name." }
       if ($t.protocol -eq 'https' -and -not $t.tlsSkipVerify -and (Test-IPv4Address $t.host)) {
         & $warn 'target.tlsSkipVerify' 'An https target addressed by IP rarely has a certificate for that IP. Enable "skip certificate verification" if the device uses a self-signed certificate.'

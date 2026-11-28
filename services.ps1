@@ -13,12 +13,12 @@
   Target types:
     docker  a container on the shared proxy network, by container name      -> http://<container>:<port>
     host    an app running directly on this Windows PC                        -> http://host.docker.internal:<port>
-    lan     another device on your network (IP address or DNS name)          -> http://10.10.0.11:32800
+    lan     another device on your network (IP address or DNS name)          -> http://10.20.30.11:32800
 
 .EXAMPLE
   .\services.ps1 list
-  .\services.ps1 add -Name plex -Hostname plex.example.com -TargetType lan -TargetHost 10.10.0.11 -Port 32800
-  .\services.ps1 add -Name plex -Hostname plex.example.com -TargetType lan -TargetHost 10.10.0.11 -Port 32800 -Apply
+  .\services.ps1 add -Name plex -Hostname plex.example.com -TargetType lan -TargetHost 10.20.30.11 -Port 32800
+  .\services.ps1 add -Name plex -Hostname plex.example.com -TargetType lan -TargetHost 10.20.30.11 -Port 32800 -Apply
   .\services.ps1 add -Name wiki -Hostname wiki.example.com -TargetType docker -TargetHost wikijs -Port 3000 -Apply
   .\services.ps1 add -Name grafana -Hostname grafana.example.com -TargetType host -Port 3000 -Apply
   .\services.ps1 set -Name plex -Port 32400 -Apply
